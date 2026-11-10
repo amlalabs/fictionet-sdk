@@ -7,8 +7,8 @@ use std::sync::{
 use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
-    Admit, Budget, Charge, ChargedDeque, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer, Mux,
-    MuxCommand, MuxEvent, OwnedWork, Port, Top, WorkOwner,
+    Admit, Budget, Charge, ChargedDeque, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer,
+    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Top, WorkOwner,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;

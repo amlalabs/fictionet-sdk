@@ -28,7 +28,7 @@ use fictionet::{Cx, Error};
 use super::body::Inner;
 use super::handlers::status_only;
 use super::http2::{Http2Server, Responder};
-use super::response::{Asked, Dates, ResponsePolicy, head_held, request_held};
+use super::response::{Asked, Dates, ResponsePolicy, head_held, headers_held, request_held};
 use super::sites::no_host;
 use super::{
     Body, Delivery, Exchange, Handler, Later, Limits, PIECE, Received, Reply, Reset, UpgradeHandler,
@@ -158,11 +158,11 @@ pub struct Http1 {
     pub(super) first_head_deadline: Option<Instant>,
     stream: Stream<http1::RequestEvents>,
     /// Bytes past the end of HTTP, kept for what comes next.
-    after: Vec<u8>,
+    after: ChargedBytes,
     phase: Phase,
     timers: Timers<Timer>,
-    head: Option<RequestHead>,
-    body: Vec<u8>,
+    head: Option<Owned<RequestHead>>,
+    body: ChargedBytes,
     too_big: bool,
     responding: Option<Responding>,
     out: VecDeque<StreamCommand>,
@@ -201,13 +201,13 @@ impl Http1 {
             h2c: false,
             first_head_deadline: None,
             stream: Stream::new(http1::RequestEvents::with_limits(opts.head)),
-            after: Vec::new(),
+            after: ChargedBytes::with_capacity(&Budget::unlimited(), 0).unwrap(),
             charge: None,
             frame_charge: None,
             phase: Phase::Opening,
             timers: Timers::new(),
             head: None,
-            body: Vec::new(),
+            body: ChargedBytes::with_capacity(&Budget::unlimited(), 0).unwrap(),
             too_big: false,
             responding: None,
             out: VecDeque::new(),
@@ -271,22 +271,6 @@ impl Http1 {
             .upgraded(settings, request)
     }
 
-    /// The bytes held, as charged to the budget. Output carries its own
-    /// charge.
-    fn holding(&self) -> usize {
-        self.stream
-            .limit()
-            .saturating_mul(2)
-            .max(self.stream.allocated())
-            .saturating_add(self.stream.held())
-            .saturating_add(self.after.capacity())
-            .saturating_add(self.decode_reservation())
-            .saturating_add(self.head.as_ref().map_or(0, head_held))
-            .saturating_add(self.body.capacity())
-            .saturating_add(self.responding.as_ref().map_or(0, Responding::held))
-            .saturating_add(self.dates.held())
-    }
-
     /// Parsing copies head strings and grows a header vector geometrically.
     /// A rejected head is boxed, cloned by Stream and copied for dispatch,
     /// so reserve all three heads. Body events copy one configured block.
@@ -307,29 +291,27 @@ impl Http1 {
         head.saturating_mul(3).max(self.opts.head.body_chunk)
     }
 
-    /// Charges what is held and `more`, if it fits.
-    fn fits(&mut self, more: usize) -> bool {
-        let need = self.holding().saturating_add(more);
-        self.charge.as_mut().is_none_or(|charge| {
-            if need < charge.bytes() {
-                charge.shrink_to(need);
-                true
-            } else {
-                charge.grow_to(need)
-            }
-        })
-    }
-
     /// Takes the first charge and starts waiting for the first head.
     fn open(&mut self, env: &mut Env<'_, Report>) {
         self.phase = Phase::Reading;
-        match env.budget().charge(self.holding().saturating_add(PIECE)) {
+        // The decoder's bounded input and temporary heads are paid once.
+        // Retained bodies, heads and output own their reservations separately.
+        let bytes = self
+            .stream
+            .limit()
+            .saturating_mul(2)
+            .saturating_add(self.decode_reservation())
+            .saturating_add(self.dates.held())
+            .saturating_add(PIECE);
+        match env.budget().charge(bytes) {
             Some(mut charge) => {
                 self.frame_charge = charge.split(PIECE);
                 self.charge = Some(charge);
             }
             None => return self.over_budget(env),
         }
+        self.body = ChargedBytes::with_capacity(env.budget(), 0).unwrap();
+        self.after = ChargedBytes::with_capacity(env.budget(), 0).unwrap();
         let at = self
             .first_head_deadline
             .take()
@@ -357,7 +339,8 @@ impl Http1 {
         env.report(Report::Closing(why));
         self.timers = Timers::new();
         self.head = None;
-        self.body = Vec::new();
+        self.body.clear();
+        self.body.trim();
         self.responding = None;
         self.work = None;
         self.work_owner.cancel();
@@ -365,11 +348,6 @@ impl Http1 {
         self.next = None;
         self.phase = Phase::Closing;
         self.out.push_back(StreamCommand::End);
-        // What is left, such as the input buffer, still counts.
-        let need = self.holding();
-        if let Some(charge) = &mut self.charge {
-            charge.shrink_to(need);
-        }
     }
 
     /// The connection holds more than its budget allows: nothing more is
@@ -407,12 +385,13 @@ impl Http1 {
                     };
                     self.push_out(out);
                 }
-                if !self.fits(head_held(&head)) {
+                let Some(charge) = env.budget().charge(head_held(&head)) else {
                     self.over_budget(env);
                     return true;
-                }
-                self.head = Some(head);
-                self.body = Vec::new();
+                };
+                self.head = Some(Owned::new(head, charge));
+                self.body.clear();
+                self.body.trim();
                 self.too_big = false;
                 true
             }
@@ -425,20 +404,18 @@ impl Http1 {
                 if need > self.body.capacity() {
                     // Grow as a vector does, charging the whole growth first.
                     let cap = need.max(self.body.capacity() * 2).min(self.opts.body);
-                    if !self.fits(cap - self.body.capacity()) {
+                    if !self.body.grow_to(cap) {
                         self.over_budget(env);
                         return true;
                     }
-                    self.body.reserve_exact(cap - self.body.len());
                 }
-                self.body.extend_from_slice(&bytes);
+                self.body
+                    .extend_within(&bytes)
+                    .expect("body growth reserved room");
                 true
             }
             Some(Ok(H1::Done)) => {
-                let Some(bytes) = self.take_body() else {
-                    self.over_budget(env);
-                    return true;
-                };
+                let bytes = self.take_body(env.budget());
                 let body = Body::from(bytes);
                 let close = self.too_big;
                 self.dispatch(env, body, close, Closing::Done);
@@ -453,15 +430,13 @@ impl Http1 {
 
     /// Move the body's reservation into its shared backing storage. Handler
     /// clones and streams may outlive both this layer and its current job.
-    fn take_body(&mut self) -> Option<Bytes> {
-        if self.body.is_empty() {
-            return Some(Bytes::new());
-        }
-        let charge = self.charge.as_mut()?.split(self.body.capacity())?;
-        Some(Bytes::from_owner(Owned::new(
-            std::mem::take(&mut self.body),
-            charge,
-        )))
+    fn take_body(&mut self, budget: &Budget) -> Bytes {
+        let bytes = std::mem::replace(
+            &mut self.body,
+            ChargedBytes::with_capacity(budget, 0).unwrap(),
+        );
+        let (bytes, charge) = bytes.into_parts();
+        Bytes::from_owner(Owned::new(bytes, charge))
     }
 
     /// Answers the request whose head is pending, with `body`. `close`
@@ -496,6 +471,14 @@ impl Http1 {
         } else {
             Received::Complete
         };
+        let mut observation = if self.observe.is_some() {
+            let Some(charge) = env.budget().charge(held) else {
+                return self.over_budget(env);
+            };
+            Some(charge)
+        } else {
+            None
+        };
         let mut delivery = Delivery::new(&self.observe, &request, &self.conn, now, received);
         let h2c = (self.h2c && keep_alive && !self.too_big && !lacks_host)
             .then(|| h2c_settings(&request))
@@ -512,6 +495,7 @@ impl Http1 {
             // The request is HTTP/2's stream 1, observed there: the 101
             // is not its answer.
             delivery = None;
+            observation = None;
             self.next = Some(Next::H2c(Box::new(self.http2(&settings, request))));
             let mut switching = status_only(StatusCode::SWITCHING_PROTOCOLS);
             switching
@@ -550,6 +534,7 @@ impl Http1 {
         self.timers.cancel(&Timer::Body);
         self.responding = Some(Responding {
             delivery,
+            observation,
             version,
             wants,
             close: !keep_alive || lacks_host,
@@ -574,15 +559,13 @@ impl Http1 {
             let pending = self.stream.decoder().pending_body_len(buffered);
             let added = pending.min(room);
             let need = self.body.len().saturating_add(added);
-            if !self.fits(need.saturating_sub(self.body.capacity())) {
+            if !self.body.grow_to(need) {
                 return self.over_budget(env);
             }
             self.body
-                .reserve_exact(need.saturating_sub(self.body.len()));
-            self.body.extend_from_slice(&self.stream.unread()[..added]);
-            let Some(bytes) = self.take_body() else {
-                return self.over_budget(env);
-            };
+                .extend_within(&self.stream.unread()[..added])
+                .expect("body growth reserved room");
+            let bytes = self.take_body(env.budget());
             let body = partial(bytes, "the request body was cut off");
             self.dispatch(env, body, true, Closing::Failed);
             env.report(Report::Failed(fail));
@@ -594,7 +577,10 @@ impl Http1 {
             && rejected.head.header("host").is_none()
         {
             self.too_big = rejected.received_body_bytes > self.opts.body;
-            self.head = Some(rejected.head.clone());
+            let Some(charge) = env.budget().charge(head_held(&rejected.head)) else {
+                return self.over_budget(env);
+            };
+            self.head = Some(Owned::new(rejected.head.clone(), charge));
             self.dispatch(env, Body::empty(), true, Closing::Failed);
             env.report(Report::Failed(fail));
             return;
@@ -640,15 +626,18 @@ impl Http1 {
             body if !r.rest.is_empty() => {
                 r.stage = body;
                 let piece = r.take_piece();
-                let framed =
-                    output(env, piece.len() + 2 * size_of::<usize>() + 4).and_then(|mut out| {
-                        out.fill(|out| {
-                            r.frame(&piece, out);
-                            Ok::<_, Infallible>(())
-                        })
-                        .ok()?;
-                        Some(out)
-                    });
+                let framed = ChargedBytes::with_capacity(
+                    env.budget(),
+                    piece.len() + 2 * size_of::<usize>() + 4,
+                )
+                .and_then(|mut out| {
+                    out.fill(|out| {
+                        r.frame(&piece, out);
+                        Ok::<_, Infallible>(())
+                    })
+                    .ok()?;
+                    Some(out)
+                });
                 let Some(out) = framed else {
                     self.over_budget(env);
                     return true;
@@ -694,6 +683,17 @@ impl Http1 {
     fn start(&mut self, env: &mut Env<'_, Report>, mut r: Responding, response: Response<Body>) {
         let (parts, body) = response.into_parts();
         if let Some(delivery) = &mut r.delivery {
+            let charge = r
+                .observation
+                .as_mut()
+                .expect("an observation owns its reservation");
+            let need = charge
+                .bytes()
+                .saturating_add(size_of::<http::response::Parts>())
+                .saturating_add(headers_held(&parts.headers));
+            if !charge.grow_to(need) {
+                return self.over_budget(env);
+            }
             delivery.response(&parts);
         }
         let hands_on = parts.status == StatusCode::SWITCHING_PROTOCOLS
@@ -724,7 +724,7 @@ impl Http1 {
         else {
             return self.over_budget(env);
         };
-        let Some(mut head) = output(env, bound) else {
+        let Some(mut head) = ChargedBytes::with_capacity(env.budget(), bound) else {
             return self.over_budget(env);
         };
         let close = r.close;
@@ -765,7 +765,7 @@ impl Http1 {
     /// Queues `bytes` of the response, of which `body` are body bytes.
     fn piece(
         &mut self,
-        env: &mut Env<'_, Report>,
+        _env: &mut Env<'_, Report>,
         mut r: Responding,
         bytes: ChargedBytes,
         body: usize,
@@ -786,11 +786,7 @@ impl Http1 {
             }
         }
         self.responding = Some(r);
-        if !self.fits(0) {
-            self.over_budget(env);
-        } else {
-            self.push_out(bytes);
-        }
+        self.push_out(bytes);
     }
 
     /// The response is written: wait for the next request, close, or
@@ -823,21 +819,11 @@ impl Http1 {
                 .push(StreamEvent::Data(Chunk::from_bytes(bytes)));
         }
         if !self.after.is_empty() {
-            // The part of the connection's charge that paid for these bytes
-            // pays for their copy instead.
-            let Some(mut charge) = self
-                .charge
-                .as_mut()
-                .and_then(|c| c.split(self.after.capacity()))
-            else {
-                return self.over_budget(env);
-            };
-            charge.shrink_to(self.after.len());
-            let mut bytes = charge.into_bytes();
-            if bytes.extend_within(&self.after).is_err() {
-                return self.over_budget(env);
-            }
-            self.after = Vec::new();
+            let mut bytes = std::mem::replace(
+                &mut self.after,
+                ChargedBytes::with_capacity(env.budget(), 0).unwrap(),
+            );
+            bytes.trim();
             self.leftover
                 .push(StreamEvent::Data(Chunk::from_bytes(bytes)));
         }
@@ -851,6 +837,7 @@ impl Http1 {
 /// A response being made or written.
 struct Responding {
     delivery: Option<Delivery>,
+    observation: Option<Charge>,
     version: Version,
     wants: Asked,
     close: bool,
@@ -877,10 +864,6 @@ enum Stage {
 }
 
 impl Responding {
-    fn held(&self) -> usize {
-        self.delivery.as_ref().map_or(0, |delivery| delivery.held)
-    }
-
     fn take_piece(&mut self) -> Bytes {
         let piece = self.rest.split_to(self.rest.len().min(PIECE));
         if self.rest.is_empty() {
@@ -960,23 +943,20 @@ impl Layer for Http1 {
                         let cap = need
                             .max(self.after.capacity().saturating_mul(2))
                             .min(self.stream.limit());
-                        if !self.fits(cap - self.after.capacity()) {
+                        if !self.after.grow_to(cap) {
                             self.over_budget(env);
                             return Ok(Admit::Closed(StreamEvent::Data(chunk)));
                         }
-                        self.after.reserve_exact(cap - self.after.len());
                     }
-                    self.after.extend_from_slice(&chunk[..n]);
+                    self.after
+                        .extend_within(&chunk[..n])
+                        .expect("handoff growth reserved room");
                     chunk.advance(n);
                     return Ok(if chunk.is_empty() {
                         Admit::Taken
                     } else {
                         Admit::Partial(StreamEvent::Data(chunk))
                     });
-                }
-                if !self.fits(0) {
-                    self.over_budget(env);
-                    return Ok(Admit::Closed(StreamEvent::Data(chunk)));
                 }
                 let n = self.stream.push(&chunk);
                 Ok(if n == 0 {
@@ -1101,9 +1081,6 @@ impl Layer for Http1 {
             Phase::Answering => self.respond(env),
             Phase::Switching | Phase::Closing | Phase::Closed => false,
         };
-        if moved && matches!(self.phase, Phase::Reading | Phase::Answering) && !self.fits(0) {
-            self.over_budget(env);
-        }
         Ok(moved)
     }
 
@@ -1376,11 +1353,11 @@ fn error_output(error: &Error, budget: &Budget) -> Option<(Response<Body>, Charg
         .len()
         .checked_add(message.len())?
         .checked_add(suffix.len())?;
-    let charge = budget.charge(len)?;
-    let mut bytes = Vec::with_capacity(len);
-    bytes.extend_from_slice(prefix.as_bytes());
-    bytes.extend_from_slice(message.as_bytes());
-    bytes.extend_from_slice(suffix.as_bytes());
+    let mut bytes = ChargedBytes::with_capacity(budget, len)?;
+    bytes.extend_within(prefix.as_bytes()).ok()?;
+    bytes.extend_within(message.as_bytes()).ok()?;
+    bytes.extend_within(suffix.as_bytes()).ok()?;
+    let (bytes, charge) = bytes.into_parts();
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
     response.headers_mut().insert(
@@ -1402,11 +1379,6 @@ fn normalize_body(body: &mut Body, budget: &Budget) -> Option<Option<Charge>> {
         }
         _ => Some(None),
     }
-}
-
-/// Room for the full output bound, charged before it is allocated.
-fn output(env: &Env<'_, Report>, bound: usize) -> Option<ChargedBytes> {
-    ChargedBytes::with_capacity(env.budget(), bound)
 }
 
 /// Bounds headers plus every generated field. Suppressed application fields
@@ -1517,7 +1489,7 @@ fn simple_output(
 ) -> Option<ChargedBytes> {
     let (parts, _) = status_only(status).into_parts();
     let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || date);
-    let mut out = output(env, head_bound(&parts, &policy)?)?;
+    let mut out = ChargedBytes::with_capacity(env.budget(), head_bound(&parts, &policy)?)?;
     out.fill(|out| Ok::<_, Infallible>(encode(out, version, &parts, &policy, true)))
         .ok()?;
     Some(out)
@@ -1530,6 +1502,43 @@ mod router_tests {
     use fictionet::stdlib::layer::{Budget, Harness};
     use fictionet::stdlib::services::stack::Polling;
     use fictionet::sync::Mutex;
+
+    #[test]
+    fn observation_budget_is_reserved_before_calling_the_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Count(Arc<AtomicUsize>);
+        impl Handler for Count {
+            fn call(&self, _: Request<Body>, _: &mut Exchange<'_>) -> Reply {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Reply::Now(Response::new(Body::empty()))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let budget = Budget::new(1 << 20);
+        let mut h = Harness::with_budget(
+            fictionet::Seed::from_u64(14),
+            Http1::new(Count(calls.clone())).observe(Arc::new(|_| {})),
+            budget.clone(),
+        );
+        let body = b"x";
+        h.push(b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 1\r\n\r\n")
+            .unwrap();
+        assert!(h.layer().head.is_some());
+        let other = budget
+            .charge(budget.limit() - budget.used() - 2 * body.len())
+            .unwrap();
+        h.push(body).unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "observation storage must fit before dispatch"
+        );
+        assert!(budget.used() <= budget.limit());
+        drop(h);
+        assert_eq!(budget.used(), other.bytes());
+        drop(other);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn a_handler_retaining_request_bytes_retains_the_backing_reservation() {
