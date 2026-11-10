@@ -164,8 +164,9 @@ body.page-expanded .map-wrap{visibility:hidden;padding:0}
 .world-menu label{font-size:var(--t2);color:var(--muted)}
 .world-menu textarea{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:8px 10px;resize:vertical;min-height:64px}
 .world-menu textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.scenario-actions{display:flex;gap:8px}
-.scenario-actions button{font-size:var(--t2);padding:5px 12px}
+.scenario-actions,.world-actions{display:flex;gap:8px}
+.scenario-actions button,.world-actions button{font-size:var(--t2);padding:5px 12px}
+.world-actions{margin-top:14px}
 #world-error{color:var(--red);margin-top:10px}
 .scenario-label{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .scenario-state{display:inline-flex;align-items:center;gap:7px;font-size:var(--t2);color:var(--muted);white-space:nowrap}

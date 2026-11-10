@@ -471,6 +471,9 @@ pub enum Command {
     SetSource {
         source: Source,
     },
+    /// Start a new session in the current mode: a fresh workstation and an
+    /// empty world.
+    Reset,
     SetScenario {
         scenario: String,
     },
@@ -716,6 +719,12 @@ impl Page {
                             Ok(())
                         }
                     },
+                    Command::Reset => {
+                        let source = *sessions.borrow();
+                        page.refresh(&pages, source, Session::Starting);
+                        sessions.send_replace(source);
+                        Ok(())
+                    }
                     Command::SetScenario { scenario } => {
                         let cx = page.cx.lock().unwrap().clone();
                         match cx {
