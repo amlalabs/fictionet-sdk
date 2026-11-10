@@ -1446,18 +1446,6 @@ impl TcpLayer {
         }
         // The options of an ACK that may complete a handshake.
         let completing = (before == Some(TcpState::SynReceived)).then(|| segment_options(t));
-        // A listening socket in an earlier slot must not take a SYN for
-        // a tuple that already belongs to a connection.
-        let mut idle = Vec::new();
-        if syn
-            && !ack
-            && handle.is_some()
-            && let Some(listener) = self.listeners.get(&dst.port())
-        {
-            for &id in &listener.idle {
-                idle.push((id, self.sockets.remove(id)));
-            }
-        }
         self.dev.rx = Some(packet);
         if let Some(h) = handle {
             self.iface.poll_ingress_targeted(
@@ -1472,9 +1460,6 @@ impl TcpLayer {
         }
         let consumed = self.dev.rx.is_none();
         self.dev.reclaim();
-        for (id, socket) in idle {
-            self.sockets.insert(id, socket);
-        }
         if let Some(h) = handle {
             if let Some(c) = self.conns.get_mut(&h)
                 && c.ecn

@@ -240,6 +240,20 @@ fn a_syn_changes_only_the_listener_that_accepts_it() {
                 .all(|&h| st.get(h).state() == TcpState::Listen)
         );
         assert_eq!(egress(&mut st, smol_now(&fcx)).len(), 1);
+        for slot in st.sockets.set.changed().collect::<Vec<_>>() {
+            st.sockets.set.acknowledge_changed(slot);
+        }
+        st.ingress(
+            &fcx,
+            &Budget::unlimited(),
+            smol_now(&fcx),
+            segment(peer, local, 100, 0, 2).0,
+        );
+        assert!(st.sockets.set.changed().all(|slot| {
+            st.sockets.ids[slot.index()] == Some(accepted)
+        }));
+        assert_eq!(st.by_tuple[&(local, peer)], accepted);
+        assert!(idle[1..].iter().all(|&h| st.get(h).state() == TcpState::Listen));
         Ok(())
     }))
     .unwrap();
