@@ -87,12 +87,194 @@ mod cache {
         }
     }
 
+    /// The most bytes of a session's key a slot holds: rustls's session
+    /// ids and stateful ticket ids are 32 bytes.
+    pub const SLOT_KEY: usize = 32;
+
+    /// The most bytes of a session a slot holds: a session without client
+    /// certificates or resumption data, whose name and protocol are each at
+    /// most 255 bytes, encodes in less.
+    pub const SLOT_VALUE: usize = 1024;
+
+    /// One session: its key and its encoding, in place.
+    struct Slot {
+        key: [u8; SLOT_KEY],
+        key_len: u8,
+        value: [u8; SLOT_VALUE],
+        value_len: u16,
+        /// When it was put, to drop the oldest first; 0 while free.
+        put: u64,
+    }
+
+    /// Sessions in slots made and paid for once, when the store is made: a
+    /// connection that stores, finds or takes a session allocates nothing
+    /// the store keeps, so nothing a connection made stays allocated after
+    /// it is gone. A session whose key or encoding does not fit a slot is
+    /// not kept. When every slot is taken, the oldest session goes.
+    pub struct ServerSessionSlots {
+        slots: Mutex<(Vec<Slot>, u64)>,
+        _paid: crate::budget::Paid,
+    }
+
+    impl ServerSessionSlots {
+        /// A store for `size` sessions, paid for by `budget` now and for
+        /// its life: `size` slots of [`SLOT_KEY`] and [`SLOT_VALUE`] bytes.
+        /// `None`, making nothing, if the budget has no room.
+        #[cfg(feature = "std")]
+        pub fn with_budget(
+            size: usize,
+            budget: Arc<dyn crate::budget::BufferBudget>,
+        ) -> Option<Arc<Self>> {
+            let mut paid = crate::budget::Paid::open(&Some(budget));
+            if !paid.grow_by(size.checked_mul(size_of::<Slot>())?) {
+                return None;
+            }
+            let mut slots = Vec::with_capacity(size);
+            slots.extend((0..size).map(|_| Slot {
+                key: [0; SLOT_KEY],
+                key_len: 0,
+                value: [0; SLOT_VALUE],
+                value_len: 0,
+                put: 0,
+            }));
+            Some(Arc::new(Self {
+                slots: Mutex::new((slots, 0)),
+                _paid: paid,
+            }))
+        }
+
+        fn find<'a>(slots: &'a mut [Slot], key: &[u8]) -> Option<&'a mut Slot> {
+            slots
+                .iter_mut()
+                .find(|slot| slot.put != 0 && &slot.key[..usize::from(slot.key_len)] == key)
+        }
+    }
+
+    impl server::StoresServerSessions for ServerSessionSlots {
+        fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+            if key.len() > SLOT_KEY || value.len() > SLOT_VALUE {
+                return false;
+            }
+            let mut guard = self.slots.lock().unwrap();
+            let (slots, clock) = &mut *guard;
+            *clock += 1;
+            let now = *clock;
+            let slot = match slots
+                .iter()
+                .position(|slot| slot.put != 0 && slot.key[..usize::from(slot.key_len)] == key[..])
+            {
+                Some(found) => &mut slots[found],
+                // A free slot, or the oldest.
+                None => match slots.iter_mut().min_by_key(|slot| slot.put) {
+                    Some(slot) => slot,
+                    None => return false,
+                },
+            };
+            slot.key[..key.len()].copy_from_slice(&key);
+            slot.key_len = key.len() as u8;
+            slot.value[..value.len()].copy_from_slice(&value);
+            slot.value_len = value.len() as u16;
+            slot.put = now;
+            true
+        }
+
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            let mut guard = self.slots.lock().unwrap();
+            let slot = Self::find(&mut guard.0, key)?;
+            Some(slot.value[..usize::from(slot.value_len)].to_vec())
+        }
+
+        fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+            let mut guard = self.slots.lock().unwrap();
+            let slot = Self::find(&mut guard.0, key)?;
+            slot.put = 0;
+            Some(slot.value[..usize::from(slot.value_len)].to_vec())
+        }
+
+        fn can_cache(&self) -> bool {
+            true
+        }
+    }
+
+    impl Debug for ServerSessionSlots {
+        fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("ServerSessionSlots").finish()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::vec;
 
         use super::*;
+        use crate::budget::testing::Limit;
         use crate::server::StoresServerSessions;
+
+        /// The slot store is charged once, when it is made, and never
+        /// again; it refuses to be made without room. Against a model of
+        /// the most recent `size` sessions, over seeded puts, gets, takes
+        /// and sessions too large to keep, it finds what the model finds.
+        #[test]
+        fn slots_are_paid_once_and_keep_the_latest_sessions() {
+            let size = 4;
+            let limit = Limit::new(1 << 10);
+            assert!(ServerSessionSlots::with_budget(size, limit.clone()).is_none());
+            assert_eq!(limit.used(), 0);
+
+            let limit = Limit::new(1 << 20);
+            let store = ServerSessionSlots::with_budget(size, limit.clone()).unwrap();
+            let paid = limit.used();
+            assert!(paid >= size * (SLOT_KEY + SLOT_VALUE));
+
+            // (key, value, when put), the model of what the store keeps.
+            let mut model: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = |n: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % n
+            };
+            for step in 1..2000u64 {
+                let key = vec![next(8) as u8; 1 + next(SLOT_KEY as u64) as usize];
+                match next(4) {
+                    0 | 1 => {
+                        let len = match next(10) {
+                            0 => SLOT_VALUE + 1,
+                            _ => next(SLOT_VALUE as u64 + 1) as usize,
+                        };
+                        let value = vec![step as u8; len];
+                        let kept = store.put(key.clone(), value.clone());
+                        assert_eq!(kept, len <= SLOT_VALUE, "step {step}");
+                        if kept {
+                            model.retain(|(k, _, _)| *k != key);
+                            if model.len() == size {
+                                let oldest = (0..model.len()).min_by_key(|&i| model[i].2).unwrap();
+                                model.remove(oldest);
+                            }
+                            model.push((key, value, step));
+                        }
+                    }
+                    2 => {
+                        let expected = model
+                            .iter()
+                            .find(|(k, _, _)| *k == key)
+                            .map(|(_, v, _)| v.clone());
+                        assert_eq!(store.get(&key), expected, "step {step}");
+                    }
+                    _ => {
+                        let expected = model
+                            .iter()
+                            .position(|(k, _, _)| *k == key)
+                            .map(|i| model.remove(i).1);
+                        assert_eq!(store.take(&key), expected, "step {step}");
+                    }
+                }
+                assert_eq!(limit.used(), paid, "step {step}: the store's charge moved");
+            }
+            drop(store);
+            assert_eq!(limit.used(), 0);
+        }
 
         #[test]
         fn test_serversessionmemorycache_accepts_put() {
@@ -150,7 +332,7 @@ mod cache {
 }
 
 #[cfg(any(feature = "std", feature = "hashbrown"))]
-pub use cache::ServerSessionMemoryCache;
+pub use cache::{ServerSessionMemoryCache, ServerSessionSlots, SLOT_KEY, SLOT_VALUE};
 
 /// Something which never produces tickets.
 #[derive(Debug)]
