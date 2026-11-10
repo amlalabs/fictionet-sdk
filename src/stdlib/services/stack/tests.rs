@@ -478,8 +478,11 @@ fn a_client_reset_ends_the_run() {
     );
 }
 
+/// A budget whose whole limit is smaller than the read buffer can never
+/// pay for it: the run ends starved, saying what it needed, instead of
+/// waiting for a release that can never make room.
 #[test]
-fn a_budget_without_room_for_the_read_buffer_never_runs_the_stack() {
+fn a_budget_smaller_than_the_read_buffer_ends_the_run_starved() {
     let client = |fcx: Cx, tcp: tcp::Endpoint| async move {
         let mut conn = tcp.connect(&fcx, server_addr()).await?;
         conn.write_all(&fcx, &wire(&frames(1))).await?;
@@ -488,13 +491,16 @@ fn a_budget_without_room_for_the_read_buffer_never_runs_the_stack() {
         assert!(got.is_empty(), "nothing is answered");
         Ok(())
     };
-    let ended = serve_one(
-        StreamLimits::default(),
-        Budget::new(READ - 1),
-        stack,
-        client,
-    );
-    assert_eq!(ended, Ok(StreamEnd::Budget));
+    let budget = Budget::new(READ - 1);
+    let limit = budget.limit();
+    let ended = serve_one(StreamLimits::default(), budget, stack, client);
+    match ended {
+        Ok(StreamEnd::Budget(starved)) => {
+            assert_eq!(starved.limit, limit);
+            assert!(starved.need > starved.limit, "{starved:?}");
+        }
+        other => panic!("the run ends starved, not {other:?}"),
+    }
 }
 
 /// Bytes read that the budget has no room to pay a copy of go to the stack
@@ -530,6 +536,46 @@ fn bytes_read_without_room_wait_for_memory() {
         Ok(())
     };
     let ended = serve_one(StreamLimits::default(), budget, stack, client);
+    assert_eq!(ended, Ok(StreamEnd::Finished));
+}
+
+/// A budget with room for the stack but not, at the start, for the read
+/// buffer: the run waits for memory instead of ending, the idle limit does
+/// not count while it waits, and once another holder frees memory the
+/// bytes the client sent at the start are read and answered.
+#[test]
+fn the_first_read_buffer_waits_for_memory() {
+    let budget = Budget::new(1 << 20);
+    let hog = budget.charge(budget.limit() - READ / 2).unwrap();
+    let idle = Duration::from_millis(100);
+    let limits = StreamLimits {
+        idle: Some(idle),
+        ..StreamLimits::default()
+    };
+    let client = move |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        let sent = frames(3);
+        conn.write_all(&fcx, &wire(&sent)).await?;
+        // Many idle limits pass with the server waiting for memory.
+        fcx.sleep(idle * 10).await?;
+        drop(hog);
+        let mut got = vec![0u8; wire(&sent).len()];
+        let mut filled = 0;
+        while filled < got.len() {
+            let n = conn.read(&fcx, &mut got[filled..]).await?;
+            assert!(n > 0, "the server answers before it ends");
+            filled += n;
+        }
+        assert_eq!(
+            read(&got),
+            sent,
+            "every frame is answered once memory frees"
+        );
+        conn.shutdown(&fcx).await?;
+        read_to_end(&fcx, &mut conn).await?;
+        Ok(())
+    };
+    let ended = serve_one(limits, budget, stack, client);
     assert_eq!(ended, Ok(StreamEnd::Finished));
 }
 
@@ -606,7 +652,7 @@ fn datagrams_reach_one_conversation_and_answers_go_to_each_sender() {
         let (server, client) = machines(&fcx);
         let socket = server.udp.bind(PORT)?;
         fcx.spawn(move |fcx| async move {
-            Ok(datagrams(
+            let end = datagrams(
                 &fcx,
                 socket,
                 server_addr(),
@@ -614,7 +660,9 @@ fn datagrams_reach_one_conversation_and_answers_go_to_each_sender() {
                 Budget::unlimited(),
                 |_| {},
             )
-            .await?)
+            .await?;
+            assert_eq!(end, DatagramEnd::Finished);
+            Ok(())
         });
         let mut a = client.udp.bind(0)?;
         let mut b = client.udp.bind(0)?;
@@ -1494,7 +1542,7 @@ fn check_datagram_extraction(command: Option<DatagramCommand<SocketAddr>>) {
                 "every extraction report reaches the observer before polling returns"
             );
             if end {
-                assert!(matches!(result, Poll::Ready(Ok(()))));
+                assert!(matches!(result, Poll::Ready(Ok(DatagramEnd::Finished))));
             } else {
                 assert!(result.is_pending());
             }
@@ -1655,7 +1703,7 @@ fn a_datagram_stack_woken_from_another_task_runs_and_ends() {
         let stop = Arc::new(Stop::default());
         let layer = StopsWhenAsked::<Datagrams<SocketAddr>>::new(stop.clone());
         let run = fcx.spawn(move |fcx| async move {
-            Ok(datagrams(
+            let end = datagrams(
                 &fcx,
                 socket,
                 server_addr(),
@@ -1663,7 +1711,9 @@ fn a_datagram_stack_woken_from_another_task_runs_and_ends() {
                 Budget::unlimited(),
                 |_| {},
             )
-            .await?)
+            .await?;
+            assert_eq!(end, DatagramEnd::Finished);
+            Ok(())
         });
         fcx.sleep(Duration::from_secs(1)).await?;
         stop.ask();
@@ -1889,14 +1939,14 @@ mod memory {
 
     use fictionet::stdlib::layer::{
         Admit, Budget, ByteStream, Charge, DatagramCommand, DatagramEvent, Datagrams, Env, Layer,
-        StreamCommand, StreamEvent, Top,
+        Starved, StreamCommand, StreamEvent, Top,
     };
     use fictionet::stdlib::network::{ConnError, ConnInfo, Connection, DatagramSocket};
     use fictionet::sync::Mutex;
     use fictionet::time::Instant;
     use fictionet::{Cx, RecvError, Seed, block_on, lab};
 
-    use super::super::{StreamEnd, StreamLimits, datagrams, stream};
+    use super::super::{DatagramEnd, StreamEnd, StreamLimits, datagrams, stream};
 
     /// The bytes each stack asks for, more than the room left at first.
     const WANT: usize = 128 * 1024;
@@ -2142,6 +2192,89 @@ mod memory {
                 "the release woke the run, with no timer"
             );
             run.join(&fcx).await?;
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// When a run ended, and how.
+    type Ended<T> = Arc<Mutex<Option<(Instant, T)>>>;
+
+    /// Checks that a run that started at `started` ended at that same
+    /// moment, in its first poll, starved of more than `limit` holds.
+    fn ended_starved_at_once(started: Instant, limit: usize, at: Instant, starved: Starved) {
+        assert_eq!(at, started, "the run ended in its first poll");
+        assert_eq!(starved.limit, limit);
+        assert!(starved.need > starved.limit, "{starved:?}");
+    }
+
+    /// A stack that asks for more than the whole limit can never be given
+    /// it: the run ends starved within its first poll, with no timer or
+    /// input to end it, instead of waiting for a release forever.
+    #[test]
+    fn a_stream_stack_needing_more_than_the_limit_ends_starved_at_once() {
+        block_on(lab(Seed::from_u64(8), |fcx| async move {
+            let budget = Budget::new(WANT / 2);
+            let limit = budget.limit();
+            let ended: Ended<Option<StreamEnd>> = Arc::default();
+            let slot = ended.clone();
+            let started = fcx.now();
+            let _run = fcx.spawn(move |fcx| async move {
+                let limits = StreamLimits {
+                    idle: None,
+                    write_timeout: None,
+                };
+                let stack = Hungry::new(Got::default());
+                let info = ConnInfo::default();
+                let end = stream(&fcx, Silent, &info, stack, budget, limits, |_| {}).await;
+                *slot.lock() = Some((fcx.now(), end.ok()));
+                Ok(())
+            });
+            fcx.sleep(Duration::from_secs(1)).await?;
+            let outcome = ended.lock().take();
+            // A run still waiting is stopped, so a run that never ends
+            // fails here instead of hanging the test.
+            fcx.cancel();
+            let (at, end) = outcome.expect("the run ended within a second");
+            match end {
+                Some(StreamEnd::Budget(starved)) => {
+                    ended_starved_at_once(started, limit, at, starved);
+                }
+                other => panic!("the run ends starved, not {other:?}"),
+            }
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// The same over datagrams.
+    #[test]
+    fn a_datagram_stack_needing_more_than_the_limit_ends_starved_at_once() {
+        block_on(lab(Seed::from_u64(9), |fcx| async move {
+            let budget = Budget::new(WANT / 2);
+            let limit = budget.limit();
+            let ended: Ended<Option<DatagramEnd>> = Arc::default();
+            let slot = ended.clone();
+            let started = fcx.now();
+            let local = SocketAddr::from(([10, 9, 0, 1], 53));
+            let _run = fcx.spawn(move |fcx| async move {
+                let stack = HungryDatagrams(Hungry::new(Got::default()));
+                let end = datagrams(&fcx, Quiet, local, stack, budget, |_| {}).await;
+                *slot.lock() = Some((fcx.now(), end.ok()));
+                Ok(())
+            });
+            fcx.sleep(Duration::from_secs(1)).await?;
+            let outcome = ended.lock().take();
+            // A run still waiting is stopped, so a run that never ends
+            // fails here instead of hanging the test.
+            fcx.cancel();
+            let (at, end) = outcome.expect("the run ended within a second");
+            match end {
+                Some(DatagramEnd::Budget(starved)) => {
+                    ended_starved_at_once(started, limit, at, starved);
+                }
+                other => panic!("the run ends starved, not {other:?}"),
+            }
             Ok(())
         }))
         .unwrap();

@@ -482,6 +482,6 @@ pub async fn serve_connection<C: Connection + Unpin>(
     match stack::stream(fcx, conn, &info, stack, budget, limits, |_| {}).await {
         Err(StackError::Cancelled) => Err(Cancelled),
         // A layer that gives up ends its connection alone.
-        Ok(_) | Err(StackError::Budget | StackError::Layer(_)) => Ok(()),
+        Ok(_) | Err(StackError::Layer(_)) => Ok(()),
     }
 }

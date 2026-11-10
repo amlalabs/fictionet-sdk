@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams, Driver,
-    Layer, Top,
+    Layer, Starved, Top,
 };
 use fictionet::stdlib::network::{ConnError, ConnInfo, Connection, DatagramSocket, Transport};
 use fictionet::sync::Mutex;
@@ -103,11 +103,11 @@ pub enum StreamEnd {
     Idle,
     /// The stack reset the connection. Whoever owns the socket resets it.
     Reset,
-    /// The budget had no room for the connection's read buffer at the
-    /// start, so the stack never ran, or for a single place in its table
-    /// of work. Bytes read later that the budget has no room for wait for
-    /// memory instead.
-    Budget,
+    /// The connection needs more than the budget's whole limit: a charge
+    /// for it needed more than any release could ever make room for. Any
+    /// other charge the budget refuses waits for memory instead, with the
+    /// idle limit stopped, the read buffer and the table of work included.
+    Budget(Starved),
     /// Reading or writing failed: the peer reset the connection, or it
     /// stopped reading ([`ConnError::TimedOut`]). The stack heard
     /// [`StreamEvent::Reset`](fictionet::stdlib::layer::StreamEvent::Reset).
@@ -121,8 +121,6 @@ pub enum StreamEnd {
 pub enum StackError<E> {
     /// The stack gave up on its connection with this error.
     Layer(E),
-    /// The runner could not retain input or work within its memory budget.
-    Budget,
     /// The run's [region](fictionet::Cx#regions) was cancelled.
     Cancelled,
 }
@@ -131,7 +129,6 @@ impl<E: core::fmt::Display> core::fmt::Display for StackError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             StackError::Layer(e) => e.fmt(f),
-            StackError::Budget => f.write_str("stack memory budget exhausted"),
             StackError::Cancelled => f.write_str("cancelled"),
         }
     }
@@ -141,7 +138,6 @@ impl<E: core::error::Error + 'static> core::error::Error for StackError<E> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             StackError::Layer(e) => Some(e),
-            StackError::Budget => None,
             StackError::Cancelled => Some(&Cancelled),
         }
     }
@@ -244,13 +240,15 @@ impl Drop for Counted {
 /// with the world's context in a [region](fictionet::Cx#regions) of its
 /// own: what it spawns is cancelled when the run ends. A task of the work
 /// that fails ends that work and cancels the run, never the caller's
-/// region. When `budget` refuses the stack a charge, the stack tries again
-/// once memory frees: the release wakes the run.
+/// region. When `budget` refuses the stack a charge, the read buffer and
+/// the table of work included, the stack tries again once memory frees:
+/// the release wakes the run, and the idle limit does not count meanwhile.
 ///
 /// It returns once the stack has ended its direction with every byte
 /// written and no work left, and input has ended or the stack declares
 /// itself terminal, or when the connection fails, the stack
-/// resets it or gives up on it, or `limits` give up on it. A cancel of the
+/// resets it or gives up on it, `limits` give up on it, or a charge needs
+/// more than the budget's whole limit ([`StreamEnd::Budget`]). A cancel of the
 /// run's region wins over any of these but the stack giving up
 /// ([`StackError::Cancelled`]). A panic in the
 /// stack names it and `info` on standard error as it unwinds
@@ -317,6 +315,18 @@ pub enum DatagramReport<R> {
     },
 }
 
+/// How a datagram run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatagramEnd {
+    /// The stack ended the conversation, or the socket closed and the
+    /// stack sent everything it still had.
+    Finished,
+    /// The stack needs more than the budget's whole limit: a charge for it
+    /// needed more than any release could ever make room for. Any other
+    /// charge the budget refuses waits for memory instead.
+    Budget(Starved),
+}
+
 /// Runs `stack` over every datagram of `socket`, which is bound at
 /// `local`, until the socket closes or the stack ends it, handing its
 /// reports to `report`, charging retained input and layer state to `budget`.
@@ -332,7 +342,9 @@ pub enum DatagramReport<R> {
 /// the stack has not taken holds up the next receive, so the socket queues
 /// them. When the socket closes the stack hears [`DatagramEvent::Ended`]
 /// and sends what it still has. The stack's work runs, and a refused
-/// charge is tried again, as in [`stream`]. A panic in the stack names it
+/// charge is tried again, as in [`stream`]; a charge that needs more than
+/// the whole limit ends the run with [`DatagramEnd::Budget`] within the
+/// round it was refused in. A panic in the stack names it
 /// and the socket on standard error as
 /// it unwinds ([`PanicNote`]).
 pub async fn datagrams<L, D>(
@@ -342,7 +354,7 @@ pub async fn datagrams<L, D>(
     stack: L,
     budget: Budget,
     mut report: impl FnMut(DatagramReport<L::Report>) + Send,
-) -> Result<(), StackError<L::Error>>
+) -> Result<DatagramEnd, StackError<L::Error>>
 where
     L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top>,
     L::Work: Job<Done = L::Done>,
@@ -366,7 +378,7 @@ async fn run_datagrams<L, D>(
     stack: L,
     budget: Budget,
     report: &mut (impl FnMut(DatagramReport<L::Report>) + Send),
-) -> Result<(), StackError<L::Error>>
+) -> Result<DatagramEnd, StackError<L::Error>>
 where
     L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top>,
     L::Work: Job<Done = L::Done>,
@@ -398,9 +410,6 @@ where
             refusals = driver.refusals();
             let mut moved = false;
             moved |= jobs.take(&mut driver);
-            if jobs.budget_exhausted() {
-                return Err(StackError::Budget);
-            }
             if let Some(event) = input.take() {
                 match driver.deliver(event).map_err(StackError::Layer)? {
                     Admit::Taken | Admit::Closed(_) => moved = true,
@@ -425,6 +434,12 @@ where
                 .drain()
                 .for_each(|event| report(DatagramReport::Layer(event)));
             moved |= sent;
+            // The one refusal that ends the run: a need no release can
+            // ever meet. Every other one waits for memory below.
+            if let Some(starved) = driver.budget().starved_since(refusals) {
+                jobs.close_completed();
+                return Ok(DatagramEnd::Budget(starved));
+            }
             if !moved {
                 settled = true;
                 break;
@@ -438,7 +453,7 @@ where
             if fcx.is_cancelled() {
                 return Err(StackError::Cancelled);
             }
-            return Ok(());
+            return Ok(DatagramEnd::Finished);
         }
         if !settled {
             rounds = 0;
