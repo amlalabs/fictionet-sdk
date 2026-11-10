@@ -1924,9 +1924,15 @@ impl<'a> Socket<'a> {
                     return Some(Self::rst_reply(ip_repr, repr));
                 }
             }
-            // Every acknowledgement must be for transmitted but unacknowledged data.
+            // Every acknowledgement must be for transmitted data. An ACK at or
+            // before SND.NXT is new or old; any other, including one half the
+            // sequence space away that `SeqNumber` leaves unordered, is ahead
+            // of what was sent (RFC 9293 section 3.10.7.4).
             (_, _, Some(ack_number)) => {
-                if ack_number >= self.local_seq_no && ack_number > self.local_seq_max {
+                if !matches!(
+                    ack_number.partial_cmp(&self.local_seq_max),
+                    Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
+                ) {
                     return self.challenge_ack_reply(cx, ip_repr, repr);
                 }
             }
@@ -1986,7 +1992,7 @@ impl<'a> Socket<'a> {
 
                     // ACK data and FIN retransmissions per RFC 9293 sections 3.10.7.4 and
                     // 3.8.6.1; rate-limit other challenges per RFC 5961 sections 4.2 and 7.
-                    if !repr.payload.is_empty()
+                    if repr.segment_len() > 0
                         && matches!(
                             repr.control,
                             TcpControl::None | TcpControl::Psh | TcpControl::Fin
@@ -12470,5 +12476,74 @@ pub(crate) mod test {
             }
         );
         assert_eq!(s.recv_slice(&mut [0; 1]), Err(RecvError::Finished));
+    }
+
+    /// RFC 9293 section 3.10.7.4 takes an ACK only when SND.UNA < SEG.ACK
+    /// =< SND.NXT, a distance from SND.UNA of 1 to SND.NXT - SND.UNA modulo
+    /// 2^32. An ACK half the sequence space from SND.UNA is neither before
+    /// nor after it in `SeqNumber`'s order, so no comparison caught it.
+    #[test]
+    fn test_established_ack_half_the_space_away_is_challenged() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..RECV_TEMPL
+            }]
+        );
+        let far = TcpSeqNumber((LOCAL_SEQ + 1).0.wrapping_add(i32::MIN));
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(far),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
+        assert_eq!(s.send_queue(), 6);
+        recv_nothing!(s);
+    }
+
+    /// The peer's FIN retransmitted in TIME-WAIT is acknowledged every time
+    /// (RFC 9293 section 3.10.7.4), however recently a challenge ACK went out.
+    #[test]
+    fn test_time_wait_bare_fin_retransmission_is_acked_after_a_challenge() {
+        let mut s = socket_time_wait(false);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        let ack = Some(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 1),
+            ..RECV_TEMPL
+        });
+        // A SYN draws a challenge ACK, which starts the rate limit.
+        send!(s, time 5_000, TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ + 1000,
+            ack_number: None,
+            ..SEND_TEMPL
+        }, ack);
+        send!(s, time 5_100, TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 1),
+            ..SEND_TEMPL
+        }, ack);
     }
 }
