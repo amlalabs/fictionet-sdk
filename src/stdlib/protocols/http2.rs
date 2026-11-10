@@ -2026,6 +2026,10 @@ fn initial_fits(window: i64, envelope: u32, most: u32) -> bool {
     window - i64::from(envelope) + i64::from(most) <= i64::from(MAX_WINDOW)
 }
 
+#[cfg(kani)]
+#[path = "../../../verification/http2-layer/kani/session.rs"]
+mod kani_session;
+
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
