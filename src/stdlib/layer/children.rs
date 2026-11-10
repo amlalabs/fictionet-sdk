@@ -3184,7 +3184,6 @@ mod http_children {
     use crate::stdlib::services::stack::Polling;
     use crate::stdlib::web::httpd::{Body, Exchange, Handler, Http1, Reply};
     use crate::{Seed, block_on, lab};
-    use http::Response;
     use std::sync::atomic::AtomicBool;
 
     struct Dropped(Arc<AtomicBool>);
@@ -3207,7 +3206,7 @@ mod http_children {
                         let _guard = Dropped(dropped);
                         std::future::pending::<()>().await;
                     }
-                    Ok(Response::new(Body::from(name)))
+                    Ok(fictionet::stdlib::web::Response::new(Body::from(name)))
                 })
             }))
         }

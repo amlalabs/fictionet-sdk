@@ -6,8 +6,6 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use http::header::LOCATION;
-
 use crate::stdlib::web::Request;
 use http::StatusCode;
 
@@ -20,9 +18,7 @@ use fictionet::stdlib::world::net::{
     PreparedShare, Sni,
 };
 
-use super::{
-    Body, Exchange, Handler, HttpOptions, Limits, Reply, http_for, serve_connection, text,
-};
+use super::{Exchange, Handler, HttpOptions, Limits, Reply, http_for, serve_connection, text};
 
 /// How [`VirtualHosts`] selected a request's handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +34,7 @@ pub enum Routing {
 // Virtual hosts
 
 /// A response selected by virtual-host routing before reaching a site's handler.
-/// Present in that response's extensions; absent for a handler's own answer.
+/// Present in that response's `answer` field; absent for a handler's own answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Answer {
     /// The request did not name a host.
@@ -84,7 +80,7 @@ impl VHost {
 ///   Its [`routing`](crate::stdlib::web::Site::routing) distinguishes a registered
 ///   host from a default-site fallback.
 ///
-/// Its own answers carry an [`Answer`] in their response extensions.
+/// Its own answers carry an [`Answer`] in their response metadata.
 #[derive(Clone, Default)]
 pub struct VirtualHosts {
     inner: Arc<VInner>,
@@ -171,7 +167,7 @@ impl Handler for VirtualHosts {
                 StatusCode::MISDIRECTED_REQUEST,
                 "This server does not serve that host.\n",
             );
-            response.extensions_mut().insert(Answer::Misdirected);
+            response.answer = Some(Answer::Misdirected);
             Reply::Now(response)
         };
         let Some((name, site, routing)) = self.site_or_default(host) else {
@@ -190,10 +186,11 @@ impl Handler for VirtualHosts {
                     StatusCode::MOVED_PERMANENTLY,
                     &format!("Moved to {location}\n"),
                 );
-                if let Ok(value) = location.parse() {
-                    response.headers_mut().insert(LOCATION, value);
-                }
-                response.extensions_mut().insert(Answer::Redirect);
+                response.fields = crate::stdlib::web::Fields::new([
+                    ("content-type", "text/plain; charset=utf-8"),
+                    ("location", location.as_str()),
+                ]);
+                response.answer = Some(Answer::Redirect);
                 Reply::Now(response)
             }
             _ => {
@@ -208,11 +205,11 @@ impl Handler for VirtualHosts {
 }
 
 /// The answer to a request that names no host: `400`, with `answer`
-/// [`Answer::NoHost`] in its extensions. [`VirtualHosts`] gives it, and [`Http1`](super::Http1)
+/// [`Answer::NoHost`] in its `answer` field. [`VirtualHosts`] gives it, and [`Http1`](super::Http1)
 /// gives it to an HTTP/1.1 request without `Host` before any handler.
-pub(super) fn no_host() -> http::Response<Body> {
+pub(super) fn no_host() -> crate::stdlib::web::Response {
     let mut response = text(StatusCode::BAD_REQUEST, "The request names no host.\n");
-    response.extensions_mut().insert(Answer::NoHost);
+    response.answer = Some(Answer::NoHost);
     response
 }
 

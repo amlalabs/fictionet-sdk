@@ -37,9 +37,11 @@ fn handler() -> impl httpd::Handler {
                     }
                 },
             ));
-            return httpd::Reply::Now(response);
+            return httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(response));
         }
-        httpd::Reply::Now(http::Response::new(httpd::Body::from(page())))
+        httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+            http::Response::new(httpd::Body::from(page())),
+        ))
     })
 }
 

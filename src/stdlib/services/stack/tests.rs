@@ -1298,11 +1298,13 @@ fn serve_lazy_frames(frames: usize) {
             let left = self.0;
             Reply::Later(Box::new(move |context| {
                 Box::pin(async move {
-                    Ok(http::Response::new(Body::new(LazyFrames {
-                        context,
-                        left,
-                        waiting: None,
-                    })))
+                    Ok(fictionet::stdlib::web::Response::new(Body::new(
+                        LazyFrames {
+                            context,
+                            left,
+                            waiting: None,
+                        },
+                    )))
                 })
             }))
         }

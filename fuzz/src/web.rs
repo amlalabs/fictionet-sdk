@@ -5,7 +5,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::Response;
+use fictionet::stdlib::web::Response;
 use http_body_util::{BodyExt, Limited};
 use rustls::pki_types::CertificateDer;
 

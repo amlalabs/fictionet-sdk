@@ -965,9 +965,18 @@ impl httpd::Handler for Model {
         let mut model = self.clone();
         model.connection = exchange.conn().clone();
         if self.catalog.is_none() && websocket::wanted(self.provider, &request) {
-            return httpd::Reply::Now(websocket::accept(model, request));
+            return httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+                websocket::accept(model, request),
+            ));
         }
-        httpd::Reply::Later(Box::new(move |_| Box::pin(model.send_observed(request))))
+        httpd::Reply::Later(Box::new(move |_| {
+            Box::pin(async move {
+                model
+                    .send_observed(request)
+                    .await
+                    .map(fictionet::stdlib::web::Response::from_http)
+            })
+        }))
     }
 }
 /// An RFC 3339 UTC timestamp to the second, as the providers write them.

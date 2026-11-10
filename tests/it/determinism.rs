@@ -90,7 +90,7 @@ fn upgrade(_: Request<httpd::Body>) -> httpd::Reply {
         .insert(httpd::UpgradeHandler::new(|cx, mut conn| async move {
             let _ = conn.write_all(&cx, b"upgraded\n").await;
         }));
-    httpd::Reply::Now(response)
+    httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(response))
 }
 
 struct Http;
@@ -106,10 +106,12 @@ impl httpd::Handler for Http {
             return upgrade(request);
         }
         if request.uri().path() == "/reset" {
-            return httpd::Reply::Now(Response::new(httpd::Body::new(BrokenBody)));
+            return httpd::Reply::Now(fictionet::stdlib::web::Response::new(httpd::Body::new(
+                BrokenBody,
+            )));
         }
         let draw = ex.random_u64();
-        httpd::Reply::Now(Response::new(
+        httpd::Reply::Now(fictionet::stdlib::web::Response::new(
             format!("{} {draw}\n", request.uri().path()).into(),
         ))
     }

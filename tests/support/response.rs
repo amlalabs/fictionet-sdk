@@ -38,27 +38,27 @@ where
     {
         fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
             let Ok(mut parts) = request.head.to_http() else {
-                return Reply::Now(
+                return Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .status(400)
                         .body(Body::empty())
                         .unwrap(),
-                );
+                ));
             };
             parts.extensions.insert(request.site);
             let request = http::Request::from_parts(parts, request.body);
             let (parts, body) = request.into_parts();
             let Some(body) = body.bytes() else {
-                return Reply::Now(
+                return Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .status(400)
                         .body(Body::empty())
                         .unwrap(),
-                );
+                ));
             };
-            Reply::Now(
+            Reply::Now(fictionet::stdlib::web::Response::from_http(
                 (self.0)(ex, Request::from_parts(parts, Bytes::from_owner(body))).map(Body::from),
-            )
+            ))
         }
     }
     std::sync::Arc::new(BytesHandler(f))
@@ -78,30 +78,32 @@ where
     {
         fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
             let Ok(mut parts) = request.head.to_http() else {
-                return Reply::Now(
+                return Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .status(400)
                         .body(Body::empty())
                         .unwrap(),
-                );
+                ));
             };
             parts.extensions.insert(request.site);
             let request = http::Request::from_parts(parts, request.body);
             let (parts, body) = request.into_parts();
             let Some(body) = body.bytes() else {
-                return Reply::Now(
+                return Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .status(400)
                         .body(Body::empty())
                         .unwrap(),
-                );
+                ));
             };
             let f = self.0.clone();
             Reply::Later(Box::new(move |cx| {
                 Box::pin(async move {
-                    Ok(f(cx, Request::from_parts(parts, Bytes::from_owner(body)))
-                        .await
-                        .map(Body::from))
+                    Ok(fictionet::stdlib::web::Response::from_http(
+                        f(cx, Request::from_parts(parts, Bytes::from_owner(body)))
+                            .await
+                            .map(Body::from),
+                    ))
                 })
             }))
         }
@@ -121,12 +123,12 @@ where
     {
         fn call(&self, request: fictionet::stdlib::web::Request, ex: &mut Exchange<'_>) -> Reply {
             let Ok(mut parts) = request.head.to_http() else {
-                return Reply::Now(
+                return Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .status(400)
                         .body(Body::empty())
                         .unwrap(),
-                );
+                ));
             };
             parts.extensions.insert(request.site);
             let request = http::Request::from_parts(parts, request.body);
@@ -142,12 +144,12 @@ pub struct EchoSocket;
 impl Handler for EchoSocket {
     fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         let Ok(mut parts) = request.head.to_http() else {
-            return Reply::Now(
+            return Reply::Now(fictionet::stdlib::web::Response::from_http(
                 http::Response::builder()
                     .status(400)
                     .body(Body::empty())
                     .unwrap(),
-            );
+            ));
         };
         parts.extensions.insert(request.site);
         let request = http::Request::from_parts(parts, request.body);
@@ -201,6 +203,6 @@ impl Handler for EchoSocket {
                     }
                 },
             ));
-        Reply::Now(response)
+        Reply::Now(fictionet::stdlib::web::Response::from_http(response))
     }
 }

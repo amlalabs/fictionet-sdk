@@ -90,12 +90,12 @@ impl httpd::Handler for Gateway {
         exchange: &mut httpd::Exchange<'_>,
     ) -> httpd::Reply {
         if request.head.path() == "/api/oauth/cli/create_api_key" {
-            return httpd::Reply::Now(
+            return httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
                 http::Response::builder()
                     .status(403)
                     .body(Body::empty())
                     .expect("static response"),
-            );
+            ));
         }
         let pages = self.pages.clone();
         let host = self.host.clone();
@@ -180,12 +180,12 @@ impl httpd::Handler for Startup {
         } else {
             403
         };
-        httpd::Reply::Now(
+        httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
             http::Response::builder()
                 .status(status)
                 .body(Body::empty())
                 .expect("static response"),
-        )
+        ))
     }
 }
 

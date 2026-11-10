@@ -145,9 +145,9 @@ impl httpd::Handler for StreamHandler {
             "/empty-frame" => vec![b"hello", b"", b" world"],
             _ => vec![b"hello", b" world"],
         };
-        httpd::Reply::Now(http::Response::new(httpd::Body::new(StreamPieces(
-            pieces.into_iter(),
-        ))))
+        httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+            http::Response::new(httpd::Body::new(StreamPieces(pieces.into_iter()))),
+        ))
     }
 }
 
@@ -334,7 +334,9 @@ pub(crate) fn framing_case(
         } else {
             streamed(&[b"bo", b"dy"])
         };
-        httpd::Reply::Now(response.body(body).unwrap())
+        httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+            response.body(body).unwrap(),
+        ))
     })
 }
 
@@ -490,7 +492,9 @@ fn an_http11_body_of_unknown_length_ends_only_at_eof() {
                     .into_iter(),
                 ))
             };
-            Reply::Now(http::Response::new(body))
+            Reply::Now(fictionet::stdlib::web::Response::from_http(
+                http::Response::new(body),
+            ))
         }
     }
 
@@ -898,7 +902,9 @@ fn http1_custom_handler_receives_partial_body_then_error() {
                 Pin::new(&mut body).poll_frame(&mut cx),
                 Poll::Ready(None)
             ));
-            httpd::Reply::Now(http::Response::new(httpd::Body::empty()))
+            httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+                http::Response::new(httpd::Body::empty()),
+            ))
         }
     }
     let seen = Arc::new(AtomicUsize::new(0));
@@ -1253,12 +1259,12 @@ mod live {
     fn tunnels() -> impl httpd::Handler {
         fictionet_test_support::reply_handler(|_, request| {
             if request.method() != http::Method::CONNECT {
-                return httpd::Reply::Now(
+                return httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .status(404)
                         .body(httpd::Body::empty())
                         .unwrap(),
-                );
+                ));
             }
             let mut response = http::Response::new(httpd::Body::empty());
             response.extensions_mut().insert(httpd::UpgradeHandler::new(
@@ -1271,7 +1277,7 @@ mod live {
                     }
                 },
             ));
-            httpd::Reply::Now(response)
+            httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(response))
         })
     }
 

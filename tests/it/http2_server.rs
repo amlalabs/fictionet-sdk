@@ -786,13 +786,13 @@ mod clients {
                 complete: false,
             };
             let reply = if request.head.path() == "/cancel" {
-                httpd::Reply::Now(
+                httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .header("content-type", "application/octet-stream")
                         .header("x-content-type-options", "nosniff")
                         .body(httpd::Body::new(Interrupted(true)))
                         .unwrap(),
-                )
+                ))
             } else {
                 self.handler.call(request, ex)
             };
@@ -800,19 +800,18 @@ mod clients {
             let cancelled = self.cancelled.clone();
             httpd::Reply::Later(Box::new(move |cx| {
                 Box::pin(async move {
-                    let response = match reply {
+                    let mut response = match reply {
                         httpd::Reply::Now(response) => response,
                         httpd::Reply::Later(work) => work(cx.clone()).await?,
                     };
-                    Ok(response.map(|inner| {
-                        httpd::Body::new(RecordedBody {
-                            inner,
-                            cx,
-                            fact: Some(fact),
-                            facts,
-                            cancelled,
-                        })
-                    }))
+                    response.body = httpd::Body::new(RecordedBody {
+                        inner: response.body,
+                        cx,
+                        fact: Some(fact),
+                        facts,
+                        cancelled,
+                    });
+                    Ok(response)
                 })
             }))
         }
@@ -884,14 +883,14 @@ let route_3 = std::sync::Arc::new(move |_: fictionet::Cx, _: http::Request<bytes
 fictionet_test_support::reply_handler(move |ex, request| {
 use fictionet::stdlib::web::httpd::{Body, Reply};
 let (parts, body) = request.into_parts();
-let Some(body) = body.bytes() else { return Reply::Now(http::Response::builder().status(400).body(Body::empty()).unwrap()); };
+let Some(body) = body.bytes() else { return Reply::Now(fictionet::stdlib::web::Response::from_http(http::Response::builder().status(400).body(Body::empty()).unwrap())); };
 let request = http::Request::from_parts(parts, Bytes::from_owner(body));
-if request.uri().path() == "/" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return Reply::Now(route_0(ex, request).map(Body::from)); }
-if request.uri().path() == "/large/curl" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return Reply::Now(route_1(ex, request).map(Body::from)); }
-if (request.uri().path() == "/large" || request.uri().path().starts_with("/large/")) && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return { let route = route_2.clone(); Reply::Later(Box::new(move |cx| Box::pin(async move { Ok(route(cx, request).await.map(Body::from)) }))) }; }
-if request.uri().path() == "/gate" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return { let route = route_3.clone(); Reply::Later(Box::new(move |cx| Box::pin(async move { Ok(route(cx, request).await.map(Body::from)) }))) }; }
-if request.uri().path() == "/" || request.uri().path() == "/large/curl" || (request.uri().path() == "/large" || request.uri().path().starts_with("/large/")) || request.uri().path() == "/gate" { return Reply::Now(http::Response::builder().status(405).body(Body::empty()).unwrap()); }
-Reply::Now(http::Response::builder().status(404).body(Body::empty()).unwrap())
+if request.uri().path() == "/" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return Reply::Now(fictionet::stdlib::web::Response::from_http(route_0(ex, request).map(Body::from))); }
+if request.uri().path() == "/large/curl" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return Reply::Now(fictionet::stdlib::web::Response::from_http(route_1(ex, request).map(Body::from))); }
+if (request.uri().path() == "/large" || request.uri().path().starts_with("/large/")) && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return { let route = route_2.clone(); Reply::Later(Box::new(move |cx| Box::pin(async move { Ok(fictionet::stdlib::web::Response::from_http(route(cx, request).await.map(Body::from))) }))) }; }
+if request.uri().path() == "/gate" && (request.method() == http::Method::GET || request.method() == http::Method::HEAD) { return { let route = route_3.clone(); Reply::Later(Box::new(move |cx| Box::pin(async move { Ok(fictionet::stdlib::web::Response::from_http(route(cx, request).await.map(Body::from))) }))) }; }
+if request.uri().path() == "/" || request.uri().path() == "/large/curl" || (request.uri().path() == "/large" || request.uri().path().starts_with("/large/")) || request.uri().path() == "/gate" { return Reply::Now(fictionet::stdlib::web::Response::from_http(http::Response::builder().status(405).body(Body::empty()).unwrap())); }
+Reply::Now(fictionet::stdlib::web::Response::from_http(http::Response::builder().status(404).body(Body::empty()).unwrap()))
 })
 };
                     let (attach, arrivals) = fictionet::attachments();
@@ -1303,7 +1302,9 @@ fn retained_request_chunks_keep_their_charge_after_the_connection() {
             _: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
             *self.0.lock().unwrap() = Some(request);
-            httpd::Reply::Now(http::Response::new(httpd::Body::empty()))
+            httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+                http::Response::new(httpd::Body::empty()),
+            ))
         }
     }
     let held = Arc::new(Mutex::new(None));
@@ -1774,7 +1775,9 @@ fn failing_response_body_is_an_internal_stream_error() {
             _: fictionet::stdlib::web::Request,
             _: &mut httpd::Exchange<'_>,
         ) -> httpd::Reply {
-            httpd::Reply::Now(http::Response::new(httpd::Body::new(Broken)))
+            httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+                http::Response::new(httpd::Body::new(Broken)),
+            ))
         }
     }
     let mut harness = server(Responder::new(Handler));
@@ -1879,7 +1882,9 @@ fn streamed_chunk_over_budget_resets_only_its_stream() {
             } else {
                 httpd::Body::from("ok")
             };
-            httpd::Reply::Now(http::Response::new(body))
+            httpd::Reply::Now(fictionet::stdlib::web::Response::from_http(
+                http::Response::new(body),
+            ))
         }
     }
     let mut harness = budgeted(
@@ -2061,39 +2066,45 @@ fn deferred_response_budget_refusal_preserves_other_streams() {
                 use fictionet::stdlib::web::httpd::{Body, Reply};
                 let (parts, body) = request.into_parts();
                 let Some(body) = body.bytes() else {
-                    return Reply::Now(
+                    return Reply::Now(fictionet::stdlib::web::Response::from_http(
                         http::Response::builder()
                             .status(400)
                             .body(Body::empty())
                             .unwrap(),
-                    );
+                    ));
                 };
                 let request = http::Request::from_parts(parts, Bytes::from_owner(body));
                 if request.uri().path() == "/small" && (request.method() == http::Method::POST) {
-                    return Reply::Now(route_0(ex, request).map(Body::from));
+                    return Reply::Now(fictionet::stdlib::web::Response::from_http(
+                        route_0(ex, request).map(Body::from),
+                    ));
                 }
                 if request.uri().path() == "/large" && (request.method() == http::Method::POST) {
                     return {
                         let route = route_1.clone();
                         Reply::Later(Box::new(move |cx| {
-                            Box::pin(async move { Ok(route(cx, request).await.map(Body::from)) })
+                            Box::pin(async move {
+                                Ok(fictionet::stdlib::web::Response::from_http(
+                                    route(cx, request).await.map(Body::from),
+                                ))
+                            })
                         }))
                     };
                 }
                 if request.uri().path() == "/small" || request.uri().path() == "/large" {
-                    return Reply::Now(
+                    return Reply::Now(fictionet::stdlib::web::Response::from_http(
                         http::Response::builder()
                             .status(405)
                             .body(Body::empty())
                             .unwrap(),
-                    );
+                    ));
                 }
-                Reply::Now(
+                Reply::Now(fictionet::stdlib::web::Response::from_http(
                     http::Response::builder()
                         .status(404)
                         .body(Body::empty())
                         .unwrap(),
-                )
+                ))
             })
         };
         let mut harness = Harness::with_budget(

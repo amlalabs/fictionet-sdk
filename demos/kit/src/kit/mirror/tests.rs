@@ -1,6 +1,6 @@
 use super::*;
 use fictionet::stdlib::web::Site;
-use http::Request;
+use http::{Request, Response, header};
 use std::sync::{Mutex, atomic::AtomicUsize};
 
 const PACKAGE: &str = "/ubuntu/pool/main/p/package/package_1_amd64.deb";
@@ -21,13 +21,13 @@ impl Upstream {
 impl Handler for Upstream {
     fn call(&self, _: web::Request, _: &mut Exchange<'_>) -> Reply {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Reply::Now(
+        Reply::Now(web::Response::from_http(
             self.replies
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Response::new(Body::from("package"))),
-        )
+        ))
     }
 }
 fn request(path: &str) -> Request<Body> {
@@ -72,8 +72,8 @@ async fn send(mirror: &Mirror<Upstream>, request: Request<Body>) -> Answer {
     .await?;
     output.lock().unwrap().take().unwrap()
 }
-async fn bytes(response: Response<Body>) -> Bytes {
-    response.into_body().collect().await.unwrap().to_bytes()
+async fn bytes(response: web::Response) -> Bytes {
+    response.body.collect().await.unwrap().to_bytes()
 }
 
 #[tokio::test]
@@ -141,7 +141,7 @@ async fn failed_and_incomplete_downloads_never_publish_files() {
             .unwrap(),
     ]);
     let mirror = Mirror::new(upstream.clone(), dir.path().into());
-    assert_eq!(send(&mirror, request(PACKAGE)).await.unwrap().status(), 503);
+    assert_eq!(send(&mirror, request(PACKAGE)).await.unwrap().status, 503);
     assert!(send(&mirror, request(PACKAGE)).await.is_err());
     let path = dir.path().join("mirror.test").join(&PACKAGE[1..]);
     assert!(!path.exists());
@@ -165,7 +165,7 @@ async fn closing_the_mirror_refuses_cached_and_upstream_files() {
     mirror.closed.store(true, Ordering::Release);
     for path in [PACKAGE, "/ubuntu/dists/noble/InRelease"] {
         let response = send(&mirror, request(path)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert_eq!(bytes(response).await, "Forbidden\n");
     }
     assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);

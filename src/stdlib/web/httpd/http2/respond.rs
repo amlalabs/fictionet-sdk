@@ -1,4 +1,5 @@
 //! A [`Handler`] on one HTTP/2 exchange.
+use crate::stdlib::web::Response;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -8,7 +9,7 @@ use std::task::{Context, Poll, ready};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::layer::{Chain, Charge, ChargedBytes, Children, Chunk, Env, Layer, Top};
@@ -184,7 +185,7 @@ enum Stage {
     /// The handler's work is making the response.
     Making,
     /// The response, to start.
-    Made(Response<Body>),
+    Made(Response),
     /// The head is out; a streamed body's next frames, if it streams.
     Body(Option<Body>),
     /// The next frame is being polled.
@@ -303,8 +304,12 @@ impl State {
                 .expect("reserved field records");
         }
         drop(parts);
-        if responder.observe.is_none() {
-            self.charge = None;
+        if responder.observe.is_none()
+            && let Some(charge) = &mut self.charge
+        {
+            // Release request storage but keep the admission owner's view.
+            // Response refusals are handled here, outside the runner's view.
+            charge.shrink_to(0);
         }
         let request = crate::stdlib::web::Request {
             head,
@@ -356,7 +361,7 @@ impl State {
     /// The response replaces the request in the budget. One the budget
     /// cannot hold gets `503` instead, so it does not end the connection's
     /// other streams.
-    fn made(&mut self, env: &Env<'_, Infallible>, mut response: Response<Body>) {
+    fn made(&mut self, env: &Env<'_, Infallible>, mut response: Response) {
         let delivery = self.delivery.as_ref().map_or(0, |d| d.held);
         let fits = self.hold(env, response_held(&response) + delivery);
         // Response admission uses the head's account: this owner handles
@@ -366,22 +371,24 @@ impl State {
             .charge
             .as_ref()
             .map_or_else(|| env.budget().clone(), |charge| charge.budget().clone());
-        let settled = if fits && matches!(response.body(), Body::Stream(_)) {
+        let settled = if fits && matches!(response.body, Body::Stream(_)) {
             let waker = env.waker();
             response
-                .body_mut()
+                .body
                 .settle(&mut Context::from_waker(&waker), &budget)
                 .is_ok()
         } else {
             fits
         };
-        let response = if settled && response.body_mut().admit(&budget) {
+        let response = if settled && response.fields.admit(&budget) && response.body.admit(&budget)
+        {
             response
         } else {
             drop(response);
             let mut response = over_budget();
             if !self.hold(env, response_held(&response) + delivery)
-                || !response.body_mut().admit(&budget)
+                || !response.fields.admit(&budget)
+                || !response.body.admit(&budget)
             {
                 self.reset();
                 return;
@@ -393,39 +400,47 @@ impl State {
 
     /// The response's head, with the framing fields the shared policy
     /// chose.
-    fn start(&mut self, response: Response<Body>) {
-        let (parts, body) = response.into_parts();
+    fn start(&mut self, response: Response) {
+        let mut parts = response;
+        let body = std::mem::take(&mut parts.body);
         if let Some(delivery) = &mut self.delivery {
             delivery.response(&parts);
         }
         // No `Date` here: the connection adds it when it frames the head.
         let policy = ResponsePolicy::new(&parts, body.size_hint().exact(), self.wants, || None);
-        let mut headers = HeaderMap::with_capacity(parts.headers.len() + 1);
-        for (name, value) in &parts.headers {
+        let Ok(mut headers) =
+            HeaderMap::try_with_capacity(parts.fields.iter().len().saturating_add(1))
+        else {
+            self.reset();
+            return;
+        };
+        for (name, value) in parts.fields.iter() {
+            let (Ok(name), Ok(value)) =
+                (HeaderName::from_bytes(name), HeaderValue::from_bytes(value))
+            else {
+                self.reset();
+                return;
+            };
             if matches!(
                 name.as_str(),
-                "connection"
-                    | "content-length"
-                    | "proxy-connection"
-                    | "keep-alive"
-                    | "transfer-encoding"
-                    | "upgrade"
+                "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
             ) {
                 continue;
             }
-            headers.append(name.clone(), value.clone());
+            headers.append(name, value);
         }
         // Preserve a valid field that agrees with the response policy. On
         // 304 it describes the selected representation, not the absent body.
-        let supplied = super::content_length(&parts.headers)
+        let supplied = super::content_length(&headers)
             .ok()
             .flatten()
             .filter(|&length| {
                 policy.len == Some(length) || parts.status == StatusCode::NOT_MODIFIED
             })
-            .and_then(|_| parts.headers.get("content-length"));
+            .and_then(|_| headers.get("content-length").cloned());
+        headers.remove(http::header::CONTENT_LENGTH);
         if let Some(length) = supplied {
-            headers.insert(http::header::CONTENT_LENGTH, length.clone());
+            headers.insert(http::header::CONTENT_LENGTH, length);
         } else if let Some(length) = policy.len {
             headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from(length));
         }
@@ -643,7 +658,7 @@ impl Layer for Respond {
 }
 
 /// A handler's answer on its way.
-type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
+type Making = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
 
 /// Work [`Respond`] asks the world to do: make a handler's async answer, or
 /// poll a streamed body for its next frame.
@@ -667,7 +682,7 @@ pub struct Done {
 }
 
 enum Answer {
-    Made(Result<Response<Body>, Error>),
+    Made(Result<Response, Error>),
     /// The body back, with its next frame or its end.
     Frame(Body, Option<Result<Frame<Bytes>, Error>>),
 }
@@ -706,17 +721,25 @@ impl Job for Work {
     }
 }
 
-pub(super) fn response_held(response: &Response<Body>) -> usize {
-    let headers = response.headers();
-    let slots = headers.capacity() + headers.len() - headers.keys_len();
-    slots * std::mem::size_of::<(HeaderName, HeaderValue)>()
-        + headers
-            .iter()
-            .map(|(n, v)| n.as_str().len() + v.as_bytes().len())
-            .sum::<usize>()
+pub(super) fn response_held(response: &Response) -> usize {
+    // Bound HeaderMap's rounded capacity plus duplicate slots, under the
+    // same public-size accounting as headers_held. Field backing storage
+    // carries its own reservation until conversion finishes.
+    let slots = response
+        .fields
+        .iter()
+        .len()
+        .saturating_add(1)
+        .saturating_mul(4);
+    response.fields.iter().fold(
+        slots
+            .saturating_mul(std::mem::size_of::<(HeaderName, HeaderValue)>())
+            .saturating_add(20),
+        |held, (name, value)| held.saturating_add(name.len()).saturating_add(value.len()),
+    )
 }
 
-fn over_budget() -> Response<Body> {
+fn over_budget() -> Response {
     text(
         StatusCode::SERVICE_UNAVAILABLE,
         "The server cannot hold this response now.\n",

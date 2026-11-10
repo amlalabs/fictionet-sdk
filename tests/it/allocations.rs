@@ -25,7 +25,7 @@ fn virtual_hosts_route_borrowed_names_and_deliver_typed_sites_without_allocating
                     .unwrap()
                     .eq_ignore_ascii_case(self.0.name.as_bytes())
             );
-            Reply::Now(http::Response::new(Body::empty()))
+            Reply::Now(fictionet::stdlib::web::Response::new(Body::empty()))
         }
     }
     let conn = ConnInfo {
@@ -67,7 +67,7 @@ fn virtual_hosts_route_borrowed_names_and_deliver_typed_sites_without_allocating
         let Reply::Now(response) = reply else {
             panic!("synchronous handler");
         };
-        response.status()
+        response.status
     };
     for i in 0..200 {
         assert!(route(&heads[i % heads.len()]).is_success());
@@ -188,4 +188,174 @@ fn pooled_full_bodies_reuse_storage() {
     );
     assert!(stats.allocations <= count.saturating_mul(CEILING_PER_BODY));
     assert!(budget.used() == pool.charged());
+}
+
+#[test]
+fn warm_now_fields_and_full_body_encode_without_allocating() {
+    use fictionet::stdlib::layer::{Admit, Driver, StreamCommand, StreamEvent};
+    use fictionet::stdlib::protocols::http1;
+    use fictionet::stdlib::web::{
+        Fields, Request, Response,
+        httpd::{Exchange, Handler, Http1, Reply},
+    };
+    use fictionet::{Chunk, Seed, SeededEntropy};
+    use std::sync::Arc;
+
+    struct Page {
+        fields: Pool,
+        budget: Budget,
+        body: Chunk,
+    }
+    impl Handler for Page {
+        fn call(&self, _: Request, _: &mut Exchange<'_>) -> Reply {
+            let mut fields = Fields::in_block(self.fields.take(&self.budget, 0).unwrap()).unwrap();
+            for _ in 0..10 {
+                fields.push("X-Field", b"value").unwrap();
+            }
+            let mut response = Response::new(Body::Full(self.body.clone()));
+            response.fields = fields;
+            Reply::Now(response)
+        }
+    }
+    let budget = Budget::new(1 << 20);
+    let fields = Pool::new(&budget, 2048, 2);
+    let bodies = Pool::new(&budget, 2048, 1);
+    let mut body = bodies.take(&budget, 0).unwrap();
+    body.extend_within(b"held response body").unwrap();
+    let expected = body.clone();
+    let mut driver = Driver::new(
+        Http1::new(Page {
+            fields,
+            budget: budget.clone(),
+            body,
+        }),
+        Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+        budget,
+        fictionet::time::Instant::ZERO,
+    );
+    driver.run().unwrap();
+    let request = Chunk::unpaid(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec());
+    let mut allocations = 0;
+    let count = 2000;
+    for i in 0..(200 + count) {
+        assert!(matches!(
+            driver.deliver(StreamEvent::Data(request.clone())).unwrap(),
+            Admit::Taken
+        ));
+        let (output, stats) = measuring(|| {
+            driver.run().unwrap();
+            let Some(StreamCommand::Write(chunk)) = driver.take_command() else {
+                panic!("response chunk");
+            };
+            assert!(
+                driver.take_command().is_none(),
+                "small response uses one chunk"
+            );
+            chunk
+        });
+        if i >= 200 {
+            allocations += stats.allocations;
+        }
+        assert!(output.headroom() >= 64);
+        let decoded = http1::Response::parse_for(&output, "GET").unwrap();
+        assert_eq!(decoded.body.as_slice(), expected.as_ref());
+        assert_eq!(
+            decoded
+                .head
+                .headers
+                .iter()
+                .filter(|field| field.name.eq_ignore_ascii_case("x-field"))
+                .count(),
+            10
+        );
+        let written = output.len();
+        drop(output);
+        assert!(matches!(
+            driver
+                .deliver(StreamEvent::Written(written as u64))
+                .unwrap(),
+            Admit::Taken
+        ));
+        driver.run().unwrap();
+    }
+    eprintln!("{count} warm responses: {allocations} allocations");
+    const PER_RESPONSE_CEILING: usize = 0;
+    assert!(allocations <= count * PER_RESPONSE_CEILING);
+}
+
+#[test]
+fn large_full_responses_send_slices_of_the_held_body() {
+    use fictionet::stdlib::layer::{Admit, Driver, StreamCommand, StreamEvent};
+    use fictionet::stdlib::protocols::http1;
+    use fictionet::stdlib::web::{
+        Request, Response,
+        httpd::{Exchange, Handler, Http1, Reply},
+    };
+    use fictionet::{Chunk, Seed, SeededEntropy};
+    use std::sync::Arc;
+
+    struct Page(Chunk);
+    impl Handler for Page {
+        fn call(&self, _: Request, _: &mut Exchange<'_>) -> Reply {
+            Reply::Now(Response::new(Body::Full(self.0.clone())))
+        }
+    }
+    let budget = Budget::new(1 << 20);
+    let pool = Pool::new(&budget, 64 * 1024, 1);
+    let mut body = pool.take(&budget, 0).unwrap();
+    body.fill(|bytes| {
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        bytes.len()
+    })
+    .unwrap();
+    let expected = body.clone();
+    let mut driver = Driver::new(
+        Http1::new(Page(body)),
+        Arc::new(SeededEntropy::new(Seed::from_u64(92))),
+        budget,
+        fictionet::time::Instant::ZERO,
+    );
+    driver.run().unwrap();
+    assert!(matches!(
+        driver
+            .deliver(StreamEvent::Data(Chunk::unpaid(
+                b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec()
+            )))
+            .unwrap(),
+        Admit::Taken
+    ));
+    driver.run().unwrap();
+    let Some(StreamCommand::Write(head)) = driver.take_command() else {
+        panic!("response head");
+    };
+    let (_, consumed) = http1::ResponseHead::parse_lenient(&head).unwrap().unwrap();
+    assert_eq!(consumed, head.len());
+    assert!(matches!(
+        driver
+            .deliver(StreamEvent::Written(head.len() as u64))
+            .unwrap(),
+        Admit::Taken
+    ));
+    drop(head);
+    let mut received = 0;
+    while received < expected.len() {
+        driver.run().unwrap();
+        let Some(StreamCommand::Write(piece)) = driver.take_command() else {
+            panic!("body piece");
+        };
+        assert!(!piece.is_empty());
+        assert_eq!(piece.as_ptr(), expected[received..].as_ptr());
+        assert_eq!(piece.as_ref(), &expected[received..received + piece.len()]);
+        received += piece.len();
+        assert!(matches!(
+            driver
+                .deliver(StreamEvent::Written(piece.len() as u64))
+                .unwrap(),
+            Admit::Taken
+        ));
+    }
+    driver.run().unwrap();
+    assert!(driver.take_command().is_none());
 }

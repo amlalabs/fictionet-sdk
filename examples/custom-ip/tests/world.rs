@@ -8,13 +8,15 @@ use fictionet::stdlib::world::net::{Host, Net};
 use fictionet_extras::hyper_io::Io;
 use fictionet_test_support::sandbox::machine;
 use fictionet_test_support::world::world;
-use http::{Request, Response, StatusCode, Version};
+use http::{Request, StatusCode, Version};
 use http_body_util::{BodyExt, Full};
 
 struct Page;
 impl Handler for Page {
     fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
-        Reply::Now(Response::new(Body::from("unchanged application")))
+        Reply::Now(fictionet::stdlib::web::Response::new(Body::from(
+            "unchanged application",
+        )))
     }
 }
 

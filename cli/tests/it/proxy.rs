@@ -1487,7 +1487,9 @@ mod routing {
              request: http::Request<bytes::Bytes>| {
                 let target = request.extensions().get::<Site>().unwrap().clone();
                 let mut response = Response::new(bytes::Bytes::new());
-                response.extensions_mut().insert(target);
+                response
+                    .extensions_mut()
+                    .insert(fictionet::stdlib::web::Facts::new(target));
                 response
             },
         ));
@@ -1501,20 +1503,20 @@ mod routing {
             (
                 "http://unknown.test/",
                 "allowed.test",
-                "allowed.test",
-                Routing::Exact,
+                "unknown.test",
+                Routing::Fallback,
             ),
             (
                 "http://allowed.test/",
                 "unknown.test",
-                "unknown.test",
-                Routing::Fallback,
+                "allowed.test",
+                Routing::Exact,
             ),
         ] {
             let httpd::Reply::Now(response) = route(&vhosts, request(uri, host), 80) else {
                 panic!("the router answers immediately");
             };
-            let target = response.extensions().get::<Site>().unwrap();
+            let target = response.facts.as_ref().unwrap().get::<Site>().unwrap();
             assert_eq!(&*target.name, name);
             assert_eq!(target.routing, routing);
             assert_eq!(target.scheme, http::uri::Scheme::HTTP);

@@ -534,6 +534,8 @@
 //! it](fictionet::stdlib#changing-a-protocol-by-copying-it).
 
 pub mod httpd;
+mod response;
+pub use response::{Facts, ObservedResponse, Response};
 mod fields;
 pub use fields::Fields;
 mod request;

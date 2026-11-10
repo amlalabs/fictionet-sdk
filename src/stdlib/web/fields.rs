@@ -81,6 +81,10 @@ impl Fields {
             .map(|(_, value)| value)
     }
 
+    pub(crate) fn admit(&mut self, budget: &fictionet::Budget) -> bool {
+        self.block.repay(budget)
+    }
+
     /// Capacity retained by the backing, including unused space.
     pub fn held(&self) -> usize {
         self.block.capacity()

@@ -1,8 +1,9 @@
+use crate::stdlib::web::Response;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use http::{HeaderValue, Response, StatusCode};
+use http::StatusCode;
 
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::network::Connection;
@@ -54,14 +55,13 @@ impl<'a> Exchange<'a> {
 /// An answer that needs async work: given the connection's [`Cx`], a future
 /// of the response. An error answers `500`, or `502` for [`BadGateway`];
 /// [`Reset`] answers nothing.
-pub type Later = Box<
-    dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>> + Send,
->;
+pub type Later =
+    Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>> + Send>;
 
 /// What a handler gives back for a request.
 pub enum Reply {
     /// The response, now.
-    Now(Response<Body>),
+    Now(Response),
     /// Work that makes the response.
     Later(Later),
 }
@@ -106,27 +106,25 @@ impl std::fmt::Display for Reset {
 
 impl std::error::Error for Reset {}
 
-pub(super) fn status_only(status: StatusCode) -> Response<Body> {
+pub(super) fn status_only(status: StatusCode) -> Response {
     let mut r = Response::new(Body::empty());
-    *r.status_mut() = status;
+    r.status = status;
     r
 }
 
 /// A short plain-text response.
-pub fn text(status: StatusCode, body: &str) -> Response<Body> {
+pub fn text(status: StatusCode, body: &str) -> Response {
     let mut response = Response::new(Body::from(body.to_owned()));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
+    response.status = status;
+    response.fields =
+        crate::stdlib::web::Fields::new([("content-type", b"text/plain; charset=utf-8")]);
     response
 }
 
 /// Runs a protocol after an HTTP/1 response that hands the connection on is
 /// written.
 ///
-/// Insert this in the extensions of a `101 Switching Protocols` response,
+/// Set this in the `upgrade` field of a `101 Switching Protocols` response,
 /// or of a 2xx response to CONNECT. Once the response is written,
 /// [`Http1::upgradable`](super::Http1::upgradable) calls it with the rest of
 /// the stream as a connection, whose first bytes are those the client sent

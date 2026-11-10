@@ -92,7 +92,7 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
 }
 
 /// Forwards one request to its [`Site`](super::Site) over the world's own network.
-async fn send_upstream(client: Arc<dyn Upstream>, request: super::Request) -> Result<Response<Body>, Error> {
+async fn send_upstream(client: Arc<dyn Upstream>, request: super::Request) -> Result<super::Response, Error> {
     use http::uri::Scheme;
     let target = request.site;
     if target.routing != Routing::Exact {
@@ -117,7 +117,7 @@ async fn send_upstream(client: Arc<dyn Upstream>, request: super::Request) -> Re
         Host::Replace(&authority),
         Some(&target.name),
     )
-    .await
+    .await.map(super::Response::from_http)
 }
 
 /// What [`dispatch`] does with the request's `Host` header.
@@ -216,7 +216,7 @@ impl Handler for Forward {
     fn call(&self, request: super::Request, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
         let forward = self.clone();
         httpd::Reply::Later(Box::new(move |_| Box::pin(async move {
-            forward.send(http::Request::from_parts(request.head.to_http()?, request.body)).await
+            forward.send(http::Request::from_parts(request.head.to_http()?, request.body)).await.map(super::Response::from_http)
         })))
     }
 }

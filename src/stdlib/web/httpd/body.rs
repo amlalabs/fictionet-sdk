@@ -106,14 +106,6 @@ impl Body {
         }
     }
 
-    /// The bytes held in full: 0 for a stream.
-    pub(super) fn full_len(&self) -> usize {
-        match self {
-            Body::Full(b) => b.len(),
-            Body::Stream(_) => 0,
-        }
-    }
-
     /// A shared view of the full body, without allocating or copying.
     /// The view keeps the backing's reservation until it is dropped.
     pub fn bytes(&self) -> Option<Chunk> {

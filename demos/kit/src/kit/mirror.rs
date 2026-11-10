@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use fictionet::stdlib::web::httpd::{Exchange, Handler, Reply};
+use fictionet::stdlib::web::{Fields, Response};
 use fictionet::{
     Cx, Error,
     stdlib::web::{
@@ -9,7 +10,7 @@ use fictionet::{
         httpd::{Body, Routing},
     },
 };
-use http::{Response, StatusCode, header};
+use http::StatusCode;
 use http_body::{Body as HttpBody, Frame};
 use http_body_util::BodyExt;
 use std::{
@@ -23,7 +24,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
-type Answer = Result<Response<Body>, Error>;
+type Answer = Result<Response, Error>;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Opens the package mirror used while guests install their software.
@@ -180,15 +181,19 @@ impl<S: Handler + Clone> Handler for Mirror<S> {
                     Reply::Later(work) => work(cx).await?,
                 };
                 let Some(path) = path.filter(|_| {
-                    response.status() == StatusCode::OK
-                        && !response.headers().contains_key(header::CONTENT_ENCODING)
+                    response.status == StatusCode::OK
+                        && response.fields.get(b"content-encoding").is_none()
                 }) else {
                     return Ok(response);
                 };
                 let expected = response
-                    .headers()
-                    .get(header::CONTENT_LENGTH)
-                    .map(|length| length.to_str()?.parse::<u64>().map_err(Error::from))
+                    .fields
+                    .get(b"content-length")
+                    .map(|length| {
+                        std::str::from_utf8(length)?
+                            .parse::<u64>()
+                            .map_err(Error::from)
+                    })
                     .transpose()?;
                 tokio::fs::create_dir_all(path.parent().expect("file parent")).await?;
                 let temporary = Temporary(path.with_extension(format!(
@@ -201,7 +206,7 @@ impl<S: Handler + Clone> Handler for Mirror<S> {
                     .create_new(true)
                     .open(&temporary.0)
                     .await?;
-                let mut body = response.into_body();
+                let mut body = response.body;
                 let mut length = 0u64;
                 while let Some(frame) = body.frame().await {
                     if let Ok(bytes) = frame?.into_data() {
@@ -223,10 +228,12 @@ impl<S: Handler + Clone> Handler for Mirror<S> {
 
 async fn file_response(file: tokio::fs::File) -> Answer {
     let length = file.metadata().await?.len();
-    Ok(Response::builder()
-        .header(header::CONTENT_LENGTH, length)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::new(FileBody { file }))?)
+    let mut response = Response::new(Body::new(FileBody { file }));
+    response.fields = Fields::new([
+        ("content-length", length.to_string().as_str()),
+        ("content-type", "application/octet-stream"),
+    ]);
+    Ok(response)
 }
 struct FileBody {
     file: tokio::fs::File,

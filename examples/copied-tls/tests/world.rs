@@ -20,7 +20,7 @@ use fictionet::stdlib::world::net::{Host, Net};
 use fictionet_extras::hyper_io::{Exec, Io};
 use fictionet_test_support::sandbox::{Machine, TlsClient, client_config, machine};
 use fictionet_test_support::{certs, world::world};
-use http::{Request, Response, StatusCode, Version};
+use http::{Request, StatusCode, Version};
 use http_body_util::{BodyExt, Full};
 
 const SITE: Ipv4Addr = Ipv4Addr::new(45, 33, 4, 80);
@@ -50,7 +50,9 @@ fn copied() -> tls::Factory {
 struct Page;
 impl Handler for Page {
     fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
-        Reply::Now(Response::new(Body::from(vec![b'x'; 16_000])))
+        Reply::Now(fictionet::stdlib::web::Response::new(Body::from(
+            vec![b'x'; 16_000],
+        )))
     }
 }
 

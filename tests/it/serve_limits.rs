@@ -255,9 +255,9 @@ struct Streams;
 
 impl Handler for Streams {
     fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
-        Reply::Now(http::Response::new(Body::new(Unsized(Some(
-            Bytes::from_static(b"streamed\n"),
-        )))))
+        Reply::Now(fictionet::stdlib::web::Response::from_http(
+            http::Response::new(Body::new(Unsized(Some(Bytes::from_static(b"streamed\n"))))),
+        ))
     }
 }
 
@@ -283,7 +283,9 @@ fn response_policy_agrees_across_http_versions() {
             if let Some(date) = request.headers().get("x-date") {
                 response = response.header("date", date);
             }
-            Reply::Now(response.body(body).unwrap())
+            Reply::Now(fictionet::stdlib::web::Response::from_http(
+                response.body(body).unwrap(),
+            ))
         }
     }
 
@@ -675,7 +677,7 @@ fn truncated_http1_requests_keep_their_body_charge() {
                 Box::pin(async move {
                     fcx.sleep(Duration::from_secs(1)).await?;
                     assert!(request.into_body().collect().await.is_err());
-                    Ok(http::Response::new(Body::empty()))
+                    Ok(fictionet::stdlib::web::Response::new(Body::empty()))
                 })
             }))
         }
@@ -771,7 +773,7 @@ impl Handler for WaitingMetadata {
                 waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::future::pending::<()>().await;
                 assert_eq!(request.headers()["x-large"].as_bytes().len(), 4096);
-                Ok(http::Response::new(Body::empty()))
+                Ok(fictionet::stdlib::web::Response::new(Body::empty()))
             })
         }))
     }
@@ -950,7 +952,9 @@ struct StreamingMetadata;
 
 impl Handler for StreamingMetadata {
     fn call(&self, _: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
-        Reply::Now(http::Response::new(Body::new(WaitingBody)))
+        Reply::Now(fictionet::stdlib::web::Response::from_http(
+            http::Response::new(Body::new(WaitingBody)),
+        ))
     }
 }
 

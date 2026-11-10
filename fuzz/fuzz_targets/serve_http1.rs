@@ -15,12 +15,12 @@ impl Handler for Pages {
     fn call(&self, request: fictionet::stdlib::web::Request, _: &mut Exchange<'_>) -> Reply {
         self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(body) = request.body.bytes() else {
-            return Reply::Now(
+            return Reply::Now(fictionet::stdlib::web::Response::from_http(
                 http::Response::builder()
                     .status(400)
                     .body(Body::empty())
                     .unwrap(),
-            );
+            ));
         };
         let response = match (request.head.method(), request.head.path()) {
             ("GET" | "HEAD", "/") => http::Response::new(Body::from("home\n")),
@@ -37,7 +37,7 @@ impl Handler for Pages {
                 .body(Body::empty())
                 .unwrap(),
         };
-        Reply::Now(response)
+        Reply::Now(fictionet::stdlib::web::Response::from_http(response))
     }
 }
 

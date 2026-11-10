@@ -371,12 +371,12 @@ async fn the_proxy_uses_its_target_and_removes_connection_headers() {
             panic!("the proxy dispatches upstream");
         };
         let response = work(fcx.clone()).await?;
-        assert_eq!(response.status(), 201);
-        assert_eq!(response.headers()["x-public"], "kept");
+        assert_eq!(response.status, 201);
+        assert_eq!(response.fields.get(b"x-public"), Some(b"kept".as_slice()));
         for name in ["connection", "x-private", "x-other", "upgrade"] {
-            assert!(!response.headers().contains_key(name));
+            assert!(response.fields.get(name.as_bytes()).is_none());
         }
-        assert_eq!(response.into_body().collect().await?.to_bytes(), "world");
+        assert_eq!(response.body.collect().await?.to_bytes(), "world");
         let request = server.await.unwrap().to_ascii_lowercase();
         assert!(request.starts_with("post /path?q=1 http/1.1\r\n"));
         assert!(request.contains(&format!("host: {address}\r\n")));

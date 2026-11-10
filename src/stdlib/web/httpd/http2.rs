@@ -4160,7 +4160,9 @@ mod tests {
                 let parts = request.head.to_http().expect("valid request head");
                 let request = http::Request::from_parts(parts, request.body);
                 if request.uri().path() == "/big" {
-                    return Reply::Now(http::Response::new(Body::from(vec![b'b'; 100_000])));
+                    return Reply::Now(fictionet::stdlib::web::Response::new(Body::from(
+                        vec![b'b'; 100_000],
+                    )));
                 }
                 Reply::Later(Box::new(|fcx| {
                     Box::pin(async move {

@@ -19,11 +19,12 @@
 //! question reaches the resolver as the fronts' own queries do, from the
 //! same cache.
 
+use fictionet::stdlib::web::{Fields, Response};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use http::header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, LOCATION};
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::header::ACCEPT;
+use http::{HeaderValue, Method, Request, StatusCode};
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::base64;
@@ -72,9 +73,10 @@ enum Answer {
 pub fn resolve(fronts: &Fronts, request: &Request<Body>, ex: &mut Exchange<'_>) -> Reply {
     if *request.method() != Method::GET {
         let mut response = httpd::text(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.\n");
-        response
-            .headers_mut()
-            .insert(ALLOW, HeaderValue::from_static("GET"));
+        response.fields = Fields::new([
+            ("content-type", "text/plain; charset=utf-8"),
+            ("allow", "GET"),
+        ]);
         return Reply::Now(response);
     }
     let Some(form) = form(request) else {
@@ -115,7 +117,7 @@ fn form(request: &Request<Body>) -> Option<Form> {
     Form::parse(request.uri().query().unwrap_or("").as_bytes()).ok()
 }
 
-fn bad_query_string() -> Response<Body> {
+fn bad_query_string() -> Response {
     httpd::text(StatusCode::BAD_REQUEST, "Bad query string.\n")
 }
 
@@ -154,31 +156,27 @@ fn json_reply(
 }
 
 /// `400 Bad Request` with `error` in JSON.
-fn json_error(error: String) -> Response<Body> {
+fn json_error(error: String) -> Response {
     let body = Value::Object(vec![("error".to_owned(), Value::from(error))]);
     let mut response = Response::new(Body::from(body.to_bytes().unwrap_or_default()));
-    *response.status_mut() = StatusCode::BAD_REQUEST;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(JSON));
+    response.status = StatusCode::BAD_REQUEST;
+    response.fields = Fields::new([("content-type", JSON)]);
     response
 }
 
 /// The response carrying the resolver's `reply` as `answer` says. A reply
 /// that does not parse goes back as the message itself. Every DNS answer,
 /// SERVFAIL and NXDOMAIN included, is `200 OK`.
-fn answered(reply: Vec<u8>, answer: Answer) -> Response<Body> {
+fn answered(reply: Vec<u8>, answer: Answer) -> Response {
     let (Answer::Json(media), Ok(message)) = (answer, read_message(&reply)) else {
         return message_response(reply);
     };
     let mut response = Response::new(Body::from(to_json(&message)));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(media));
-    if let Some(seconds) = freshness(&message)
-        && let Ok(value) = HeaderValue::from_str(&format!("max-age={seconds}"))
-    {
-        headers.insert(CACHE_CONTROL, value);
-    }
+    let cache = freshness(&message).map(|seconds| format!("max-age={seconds}"));
+    response.fields = Fields::new(
+        std::iter::once(("content-type", media))
+            .chain(cache.as_deref().map(|value| ("cache-control", value))),
+    );
     response
 }
 
@@ -513,13 +511,11 @@ fn no_query(request: &Request<Body>) -> bool {
 }
 
 /// A response with `status`, `body`, and its media type when it has one.
-fn http_reply(status: StatusCode, media: Option<&'static str>, body: String) -> Response<Body> {
+fn http_reply(status: StatusCode, media: Option<&'static str>, body: String) -> Response {
     let mut response = Response::new(Body::from(body));
-    *response.status_mut() = status;
+    response.status = status;
     if let Some(media) = media {
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static(media));
+        response.fields = Fields::new([("content-type", media)]);
     }
     response
 }
@@ -536,7 +532,7 @@ struct Google {
 
 impl Google {
     /// Google's error page for `status`, saying `message`.
-    fn error(status: StatusCode, message: &str) -> Response<Body> {
+    fn error(status: StatusCode, message: &str) -> Response {
         let code = status.as_u16();
         let reason = status.canonical_reason().unwrap_or_default();
         let body = format!(
@@ -644,7 +640,12 @@ impl Handler for Cloudflare {
             body.to_owned(),
         );
         if let Ok(location) = HeaderValue::from_str(&format!("https://one.one.one.one{target}")) {
-            response.headers_mut().insert(LOCATION, location);
+            response.fields = Fields::new(
+                response
+                    .fields
+                    .iter()
+                    .chain([(b"location".as_slice(), location.as_bytes())]),
+            );
         }
         Reply::Now(response)
     }
@@ -691,7 +692,7 @@ struct OpenDns;
 
 impl OpenDns {
     /// OpenDNS's error page for `status`, saying `message`.
-    fn error(status: StatusCode, message: &str) -> Response<Body> {
+    fn error(status: StatusCode, message: &str) -> Response {
         let code = status.as_u16();
         let reason = status.canonical_reason().unwrap_or_default();
         let body = format!(

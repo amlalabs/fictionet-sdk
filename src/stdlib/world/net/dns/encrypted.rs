@@ -67,8 +67,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, SystemTime};
 
-use http::header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE};
-use http::{HeaderValue, Response, StatusCode};
+use fictionet::stdlib::web::{Fields, Response};
+use http::StatusCode;
 
 use fictionet::Cx;
 use fictionet::stdlib::codec::Wire;
@@ -778,15 +778,16 @@ enum Refusal {
 }
 
 impl Refusal {
-    fn response(self) -> Response<Body> {
+    fn response(self) -> fictionet::stdlib::web::Response {
         match self {
             Refusal::Text(status, text) => httpd::text(status, text),
             Refusal::Method(allowed) => {
                 let mut response =
                     httpd::text(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.\n");
-                response
-                    .headers_mut()
-                    .insert(ALLOW, HeaderValue::from_static(allowed));
+                response.fields = fictionet::stdlib::web::Fields::new([
+                    ("content-type", "text/plain; charset=utf-8"),
+                    ("allow", allowed),
+                ]);
                 response
             }
         }
@@ -907,16 +908,14 @@ fn base64url(text: &str) -> Option<Vec<u8>> {
 /// `application/dns-message`, with a `Cache-Control` freshness from
 /// [`freshness`] when the answer parses. Every DNS answer, SERVFAIL and
 /// NXDOMAIN included, is `200 OK` (RFC 8484 §4.2.1).
-pub fn message_response(answer: Vec<u8>) -> Response<Body> {
+pub fn message_response(answer: Vec<u8>) -> Response {
     let freshness = read_message(&answer).ok().as_ref().and_then(freshness);
     let mut response = Response::new(Body::from(answer));
-    let headers = response.headers_mut();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(DNS_MESSAGE));
-    if let Some(seconds) = freshness
-        && let Ok(value) = HeaderValue::from_str(&format!("max-age={seconds}"))
-    {
-        headers.insert(CACHE_CONTROL, value);
-    }
+    let cache = freshness.map(|seconds| format!("max-age={seconds}"));
+    response.fields = Fields::new(
+        std::iter::once(("content-type", DNS_MESSAGE))
+            .chain(cache.as_deref().map(|value| ("cache-control", value))),
+    );
     response
 }
 

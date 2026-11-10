@@ -1,13 +1,13 @@
+use crate::stdlib::web::Response;
 use std::time::SystemTime;
 
 use bytes::BytesMut;
-use http::header::{CONTENT_LENGTH, DATE};
-use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 
 use fictionet::Error;
 use fictionet::time::Instant;
 
-use super::{BadGateway, Body, text};
+use super::{BadGateway, text};
 
 /// Owned HTTP head storage. `http` hides allocation capacities, so charge
 /// string lengths and the header map's capacity, including shared values
@@ -33,13 +33,13 @@ pub(super) fn headers_held(headers: &HeaderMap) -> usize {
             .sum::<usize>()
 }
 
-/// What a copy of a response head holds, counted as for [`request_held`].
-pub(super) fn response_held(parts: &http::response::Parts) -> usize {
-    std::mem::size_of::<http::response::Parts>() + headers_held(&parts.headers)
+/// Inline observation metadata; field storage remains charged to its backing.
+pub(super) fn response_held(_parts: &Response) -> usize {
+    std::mem::size_of::<crate::stdlib::web::ObservedResponse>()
 }
 
 /// The response for a handler error: `502` for [`BadGateway`], else `500`.
-pub(super) fn error_response(e: &Error) -> Response<Body> {
+pub(super) fn error_response(e: &Error) -> Response {
     if e.is::<BadGateway>() {
         text(StatusCode::BAD_GATEWAY, &format!("{e}\n"))
     } else {
@@ -87,7 +87,7 @@ pub(super) struct ResponsePolicy {
 impl ResponsePolicy {
     /// `date` makes the `Date` header, if the handler set none.
     pub(super) fn new(
-        parts: &http::response::Parts,
+        parts: &Response,
         len: Option<u64>,
         asked: Asked,
         date: impl FnOnce() -> Option<HeaderValue>,
@@ -102,9 +102,9 @@ impl ResponsePolicy {
         } else if head_only {
             // A handler that drops the HEAD body can supply the GET length.
             parts
-                .headers
-                .get(CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+                .fields
+                .get(b"content-length")
+                .and_then(|v| std::str::from_utf8(v).ok()?.parse::<u64>().ok())
                 .or(len)
         } else {
             len
@@ -112,7 +112,7 @@ impl ResponsePolicy {
         Self {
             bodiless: head_only || no_body,
             len,
-            date: if parts.headers.contains_key(DATE) {
+            date: if parts.fields.get(b"date").is_some() {
                 None
             } else {
                 date()
@@ -245,12 +245,10 @@ mod tests {
 
     #[test]
     fn a_handler_date_is_kept_without_making_one() {
-        let mut response = Response::new(());
-        response.headers_mut().insert(
-            DATE,
-            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
-        );
-        let (parts, ()) = response.into_parts();
+        let mut response = Response::new(crate::stdlib::web::Body::empty());
+        response.fields =
+            crate::stdlib::web::Fields::new([("date", b"Sun, 06 Nov 1994 08:49:37 GMT")]);
+        let parts = response;
         let mut made = false;
         let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || {
             made = true;

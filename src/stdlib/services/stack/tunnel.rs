@@ -642,7 +642,7 @@ mod tests {
                         *outcome.lock() = Some(flushed);
                     },
                 ));
-                Reply::Now(response)
+                Reply::Now(fictionet::stdlib::web::Response::from_http(response))
             }
         }
 
