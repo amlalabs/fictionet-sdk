@@ -843,13 +843,15 @@ impl Transport {
         if !self.started {
             return Err(TransportError::State);
         }
-        let payload = Message::Disconnect {
-            reason,
-            description: description.to_owned(),
-            language: String::new(),
-        }
-        .to_bytes()?;
-        self.send(&payload, out)
+        // Written as `Message::Disconnect` writes it, straight into the
+        // packet: no message and no payload are made for it.
+        let len = super::disconnect_len(reason, description, "")?;
+        self.outgoing.write_with(
+            len,
+            self.rng.as_mut().ok_or(TransportError::Unseeded)?,
+            out,
+            |out| super::put_disconnect(out, reason, description, ""),
+        )
     }
 
     fn send(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), TransportError> {
@@ -1139,17 +1141,32 @@ impl Direction {
         rng: &mut ChaCha20Rng,
         out: &mut Vec<u8>,
     ) -> Result<(), TransportError> {
-        if payload.is_empty() {
+        self.write_with(payload.len(), rng, out, |out| {
+            out.extend_from_slice(payload);
+        })
+    }
+
+    /// Writes one packet whose payload is the `len` bytes `fill` appends
+    /// to `out`. A `fill` that appends another length leaves `out` as it
+    /// was and fails, as a write of a payload too long does.
+    fn write_with(
+        &mut self,
+        len: usize,
+        rng: &mut ChaCha20Rng,
+        out: &mut Vec<u8>,
+        fill: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), TransportError> {
+        if len == 0 {
             return Err(Error::Empty.into());
         }
-        if payload.len() > MAX_PAYLOAD {
-            return Err(Error::PayloadTooLong(payload.len().min(u32::MAX as usize) as u32).into());
+        if len > MAX_PAYLOAD {
+            return Err(Error::PayloadTooLong(len.min(u32::MAX as usize) as u32).into());
         }
         let encrypted = !matches!(self.cipher, Cipher::Plain);
         let offset = if encrypted { 1 } else { 5 };
         let block = self.block();
-        let padding = 4 + (block - (offset + payload.len() + 4) % block) % block;
-        let length = 1 + payload.len() + padding;
+        let padding = 4 + (block - (offset + len + 4) % block) % block;
+        let length = 1 + len + padding;
         self.check_limit(length + 4)?;
         let tag = if encrypted { 16 } else { 0 };
         out.try_reserve(4 + length + tag)
@@ -1159,9 +1176,13 @@ impl Direction {
         let start = out.len();
         out.extend_from_slice(&(length as u32).to_be_bytes());
         out.push(padding as u8);
-        out.extend_from_slice(payload);
+        fill(out);
+        if out.len() != start + 5 + len {
+            out.truncate(start);
+            return Err(Error::Unwritable.into());
+        }
         out.resize(start + 4 + length, 0);
-        rng.fill_bytes(&mut out[start + 5 + payload.len()..]);
+        rng.fill_bytes(&mut out[start + 5 + len..]);
         let packet = &mut out[start..];
         let sealed = match &self.cipher {
             Cipher::Plain => Ok(None),
@@ -1307,6 +1328,50 @@ mod tests {
             Message::KexInit(transport.proposal().clone())
         );
         assert!(transport.is_rekeying());
+    }
+
+    /// A disconnect written straight into the packet carries the payload
+    /// the DISCONNECT message itself encodes to, for any reason and any
+    /// text up to the limit; past it, nothing is written.
+    #[test]
+    fn a_disconnect_carries_the_payload_of_its_message() {
+        use super::super::{DisconnectReason, MAX_TEXT};
+        let mut rng = ChaCha20Rng::from_seed([23; 32]);
+        let key = Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap());
+        let identification = Identification::new("2.0", "server", None).unwrap();
+        for _ in 0..64 {
+            let mut transport = Transport::new(key.clone(), identification.clone());
+            transport.seed([19; 32]).unwrap();
+            let mut out = Vec::new();
+            transport.start_identification(&mut out).unwrap();
+            out.clear();
+            let reason = DisconnectReason::from_code(rng.next_u32() % 20);
+            let len = match rng.next_u32() % 4 {
+                0 => 0,
+                1 => MAX_TEXT,
+                2 => MAX_TEXT + 1,
+                _ => rng.next_u32() as usize % 256,
+            };
+            let description: String = (0..len)
+                .map(|_| char::from(b'a' + (rng.next_u32() % 26) as u8))
+                .collect();
+            let message = Message::Disconnect {
+                reason,
+                description: description.clone(),
+                language: String::new(),
+            };
+            let written = transport.disconnect(reason, &description, &mut out);
+            match message.to_bytes() {
+                Ok(payload) => {
+                    written.unwrap();
+                    assert_eq!(Packet::parse(&out).unwrap().payload, payload);
+                }
+                Err(_) => {
+                    assert!(written.is_err(), "{len} bytes of text");
+                    assert!(out.is_empty(), "a refused disconnect writes nothing");
+                }
+            }
+        }
     }
 
     #[test]

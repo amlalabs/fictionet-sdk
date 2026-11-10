@@ -275,6 +275,42 @@ fn syslog_allocation_refusal_leaves_output_unchanged() {
     assert_eq!(out, [42]);
 }
 
+/// An SSH server's choice of algorithms and its own disconnect allocate
+/// nothing: the choice reads both lists where they are, however long the
+/// peer's, and the disconnect is written straight into output that has
+/// room for it, as the connection's output always has.
+#[test]
+fn ssh_choice_and_disconnect_allocate_nothing() {
+    use fictionet::stdlib::protocols::ssh::transport::{HostKey, Transport};
+    use fictionet::stdlib::protocols::ssh::{
+        DisconnectReason, Identification, KexInit, MAX_PACKET,
+    };
+    use std::sync::Arc;
+    let ours: Vec<String> = ["curve25519-sha256", "ecdh-sha2-nistp256"]
+        .map(String::from)
+        .to_vec();
+    let mut peer: Vec<String> = (0..4096).map(|i| format!("peer-{i:05}")).collect();
+    peer.push(ours[1].clone());
+    let (chosen, stats) = measuring(|| KexInit::choose(&peer, &ours).map(str::len));
+    assert_eq!(chosen, Some(ours[1].len()));
+    assert_eq!(stats.allocations, 0, "choosing allocates nothing");
+
+    let key = Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap());
+    let mut transport = Transport::new(key, Identification::new("2.0", "server", None).unwrap());
+    transport.seed([19; 32]).unwrap();
+    let mut out = Vec::with_capacity(2 * MAX_PACKET);
+    transport.start_identification(&mut out).unwrap();
+    let before = out.len();
+    let (written, stats) =
+        measuring(|| transport.disconnect(DisconnectReason::ByApplication, "done", &mut out));
+    written.unwrap();
+    assert!(out.len() > before, "the disconnect went out");
+    assert_eq!(
+        stats.allocations, 0,
+        "a disconnect into room allocates nothing"
+    );
+}
+
 /// SSH authentication and connection messages are written in place: into
 /// room already there they allocate nothing, so a writer that encodes
 /// into a buffer it paid for pays for every byte. A message that cannot

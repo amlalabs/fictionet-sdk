@@ -948,6 +948,45 @@ fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// The length of a DISCONNECT payload with these fields, which
+/// [`put_disconnect`] writes, or `Unwritable` for a reason the wire cannot
+/// say or a text past [`MAX_TEXT`]. [`Message::Disconnect`] is written
+/// with these two, and so is a transport's own disconnect, which makes no
+/// message for it.
+fn disconnect_len(
+    reason: DisconnectReason,
+    description: &str,
+    language: &str,
+) -> Result<usize, Error> {
+    if DisconnectReason::from_code(reason.code()) != reason
+        || description.len() > MAX_TEXT
+        || language.len() > MAX_TEXT
+    {
+        return Err(Error::Unwritable);
+    }
+    Ok(DISCONNECT_FIXED
+        .saturating_add(description.len())
+        .saturating_add(language.len()))
+}
+
+/// Appends a DISCONNECT payload whose fields [`disconnect_len`] accepted.
+fn put_disconnect(out: &mut Vec<u8>, reason: DisconnectReason, description: &str, language: &str) {
+    out.push(msg::DISCONNECT);
+    put_disconnect_fields(out, reason, description, language);
+}
+
+/// Appends what follows a DISCONNECT's message number.
+fn put_disconnect_fields(
+    out: &mut Vec<u8>,
+    reason: DisconnectReason,
+    description: &str,
+    language: &str,
+) {
+    put_uint32(out, reason.code());
+    put_string(out, description.as_bytes());
+    put_string(out, language.as_bytes());
+}
+
 fn list_len(names: &[String], ok: fn(&[u8]) -> bool) -> Result<usize, Error> {
     let mut size = names.len().saturating_sub(1);
     for name in names {
@@ -1192,14 +1231,17 @@ impl KexInit {
     /// exchange needs a host key algorithm both sides have that can sign or
     /// encrypt as it requires. This function knows nothing of what an
     /// algorithm can do, so world code that offers key exchanges with
-    /// different needs checks those itself. It takes time in proportion to
-    /// the two lists' lengths together.
+    /// different needs checks those itself.
+    ///
+    /// It allocates nothing, and takes time in proportion to the two
+    /// lists' lengths multiplied: one of them is the caller's own, a few
+    /// names its world chose, so the work is linear in the peer's list
+    /// however long the peer makes it.
     pub fn choose<'a>(client: &'a [String], server: &[String]) -> Option<&'a str> {
-        let server: std::collections::HashSet<&str> = server.iter().map(String::as_str).collect();
         client
             .iter()
             .map(String::as_str)
-            .find(|c| server.contains(c))
+            .find(|c| server.iter().any(|s| s == c))
     }
 
     /// The length of this KEXINIT as a payload.
@@ -1433,11 +1475,7 @@ impl Wire for Message {
                 reason,
                 description,
                 language,
-            } => {
-                put_uint32(out, reason.code());
-                put_string(out, description.as_bytes());
-                put_string(out, language.as_bytes());
-            }
+            } => put_disconnect_fields(out, *reason, description, language),
             Self::Ignore(data) => put_string(out, data),
             Self::Unimplemented(sequence) => put_uint32(out, *sequence),
             Self::Debug {
@@ -1476,17 +1514,7 @@ impl Message {
                 reason,
                 description,
                 language,
-            } => {
-                if DisconnectReason::from_code(reason.code()) != *reason
-                    || description.len() > MAX_TEXT
-                    || language.len() > MAX_TEXT
-                {
-                    return Err(Error::Unwritable);
-                }
-                DISCONNECT_FIXED
-                    .saturating_add(description.len())
-                    .saturating_add(language.len())
-            }
+            } => disconnect_len(*reason, description, language)?,
             Self::Debug {
                 message, language, ..
             } => {
@@ -1919,16 +1947,27 @@ mod tests {
         assert_eq!(KexInit::choose(&[], &client), None);
     }
 
+    /// One list is the peer's, as long as the test makes it; the other is
+    /// the caller's own, a few names. Either way round, the choice is the
+    /// client's first name the server also has, wherever the server put
+    /// it, and none when they share none.
     #[test]
-    fn choose_respects_client_order_in_large_lists() {
+    fn choose_respects_client_order_against_a_peers_large_list() {
         for size in [rounds(12_500), 4 * (rounds(12_500))] {
-            let client: Vec<String> = (0..size).map(|i| format!("client-{i:08}")).collect();
-            let server: Vec<String> = (0..size).map(|i| format!("server-{i:08}")).collect();
-            assert_eq!(KexInit::choose(&client, &server), None);
-            let mut both = server.clone();
-            both.push(client[size - 1].clone());
-            both.push(client[123].clone());
-            assert_eq!(KexInit::choose(&client, &both), Some("client-00000123"));
+            let peer: Vec<String> = (0..size).map(|i| format!("peer-{i:08}")).collect();
+            let ours: Vec<String> = (0..8).map(|i| format!("ours-{i:08}")).collect();
+            // The peer is the client.
+            assert_eq!(KexInit::choose(&peer, &ours), None);
+            let mut theirs = peer.clone();
+            theirs.insert(123, ours[5].clone());
+            theirs.push(ours[1].clone());
+            assert_eq!(KexInit::choose(&theirs, &ours), Some(ours[5].as_str()));
+            // The peer is the server.
+            assert_eq!(KexInit::choose(&ours, &peer), None);
+            let mut theirs = peer.clone();
+            theirs.insert(0, ours[6].clone());
+            theirs.push(ours[2].clone());
+            assert_eq!(KexInit::choose(&ours, &theirs), Some(ours[2].as_str()));
         }
     }
 
