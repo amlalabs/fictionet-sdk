@@ -15,7 +15,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 use fictionet::stdlib::codec::{self, Fail, Wire};
 use fictionet::stdlib::layer::{
     Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedDeque, ChargedVec, ChildId, Chunk,
-    Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Slots, StreamCommand, StreamEvent, Top,
+    Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand,
+    StreamEvent, Top,
 };
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
@@ -173,7 +174,7 @@ pub struct Http2 {
     dates_storage: Option<Charge>,
     last_words: Option<Charge>,
     /// The request an HTTP/1 `Upgrade: h2c` brought, for stream 1.
-    upgrade: Option<(Opening, Option<Chunk>)>,
+    upgrade: Option<(Box<Request<()>>, Option<Chunk>)>,
     /// The `Date` headers of the responses: one made per second of the
     /// world's clock serves every stream framed in that second.
     dates: Dates,
@@ -504,7 +505,7 @@ impl Http2 {
     pub(super) fn upgraded(
         limits: Limits,
         settings: &[wire::Setting],
-        opening: Opening,
+        request: Request<()>,
         body: Option<Chunk>,
     ) -> Self {
         let mut h2 = Self::new(limits);
@@ -513,7 +514,7 @@ impl Http2 {
             let _ = h2.peer_setting(*setting);
         }
         h2.last_stream = 1;
-        h2.upgrade = Some((opening, body));
+        h2.upgrade = Some((Box::new(request), body));
         h2
     }
 
@@ -585,10 +586,9 @@ impl Http2 {
             return;
         }
         self.settings_deadline = Some(env.now() + self.limits.header_timeout);
-        if let Some((mut opening, body)) = self.upgrade.take() {
-            opening.at = env.now();
+        if let Some((request, body)) = self.upgrade.take() {
             let ended = body.is_none();
-            let admitted = self.admit(env, 1, opening, None, ended).is_ok();
+            let admitted = self.admit(env, 1, request, None, ended).is_ok();
             // The request came whole over HTTP/1: stream 1 is half closed
             // from the client's side (RFC 7540 section 3.2).
             if let Some(stream) = self.streams.get_mut(&1) {
@@ -821,18 +821,19 @@ impl Http2 {
     // -----------------------------------------------------------------------
     // Children
 
-    /// Opens stream `id`'s child with `opening`, or refuses the stream
-    /// when its head and state do not fit the budget.
+    /// Opens stream `id`'s child with `request`, the head that arrived now,
+    /// or refuses the stream when its head and state do not fit the
+    /// budget.
     fn admit(
         &mut self,
         env: &mut Env<'_, Report>,
         id: u32,
-        mut opening: Opening,
+        request: Box<Request<()>>,
         remaining: Option<u64>,
         ended: bool,
     ) -> Result<(), wire::Error> {
         let entry = env.budget().charge(size_of::<(u32, Stream)>());
-        let head = env.budget().charge(request_held(&opening.request));
+        let head = env.budget().charge(request_held(&request));
         // Places for its first two events and, from now on, for the event
         // that ends it.
         let streams = self.streams.len() + 1;
@@ -859,8 +860,11 @@ impl Http2 {
             return self.reset(env, id, ErrorCode::RefusedStream);
         };
         let child_id = child.id();
-        opening.charge = Some(head);
-        opening.ended = ended;
+        let opening = Opening {
+            request: Owned::new(request, head),
+            ended,
+            at: env.now(),
+        };
         // The stream's queues charge their storage as they grow.
         self.streams.insert(
             id,
@@ -1201,13 +1205,7 @@ impl Http2 {
             return self.reset(env, id, ErrorCode::ProtocolError);
         }
         self.batch = true;
-        let opening = Opening {
-            request: Box::new(request),
-            ended: read.end,
-            at: env.now(),
-            charge: None,
-        };
-        self.admit(env, id, opening, remaining, read.end)
+        self.admit(env, id, Box::new(request), remaining, read.end)
     }
 
     fn on_data(&mut self, env: &mut Env<'_, Report>, data: wire::Data) -> Result<(), wire::Error> {
@@ -2943,15 +2941,9 @@ mod tests {
             .version(Version::HTTP_2)
             .body(())
             .unwrap();
-        let opening = Opening {
-            request: Box::new(request),
-            ended: false,
-            at: Instant::ZERO,
-            charge: None,
-        };
         let body = Chunk::unpaid(vec![b'x'; 200_000]);
         let server = Chain::new(
-            Http2::upgraded(Limits::default(), &[], opening, Some(body)),
+            Http2::upgraded(Limits::default(), &[], request, Some(body)),
             Children::new(8, Http2::WINDOW, |_, opening: Opening, _| {
                 Some(Sink::reading(opening.request.uri().path() != "/stall"))
             }),
@@ -2970,6 +2962,44 @@ mod tests {
             "{output:?}"
         );
         assert!(!harness.ended());
+    }
+
+    /// Every head a child opens with carries its charge inside it, on the
+    /// stream an `Upgrade: h2c` brought and on one a HEADERS frame opened:
+    /// what is charged covers what the head holds, and goes with the head.
+    #[test]
+    fn every_opening_carries_the_charge_of_its_head() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/upgraded")
+            .version(Version::HTTP_2)
+            .body(())
+            .unwrap();
+        // Each head's path, what it is charged, and what it holds.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = seen.clone();
+        let server = Chain::new(
+            Http2::upgraded(Limits::default(), &[], request, None),
+            Children::new(8, Http2::WINDOW, move |_, opening: Opening, _| {
+                noted.lock().unwrap().push((
+                    opening.request.uri().path().to_owned(),
+                    opening.request.charged(),
+                    request_held(&opening.request),
+                ));
+                Some(Sink::reading(true))
+            }),
+        );
+        let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
+        harness.push(&client_preface()).unwrap();
+        harness.push(&headers_without_end(3)).unwrap();
+        let seen = seen.lock().unwrap();
+        let paths: Vec<&str> = seen.iter().map(|(path, ..)| path.as_str()).collect();
+        assert_eq!(paths, ["/upgraded", "/"], "both streams opened");
+        for (path, charged, held) in seen.iter() {
+            assert!(*held > 0, "{path}: a head holds something");
+            assert!(charged >= held, "{path}: {charged} charged, {held} held");
+        }
     }
 
     /// `POST /` over HTTP as one HEADERS frame on `stream`, its body to

@@ -3,7 +3,7 @@
 
 use http::{HeaderMap, StatusCode};
 
-use fictionet::stdlib::layer::{Budget, Charge, Chunk, Credited, Port};
+use fictionet::stdlib::layer::{Budget, Charge, Chunk, Credited, Owned, Port};
 use fictionet::stdlib::protocols::http2::ErrorCode;
 use fictionet::time::Instant;
 
@@ -39,15 +39,15 @@ impl Port for HttpExchange {
 /// checked it.
 #[derive(Debug)]
 pub struct Opening {
-    /// The request without its body. Its version is the connection's.
-    pub request: Box<http::Request<()>>,
+    /// The request without its body, with what it is charged to the
+    /// connection's budget: whoever holds the head holds its charge, and
+    /// one goes with the other ([`Owned::into_parts`]). Its version is the
+    /// connection's.
+    pub request: Owned<Box<http::Request<()>>>,
     /// Whether the request has no body: it ended with its head.
     pub ended: bool,
     /// When the head arrived, on the run's clock.
     pub at: Instant,
-    /// What the head is charged to the connection's budget. The child
-    /// keeps it while it holds the head.
-    pub charge: Option<Charge>,
 }
 
 /// A request's trailers, as the connection read and checked them.

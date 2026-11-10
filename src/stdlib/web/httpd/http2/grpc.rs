@@ -82,12 +82,15 @@ pub struct Grpc {
 impl Grpc {
     /// The call `opening` starts.
     pub fn new(opening: Opening) -> Grpc {
+        // The head's charge stays with the call, for the partial message
+        // it holds next.
+        let (request, charge) = opening.request.into_parts();
         let mut grpc = Grpc {
             content_type: ContentType::plain(),
             up: VecDeque::new(),
             partial: Vec::new(),
             checked: 0,
-            charge: opening.charge,
+            charge: Some(charge),
             next: None,
             message: None,
             head_sent: false,
@@ -95,7 +98,6 @@ impl Grpc {
             read_over: false,
             client_ended: false,
         };
-        let request = &opening.request;
         let pseudo = [
             (":method", request.method().as_str().to_owned()),
             (

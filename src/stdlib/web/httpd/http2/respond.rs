@@ -112,13 +112,7 @@ impl Responder {
             .bytes()
             .filter(|bytes| !bytes.is_empty())
             .map(|bytes| Chunk::unpaid(bytes.to_vec()));
-        let opening = Opening {
-            request: Box::new(head),
-            ended: body.is_none(),
-            at: Instant::ZERO,
-            charge: None,
-        };
-        self.server(Http2::upgraded(self.limits, settings, opening, body))
+        self.server(Http2::upgraded(self.limits, settings, head, body))
     }
 
     fn server(&self, mut connection: Http2) -> Http2Server {
@@ -198,11 +192,14 @@ enum Stage {
 impl Respond {
     fn new(responder: Arc<Responder>, opening: Opening) -> Respond {
         let deadline = (!opening.ended).then(|| opening.at + responder.limits.body_timeout);
+        // The head's charge pays for the head while it is held, then for
+        // the response's head and body bytes not yet sent.
+        let (head, charge) = opening.request.into_parts();
         Respond {
             state: Box::new(State {
                 responder,
-                head: Some(*opening.request),
-                charge: opening.charge,
+                head: Some(*head),
+                charge: Some(charge),
                 body: None,
                 handed: None,
                 deadline,
