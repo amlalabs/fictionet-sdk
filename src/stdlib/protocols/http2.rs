@@ -1121,6 +1121,27 @@ pub enum Event {
     },
     /// An extension frame that was ignored by connection state.
     Unknown(Unknown),
+    /// A frame that is a stream error (RFC 9113 section 5.4.2), such as
+    /// WINDOW_UPDATE with no credit on a stream: the receiver resets
+    /// `stream` with `error.code`, and the connection goes on.
+    StreamError {
+        /// The stream the receiver resets.
+        stream: u32,
+        /// Why, with the code its RST_STREAM carries.
+        error: Error,
+    },
+}
+/// What credit from the other direction did to this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Credit {
+    /// The window grew by the increment.
+    Granted,
+    /// The stream is unknown, ended, or retired: nothing changed.
+    Ignored,
+    /// The stream's window would pass 2^31 - 1: it stays as it was, and
+    /// the sender ends the stream with RST_STREAM FLOW_CONTROL_ERROR (RFC
+    /// 9113 section 6.9.1). The connection goes on.
+    StreamOverflow,
 }
 /// A block that waits for CONTINUATION. Its fragments so far are in the
 /// assembly storage.
@@ -1658,25 +1679,32 @@ impl Session {
         if self.settings_updates.len() >= 64 {
             return Err(budget("too many unacknowledged settings"));
         }
-        let mut window_min = peer.initial_window_size;
         let mut window_max = peer.initial_window_size;
         let mut frame_max = peer.max_frame_size;
         let mut table_min: Option<u32> = None;
         for setting in &settings.entries {
             match setting.id {
                 1 => table_min = Some(table_min.map_or(setting.value, |n| n.min(setting.value))),
-                4 => {
-                    window_min = window_min.min(setting.value);
-                    window_max = window_max.max(setting.value);
-                }
+                4 => window_max = window_max.max(setting.value),
                 5 => frame_max = frame_max.max(setting.value),
                 _ => {}
             }
         }
-        // Check all intermediate window extremes, then apply one net delta.
-        // Reductions remain optional until ACK, including for new streams.
-        let initial = self.initial_window.max(window_max);
-        self.set_initial_window(initial, window_min, initial)?;
+        // The sender applies the values in turn to the windows of streams
+        // that may still send: one that takes a window past 2^31 - 1 is a
+        // connection error (RFC 9113 section 6.9.2).
+        let envelope = self.initial_window;
+        if self
+            .streams
+            .values()
+            .any(|state| !state.closed && !initial_fits(state.window, envelope, window_max))
+        {
+            return Err(error(ErrorCode::FlowControlError, "window overflow"));
+        }
+        // DATA sent before the sender read these may use the larger
+        // window, so a reduction applies here only at the ACK, including
+        // for new streams.
+        self.set_initial_window(envelope.max(window_max));
         if peer.header_table_size as usize > self.table_limit {
             self.table_limit = peer.header_table_size as usize;
             self.blocks.table.set_settings_limit(self.table_limit);
@@ -1693,26 +1721,15 @@ impl Session {
         self.set_frame_size(self.frame_size.max(frame_max));
         Ok(())
     }
-    fn set_initial_window(&mut self, value: u32, min: u32, max: u32) -> Result<(), Error> {
+    /// Moves the windows of streams that may still send to count from
+    /// initial window `value`. An ended stream's window no longer moves
+    /// (RFC 9113 section 6.9.2).
+    fn set_initial_window(&mut self, value: u32) {
         let delta = i64::from(value) - i64::from(self.initial_window);
-        let low = i64::from(min) - i64::from(self.initial_window);
-        let high = i64::from(max) - i64::from(self.initial_window);
-        for state in self.streams.values_mut() {
-            if state.window.checked_add(low).is_none()
-                || state
-                    .window
-                    .checked_add(high)
-                    .is_none_or(|n| n > i64::from(MAX_WINDOW))
-            {
-                return Err(error(ErrorCode::FlowControlError, "window overflow"));
-            }
-            state.window = state
-                .window
-                .checked_add(delta)
-                .ok_or_else(|| error(ErrorCode::FlowControlError, "window overflow"))?;
+        for state in self.streams.values_mut().filter(|state| !state.closed) {
+            state.window += delta;
         }
         self.initial_window = value;
-        Ok(())
     }
     fn set_frame_size(&mut self, value: u32) {
         self.frame_size = value;
@@ -1738,7 +1755,7 @@ impl Session {
         }
         self.table_limit = table_limit;
         self.blocks.table.set_settings_limit(table_limit);
-        self.set_initial_window(window, window, window)?;
+        self.set_initial_window(window);
         self.set_frame_size(frame_size);
         Ok(())
     }
@@ -1746,33 +1763,41 @@ impl Session {
     /// with [`peer_open`](Self::peer_open) first to retain credit before headers.
     /// Unknown, closed, and retired streams are ignored. The caller checks
     /// idle-stream rules using both directions' opening headers.
-    /// Overflow and invalid increments stop decoding.
-    pub fn peer_window_update(&mut self, update: &WindowUpdate) -> Result<(), Error> {
+    /// Credit past 2^31 - 1 on the connection, and invalid increments, stop
+    /// decoding; on a stream, it leaves the window as it was and returns
+    /// [`Credit::StreamOverflow`] (RFC 9113 section 6.9.1).
+    pub fn peer_window_update(&mut self, update: &WindowUpdate) -> Result<Credit, Error> {
         if self.stopped {
-            return Ok(());
+            return Ok(Credit::Ignored);
         }
         let result = (|| {
             if update.increment == 0 || update.increment > MAX_WINDOW {
                 return Err(protocol("invalid window increment"));
             }
-            let window = if update.stream == 0 {
-                &mut self.window
-            } else if let Some(state) = self.streams.get_mut(&update.stream) {
-                if state.closed {
-                    return Ok(());
+            if update.stream == 0 {
+                let next = self.window + i64::from(update.increment);
+                if next > i64::from(MAX_WINDOW) {
+                    return Err(error(ErrorCode::FlowControlError, "window overflow"));
                 }
-                &mut state.window
-            } else {
-                return Ok(());
-            };
-            let next = window
-                .checked_add(i64::from(update.increment))
-                .ok_or_else(|| error(ErrorCode::FlowControlError, "window overflow"))?;
-            if next > i64::from(MAX_WINDOW) {
-                return Err(error(ErrorCode::FlowControlError, "window overflow"));
+                self.window = next;
+                return Ok(Credit::Granted);
             }
-            *window = next;
-            Ok(())
+            let (envelope, latest) = (self.initial_window, self.peer.initial_window_size);
+            let Some(state) = self.streams.get_mut(&update.stream) else {
+                return Ok(Credit::Ignored);
+            };
+            if state.closed {
+                return Ok(Credit::Ignored);
+            }
+            Ok(
+                match credited(state.window, envelope, latest, update.increment) {
+                    Some(window) => {
+                        state.window = window;
+                        Credit::Granted
+                    }
+                    None => Credit::StreamOverflow,
+                },
+            )
         })();
         self.remember(result)
     }
@@ -1835,6 +1860,19 @@ impl Session {
         let frame = match item {
             Input::Preface => return Ok(Some(Event::Preface)),
             Input::Frame(f) => f,
+            // A stream error ends only its stream (RFC 9113 section 5.4.2),
+            // except as the first frame or inside a header block.
+            Input::Refused {
+                header,
+                error,
+                scope: ErrorScope::Stream,
+                ..
+            } if !self.first && self.blocks.pending.is_none() => {
+                return Ok(Some(Event::StreamError {
+                    stream: header.stream,
+                    error,
+                }));
+            }
             Input::Refused { error, .. } => return Err(error),
         };
         if self.first {
@@ -1971,6 +2009,27 @@ impl Session {
     }
 }
 
+/// A stream's window here after credit of `increment`, or `None` if the
+/// sender's own window would pass 2^31 - 1 (RFC 9113 section 6.9.1). The
+/// window here counts from initial window `envelope`, the largest the
+/// sender may still be under; the sender applies SETTINGS as it reads
+/// them, so its own counts from `latest`, the one announced last.
+fn credited(window: i64, envelope: u32, latest: u32, increment: u32) -> Option<i64> {
+    let sender = window - i64::from(envelope) + i64::from(latest);
+    (sender + i64::from(increment) <= i64::from(MAX_WINDOW)).then(|| window + i64::from(increment))
+}
+
+/// Whether initial windows of at most `most`, applied in turn by the
+/// sender, keep a stream's window within 2^31 - 1 (RFC 9113 section
+/// 6.9.2). The window here counts from initial window `envelope`.
+fn initial_fits(window: i64, envelope: u32, most: u32) -> bool {
+    window - i64::from(envelope) + i64::from(most) <= i64::from(MAX_WINDOW)
+}
+
+#[cfg(kani)]
+#[path = "../../../verification/http2-layer/kani/session.rs"]
+mod kani_session;
+
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
@@ -2039,7 +2098,7 @@ pub mod harness {
                     Ok(Event::Headers { stream, .. }) => peer.peer_open(*stream),
                     Ok(Event::PushPromise { promised, .. }) => peer.peer_open(*promised),
                     Ok(Event::Settings(settings)) => peer.peer_settings(settings),
-                    Ok(Event::WindowUpdate(update)) => peer.peer_window_update(update),
+                    Ok(Event::WindowUpdate(update)) => peer.peer_window_update(update).map(|_| ()),
                     Ok(Event::Reset { stream, .. }) => {
                         peer.peer_reset(*stream);
                         Ok(())
@@ -3553,6 +3612,117 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::FlowControlError);
+    }
+
+    /// Credit that would take a stream's window past 2^31 - 1 ends that
+    /// stream with FLOW_CONTROL_ERROR (RFC 9113 section 6.9.1), not the
+    /// connection: the window stays as it was and the other streams and
+    /// the connection go on.
+    #[test]
+    fn a_stream_window_overflow_ends_only_the_stream() {
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        for stream in [1, 3] {
+            c.peer_open(stream).unwrap();
+            accept(&mut c, &raw(1, 4, stream, &[0x88]));
+        }
+        let credit = c.peer_window_update(&fixture_window_update(1, 0, MAX_WINDOW));
+        assert!(matches!(credit, Ok(Credit::StreamOverflow)), "{credit:?}");
+        assert!(c.failed().is_none());
+        assert_eq!(c.stream_window(1), Some(65_535));
+        // Exactly 2^31 - 1 still fits.
+        let credit = c.peer_window_update(&fixture_window_update(1, 0, MAX_WINDOW - 65_535));
+        assert!(matches!(credit, Ok(Credit::Granted)), "{credit:?}");
+        assert_eq!(c.stream_window(1), Some(i64::from(MAX_WINDOW)));
+        let events = accept(&mut c, &raw(0, 1, 3, b"body"));
+        assert!(matches!(&events[..], [Event::Data { stream: 3, .. }]));
+        // The connection window past 2^31 - 1 is still a connection error.
+        let error = c
+            .peer_window_update(&fixture_window_update(0, 0, MAX_WINDOW))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::FlowControlError);
+        assert!(c.is_done());
+    }
+
+    /// A change of initial window moves only the windows of streams that
+    /// can still send DATA (RFC 9113 section 6.9.2): one whose sender has
+    /// ended it is left alone, even at 2^31 - 1.
+    #[test]
+    fn an_initial_window_change_leaves_ended_streams_alone() {
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        for stream in [1, 3] {
+            c.peer_open(stream).unwrap();
+            accept(&mut c, &raw(1, 4, stream, &[0x88]));
+        }
+        c.peer_window_update(&fixture_window_update(1, 0, MAX_WINDOW - 65_535))
+            .unwrap();
+        // Stream 1 ends with its window at 2^31 - 1.
+        accept(&mut c, &raw(0, 1, 1, &[]));
+        c.peer_settings(&Settings {
+            flags: 0,
+            entries: vec![Setting {
+                id: 4,
+                value: 65_536,
+            }],
+        })
+        .unwrap();
+        assert!(c.failed().is_none());
+        assert_eq!(c.stream_window(3), Some(65_536));
+    }
+
+    /// The sender applies each SETTINGS as it reads it, so its windows
+    /// count from the initial window announced last, even before the
+    /// ACK: credit and later settings pass 2^31 - 1 only by that count.
+    /// DATA may still use a larger window announced earlier and not yet
+    /// acknowledged away.
+    #[test]
+    fn overflow_counts_from_the_initial_window_announced_last() {
+        let initial = |value| Settings {
+            flags: 0,
+            entries: vec![Setting { id: 4, value }],
+        };
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        c.peer_open(1).unwrap();
+        accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        c.peer_settings(&initial(100_000)).unwrap();
+        c.peer_settings(&initial(1)).unwrap();
+        // The sender's window is 1: credit to exactly 2^31 - 1 fits.
+        let credit = c.peer_window_update(&fixture_window_update(1, 0, MAX_WINDOW - 1));
+        assert!(matches!(credit, Ok(Credit::Granted)), "{credit:?}");
+        let credit = c.peer_window_update(&fixture_window_update(1, 0, 1));
+        assert!(matches!(credit, Ok(Credit::StreamOverflow)), "{credit:?}");
+        // Announcing 1 again keeps it at 2^31 - 1; 2 passes it.
+        c.peer_settings(&initial(1)).unwrap();
+        let error = c.peer_settings(&initial(2)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::FlowControlError);
+    }
+
+    /// WINDOW_UPDATE with no credit on a stream is a stream error
+    /// (RFC 9113 section 6.9): it is reported for that stream, and the
+    /// frames after it are read.
+    #[test]
+    fn a_zero_increment_on_a_stream_is_a_stream_error() {
+        let mut c = Session::server_side(Limits::default());
+        accept(&mut c, &settings());
+        accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        let bytes = [raw(8, 0, 1, &[0; 4]), raw(6, 0, 0, &[0; 8])].concat();
+        let events = accept(&mut c, &bytes);
+        assert!(
+            matches!(&events[..], [
+                Event::StreamError { stream: 1, error },
+                Event::Ping(_),
+            ] if error.code == ErrorCode::ProtocolError),
+            "{events:?}"
+        );
+        assert!(c.failed().is_none());
+        // On the connection it is a connection error.
+        assert_eq!(c.push(&raw(8, 0, 0, &[0; 4])), 13);
+        assert_eq!(
+            c.next().unwrap().unwrap_err().code,
+            ErrorCode::ProtocolError
+        );
     }
 
     #[test]
