@@ -1116,10 +1116,20 @@ impl Encoder {
             }
             put_string(out, field.value, self.huffman)?;
             if !field.never_index && self.table.max != 0 {
-                self.table
-                    .table
-                    .insert(field.name.into(), field.value.to_vec());
-                self.table.table.evict(self.table.max);
+                let size = field.name.len() + field.value.len() + ENTRY_OVERHEAD;
+                if size > self.table.max {
+                    // An entry larger than the table empties it and is
+                    // not added (RFC 7541 section 4.4), as the decoder
+                    // does: nothing is copied for it.
+                    self.table.table.evict(0);
+                } else {
+                    // Room is made first, so the table never holds more
+                    // than its size.
+                    self.table.table.evict(self.table.max - size);
+                    self.table
+                        .table
+                        .insert(field.name.into(), field.value.to_vec());
+                }
             }
         }
         Ok(())

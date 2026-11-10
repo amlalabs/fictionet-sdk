@@ -174,3 +174,34 @@ fn an_entry_larger_than_the_table_is_not_copied_for_it() {
         value.len()
     );
 }
+
+/// The encoder does as the decoder does: a field larger than its whole
+/// table empties the table and is not copied into it, and the table never
+/// holds more than `most_held()`.
+#[test]
+fn an_encoder_entry_larger_than_the_table_is_not_copied_for_it() {
+    let mut encoder = Encoder::new(4096);
+    let mut out = Vec::new();
+    encoder
+        .encode_block(&[Field::new("x-small", "kept")], &mut out)
+        .unwrap();
+    assert!(encoder.table_size() > 0);
+    let value = vec![b'v'; 60_000];
+    let big = [Field::new("x-big", &value)];
+    let mut out = Vec::with_capacity(encoder.block_bound(&big).unwrap());
+    let charge = encoder.most_held();
+    let (encoded, stats) = measuring(|| encoder.encode_block(&big, &mut out));
+    encoded.unwrap();
+    assert_eq!(encoder.table_size(), 0, "the table is emptied");
+    assert!(
+        stats.largest_request < value.len(),
+        "{} bytes allocated at once for a {}-byte entry the table cannot hold",
+        stats.largest_request,
+        value.len()
+    );
+    assert!(
+        encoder.held() <= charge,
+        "the table holds {} bytes, past its bound of {charge}",
+        encoder.held()
+    );
+}
