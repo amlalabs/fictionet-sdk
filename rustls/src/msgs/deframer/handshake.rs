@@ -8,9 +8,11 @@ use crate::msgs::codec::{u24, Codec};
 use crate::msgs::message::InboundPlainMessage;
 use crate::{ContentType, ProtocolVersion};
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct HandshakeDeframer {
     /// Spans covering individual handshake payloads, in order of receipt.
+    /// Allocated only while a flight is being handed out: an idle
+    /// connection holds none.
     spans: Vec<FragmentSpan>,
 
     /// Discard value, tracking the rightmost extent of the last message
@@ -221,17 +223,6 @@ impl HandshakeDeframer {
     }
 }
 
-impl Default for HandshakeDeframer {
-    fn default() -> Self {
-        Self {
-            // capacity: a typical upper limit on handshake messages in
-            // a single flight
-            spans: Vec::with_capacity(16),
-            outer_discard: 0,
-        }
-    }
-}
-
 struct DissectHandshakeIter<'a, 'b> {
     version: ProtocolVersion,
     payload: &'b [u8],
@@ -329,6 +320,10 @@ impl<'b> Iterator for HandshakeIter<'_, 'b> {
 impl Drop for HandshakeIter<'_, '_> {
     fn drop(&mut self) {
         self.deframer.spans.drain(..self.index);
+        // Every message handed out: the spans of a finished flight go.
+        if self.deframer.spans.is_empty() {
+            self.deframer.spans = Vec::new();
+        }
     }
 }
 
