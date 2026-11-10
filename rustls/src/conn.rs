@@ -15,6 +15,7 @@ use crate::log::trace;
 use crate::msgs::deframer::buffers::{BufferProgress, DeframerVecBuffer, Delocator, Locator};
 use crate::msgs::deframer::handshake::HandshakeDeframer;
 use crate::msgs::deframer::DeframerIter;
+use crate::msgs::fragmenter::MAX_FRAGMENT_LEN;
 use crate::msgs::handshake::Random;
 use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
 use crate::record_layer::Decrypted;
@@ -1170,6 +1171,14 @@ impl<Data> ConnectionCore<Data> {
                 };
 
                 if allowed_plaintext && !self.hs_deframer.is_active() {
+                    // Unprotected, so at most 2^14 bytes (RFC 8446 section
+                    // 5.1), as decrypt_incoming checks for records before
+                    // the keys.
+                    if message.payload.len() > MAX_FRAGMENT_LEN {
+                        return Err(
+                            self.handle_deframe_error(Error::PeerSentOversizedRecord, state)
+                        );
+                    }
                     break (message.into_plain_message(), iter.bytes_consumed());
                 }
 

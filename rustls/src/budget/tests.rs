@@ -556,6 +556,13 @@ fn a_tls13_record_longer_than_2_14_plus_256_is_refused_before_decryption() {
 }
 
 #[test]
+fn an_unprotected_change_cipher_spec_in_tls13_is_held_to_2_14() {
+    let mut server = connected(&TLS13);
+    let error = process_all(&mut server, &record(20, (1 << 14) + 1)).unwrap_err();
+    assert_eq!(error, Error::PeerSentOversizedRecord);
+}
+
+#[test]
 fn a_tls12_record_may_be_2_14_plus_2048_long_and_no_longer() {
     let mut server = connected(&TLS12);
     let error = process_all(&mut server, &record(23, (1 << 14) + 2048)).unwrap_err();
