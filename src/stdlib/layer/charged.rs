@@ -244,17 +244,21 @@ impl<T> ChargedDeque<T> {
         })
     }
 
-    /// Makes a place for one more item, charging new places before they
-    /// are allocated.
-    fn make_room(&mut self) -> bool {
+    /// Makes places for `additional` more items, so that many pushes
+    /// cannot refuse, charging new places before they are allocated. It
+    /// grows as a push does, by doubling, or to exactly what is asked if
+    /// that is more. Refuses, changing nothing, if the growth does not fit
+    /// the budget or the items would pass `most`.
+    #[must_use = "a refused reservation leaves no places for the items"]
+    pub fn reserve(&mut self, additional: usize) -> bool {
         let len = self.items.len();
-        if len >= self.most {
+        let Some(wanted) = len.checked_add(additional).filter(|&n| n <= self.most) else {
             return false;
-        }
-        if len < self.items.capacity() {
+        };
+        if wanted <= self.items.capacity() {
             return true;
         }
-        let places = more_places(self.items.capacity(), self.most);
+        let places = more_places(self.items.capacity(), self.most).max(wanted);
         let Some(bytes) = places.checked_mul(size_of::<T>()) else {
             return false;
         };
@@ -269,7 +273,7 @@ impl<T> ChargedDeque<T> {
     /// back, changing nothing, if the growth does not fit the budget or
     /// the queue holds `most` items.
     pub fn push_back(&mut self, item: T) -> Result<(), T> {
-        if !self.make_room() {
+        if !self.reserve(1) {
             return Err(item);
         }
         self.items.push_back(item);
@@ -278,7 +282,7 @@ impl<T> ChargedDeque<T> {
 
     /// Puts `item` first, as [`push_back`](Self::push_back) puts it last.
     pub fn push_front(&mut self, item: T) -> Result<(), T> {
-        if !self.make_room() {
+        if !self.reserve(1) {
             return Err(item);
         }
         self.items.push_front(item);
@@ -290,9 +294,45 @@ impl<T> ChargedDeque<T> {
         self.items.pop_front()
     }
 
+    /// Takes the last item. Its place stays paid for.
+    pub fn pop_back(&mut self) -> Option<T> {
+        self.items.pop_back()
+    }
+
     /// The first item.
+    pub fn front(&self) -> Option<&T> {
+        self.items.front()
+    }
+
+    /// The first item, to change.
     pub fn front_mut(&mut self) -> Option<&mut T> {
         self.items.front_mut()
+    }
+
+    /// The item at `index`, counting from the first.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        self.items.get(index)
+    }
+
+    /// The item at `index`, to change.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.items.get_mut(index)
+    }
+
+    /// Keeps the first `len` items. Their places stay paid for.
+    pub fn truncate(&mut self, len: usize) {
+        self.items.truncate(len);
+    }
+
+    /// Keeps the items `keep` accepts, in order. Their places stay paid
+    /// for.
+    pub fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
+        self.items.retain(keep);
+    }
+
+    /// Forgets every item. Their places stay paid for.
+    pub fn clear(&mut self) {
+        self.items.clear();
     }
 
     /// How many items it holds.
@@ -398,6 +438,17 @@ impl<T> ChargedVec<T> {
     /// Takes the last item. Its place stays paid for.
     pub fn pop(&mut self) -> Option<T> {
         self.items.pop()
+    }
+
+    /// Keeps the items `keep` accepts, in order. Their places stay paid
+    /// for.
+    pub fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
+        self.items.retain(keep);
+    }
+
+    /// Forgets every item. Their places stay paid for.
+    pub fn clear(&mut self) {
+        self.items.clear();
     }
 
     /// Takes the items in `range`. Their places stay paid for.
@@ -809,7 +860,7 @@ mod tests {
                 refused: !done,
                 trimmed: None,
             };
-            match self.below(22) {
+            match self.below(23) {
                 0 | 1 => {
                     let n = self.below(96);
                     let fits = n <= self.room(budget);
@@ -969,9 +1020,15 @@ mod tests {
                     let Item::Deque(deque) = &mut self.held[at].item else {
                         unreachable!()
                     };
-                    match keep % 3 {
+                    match keep % 4 {
                         0 => {
                             deque.pop_front();
+                        }
+                        3 => {
+                            let len = deque.len();
+                            deque.retain(|item| item % 2 == 0);
+                            assert!(deque.len() <= len);
+                            assert!(deque.iter().all(|item| item % 2 == 0));
                         }
                         1 => {
                             let half = deque.len() / 2;
@@ -1003,7 +1060,13 @@ mod tests {
                         unreachable!()
                     };
                     if shrink {
-                        list.pop();
+                        match item % 3 {
+                            0 => drop(list.pop()),
+                            1 => list.retain(|item| item % 2 == 1),
+                            _ => list.clear(),
+                        }
+                        let places = list.places();
+                        assert_eq!(list.charged(), places * size_of::<u32>(), "still paid for");
                         list.shrink_to(0);
                         assert_eq!(list.places(), list.len());
                         return refused(true);
@@ -1121,6 +1184,31 @@ mod tests {
                         self.held[at].payer = to;
                     }
                     refused(moved)
+                }
+                21 => {
+                    let Some(at) = self.pick(|item| matches!(item, Item::Deque(_))) else {
+                        return refused(false);
+                    };
+                    let room = self.room(self.held[at].payer);
+                    let additional = self.below(24);
+                    let Item::Deque(deque) = &mut self.held[at].item else {
+                        unreachable!()
+                    };
+                    let (len, places) = (deque.len(), deque.places());
+                    let wanted = len + additional;
+                    let grown = more_places(places, deque.most).max(wanted);
+                    let fits = wanted <= deque.most
+                        && (wanted <= places || grown * size_of::<u64>() - deque.charged() <= room);
+                    let reserved = deque.reserve(additional);
+                    assert_eq!(reserved, fits);
+                    if reserved {
+                        assert!(deque.places() >= wanted);
+                        for item in 0..additional as u64 {
+                            assert!(deque.push_back(item).is_ok(), "a reserved place refused");
+                        }
+                        assert_eq!(deque.len(), wanted);
+                    }
+                    refused(reserved)
                 }
                 17 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Bytes(_))) else {
