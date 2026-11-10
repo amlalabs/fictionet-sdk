@@ -601,7 +601,7 @@ where
         let Some(storage) = &mut self.storage else {
             return false;
         };
-        if !storage.set(bytes) {
+        if !storage.grow_to(bytes) {
             return false;
         }
         self.kids.reserve_exact(places - self.kids.len());
@@ -755,7 +755,7 @@ where
         self.down.shrink_to((QUEUE + FLOOR).max(self.down.len()));
         let places = self.down.capacity().saturating_sub(QUEUE);
         if let (Some(storage), Some(bytes)) = (&mut self.storage, Self::routing_bytes(places)) {
-            storage.set(bytes);
+            storage.shrink_to(bytes);
         }
     }
 
@@ -1074,7 +1074,7 @@ where
                             // child the budget cannot hold is refused.
                             let places = (kid.inbox.capacity() * 2).clamp(4, QUEUE);
                             let bytes = places * size_of::<(EventOf<B::Lower>, bool)>();
-                            if !kid.storage.set(bytes) {
+                            if !kid.storage.grow_to(bytes) {
                                 self.refuse(env, id);
                                 return Ok(Admit::Taken);
                             }

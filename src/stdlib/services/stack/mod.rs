@@ -475,11 +475,10 @@ where
         };
         match got {
             Some(Ok((bytes, from))) => {
-                if let Some(charge) = driver.budget().charge(bytes.capacity()) {
-                    input = Some(DatagramEvent::Datagram(Datagram::new(
-                        Chunk::with_charge(bytes, charge),
-                        from,
-                    )));
+                // What the socket received is paid for as it is taken in.
+                let mut bytes = Chunk::new(bytes);
+                if bytes.repay(driver.budget()) {
+                    input = Some(DatagramEvent::Datagram(Datagram::new(bytes, from)));
                 } else {
                     report(DatagramReport::Dropped {
                         from,

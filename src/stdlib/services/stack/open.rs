@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Chunk, Layer, StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, ChargedBytes, Chunk, Layer, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 
@@ -210,13 +210,9 @@ where
             return Poll::Pending;
         }
         let n = data.len().min(WRITE);
-        let charge = self
-            .live
-            .driver()
-            .budget()
-            .charge(n)
+        let bytes = ChargedBytes::copy_of(self.live.driver().budget(), &data[..n])
             .ok_or(ConnError::Broken)?;
-        let command = StreamCommand::Write(Chunk::with_charge(data[..n].to_vec(), charge));
+        let command = StreamCommand::Write(Chunk::from_bytes(bytes));
         let taken = match self.live.driver().command(command).map_err(Into::into)? {
             Admit::Taken => n,
             Admit::Partial(StreamCommand::Write(rest)) => n - rest.len(),

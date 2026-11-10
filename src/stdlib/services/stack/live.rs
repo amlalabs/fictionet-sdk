@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, Chunk, Driver, EventOf, Layer, StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, Chunk, Driver, EventOf, Layer, StreamCommand,
+    StreamEvent,
 };
 use fictionet::stdlib::network::{ConnError, Connection, Read};
 use fictionet::{Cx, Timer};
@@ -210,10 +211,10 @@ where
                         // move what the connection handed over to this budget.
                         let budget = self.driver.budget();
                         let chunk = match read {
-                            Read::Copied(n) => budget
-                                .charge(n)
-                                .map(|charge| Chunk::with_charge(self.buf[..n].to_vec(), charge)),
-                            Read::Owned(mut chunk) => chunk.recharge(budget).then_some(chunk),
+                            Read::Copied(n) => {
+                                ChargedBytes::copy_of(budget, &self.buf[..n]).map(Chunk::from_bytes)
+                            }
+                            Read::Owned(mut chunk) => chunk.repay(budget).then_some(chunk),
                         };
                         let Some(chunk) = chunk else {
                             self.broken(ConnError::Reset, above, report)?;

@@ -219,7 +219,11 @@ impl State {
     /// fits.
     fn hold(&mut self, env: &Env<'_, Infallible>, bytes: usize) -> bool {
         match &mut self.charge {
-            Some(charge) => charge.set(bytes),
+            Some(charge) if bytes < charge.bytes() => {
+                charge.shrink_to(bytes);
+                true
+            }
+            Some(charge) => charge.grow_to(bytes),
             None => {
                 self.charge = env.budget().charge(bytes);
                 self.charge.is_some()
@@ -382,7 +386,9 @@ impl State {
             Some(charge) => charge,
             None => env.budget().charge(piece.len())?,
         };
-        Some(Chunk::with_charge(piece.to_vec(), charge))
+        let mut bytes = charge.into_bytes();
+        bytes.extend_within(&piece).ok()?;
+        Some(Chunk::from_bytes(bytes))
     }
 
     fn reset(&mut self) {

@@ -170,7 +170,7 @@ enum EchoError {
 struct Echo {
     lines: Stream<Lines>,
     room: usize,
-    out: Vec<u8>,
+    out: Option<ChargedBytes>,
     ready: Option<Chunk>,
     reserve: Option<Charge>,
     upgrade: Option<&'static [u8]>,
@@ -194,7 +194,7 @@ impl Echo {
         Echo {
             lines: Stream::new(Lines::new(LINE, Ending::LfOrCrlf)),
             room,
-            out: Vec::new(),
+            out: None,
             ready: None,
             reserve: None,
             upgrade: None,
@@ -233,6 +233,11 @@ impl Echo {
     /// The bytes it reserves: its line buffer and its reply buffer.
     fn reservation(&self) -> usize {
         self.lines.limit() + self.room
+    }
+
+    /// Whether no reply is being written.
+    fn out_empty(&self) -> bool {
+        self.out.as_ref().is_none_or(|out| out.is_empty())
     }
 }
 
@@ -302,41 +307,46 @@ impl Layer for Echo {
         let Some(reserve) = &mut self.reserve else {
             return Ok(false);
         };
-        // A reply that went below took part of the reservation with it.
-        if !reserve.set(reservation) {
+        // The reply buffer is made from the reservation. A reply that went
+        // below took its share with it, so the reservation grows back first.
+        if self.out.is_none() {
+            if !reserve.grow_to(reservation) {
+                return Ok(false);
+            }
+            let Some(room) = reserve.split(self.room) else {
+                return Ok(false);
+            };
+            self.out = Some(room.into_bytes());
+        }
+        let Some(out) = self.out.as_mut() else {
             return Ok(false);
-        }
-        if self.out.capacity() == 0 {
-            self.out.reserve_exact(self.room);
-        }
+        };
         let mut moved = false;
-        while !self.boundary && self.out.len() + LINE < self.room {
-            match self.lines.next() {
+        while !self.boundary && out.len() + LINE < self.room {
+            let written = match self.lines.next() {
                 Some(Ok(Ok(line))) => {
                     env.report(line.len());
                     if Some(line.as_slice()) == self.upgrade {
-                        self.out.extend_from_slice(Echo::ACCEPTED);
                         self.boundary = true;
+                        out.extend_within(Echo::ACCEPTED)
                     } else {
-                        self.out.extend(Echo::reply(&line));
+                        out.extend_within(&Echo::reply(&line))
                     }
                 }
-                Some(Ok(Err(_))) => self.out.extend_from_slice(b"?\n"),
+                Some(Ok(Err(_))) => out.extend_within(b"?\n"),
                 Some(Err(_)) => return Err(EchoError::Decode),
                 None => {
                     self.drained = self.peer_ended;
                     break;
                 }
-            }
+            };
+            written.map_err(|_| EchoError::Budget)?;
             moved = true;
         }
-        if self.ready.is_none() && !self.out.is_empty() {
-            let bytes = std::mem::take(&mut self.out);
-            let share = bytes.capacity().min(reserve.bytes());
-            let charge = reserve
-                .split(share)
-                .expect("the reservation holds the share");
-            self.ready = Some(Chunk::with_charge(bytes, charge));
+        if self.ready.is_none()
+            && let Some(out) = self.out.take_if(|out| !out.is_empty())
+        {
+            self.ready = Some(Chunk::from_bytes(out));
             moved = true;
         }
         Ok(moved)
@@ -347,7 +357,7 @@ impl Layer for Echo {
             self.sent += chunk.len() as u64;
             return Some(StreamCommand::Write(chunk));
         }
-        if self.drained && self.out.is_empty() && !self.end_sent && !self.boundary {
+        if self.drained && self.out_empty() && !self.end_sent && !self.boundary {
             self.end_sent = true;
             return Some(StreamCommand::End);
         }
@@ -363,7 +373,7 @@ impl Handoff for Echo {
     type Next = Upgraded;
 
     fn handover(&mut self) -> Option<Handover<Upgraded, ByteStream, Top>> {
-        if !self.boundary || self.handed || !self.out.is_empty() || self.ready.is_some() {
+        if !self.boundary || self.handed || !self.out_empty() || self.ready.is_some() {
             return None;
         }
         self.handed = true;

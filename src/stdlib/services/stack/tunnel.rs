@@ -7,8 +7,8 @@ use std::task::{Context, Poll, Waker};
 
 use super::Job;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Chunk, CommandOf, Env, EventOf, Layer, StreamCommand, StreamEvent,
-    Successor, Top,
+    Admit, Budget, ByteStream, ChargedBytes, Chunk, CommandOf, Env, EventOf, Layer, StreamCommand,
+    StreamEvent, Successor, Top,
 };
 use fictionet::stdlib::network::{ConnError, Connection};
 use fictionet::sync::Mutex;
@@ -322,17 +322,12 @@ impl Connection for TunnelConn {
             return Poll::Pending;
         }
         let n = room.min(data.len());
-        let charge = match &shared.budget {
-            Some(budget) => match budget.charge(n) {
-                Some(charge) => Some(charge),
+        let chunk = match &shared.budget {
+            Some(budget) => match ChargedBytes::copy_of(budget, &data[..n]) {
+                Some(bytes) => Chunk::from_bytes(bytes),
                 None => return Poll::Ready(Err(ConnError::Closed)),
             },
-            None => None,
-        };
-        let bytes = data[..n].to_vec();
-        let chunk = match charge {
-            Some(charge) => Chunk::with_charge(bytes, charge),
-            None => Chunk::new(bytes),
+            None => Chunk::new(&data[..n]),
         };
         shared.outbound_len += n;
         shared.unwritten += n as u64;

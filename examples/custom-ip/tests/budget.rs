@@ -1,7 +1,7 @@
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
-use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, PacketCommand};
+use fictionet::stdlib::layer::{Admit, Budget, ChargedBytes, Driver, PacketCommand};
 use fictionet::stdlib::network::ip;
 use fictionet::{Seed, SeededEntropy};
 use fictionet_custom_ip::HopLimit;
@@ -16,9 +16,11 @@ fn rewriting_a_packet_keeps_its_reservation_until_delivery() {
             &[0; 8],
         )
         .0;
-        let capacity = packet.capacity();
+        let capacity = packet.len();
         let budget = Budget::new(capacity);
-        let chunk = Chunk::with_charge(packet, budget.charge(capacity).unwrap());
+        let chunk = ChargedBytes::copy_of(&budget, &packet)
+            .unwrap()
+            .into_chunk();
         let mut driver = Driver::new(
             HopLimit::new(NonZeroU8::new(37).unwrap()),
             Arc::new(SeededEntropy::new(Seed::from_u64(7))),
@@ -55,9 +57,11 @@ fn a_shared_packet_waits_for_copy_budget_without_losing_ownership() {
         &[0; 8],
     )
     .0;
-    let capacity = packet.capacity();
+    let capacity = packet.len();
     let budget = Budget::new(capacity);
-    let mut retained = Chunk::with_charge(packet, budget.charge(capacity).unwrap());
+    let mut retained = ChargedBytes::copy_of(&budget, &packet)
+        .unwrap()
+        .into_chunk();
     let chunk = retained.split_to(retained.len());
     let mut driver = Driver::new(
         HopLimit::new(NonZeroU8::new(37).unwrap()),

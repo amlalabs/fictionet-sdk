@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, Env, Handoff, Handover, Layer, Side, StreamCommand,
+    Admit, ByteStream, ChargedBytes, Chunk, Env, Handoff, Handover, Layer, Side, StreamCommand,
     StreamEvent, Successor, Switch, Top,
 };
 use fictionet::stdlib::protocols::http2::PREFACE;
@@ -101,8 +101,9 @@ where
 /// # drop(http);
 /// ```
 pub struct Detect<S = Servers> {
-    first: Vec<u8>,
-    charge: Option<Charge>,
+    /// The first bytes, in room for the preface paid for before it was
+    /// allocated.
+    first: Option<ChargedBytes>,
     timeout: Option<Duration>,
     deadline: Option<Instant>,
     servers: Option<S>,
@@ -130,8 +131,7 @@ impl<S: MakeVersion> Detect<S> {
     /// then makes the version they chose from `servers`.
     pub fn with(timeout: Duration, servers: S) -> Self {
         Self {
-            first: Vec::new(),
-            charge: None,
+            first: None,
             timeout: Some(timeout),
             deadline: None,
             servers: Some(servers),
@@ -176,16 +176,19 @@ impl<S: MakeVersion> Layer for Detect<S> {
         }
         match event {
             StreamEvent::Data(mut chunk) => {
-                if self.charge.is_none() {
-                    self.charge = env.budget().charge(PREFACE.len());
-                    if self.charge.is_none() {
-                        self.closed = true;
-                        self.out = Some(StreamCommand::End);
-                        return Ok(Admit::Closed(StreamEvent::Data(chunk)));
-                    }
-                    self.first.reserve_exact(PREFACE.len());
+                if self.first.is_none() {
+                    self.first = ChargedBytes::with_capacity(env.budget(), PREFACE.len());
                 }
-                let (taken, chosen) = scan(&mut self.first, &chunk);
+                // Scanning stops at the preface's length, the room paid for.
+                let scanned = self
+                    .first
+                    .as_mut()
+                    .map(|first| first.fill(|first| Ok::<_, Infallible>(scan(first, &chunk))));
+                let Some(Ok((taken, chosen))) = scanned else {
+                    self.closed = true;
+                    self.out = Some(StreamCommand::End);
+                    return Ok(Admit::Closed(StreamEvent::Data(chunk)));
+                };
                 self.chosen = chosen;
                 chunk.advance(taken);
                 Ok(if chunk.is_empty() {
@@ -285,12 +288,8 @@ impl<S: MakeVersion> Handoff for Detect<S> {
         }
         let servers = self.servers.take()?;
         let mut below = Vec::new();
-        if !self.first.is_empty() {
-            let bytes = std::mem::take(&mut self.first);
-            below.push(StreamEvent::Data(match self.charge.take() {
-                Some(charge) => Chunk::with_charge(bytes, charge),
-                None => Chunk::new(bytes),
-            }));
+        if let Some(first) = self.first.take_if(|first| !first.is_empty()) {
+            below.push(StreamEvent::Data(Chunk::from_bytes(first)));
         }
         if self.peer_ended {
             below.push(StreamEvent::Ended);

@@ -947,10 +947,13 @@ impl<E: Engine + Send + 'static> Driver<E> {
                         input.drain(..used);
                         self.query(client.clone(), query);
                     }
-                    if let Some(charge) = &mut charge
-                        && !charge.set(buf.len() + input.len())
-                    {
-                        break;
+                    if let Some(charge) = &mut charge {
+                        let need = buf.len() + input.len();
+                        if need < charge.bytes() {
+                            charge.shrink_to(need);
+                        } else if !charge.grow_to(need) {
+                            break;
+                        }
                     }
                     quiet_since = fcx.now();
                 }

@@ -136,7 +136,7 @@ fn tcp_hands_received_chunks_over_and_sends_pieces_of_chunks() {
                 Read::Copied(n) => panic!("{n} bytes were copied out of the chunks"),
                 Read::Owned(mut chunk) => {
                     assert!(!chunk.is_empty() && chunk.len() <= buf.len());
-                    assert!(chunk.recharge(&budget));
+                    assert!(chunk.repay(&budget));
                     got.extend_from_slice(&chunk);
                 }
             }

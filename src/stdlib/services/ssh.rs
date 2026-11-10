@@ -18,8 +18,9 @@ use super::stack;
 use crate::Cx;
 use crate::stdlib::codec::Wire;
 use crate::stdlib::layer::{
-    Admit, Budget, ByteStream, Chain, Charge, ChildId, Children, Chunk as Bytes, Env, Layer, Mux,
-    MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand, StreamEvent, Timers, Top,
+    Admit, Budget, ByteStream, Chain, Charge, ChargedBytes, ChildId, Children, Chunk as Bytes, Env,
+    Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand, StreamEvent, Timers, Top,
+    WriteFailure,
 };
 use crate::stdlib::protocols::ssh::transport::{HostKey, TransportError};
 use crate::stdlib::protocols::ssh::{self, auth, connection as wire};
@@ -369,16 +370,12 @@ impl Output {
         let next = self.next_bytes(bytes.len())?;
         if !bytes.is_empty() {
             self.reserve()?;
-            let charge = self
-                .budget
-                .as_ref()
-                .unwrap()
-                .charge(bytes.len())
-                .ok_or(OutputFull)?;
+            let data =
+                ChargedBytes::copy_of(self.budget.as_ref().unwrap(), bytes).ok_or(OutputFull)?;
             self.bytes = next;
             self.chunks.push_back(Chunk::Data {
                 stderr,
-                data: Bytes::with_charge(bytes.to_vec(), charge),
+                data: Bytes::from_bytes(data),
             });
         }
         Ok(())
@@ -795,8 +792,9 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     ended: bool,
     end_sent: bool,
     state: Option<Charge>,
-    out: Vec<u8>,
-    out_charge: Option<Charge>,
+    /// What goes down next, written into room for four packets that was
+    /// paid for before it was allocated ([`Self::output`]).
+    out: Option<ChargedBytes>,
     out_child: Option<(ChildId, u64)>,
     flights: VecDeque<Flight>,
     up: VecDeque<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>,
@@ -846,8 +844,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             ended: false,
             end_sent: false,
             state: None,
-            out: Vec::new(),
-            out_charge: None,
+            out: None,
             out_child: None,
             flights: VecDeque::new(),
             up: VecDeque::new(),
@@ -909,7 +906,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         // A name list may expand a two-byte wire name into a String and its
         // allocation. Parsing and observation can temporarily hold several copies.
         let charge = self.state.as_mut().ok_or(TransportError::State)?;
-        if charge.set(charge.bytes() + 64 * ssh::MAX_PACKET) {
+        if charge.grow_to(charge.bytes() + 64 * ssh::MAX_PACKET) {
             Ok(())
         } else {
             Err(Error::Budget)
@@ -933,21 +930,45 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         Ok(())
     }
     fn output(&mut self, env: &Env<'_, Ended>) -> Result<(), Error> {
-        if self.out_charge.is_none() {
-            let bytes = 4 * ssh::MAX_PACKET;
-            let charge = env.budget().charge(bytes).ok_or(Error::Budget)?;
-            self.out = Vec::with_capacity(bytes);
-            self.out_charge = Some(charge);
+        if self.out.is_none() {
+            let room = ChargedBytes::with_capacity(env.budget(), 4 * ssh::MAX_PACKET)
+                .ok_or(Error::Budget)?;
+            self.out = Some(room);
         }
         Ok(())
     }
+    /// Whether output waits to go down.
+    fn out_pending(&self) -> bool {
+        self.out.as_ref().is_some_and(|out| !out.is_empty())
+    }
+    /// Runs `write` with the transport and the output. A writer that
+    /// grows the output past the room paid for fails the connection; its
+    /// own result comes back as it was.
+    fn written<R, E>(
+        &mut self,
+        env: &Env<'_, Ended>,
+        write: impl FnOnce(&mut T, &mut Vec<u8>) -> Result<R, E>,
+    ) -> Result<Result<R, E>, Error> {
+        self.output(env)?;
+        let (Some(out), transport) = (self.out.as_mut(), &mut self.transport) else {
+            return Err(TransportError::State.into());
+        };
+        match out.fill(|out| write(transport, out)) {
+            Ok(written) => Ok(Ok(written)),
+            Err(WriteFailure::Value(error)) => Ok(Err(error)),
+            Err(WriteFailure::Bound) => Err(TransportError::State.into()),
+        }
+    }
     fn write(&mut self, env: &Env<'_, Ended>, payload: &[u8]) -> Result<(), Error> {
         self.output(env)?;
-        if self.out.len() + ssh::MAX_PACKET > self.out.capacity() {
+        if self
+            .out
+            .as_ref()
+            .is_none_or(|out| out.room() < ssh::MAX_PACKET)
+        {
             return Err(TransportError::State.into());
         }
-        self.transport
-            .write_packet(payload, &mut self.out)
+        self.written(env, |transport, out| transport.write_packet(payload, out))?
             .map_err(Error::Protocol)
     }
     fn send(
@@ -970,9 +991,9 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         reason: ssh::DisconnectReason,
         description: &str,
     ) -> Result<(), Error> {
-        self.output(env)?;
-        self.transport
-            .disconnect(reason, description, &mut self.out)?;
+        self.written(env, |transport, out| {
+            transport.disconnect(reason, description, out)
+        })??;
         self.close(env, Ended::Closed);
         Ok(())
     }
@@ -1323,8 +1344,11 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 },
             );
         }
-        let charge = env.budget().charge(data.capacity()).ok_or(Error::Budget)?;
-        let data = Bytes::with_charge(data, charge);
+        // The decoded payload is paid for as the connection takes it in.
+        let mut data = Bytes::new(data);
+        if !data.repay(env.budget()) {
+            return Err(Error::Budget);
+        }
         self.up.push_back(MuxEvent::Child(
             id,
             match kind {
@@ -1389,15 +1413,14 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             )?;
             return Ok(true);
         }
-        if self.ended || !self.out.is_empty() || self.up.len() >= 4 || self.flights.len() >= 120 {
+        if self.ended || self.out_pending() || self.up.len() >= 4 || self.flights.len() >= 120 {
             return Ok(false);
         }
         self.reserve(env)?;
         if !self.started {
-            self.output(env)?;
             let mut seed = [0; 32];
             env.entropy().fill_random(&mut seed);
-            self.transport.start(seed, &mut self.out)?;
+            self.written(env, |transport, out| transport.start(seed, out))??;
             self.timers
                 .set(Timer::Login, env.now() + self.config.login_grace);
             self.started = true;
@@ -1482,8 +1505,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 return Ok(true);
             }
             if self.transport.needs_rekey() {
-                self.output(env)?;
-                self.transport.rekey(&mut self.out)?;
+                self.written(env, |transport, out| transport.rekey(out))??;
                 return Ok(true);
             }
         }
@@ -1491,16 +1513,17 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             return Ok(false);
         }
         self.scratch()?;
-        self.output(env)?;
-        let event = match self.transport.poll(&mut self.out) {
+        let event = match self.written(env, |transport, out| transport.poll(out))? {
             Ok(Some(event)) => event,
             Ok(None) => return Ok(false),
             Err(transport::Failure::Framing(_)) => {
-                self.transport.disconnect(
-                    ssh::DisconnectReason::ProtocolError,
-                    "Invalid SSH packet",
-                    &mut self.out,
-                )?;
+                self.written(env, |transport, out| {
+                    transport.disconnect(
+                        ssh::DisconnectReason::ProtocolError,
+                        "Invalid SSH packet",
+                        out,
+                    )
+                })??;
                 self.close(env, Ended::Failed);
                 return Ok(true);
             }
@@ -1566,10 +1589,12 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
             + 128 * std::mem::size_of::<Flight>()
             + 128 * std::mem::size_of::<(u32, Owned<Vec<u8>>)>()
             + 8 * std::mem::size_of::<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>();
-        if let Some(charge) = &mut self.state
-            && !charge.set(bytes)
-        {
-            return Err(Error::Budget);
+        if let Some(charge) = &mut self.state {
+            if bytes < charge.bytes() {
+                charge.shrink_to(bytes);
+            } else if !charge.grow_to(bytes) {
+                return Err(Error::Budget);
+            }
         }
         result
     }
@@ -1634,7 +1659,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         if self.ended {
             return Ok(Admit::Closed(command));
         }
-        if !self.out.is_empty()
+        if self.out_pending()
             || self.up.len() >= 4
             || !matches!(self.transport.state(), TransportState::Established { .. })
             || self.flights.len() >= 120
@@ -1778,16 +1803,12 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
         self.up.remove(position)
     }
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
-        if !self.out.is_empty() {
-            let bytes = std::mem::take(&mut self.out);
+        if let Some(bytes) = self.out.take_if(|out| !out.is_empty()) {
             self.flights.push_back(Flight {
                 bytes: bytes.len(),
                 child: self.out_child.take(),
             });
-            return Some(StreamCommand::Write(Bytes::with_charge(
-                bytes,
-                self.out_charge.take().unwrap(),
-            )));
+            return Some(StreamCommand::Write(Bytes::from_bytes(bytes)));
         }
         if self.ended && !self.end_sent {
             self.end_sent = true;

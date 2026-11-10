@@ -5,9 +5,9 @@ use std::net::{IpAddr, SocketAddr};
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
-    Admit, ChildId, Chunk, CommandOf, Datagram, DatagramCommand, DatagramEvent, Datagrams, Env,
-    EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand,
-    PacketEvent, Packets, Slots,
+    Admit, Charge, ChargedBytes, ChildId, Chunk, CommandOf, Datagram, DatagramCommand,
+    DatagramEvent, Datagrams, Env, EventOf, Layer, MessageCommand, MessageEvent, Messages,
+    MuxEvent, MuxOp, PacketCommand, PacketEvent, Packets, Slots,
 };
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::icmp;
@@ -104,7 +104,10 @@ pub struct UdpLayer {
 /// One bound socket.
 struct Socket {
     port: u16,
-    queue: VecDeque<Datagram<SocketAddr>>,
+    /// The datagrams waiting, each with the charge for its place: its
+    /// sender's address and its slot, [`DATAGRAM_COST`], given back when
+    /// it leaves. Its bytes carry their own charge.
+    queue: VecDeque<(Datagram<SocketAddr>, Charge)>,
     /// What `queue` holds, counted as for [`QUEUE`].
     bytes: usize,
     /// Credit the port above granted for this socket's datagrams.
@@ -338,13 +341,13 @@ impl UdpLayer {
         let cost = payload.len() + DATAGRAM_COST;
         let cause = if socket.bytes + cost > QUEUE {
             Dropped::QueueFull
-        } else if let Some(charge) = env.budget().charge(cost) {
-            let mut bytes = Vec::with_capacity(payload.len());
-            bytes.extend_from_slice(payload);
+        } else if let Some(place) = env.budget().charge(DATAGRAM_COST)
+            && let Some(bytes) = ChargedBytes::copy_of(env.budget(), payload)
+        {
             socket.bytes += cost;
             socket
                 .queue
-                .push_back(Datagram::new(Chunk::with_charge(bytes, charge), peer));
+                .push_back((Datagram::new(Chunk::from_bytes(bytes), peer), place));
             self.wake(id);
             return;
         } else {
@@ -366,7 +369,7 @@ impl UdpLayer {
                 socket.credit += owed;
                 MuxEvent::Credit(id, owed)
             } else if socket.granted > 0
-                && let Some(datagram) = socket.queue.pop_front()
+                && let Some((datagram, _place)) = socket.queue.pop_front()
             {
                 socket.granted -= 1;
                 socket.bytes -= datagram.payload().len() + DATAGRAM_COST;

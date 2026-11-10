@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Stream};
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, Chunk, Datagram, DatagramCommand, DatagramEvent, Datagrams,
-    Env, Handoff, Handover, Layer, StreamCommand, StreamEvent, Timers, Top,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, Chunk, Datagram, DatagramCommand,
+    DatagramEvent, Datagrams, Env, Handoff, Handover, Layer, StreamCommand, StreamEvent, Timers,
+    Top,
 };
 use fictionet::stdlib::network::{ConnInfo, tcp};
 use fictionet::stdlib::services::stack::{self, Job, StreamLimits};
@@ -45,10 +46,8 @@ impl<T: Clone + Eq, W, N> Out<'_, T, W, N> {
     /// stack's budget until the transport takes them; a write the budget
     /// has no room for ends the connection.
     pub(crate) fn write(&mut self, bytes: &[u8]) {
-        match self.budget.charge(bytes.len()) {
-            Some(charge) => self
-                .writes
-                .push_back(Chunk::with_charge(bytes.to_vec(), charge)),
+        match ChargedBytes::copy_of(self.budget, bytes) {
+            Some(bytes) => self.writes.push_back(Chunk::from_bytes(bytes)),
             None => *self.over_budget = true,
         }
     }

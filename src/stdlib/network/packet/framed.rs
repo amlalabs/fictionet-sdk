@@ -2,7 +2,7 @@
 
 use core::convert::Infallible;
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, Env, Layer, PacketCommand, PacketEvent, Packets,
+    Admit, ByteStream, ChargedBytes, Chunk, Env, Layer, PacketCommand, PacketEvent, Packets,
     StreamCommand, StreamEvent,
 };
 
@@ -22,9 +22,9 @@ use fictionet::stdlib::layer::{
 pub struct Framed {
     prefix: [u8; 4],
     prefix_len: usize,
-    body: Vec<u8>,
-    charge: Option<Charge>,
-    size: Option<usize>,
+    /// The packet being read, in room for exactly the length its prefix
+    /// gave, paid for before it was allocated.
+    body: Option<ChargedBytes>,
     packet: Option<PacketEvent<Chunk>>,
     output: Option<StreamCommand>,
     ended: bool,
@@ -78,9 +78,7 @@ impl Layer for Framed {
             return Ok(Admit::Taken);
         }
         if matches!(event, StreamEvent::Reset) {
-            self.body = Vec::new();
-            self.charge = None;
-            self.size = None;
+            self.body = None;
             self.prefix_len = 0;
             // The packets above end once: a reset after the stream's end,
             // which a peer may send, ends nothing more.
@@ -99,7 +97,7 @@ impl Layer for Framed {
             return Ok(Admit::Blocked(event));
         }
         let StreamEvent::Data(mut bytes) = event else {
-            if self.prefix_len > 0 || self.size.is_some() {
+            if self.prefix_len > 0 || self.body.is_some() {
                 return Err(FrameError::Truncated);
             }
             self.ended = true;
@@ -119,22 +117,21 @@ impl Layer for Framed {
         if size > 65_575 {
             return Err(FrameError::TooLong);
         }
-        if self.size.is_none() {
-            self.charge = Some(env.budget().charge(size).ok_or(FrameError::Budget)?);
-            self.body = Vec::with_capacity(size);
-            self.size = Some(size);
-        }
-        let count = (size - self.body.len()).min(bytes.len());
-        self.body.extend_from_slice(&bytes[..count]);
+        let body = match &mut self.body {
+            Some(body) => body,
+            None => self
+                .body
+                .insert(ChargedBytes::with_capacity(env.budget(), size).ok_or(FrameError::Budget)?),
+        };
+        let count = body.room().min(bytes.len());
+        body.extend_within(&bytes[..count])
+            .map_err(|_| FrameError::Budget)?;
         bytes.advance(count);
-        if self.body.len() == size {
-            let packet = Chunk::with_charge(
-                core::mem::take(&mut self.body),
-                self.charge.take().expect("reserved frame"),
-            );
-            self.packet = Some(PacketEvent::Packet(packet));
+        if body.room() == 0
+            && let Some(body) = self.body.take()
+        {
+            self.packet = Some(PacketEvent::Packet(Chunk::from_bytes(body)));
             self.prefix_len = 0;
-            self.size = None;
         }
         Ok(if bytes.is_empty() {
             Admit::Taken
@@ -159,14 +156,13 @@ impl Layer for Framed {
                 if packet.len() > 65_575 {
                     return Err(FrameError::TooLong);
                 }
-                let charge = env
-                    .budget()
-                    .charge(packet.len() + 4)
+                let mut frame = ChargedBytes::with_capacity(env.budget(), packet.len() + 4)
                     .ok_or(FrameError::Budget)?;
-                let mut frame = Vec::with_capacity(packet.len() + 4);
-                frame.extend_from_slice(&(packet.len() as u32).to_be_bytes());
-                frame.extend_from_slice(&packet);
-                StreamCommand::Write(Chunk::with_charge(frame, charge))
+                frame
+                    .extend_within(&(packet.len() as u32).to_be_bytes())
+                    .and_then(|()| frame.extend_within(&packet))
+                    .map_err(|_| FrameError::Budget)?;
+                StreamCommand::Write(Chunk::from_bytes(frame))
             }
             PacketCommand::End => {
                 self.output_end = true;

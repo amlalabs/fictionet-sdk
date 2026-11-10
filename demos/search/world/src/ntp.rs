@@ -101,12 +101,16 @@ impl<C: Fn() -> SystemTime> Layer for TimeServer<C> {
         let Some(reservation) = temporary.checked_add(2 * ntp::HEADER_LEN) else {
             return Ok(Admit::Taken);
         };
+        // The reply keeps its share of the reservation in a copy of its
+        // own; the rest goes back once the copy is made.
         if let Some(mut charge) = env.budget().charge(reservation)
-            && let Some(bytes) = self.answer(datagram.payload())
+            && let Some(answer) = self.answer(datagram.payload())
+            && let Some(room) = charge.split(answer.len())
         {
-            charge.set(ntp::HEADER_LEN);
-            let payload = Chunk::with_charge(bytes, charge);
-            self.reply = Some(Datagram::new(payload, client));
+            let mut bytes = room.into_bytes();
+            if bytes.extend_within(&answer).is_ok() {
+                self.reply = Some(Datagram::new(Chunk::from_bytes(bytes), client));
+            }
         }
         Ok(Admit::Taken)
     }

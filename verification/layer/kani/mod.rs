@@ -138,12 +138,13 @@ fn slots_never_answer_another_connections_id() {
 // Budget and Charge (src/stdlib/layer/budget.rs)
 
 /// Over every `u8` limit and charge sizes: two charges, a split of the
-/// first, a new size for the split part, and the three dropped in any
-/// order. At every step the budget's count is the sum of the live charges
-/// and never past the limit; a split moves bytes without changing the
-/// total, and refuses, changing nothing, when the charge holds less; a
-/// refused `set` changes nothing; every charge is given back when dropped,
-/// so the count ends at zero.
+/// first, a growth or a shrink of the split part, and the three dropped in
+/// any order. At every step the budget's count is the sum of the live
+/// charges and never past the limit; a split moves bytes without changing
+/// the total, and refuses, changing nothing, when the charge holds less; a
+/// refused growth changes nothing, and a shrink always gives back what it
+/// lets go; every charge is given back when dropped, so the count ends at
+/// zero.
 #[kani::proof]
 #[kani::unwind(4)]
 fn charges_split_and_drop_within_the_limit() {
@@ -186,9 +187,17 @@ fn charges_split_and_drop_within_the_limit() {
         let was = split.bytes();
         let others = budget.used() - was;
         let to: u8 = kani::any();
-        let fits = split.set(to as usize);
-        assert_eq!(fits, others + to as usize <= limit as usize);
-        assert_eq!(split.bytes(), if fits { to as usize } else { was });
+        if kani::any() {
+            let grew = split.grow_to(to as usize);
+            assert_eq!(
+                grew,
+                to as usize <= was || others + to as usize <= limit as usize
+            );
+            assert_eq!(split.bytes(), if grew { was.max(to as usize) } else { was });
+        } else {
+            split.shrink_to(to as usize);
+            assert_eq!(split.bytes(), was.min(to as usize));
+        }
     }
     assert_eq!(budget.used(), held(&a, &b, &c));
     assert!(budget.used() <= budget.limit());
@@ -206,11 +215,12 @@ fn charges_split_and_drop_within_the_limit() {
     assert_eq!(budget.used(), 0);
 }
 
-/// `Charge::set` on a charge taken from the budget keeps the budget's
-/// count equal to the sum of its charges and never past the limit: a change
-/// that would pass it is refused and changes nothing, less always fits, and
-/// dropping a charge gives it back. Moved here from the serving engine's
-/// proofs, which checked the budget its connections were charged to.
+/// `Charge::grow_to` and `Charge::shrink_to` on a charge taken from the
+/// budget keep the budget's count equal to the sum of its charges and never
+/// past the limit: a growth that would pass it is refused and changes
+/// nothing, a shrink always fits, and dropping a charge gives it back.
+/// Moved here from the serving engine's proofs, which checked the budget
+/// its connections were charged to.
 #[kani::proof]
 #[kani::unwind(4)]
 fn charges_sum_to_the_budget_and_never_pass_its_limit() {
@@ -227,9 +237,17 @@ fn charges_sum_to_the_budget_and_never_pass_its_limit() {
     if let Some(mut a) = a {
         let was = a.bytes();
         let to: u8 = kani::any();
-        let fits = a.set(to as usize);
-        assert_eq!(fits, held - was + to as usize <= limit as usize);
-        assert_eq!(a.bytes(), if fits { to as usize } else { was });
+        if kani::any() {
+            let grew = a.grow_to(to as usize);
+            assert_eq!(
+                grew,
+                to as usize <= was || held - was + to as usize <= limit as usize
+            );
+            assert_eq!(a.bytes(), if grew { was.max(to as usize) } else { was });
+        } else {
+            a.shrink_to(to as usize);
+            assert_eq!(a.bytes(), was.min(to as usize));
+        }
         assert_eq!(budget.used(), held - was + a.bytes());
         assert!(budget.used() <= budget.limit());
         drop(a);
@@ -412,8 +430,7 @@ fn a_chunk_cursor_keeps_the_rest_in_place() {
     let budget = Budget::new(CHUNK);
     let charged: bool = kani::any();
     let mut chunk = if charged {
-        let charge = budget.charge(length).unwrap();
-        Chunk::with_charge(bytes.to_vec(), charge)
+        ChargedBytes::copy_of(&budget, &bytes).unwrap().into_chunk()
     } else {
         Chunk::new(bytes.to_vec())
     };
@@ -466,10 +483,8 @@ fn stream_credit_splits_keep_the_allocation_owned() {
     let units: usize = kani::any();
     kani::assume(units > 0 && units < CHUNK);
     let budget = Budget::new(CHUNK);
-    let command = StreamCommand::Write(Chunk::with_charge(
-        bytes.to_vec(),
-        budget.charge(CHUNK).unwrap(),
-    ));
+    let command =
+        StreamCommand::Write(ChargedBytes::copy_of(&budget, &bytes).unwrap().into_chunk());
     let (StreamCommand::Write(prefix), Some(StreamCommand::Write(suffix))) =
         command.admit_credit(units as u64).unwrap()
     else {
@@ -530,7 +545,7 @@ fn a_shared_chunk_edit_preserves_ownership_and_budget() {
     let value: u8 = kani::any();
     let room: bool = kani::any();
     let budget = Budget::new(if room { 6 } else { 5 });
-    let mut suffix = Chunk::with_charge(bytes.to_vec(), budget.charge(4).unwrap());
+    let mut suffix = ChargedBytes::copy_of(&budget, &bytes).unwrap().into_chunk();
     let mut prefix = suffix.split_to(2);
     let edited = prefix.make_mut(&budget);
     assert_eq!(edited.is_some(), room);

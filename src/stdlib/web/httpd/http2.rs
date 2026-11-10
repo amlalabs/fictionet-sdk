@@ -14,8 +14,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 
 use fictionet::stdlib::codec::{self, Fail, Wire};
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, ChildId, Chunk, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Slots,
-    StreamCommand, StreamEvent, Top,
+    Admit, ByteStream, Charge, ChargedBytes, ChargedDeque, ChildId, Chunk, Env, Layer, Mux,
+    MuxCommand, MuxEvent, MuxOp, Slots, StreamCommand, StreamEvent, Top,
 };
 use fictionet::stdlib::protocols::hpack;
 use fictionet::stdlib::protocols::http2::{self as wire, ErrorCode, Frame, Input, Inputs};
@@ -201,7 +201,7 @@ struct Receive {
 struct Delivery {
     /// Body bytes that wait for the child's credit, in order. Behind them
     /// go the overflow, if any, and then the end.
-    pending: ChargedQueue<Chunk>,
+    pending: ChargedDeque<Chunk>,
     /// Bytes of DATA frames waiting in `pending`: they count against the
     /// receive windows until they go up.
     windowed_bytes: u32,
@@ -242,48 +242,6 @@ enum RequestEnd {
     Told,
 }
 
-/// A queue whose storage is charged to the budget before it grows.
-struct ChargedQueue<T> {
-    items: VecDeque<T>,
-    storage: Charge,
-}
-
-impl<T> ChargedQueue<T> {
-    /// An empty queue, its storage charged to `storage` as it grows.
-    fn new(storage: Charge) -> Self {
-        Self {
-            items: VecDeque::new(),
-            storage,
-        }
-    }
-
-    /// Puts `item` at the back, charging the queue's growth first. Hands
-    /// `item` back if the growth does not fit.
-    fn push_back(&mut self, item: T) -> Result<(), T> {
-        if self.items.len() == self.items.capacity() {
-            let places = (self.items.capacity() * 2).max(4);
-            if !self.storage.set(places * size_of::<T>()) {
-                return Err(item);
-            }
-            self.items.reserve_exact(places - self.items.len());
-        }
-        self.items.push_back(item);
-        Ok(())
-    }
-
-    fn front_mut(&mut self) -> Option<&mut T> {
-        self.items.front_mut()
-    }
-
-    fn pop_front(&mut self) -> Option<T> {
-        self.items.pop_front()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-}
-
 /// The response on its way out, within the client's send windows.
 struct Response {
     /// The bytes the client lets the server send on the stream.
@@ -291,7 +249,7 @@ struct Response {
     /// Body credit the child holds: the bytes it may still send down.
     credit_bytes: u64,
     /// Body bytes the child sent that wait to be framed.
-    queue: ChargedQueue<Chunk>,
+    queue: ChargedDeque<Chunk>,
     /// The bytes in `queue`.
     queued_bytes: u64,
     /// Body bytes whose whole frames the transport took.
@@ -501,7 +459,14 @@ impl Http2 {
     /// Charges what is held now. Returns whether it fits.
     fn fits(&mut self) -> bool {
         let need = self.holding();
-        self.charge.as_mut().is_none_or(|charge| charge.set(need))
+        self.charge.as_mut().is_none_or(|charge| {
+            if need < charge.bytes() {
+                charge.shrink_to(need);
+                true
+            } else {
+                charge.grow_to(need)
+            }
+        })
     }
 
     fn open(&mut self, env: &mut Env<'_, Report>) {
@@ -552,7 +517,7 @@ impl Http2 {
                 stream.receive.closed = true;
             }
             if admitted && let Some(mut chunk) = body {
-                if chunk.reserve(env.budget()) {
+                if chunk.repay(env.budget()) {
                     self.deliver_body(1, chunk, false);
                 } else {
                     self.overflow(1, chunk.len() as u64);
@@ -600,16 +565,18 @@ impl Http2 {
         stream: u32,
         end: bool,
     ) -> bool {
-        let Some(charge) = env.budget().charge(len) else {
+        // A frame that does not fit the room charged for it ends the
+        // connection, as the budget does.
+        let Some(mut bytes) = ChargedBytes::with_capacity(env.budget(), len) else {
             self.over_budget(env);
             return false;
         };
-        let mut bytes = Vec::with_capacity(len);
-        frame
-            .write(&mut bytes)
-            .expect("outbound frame has valid fields");
+        if bytes.fill(|bytes| frame.write(bytes)).is_err() {
+            self.over_budget(env);
+            return false;
+        }
         debug_assert_eq!(bytes.len(), len);
-        self.queue(Chunk::with_charge(bytes, charge), stream, 0, end);
+        self.queue(Chunk::from_bytes(bytes), stream, 0, end);
         true
     }
 
@@ -693,18 +660,18 @@ impl Http2 {
         }
         self.out.truncate(keep);
         if let Some(charge) = self.last_words.take() {
-            let mut bytes = Vec::with_capacity(LAST_WORDS);
-            wire::GoAway {
+            let goaway = wire::GoAway {
                 flags: 0,
                 last_stream: self
                     .last_stream
                     .min(self.goaway_last.unwrap_or(wire::MAX_WINDOW)),
                 code: ErrorCode::EnhanceYourCalm as u32,
                 debug: Vec::new(),
+            };
+            let mut bytes = charge.into_bytes();
+            if bytes.fill(|bytes| goaway.write(bytes)).is_ok() {
+                self.queue(Chunk::from_bytes(bytes), 0, 0, false);
             }
-            .write(&mut bytes)
-            .expect("outbound frame has valid fields");
-            self.queue(Chunk::with_charge(bytes, charge), 0, 0, false);
         }
         self.close();
     }
@@ -782,8 +749,6 @@ impl Http2 {
         opening.charge = Some(head);
         opening.ended = ended;
         // The stream's queues charge their storage as they grow.
-        let pending = env.budget().charge(0).expect("nothing always fits");
-        let queue = env.budget().charge(0).expect("nothing always fits");
         self.streams.insert(
             id,
             Stream {
@@ -797,7 +762,7 @@ impl Http2 {
                     credit_due: false,
                 },
                 delivery: Delivery {
-                    pending: ChargedQueue::new(pending),
+                    pending: ChargedDeque::new(env.budget(), usize::MAX),
                     windowed_bytes: 0,
                     unwindowed_bytes: 0,
                     credit_bytes: 0,
@@ -809,7 +774,7 @@ impl Http2 {
                 response: Response {
                     window: self.initial,
                     credit_bytes: SEND_CREDIT,
-                    queue: ChargedQueue::new(queue),
+                    queue: ChargedDeque::new(env.budget(), usize::MAX),
                     queued_bytes: 0,
                     written_bytes: 0,
                     reply: Reply::Waiting,
@@ -1140,14 +1105,14 @@ impl Http2 {
         let end = data.flags & 1 != 0;
         receive.closed = end;
         if !data.data.is_empty() && matches!(stream.delivery.overflow, Overflow::None) {
-            match env.budget().charge(data.data.capacity()) {
-                Some(charge) => {
-                    let chunk = Chunk::with_charge(data.data, charge);
-                    self.deliver_body(id, chunk, true);
-                }
+            // The decoded body is paid for as the connection takes it in.
+            let mut chunk = Chunk::new(data.data);
+            if chunk.repay(env.budget()) {
+                self.deliver_body(id, chunk, true);
+            } else {
                 // The body is the stream's alone to lose: its child
                 // answers, and the other streams go on.
-                None => self.overflow(id, data.data.len() as u64),
+                self.overflow(id, chunk.len() as u64);
             }
         }
         if end {
@@ -1544,11 +1509,10 @@ impl Http2 {
         let first = block.len().min(max);
         let frames = 1 + (block.len() - first).div_ceil(max);
         let len = block.len() + frames * wire::HEADER_LEN;
-        let Some(charge) = env.budget().charge(len) else {
+        let Some(mut out) = ChargedBytes::with_capacity(env.budget(), len) else {
             self.over_budget(env);
             return false;
         };
-        let mut out = Vec::with_capacity(len);
         let write = |out: &mut Vec<u8>| -> Result<(), wire::Error> {
             wire::Headers {
                 stream: id,
@@ -1573,12 +1537,12 @@ impl Http2 {
             }
             Ok(())
         };
-        if write(&mut out).is_err() {
-            drop(charge);
+        if out.fill(write).is_err() {
+            drop(out);
             self.write_reset(env, id, ErrorCode::InternalError);
             return false;
         }
-        self.queue(Chunk::with_charge(out, charge), id, 0, end);
+        self.queue(Chunk::from_bytes(out), id, 0, end);
         true
     }
 
@@ -1647,24 +1611,27 @@ impl Http2 {
             // where bulk bodies go, and a TLS record could not hold both.
             let whole = n < frame;
             let len = wire::HEADER_LEN + if whole { n } else { 0 };
-            let Some(charge) = env.budget().charge(len) else {
-                self.over_budget(env);
-                return Sent::Frame;
-            };
-            let mut bytes = Vec::with_capacity(len);
-            wire::FrameHeader {
+            let header = wire::FrameHeader {
                 length: n,
                 kind: 0,
                 flags: 0,
                 stream: id,
-            }
-            .write(&mut bytes)
-            .expect("outbound frame has valid fields");
+            };
+            let framed = ChargedBytes::with_capacity(env.budget(), len).and_then(|mut bytes| {
+                bytes.fill(|bytes| header.write(bytes)).ok()?;
+                if whole {
+                    bytes.extend_within(&payload).ok()?;
+                }
+                Some(bytes)
+            });
+            let Some(bytes) = framed else {
+                self.over_budget(env);
+                return Sent::Frame;
+            };
             if whole {
-                bytes.extend_from_slice(&payload);
-                self.queue(Chunk::with_charge(bytes, charge), id, n as u64, false);
+                self.queue(Chunk::from_bytes(bytes), id, n as u64, false);
             } else {
-                self.queue(Chunk::with_charge(bytes, charge), id, 0, false);
+                self.queue(Chunk::from_bytes(bytes), id, 0, false);
                 self.queue_continuation(payload, id, n as u64);
             }
             self.grant(id);

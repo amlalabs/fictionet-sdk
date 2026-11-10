@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::future::Future;
 use std::io::Write as _;
 use std::pin::Pin;
@@ -13,8 +14,9 @@ use http_body::{Body as _, Frame};
 
 use fictionet::stdlib::codec::{Fail, Stream, base64};
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, Chunk, CommandOf, Env, Handoff, Handover, Layer, Owned,
-    OwnedWork, Side, StreamCommand, StreamEvent, Successor, Switch, Timers, Top, WorkOwner,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, Chunk, CommandOf, Env, Handoff, Handover,
+    Layer, Owned, OwnedWork, Side, StreamCommand, StreamEvent, Successor, Switch, Timers, Top,
+    WorkOwner,
 };
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http1::{self, Event as H1, RequestError, RequestHead};
@@ -308,7 +310,14 @@ impl Http1 {
     /// Charges what is held and `more`, if it fits.
     fn fits(&mut self, more: usize) -> bool {
         let need = self.holding().saturating_add(more);
-        self.charge.as_mut().is_none_or(|charge| charge.set(need))
+        self.charge.as_mut().is_none_or(|charge| {
+            if need < charge.bytes() {
+                charge.shrink_to(need);
+                true
+            } else {
+                charge.grow_to(need)
+            }
+        })
     }
 
     /// Takes the first charge and starts waiting for the first head.
@@ -329,10 +338,10 @@ impl Http1 {
     }
 
     /// Queues bytes whose allocation was reserved before encoding.
-    fn push_out(&mut self, bytes: Vec<u8>, charge: Charge) {
+    fn push_out(&mut self, bytes: ChargedBytes) {
         self.queued += bytes.len() as u64;
         self.out
-            .push_back(StreamCommand::Write(Chunk::with_charge(bytes, charge)));
+            .push_back(StreamCommand::Write(Chunk::from_bytes(bytes)));
     }
 
     /// Whether everything queued has been handed below and written.
@@ -359,7 +368,7 @@ impl Http1 {
         // What is left, such as the input buffer, still counts.
         let need = self.holding();
         if let Some(charge) = &mut self.charge {
-            charge.set(need.min(charge.bytes()));
+            charge.shrink_to(need);
         }
     }
 
@@ -392,12 +401,11 @@ impl Http1 {
                     .set(Timer::Body, env.now() + self.opts.body_timeout);
                 if head.expects_continue() {
                     let bytes = b"HTTP/1.1 100 Continue\r\n\r\n";
-                    let Some((mut out, charge)) = output(env, bytes.len()) else {
+                    let Some(out) = ChargedBytes::copy_of(env.budget(), bytes) else {
                         self.over_budget(env);
                         return true;
                     };
-                    out.extend_from_slice(bytes);
-                    self.push_out(out, charge);
+                    self.push_out(out);
                 }
                 if !self.fits(head_held(&head)) {
                     self.over_budget(env);
@@ -466,11 +474,10 @@ impl Http1 {
         let keep_alive = !close && head.keep_alive().unwrap_or(false) && head.method() != "CONNECT";
         let Some(mut request) = to_request(&head, version, body) else {
             let date = self.dates.at(env.now());
-            let Some((out, charge)) = simple_output(env, version, StatusCode::BAD_REQUEST, date)
-            else {
+            let Some(out) = simple_output(env, version, StatusCode::BAD_REQUEST, date) else {
                 return self.over_budget(env);
             };
-            self.push_out(out, charge);
+            self.push_out(out);
             return self.close(env, Closing::Failed);
         };
         request.extensions_mut().insert(self.conn.clone());
@@ -602,10 +609,10 @@ impl Http1 {
             StatusCode::BAD_REQUEST
         };
         env.report(Report::Failed(fail));
-        let Some((out, charge)) = simple_output(env, Version::HTTP_11, status, date) else {
+        let Some(out) = simple_output(env, Version::HTTP_11, status, date) else {
             return self.over_budget(env);
         };
-        self.push_out(out, charge);
+        self.push_out(out);
         self.close(env, Closing::Failed);
     }
 
@@ -633,15 +640,22 @@ impl Http1 {
             body if !r.rest.is_empty() => {
                 r.stage = body;
                 let piece = r.take_piece();
-                let Some((mut out, charge)) = output(env, piece.len() + 2 * size_of::<usize>() + 4)
-                else {
+                let framed =
+                    output(env, piece.len() + 2 * size_of::<usize>() + 4).and_then(|mut out| {
+                        out.fill(|out| {
+                            r.frame(&piece, out);
+                            Ok::<_, Infallible>(())
+                        })
+                        .ok()?;
+                        Some(out)
+                    });
+                let Some(out) = framed else {
                     self.over_budget(env);
                     return true;
                 };
-                r.frame(&piece, &mut out);
                 let body_len = piece.len();
                 drop(piece);
-                self.piece(env, r, out, charge, body_len);
+                self.piece(env, r, out, body_len);
                 true
             }
             Stage::Body(Some(body)) => {
@@ -661,12 +675,11 @@ impl Http1 {
             Stage::Body(None) if r.chunked => {
                 r.chunked = false;
                 let bytes = b"0\r\n\r\n";
-                let Some((mut out, charge)) = output(env, bytes.len()) else {
+                let Some(out) = ChargedBytes::copy_of(env.budget(), bytes) else {
                     self.over_budget(env);
                     return true;
                 };
-                out.extend_from_slice(bytes);
-                self.piece(env, r, out, charge, 0);
+                self.piece(env, r, out, 0);
                 true
             }
             Stage::Body(None) => {
@@ -711,13 +724,18 @@ impl Http1 {
         else {
             return self.over_budget(env);
         };
-        let Some((mut head, charge)) = output(env, bound) else {
+        let Some(mut head) = output(env, bound) else {
             return self.over_budget(env);
         };
-        r.close = encode(&mut head, r.version, &parts, &policy, r.close);
+        let close = r.close;
+        match head.fill(|head| Ok::<_, Infallible>(encode(head, r.version, &parts, &policy, close)))
+        {
+            Ok(close) => r.close = close,
+            Err(_) => return self.over_budget(env),
+        }
         r.chunked = !policy.bodiless && policy.len.is_none() && r.version != Version::HTTP_10;
         if policy.bodiless {
-            return self.piece(env, r, head, charge, 0);
+            return self.piece(env, r, head, 0);
         }
         // A body held in full goes out with the head, a piece at a time.
         match body.0 {
@@ -729,12 +747,19 @@ impl Http1 {
         // A streamed body has nothing held yet, and an empty chunk would
         // end it before it starts.
         let piece = r.take_piece();
-        if !piece.is_empty() {
-            r.frame(&piece, &mut head);
+        let framed = piece.is_empty()
+            || head
+                .fill(|head| {
+                    r.frame(&piece, head);
+                    Ok::<_, Infallible>(())
+                })
+                .is_ok();
+        if !framed {
+            return self.over_budget(env);
         }
         let body_len = piece.len();
         drop(piece);
-        self.piece(env, r, head, charge, body_len)
+        self.piece(env, r, head, body_len)
     }
 
     /// Queues `bytes` of the response, of which `body` are body bytes.
@@ -742,8 +767,7 @@ impl Http1 {
         &mut self,
         env: &mut Env<'_, Report>,
         mut r: Responding,
-        bytes: Vec<u8>,
-        charge: Charge,
+        bytes: ChargedBytes,
         body: usize,
     ) {
         if let Some(delivery) = &mut r.delivery {
@@ -752,8 +776,10 @@ impl Http1 {
         if r.rest.is_empty() {
             if self.frame_charge.is_none() {
                 self.frame_charge = r.body_charge.take();
+                // A body frame's room: what it needs past this is charged
+                // before its bytes are copied (`Op::Frame`).
                 if let Some(charge) = &mut self.frame_charge {
-                    charge.set(PIECE);
+                    charge.shrink_to(PIECE);
                 }
             } else {
                 r.body_charge = None;
@@ -763,7 +789,7 @@ impl Http1 {
         if !self.fits(0) {
             self.over_budget(env);
         } else {
-            self.push_out(bytes, charge);
+            self.push_out(bytes);
         }
     }
 
@@ -790,24 +816,30 @@ impl Http1 {
         self.timers = Timers::new();
         let unread = self.stream.unread();
         if !unread.is_empty() {
-            let Some(charge) = env.budget().charge(unread.len()) else {
+            let Some(bytes) = ChargedBytes::copy_of(env.budget(), unread) else {
                 return self.over_budget(env);
             };
-            let chunk = Chunk::with_charge(unread.to_vec(), charge);
-            self.leftover.push(StreamEvent::Data(chunk));
+            self.leftover
+                .push(StreamEvent::Data(Chunk::from_bytes(bytes)));
         }
         if !self.after.is_empty() {
-            let Some(charge) = self
+            // The part of the connection's charge that paid for these bytes
+            // pays for their copy instead.
+            let Some(mut charge) = self
                 .charge
                 .as_mut()
                 .and_then(|c| c.split(self.after.capacity()))
             else {
                 return self.over_budget(env);
             };
-            self.leftover.push(StreamEvent::Data(Chunk::with_charge(
-                std::mem::take(&mut self.after),
-                charge,
-            )));
+            charge.shrink_to(self.after.len());
+            let mut bytes = charge.into_bytes();
+            if bytes.extend_within(&self.after).is_err() {
+                return self.over_budget(env);
+            }
+            self.after = Vec::new();
+            self.leftover
+                .push(StreamEvent::Data(Chunk::from_bytes(bytes)));
         }
         if self.peer_ended {
             self.leftover.push(StreamEvent::Ended);
@@ -910,7 +942,7 @@ impl Layer for Http1 {
                     if self.leftover.len() >= 4 {
                         return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
                     }
-                    if !chunk.reserve(env.budget()) {
+                    if !chunk.repay(env.budget()) {
                         self.over_budget(env);
                         return Ok(Admit::Closed(StreamEvent::Data(chunk)));
                     }
@@ -1200,11 +1232,16 @@ impl Job for Work {
                             Ok(data) => data,
                             Err(_) => return Ok(Frame::data(Bytes::new())),
                         };
-                        if !self
-                            .charge
-                            .as_mut()
-                            .is_some_and(|charge| charge.set(PIECE.max(data.len())))
-                        {
+                        let want = PIECE.max(data.len());
+                        let fits = self.charge.as_mut().is_some_and(|charge| {
+                            if want < charge.bytes() {
+                                charge.shrink_to(want);
+                                true
+                            } else {
+                                charge.grow_to(want)
+                            }
+                        });
+                        if !fits {
                             return Err(Error::msg("the body frame exceeds the connection budget"));
                         }
                         Ok(Frame::data(Bytes::copy_from_slice(&data)))
@@ -1367,10 +1404,9 @@ fn normalize_body(body: &mut Body, budget: &Budget) -> Option<Option<Charge>> {
     }
 }
 
-/// Reserves the full output bound before the vector can grow.
-fn output(env: &Env<'_, Report>, bound: usize) -> Option<(Vec<u8>, Charge)> {
-    let charge = env.budget().charge(bound)?;
-    Some((Vec::with_capacity(bound), charge))
+/// Room for the full output bound, charged before it is allocated.
+fn output(env: &Env<'_, Report>, bound: usize) -> Option<ChargedBytes> {
+    ChargedBytes::with_capacity(env.budget(), bound)
 }
 
 /// Bounds headers plus every generated field. Suppressed application fields
@@ -1478,12 +1514,13 @@ fn simple_output(
     version: Version,
     status: StatusCode,
     date: Option<HeaderValue>,
-) -> Option<(Vec<u8>, Charge)> {
+) -> Option<ChargedBytes> {
     let (parts, _) = status_only(status).into_parts();
     let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || date);
-    let (mut out, charge) = output(env, head_bound(&parts, &policy)?)?;
-    encode(&mut out, version, &parts, &policy, true);
-    Some((out, charge))
+    let mut out = output(env, head_bound(&parts, &policy)?)?;
+    out.fill(|out| Ok::<_, Infallible>(encode(out, version, &parts, &policy, true)))
+        .ok()?;
+    Some(out)
 }
 
 #[cfg(test)]

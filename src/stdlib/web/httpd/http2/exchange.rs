@@ -136,10 +136,10 @@ impl Credited for ExchangeEvent {
         }
     }
 
-    /// Body bytes carry the charge the connection took for them.
+    /// Body bytes are paid for by the budget that admits them.
     fn reserve(&mut self, budget: &Budget) -> bool {
         match self {
-            ExchangeEvent::Data(chunk) => chunk.reserve(budget),
+            ExchangeEvent::Data(chunk) => chunk.repay(budget),
             _ => true,
         }
     }
@@ -163,7 +163,7 @@ impl Credited for ExchangeCommand {
 
     fn reserve(&mut self, budget: &Budget) -> bool {
         match self {
-            ExchangeCommand::Data(chunk) => chunk.reserve(budget),
+            ExchangeCommand::Data(chunk) => chunk.repay(budget),
             _ => true,
         }
     }

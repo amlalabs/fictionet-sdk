@@ -206,7 +206,7 @@ impl<W: Job> Jobs<W> {
                 let capacity = self.running.len() + 1;
                 let bytes = capacity * std::mem::size_of::<Running<W>>();
                 let reserved = match &mut self.storage {
-                    Some(charge) => charge.set(bytes),
+                    Some(charge) => charge.grow_to(bytes),
                     None => {
                         self.storage = driver.budget().charge(bytes);
                         self.storage.is_some()
@@ -225,9 +225,7 @@ impl<W: Job> Jobs<W> {
             }
             let Some(work) = driver.take_work() else {
                 if let Some(charge) = &mut self.storage {
-                    assert!(
-                        charge.set(self.running.capacity() * std::mem::size_of::<Running<W>>())
-                    );
+                    charge.shrink_to(self.running.capacity() * std::mem::size_of::<Running<W>>());
                 }
                 break;
             };
@@ -318,7 +316,7 @@ impl<W: Job> Jobs<W> {
             // Release the allocation before returning its reservation.
             self.running.shrink_to(1);
             if let Some(charge) = &mut self.storage {
-                assert!(charge.set(self.running.capacity() * std::mem::size_of::<Running<W>>()));
+                charge.shrink_to(self.running.capacity() * std::mem::size_of::<Running<W>>());
             }
         }
         Ok(finished)

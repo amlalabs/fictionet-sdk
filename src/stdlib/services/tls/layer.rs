@@ -24,34 +24,6 @@ const CHUNK: usize = 16 * 1024;
 const RECORD: usize = 5 + (1 << 14) + 2048;
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
 
-/// Appends to a vector up to its capacity, so a TLS write fills exactly the
-/// allocation made for it and never grows it.
-struct Fill<'a>(&'a mut Vec<u8>);
-
-impl Write for Fill<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = buf.len().min(self.0.capacity() - self.0.len());
-        self.0.extend_from_slice(&buf[..n]);
-        Ok(n)
-    }
-
-    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        let mut total = 0;
-        for buf in bufs {
-            let n = self.write(buf)?;
-            total += n;
-            if n < buf.len() {
-                break;
-            }
-        }
-        Ok(total)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 /// The client's requested name and application protocols, before selection.
 pub struct Hello {
     server_name: Option<String>,
@@ -601,7 +573,7 @@ impl Layer for TlsLayer {
             let mut charge = self.output_reserve.take().unwrap();
             // The reservation holds the largest record, so a single whole
             // record goes down in the buffer rustls encrypted it into.
-            // Anything else is copied into room for exactly what is to go,
+            // Anything else is written into room for exactly what is to go,
             // up to the reservation: several records coalesced, the rest
             // of a split record, the rejection, or the alert, whose size is
             // not known ahead. Either way the reservation then shrinks to
@@ -614,8 +586,10 @@ impl Layer for TlsLayer {
                     .unwrap()
                     .take_sendable_tls_chunk(charge.bytes())
             };
-            let bytes = if let Some(bytes) = owned {
-                bytes
+            let bytes = if let Some(record) = owned {
+                Chunk::adopt(record, charge).map_err(|_| {
+                    HandshakeError::Failed("ciphertext outgrew its reservation".to_owned())
+                })?
             } else {
                 let room = if self.reject {
                     UNRECOGNIZED_NAME.len()
@@ -628,28 +602,25 @@ impl Layer for TlsLayer {
                         .sendable_tls_len()
                         .min(charge.bytes())
                 };
-                let mut bytes = Vec::with_capacity(room);
+                charge.shrink_to(room);
+                let mut bytes = charge.into_bytes();
                 let result = if self.reject {
-                    Fill(&mut bytes).write(UNRECOGNIZED_NAME.as_slice())
+                    bytes.write(UNRECOGNIZED_NAME.as_slice())
                 } else if let Some(alert) = self.alert.as_mut() {
-                    alert.write(&mut Fill(&mut bytes))
+                    alert.write(&mut bytes)
                 } else {
-                    self.tls.as_mut().unwrap().write_tls(&mut Fill(&mut bytes))
+                    self.tls.as_mut().unwrap().write_tls(&mut bytes)
                 };
                 result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
-                bytes.shrink_to_fit();
-                bytes
+                bytes.trim();
+                Chunk::from_bytes(bytes)
             };
             self.reject = false;
             if bytes.is_empty() {
                 self.alert = None;
             } else {
-                // Both paths above bound the allocation by the reservation,
-                // so shrinking the charge to it always fits.
-                let shrunk = charge.set(bytes.capacity());
-                debug_assert!(shrunk, "ciphertext outgrew its reservation");
                 self.ciphertext_emitted += bytes.len() as u64;
-                self.below = Some(StreamCommand::Write(Chunk::with_charge(bytes, charge)));
+                self.below = Some(StreamCommand::Write(bytes));
             }
             if let Some(completion) = self.plaintext_completion.as_mut()
                 && completion.ciphertext_end.is_none()
@@ -677,17 +648,22 @@ impl Layer for TlsLayer {
                     // section 5.1), and goes up in the buffer rustls
                     // decrypted it into.
                     let n = plaintext.len();
-                    let Some(mut charge) = env.budget().charge(n) else {
+                    let Some(room) = env.budget().charge(n) else {
                         return Ok(false);
                     };
-                    let mut bytes = tls
+                    let bytes = tls
                         .reader()
                         .take_first_chunk()
                         .map_err(|error| HandshakeError::Failed(error.to_string()))?;
-                    if bytes.capacity() > n && !charge.set(bytes.capacity()) {
+                    // Room for more than the plaintext was not charged, so
+                    // the buffer gives its spare capacity back first.
+                    let chunk = Chunk::adopt(bytes, room).or_else(|(mut bytes, room)| {
                         bytes.shrink_to_fit();
-                    }
-                    self.above = Some(StreamEvent::Data(Chunk::with_charge(bytes, charge)));
+                        Chunk::adopt(bytes, room).map_err(|_| {
+                            HandshakeError::Failed("plaintext outgrew its charge".to_owned())
+                        })
+                    })?;
+                    self.above = Some(StreamEvent::Data(chunk));
                     return Ok(true);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}

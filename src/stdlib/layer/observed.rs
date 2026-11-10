@@ -164,7 +164,7 @@ impl Credited for ObservedEvent {
 
     fn reserve(&mut self, budget: &Budget) -> bool {
         match self {
-            ObservedEvent::Data { bytes, .. } => bytes.reserve(budget),
+            ObservedEvent::Data { bytes, .. } => bytes.repay(budget),
             _ => true,
         }
     }

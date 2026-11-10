@@ -87,7 +87,7 @@ impl<E> Observations<E> {
                 return false;
             };
             match &mut self.storage {
-                Some(charge) => charge.set(wanted),
+                Some(charge) => charge.grow_to(wanted),
                 None => {
                     self.storage = self.budget.charge(wanted);
                     self.storage.is_some()

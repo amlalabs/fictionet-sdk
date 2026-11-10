@@ -436,8 +436,9 @@ fn a_full_queue_drops_what_does_not_fit_and_charges_go_with_datagrams() {
     command(&mut d, child.grant(1));
     let mut first = up(&mut d);
     assert_eq!(first.len(), 1);
-    // The datagram took its charge up with it.
-    assert_eq!(budget.used(), held);
+    // The datagram took the charge for its bytes up with it, and its place
+    // in the queue went back as it left.
+    assert_eq!(budget.used(), held - DATAGRAM_COST);
     first.clear();
     assert_eq!(budget.used(), held - cost);
     // And room for one more.

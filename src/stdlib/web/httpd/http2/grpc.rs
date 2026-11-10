@@ -7,7 +7,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::layer::{
-    Admit, Charge, Chunk, Env, Layer, MessageCommand, MessageEvent, Messages,
+    Admit, Charge, ChargedBytes, Chunk, Env, Layer, MessageCommand, MessageEvent, Messages,
 };
 use fictionet::stdlib::protocols::grpc::{self, Code, ContentType, Rejection, Status};
 use fictionet::stdlib::protocols::http2::ErrorCode;
@@ -189,18 +189,17 @@ impl Grpc {
     /// allocated.
     fn send(&mut self, env: &Env<'_, Infallible>, message: grpc::Message) {
         let len = message.data.len() + 5;
-        let Some(charge) = env.budget().charge(len) else {
+        let Some(mut bytes) = ChargedBytes::with_capacity(env.budget(), len) else {
             self.next = Some(ExchangeCommand::Reset(ErrorCode::InternalError));
             self.finished = true;
             return;
         };
-        let mut bytes = Vec::with_capacity(len);
-        if message.write(&mut bytes).is_err() {
-            drop(charge);
+        if bytes.fill(|bytes| message.write(bytes)).is_err() {
+            drop(bytes);
             self.finish(Status::new(Code::ResourceExhausted, "message too large"));
             return;
         }
-        self.next = Some(ExchangeCommand::Data(Chunk::with_charge(bytes, charge)));
+        self.next = Some(ExchangeCommand::Data(Chunk::from_bytes(bytes)));
     }
 
     /// Reads the whole messages at the start of the partial bytes, while
@@ -304,7 +303,7 @@ impl Layer for Grpc {
                 let held = self.charge.as_ref().map_or(0, Charge::bytes);
                 let grown = held + need.saturating_sub(self.partial.capacity());
                 let fits = match &mut self.charge {
-                    Some(charge) => charge.set(grown),
+                    Some(charge) => charge.grow_to(grown),
                     None => {
                         self.charge = env.budget().charge(grown);
                         self.charge.is_some()

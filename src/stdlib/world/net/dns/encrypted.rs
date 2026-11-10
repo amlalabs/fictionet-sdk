@@ -542,7 +542,7 @@ impl Layer for Queried {
                 // The framing charged it as the longest message; it keeps
                 // only what it holds, and less always fits.
                 let (query, mut charge) = query.into_parts();
-                charge.set(query.capacity());
+                charge.shrink_to(query.capacity());
                 let generation = self.next;
                 self.next += 1;
                 self.asking.push(generation);
@@ -687,7 +687,13 @@ impl Job for Ask {
         self.asking = None;
         let outcome = match (answer, self.charge.take()) {
             (Some(answer), Some(mut charge)) => {
-                if charge.set(answer.capacity()) {
+                let fits = if answer.capacity() < charge.bytes() {
+                    charge.shrink_to(answer.capacity());
+                    true
+                } else {
+                    charge.grow_to(answer.capacity())
+                };
+                if fits {
                     Outcome::Answer(Owned::new(StreamMessage(answer), charge))
                 } else {
                     Outcome::Budget

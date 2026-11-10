@@ -3,8 +3,8 @@ use core::marker::PhantomData;
 
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, Chunk, Env, Layer, MessageCommand, MessageEvent, Messages,
-    StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, Chunk, Env, Layer, MessageCommand,
+    MessageEvent, Messages, Owned, StreamCommand, StreamEvent,
 };
 
 /// A wire writer whose output allocation is known before writing.
@@ -99,43 +99,6 @@ pub trait BoundedDecode: Decode {
     fn allocation_bound(&self) -> usize;
 }
 
-/// An owned value and the reservation that follows its allocation.
-#[derive(Debug)]
-pub struct Owned<T> {
-    value: T,
-    charge: Charge,
-}
-
-impl<T> Owned<T> {
-    /// Attaches a reservation acquired before constructing the value.
-    pub fn new(value: T, charge: Charge) -> Self {
-        Self { value, charge }
-    }
-
-    /// Transfers both the value and its reservation to another owner.
-    pub fn into_parts(self) -> (T, Charge) {
-        (self.value, self.charge)
-    }
-
-    /// Reserved allocation bytes.
-    pub fn charged(&self) -> usize {
-        self.charge.bytes()
-    }
-}
-
-impl<T: AsRef<[u8]>> AsRef<[u8]> for Owned<T> {
-    fn as_ref(&self) -> &[u8] {
-        self.value.as_ref()
-    }
-}
-
-impl<T> core::ops::Deref for Owned<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.value
-    }
-}
-
 /// What a framed byte stream hands up: the next item, or why framing
 /// stopped.
 pub type Decoded<D> = Result<Owned<<D as Decode>::Item>, Fail<<D as Decode>::Error>>;
@@ -222,7 +185,11 @@ impl<D: Decode, O> Framed<D, O> {
             .max(self.stream.allocated())
             .saturating_add(self.stream.held());
         let fits = match &mut self.charge {
-            Some(charge) => charge.set(need),
+            Some(charge) if need < charge.bytes() => {
+                charge.shrink_to(need);
+                true
+            }
+            Some(charge) => charge.grow_to(need),
             None => {
                 self.charge = env.budget().charge(need);
                 self.charge.is_some()
@@ -305,17 +272,26 @@ where
                 let bound = value
                     .write_bound()
                     .map_err(|e| FramedError::Write(WriteFailure::Value(e)))?;
-                let charge = env.budget().charge(bound).ok_or(FramedError::Budget)?;
-                let mut bytes = vec![0; bound];
-                let mut writer = BoundedWriter::new(&mut bytes);
-                value
-                    .write_bounded(&mut writer)
-                    .map_err(|e| FramedError::Write(WriteFailure::Value(e)))?;
-                let written = writer
-                    .finish()
-                    .map_err(|_| FramedError::Write(WriteFailure::Bound))?;
-                bytes.truncate(written);
-                self.out = Some(Chunk::with_charge(bytes, charge));
+                let mut bytes =
+                    ChargedBytes::with_capacity(env.budget(), bound).ok_or(FramedError::Budget)?;
+                let filled = bytes.fill(|out| {
+                    out.resize(bound, 0);
+                    let mut writer = BoundedWriter::new(out);
+                    value
+                        .write_bounded(&mut writer)
+                        .map_err(WriteFailure::Value)?;
+                    let written = writer.finish().map_err(|_| WriteFailure::Bound)?;
+                    out.truncate(written);
+                    Ok(())
+                });
+                match filled {
+                    Ok(()) => {}
+                    Err(WriteFailure::Value(failure)) => return Err(FramedError::Write(failure)),
+                    Err(WriteFailure::Bound) => {
+                        return Err(FramedError::Write(WriteFailure::Bound));
+                    }
+                }
+                self.out = Some(Chunk::from_bytes(bytes));
                 Ok(Admit::Taken)
             }
             MessageCommand::End => {

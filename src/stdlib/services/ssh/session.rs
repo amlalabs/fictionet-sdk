@@ -76,7 +76,11 @@ impl<H: Handler> SessionLayer<H> {
     fn account(&mut self, budget: &Budget) -> Result<(), TransportError> {
         let bytes = 4 * super::ssh::MAX_PAYLOAD + self.session.as_ref().map_or(0, Session::held);
         let fits = match &mut self.state {
-            Some(charge) => charge.set(bytes),
+            Some(charge) if bytes < charge.bytes() => {
+                charge.shrink_to(bytes);
+                true
+            }
+            Some(charge) => charge.grow_to(bytes),
             None => {
                 self.state = budget.charge(bytes);
                 self.state.is_some()

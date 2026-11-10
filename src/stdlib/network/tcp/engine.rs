@@ -21,9 +21,9 @@ use core::convert::Infallible;
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, Child, ChildId, Chunk, CommandOf, Env, EventOf, Layer,
-    MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand, PacketEvent, Packets,
-    Slots, StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, Child, ChildId, Chunk, CommandOf, Env,
+    EventOf, Layer, MessageCommand, MessageEvent, Messages, MuxEvent, MuxOp, PacketCommand,
+    PacketEvent, Packets, Slots, StreamCommand, StreamEvent,
 };
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::packet::{CheckedIpPacket, Sort};
@@ -2203,18 +2203,19 @@ impl TcpLayer {
         let mut moved = false;
         while c.recv_credit > 0 && s.can_recv() && self.up.len() < UP_ROOM {
             let n = (c.recv_credit as usize).min(s.recv_queue()).min(DATA_MAX);
-            let Some(charge) = budget.charge(n) else {
+            let Some(mut bytes) = ChargedBytes::with_capacity(budget, n) else {
                 break;
             };
             // Copied straight out of the socket's ring, which may hand the
             // bytes over in two pieces, into memory nothing zeroed first.
-            let mut bytes = Vec::with_capacity(n);
-            while bytes.len() < n && s.can_recv() {
+            while bytes.room() > 0 && s.can_recv() {
                 let took = s
                     .recv(|data| {
-                        let take = data.len().min(n - bytes.len());
-                        bytes.extend_from_slice(&data[..take]);
-                        (take, take)
+                        let take = data.len().min(bytes.room());
+                        match bytes.extend_within(&data[..take]) {
+                            Ok(()) => (take, take),
+                            Err(_) => (0, 0),
+                        }
                     })
                     .unwrap_or(0);
                 if took == 0 {
@@ -2228,7 +2229,7 @@ impl TcpLayer {
             c.recv_credit -= got as u64;
             self.up.push_back(MuxEvent::Child(
                 id,
-                StreamEvent::Data(Chunk::with_charge(bytes, charge)),
+                StreamEvent::Data(Chunk::from_bytes(bytes)),
             ));
             moved = true;
         }

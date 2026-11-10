@@ -63,8 +63,9 @@ pub trait Whole {
         self.len() == 0
     }
 
-    /// Charges the packet's backing storage to `budget`, unless it already
-    /// carries a charge. Refuses, changing nothing, when it does not fit.
+    /// Makes sure the packet's backing storage is paid for, charging
+    /// `budget` for what it does not pay for yet. Refuses, changing
+    /// nothing, when it does not fit.
     fn reserve(&mut self, budget: &Budget) -> bool;
 }
 
@@ -74,7 +75,7 @@ impl Whole for Chunk {
     }
 
     fn reserve(&mut self, budget: &Budget) -> bool {
-        Chunk::reserve(self, budget)
+        self.repay(budget)
     }
 }
 

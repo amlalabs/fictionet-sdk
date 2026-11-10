@@ -86,8 +86,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fictionet::Packet;
 use fictionet::stdlib::layer::{
-    Admit, Budget, Chunk, CommandOf, Datagram, Env, EventOf, Layer, PacketCommand, PacketEvent,
-    Packets, Whole,
+    Admit, Budget, ChargedBytes, Chunk, CommandOf, Datagram, Env, EventOf, Layer, PacketCommand,
+    PacketEvent, Packets, Whole,
 };
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::ip::{Header, Intake, Reassembly, protocol};
@@ -403,7 +403,7 @@ impl Whole for ObservedIpPacket {
         self.bytes.len()
     }
     fn reserve(&mut self, budget: &Budget) -> bool {
-        self.bytes.reserve(budget)
+        self.bytes.repay(budget)
     }
 }
 
@@ -441,23 +441,32 @@ impl Whole for CheckedIpPacket {
     }
 
     /// Charges the packet and, for a normalized one, the original it keeps,
-    /// together or not at all.
+    /// together or not at all: each is copied into an allocation of its
+    /// own, charged before it is made, and both copies are made before
+    /// either takes the place of what it copies.
     fn reserve(&mut self, budget: &Budget) -> bool {
         let original = match &self.origin {
-            Origin::Normalized { original } if original.charged() == 0 => Some(original.len()),
+            Origin::Normalized { original } if original.charged() == 0 => {
+                let Some(copy) = ChargedBytes::copy_of(budget, original) else {
+                    return false;
+                };
+                Some(copy)
+            }
             _ => None,
         };
-        let packet = (self.bytes.charged() == 0).then(|| self.bytes.len());
-        let total = original.unwrap_or(0) + packet.unwrap_or(0);
-        let Some(mut charge) = budget.charge(total) else {
-            return false;
+        let packet = if self.bytes.charged() == 0 {
+            let Some(copy) = ChargedBytes::copy_of(budget, &self.bytes) else {
+                return false;
+            };
+            Some(copy)
+        } else {
+            None
         };
-        if let (Some(len), Origin::Normalized { original }) = (original, &mut self.origin) {
-            let part = charge.split(len).expect("the charge covers both");
-            *original = Chunk::with_charge(original.to_vec(), part);
+        if let (Some(copy), Origin::Normalized { original }) = (original, &mut self.origin) {
+            *original = Chunk::from_bytes(copy);
         }
-        if packet.is_some() {
-            self.bytes = Chunk::with_charge(self.bytes.to_vec(), charge);
+        if let Some(copy) = packet {
+            self.bytes = Chunk::from_bytes(copy);
         }
         true
     }

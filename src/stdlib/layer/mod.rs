@@ -193,6 +193,7 @@
 mod budget;
 mod carrier;
 mod chain;
+mod charged;
 mod children;
 mod choice;
 mod driver;
@@ -219,7 +220,8 @@ pub(crate) use framed::tests as framed_echo;
 #[path = "../../../verification/layer/kani/mod.rs"]
 mod proofs;
 
-pub use budget::{Budget, Charge, OwnedWork, WorkOwner};
+pub use budget::{Budget, Charge, OwnedWork, Refusals, WorkOwner};
+pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, Owned};
 
 /// Maximum supported composition depth, including erased layers.
 pub const MAX_DEPTH: usize = 32;
@@ -234,8 +236,7 @@ pub use choice::Later;
 pub use driver::{Driver, Observations};
 pub use env::{Env, Observe};
 pub use framed::{
-    BoundedDecode, BoundedWire, BoundedWriter, Decoded, Framed, FramedError, Framing, Owned,
-    WriteFailure,
+    BoundedDecode, BoundedWire, BoundedWriter, Decoded, Framed, FramedError, Framing, WriteFailure,
 };
 pub use harness::{Harness, Worker};
 pub use observed::{Direction, ObservedEvent, ObservedStream, Source, Termination};

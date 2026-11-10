@@ -12,7 +12,7 @@ use rustls::server::{Accepted, AcceptedAlert, Acceptor, ServerConnection};
 
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
+    Admit, ByteStream, Charge, ChargedBytes, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
 };
 use fictionet::stdlib::services::stack::Job;
 use fictionet::stdlib::services::tls::{Handshake, HandshakeError, Negotiation};
@@ -552,24 +552,21 @@ impl Layer for TlsLayer {
             if !self.reserve_output(env) {
                 return Ok(false);
             }
-            let charge = self.output_reserve.take().unwrap();
-            let mut bytes = vec![0; CHUNK];
-            let mut writer = &mut bytes[..];
+            let mut bytes = self.output_reserve.take().unwrap().into_bytes();
             let result = if self.reject {
-                writer.write(UNRECOGNIZED_NAME.as_slice())
+                bytes.write(UNRECOGNIZED_NAME.as_slice())
             } else if let Some(alert) = self.alert.as_mut() {
-                alert.write(&mut writer)
+                alert.write(&mut bytes)
             } else {
-                self.tls.as_mut().unwrap().write_tls(&mut writer)
+                self.tls.as_mut().unwrap().write_tls(&mut bytes)
             };
             let n = result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
             self.reject = false;
             if n == 0 {
                 self.alert = None;
             } else {
-                bytes.truncate(n);
                 self.produced += n as u64;
-                self.below = Some(StreamCommand::Write(Chunk::with_charge(bytes, charge)));
+                self.below = Some(StreamCommand::Write(Chunk::from_bytes(bytes)));
             }
             if self.pending_plaintext != 0
                 && self.fence.is_none()
@@ -594,12 +591,11 @@ impl Layer for TlsLayer {
                 }
                 Ok(plaintext) => {
                     let n = plaintext.len().min(CHUNK);
-                    let Some(charge) = env.budget().charge(n) else {
+                    let Some(bytes) = ChargedBytes::copy_of(env.budget(), &plaintext[..n]) else {
                         return Ok(false);
                     };
-                    let bytes = plaintext[..n].to_vec();
                     tls.reader().consume(n);
-                    self.above = Some(StreamEvent::Data(Chunk::with_charge(bytes, charge)));
+                    self.above = Some(StreamEvent::Data(Chunk::from_bytes(bytes)));
                     return Ok(true);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
