@@ -290,6 +290,12 @@ impl<T> ChargedDeque<T> {
         self.items.pop_front()
     }
 
+    /// Takes the item at `index`, preserving the order of the rest.
+    /// Its place stays paid for.
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        self.items.remove(index)
+    }
+
     /// The first item.
     pub fn front_mut(&mut self) -> Option<&mut T> {
         self.items.front_mut()

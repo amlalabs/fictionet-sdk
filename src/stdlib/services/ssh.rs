@@ -6,7 +6,6 @@
 //! windows apply when the queue is sent.
 //! The world supplies identity, authentication policy and application behavior.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,9 +17,9 @@ use super::stack;
 use crate::Cx;
 use crate::stdlib::codec::Wire;
 use crate::stdlib::layer::{
-    Admit, Budget, ByteStream, Chain, Charge, ChargedBytes, ChildId, Children, Chunk as Bytes, Env,
-    Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand, StreamEvent, Timers, Top,
-    WriteFailure,
+    Admit, Budget, ByteStream, Chain, Charge, ChargedBytes, ChargedDeque, ChildId, Children,
+    Chunk as Bytes, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand,
+    StreamEvent, Timers, Top, WriteFailure,
 };
 use crate::stdlib::protocols::ssh::transport::{HostKey, TransportError};
 use crate::stdlib::protocols::ssh::{self, auth, connection as wire};
@@ -304,15 +303,14 @@ enum Chunk {
 }
 
 /// Bounded session output and connection-wide disconnect requests.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Output {
-    chunks: VecDeque<Chunk>,
+    chunks: ChargedDeque<Chunk>,
     bytes: usize,
     exited: bool,
     disconnect: bool,
     hangup: bool,
-    budget: Option<Budget>,
-    storage: Option<Charge>,
+    budget: Budget,
 }
 
 /// Output would exceed the queue bound or follow an exit or disconnect.
@@ -324,28 +322,34 @@ impl std::fmt::Display for OutputFull {
     }
 }
 impl std::error::Error for OutputFull {}
+impl Default for Output {
+    fn default() -> Self {
+        Self::with_budget(Budget::unlimited())
+    }
+}
+
 impl Output {
     fn with_budget(budget: Budget) -> Self {
         Self {
-            budget: Some(budget),
-            ..Self::default()
+            chunks: ChargedDeque::new(&budget, 1025),
+            budget,
+            bytes: 0,
+            exited: false,
+            disconnect: false,
+            hangup: false,
         }
     }
     fn clear(&mut self) {
-        self.chunks.clear();
+        drop(self.chunks.drain(..));
         self.bytes = 0;
         self.exited = false;
         self.disconnect = false;
         self.hangup = false;
     }
     fn reserve(&mut self) -> Result<(), OutputFull> {
-        if self.storage.is_none() {
-            let budget = self.budget.get_or_insert_with(Budget::unlimited);
-            let charge = budget
-                .charge(1025 * std::mem::size_of::<Chunk>())
-                .ok_or(OutputFull)?;
-            self.chunks = VecDeque::with_capacity(1025);
-            self.storage = Some(charge);
+        if self.chunks.places() == 0 {
+            let budget = &self.budget;
+            self.chunks = ChargedDeque::with_places(budget, 1025, 1025).ok_or(OutputFull)?;
         }
         Ok(())
     }
@@ -369,14 +373,25 @@ impl Output {
     fn push(&mut self, stderr: bool, bytes: &[u8]) -> Result<(), OutputFull> {
         let next = self.next_bytes(bytes.len())?;
         if !bytes.is_empty() {
-            self.reserve()?;
-            let data =
-                ChargedBytes::copy_of(self.budget.as_ref().unwrap(), bytes).ok_or(OutputFull)?;
+            let mut data = if self.chunks.places() == 0 {
+                let places = 1025 * size_of::<Chunk>();
+                let mut charge = self.budget.charge(places + bytes.len()).ok_or(OutputFull)?;
+                self.chunks = charge.split(places).unwrap().into_deque();
+                charge.into_bytes()
+            } else {
+                ChargedBytes::with_capacity(&self.budget, bytes.len()).ok_or(OutputFull)?
+            };
+            data.extend_within(bytes)
+                .expect("output was reserved in full");
             self.bytes = next;
-            self.chunks.push_back(Chunk::Data {
-                stderr,
-                data: Bytes::from_bytes(data),
-            });
+            assert!(
+                self.chunks
+                    .push_back(Chunk::Data {
+                        stderr,
+                        data: Bytes::from_bytes(data),
+                    })
+                    .is_ok()
+            );
         }
         Ok(())
     }
@@ -390,7 +405,7 @@ impl Output {
                 return;
             }
             self.exited = true;
-            self.chunks.push_back(Chunk::Exit(status));
+            assert!(self.chunks.push_back(Chunk::Exit(status)).is_ok());
         }
     }
     /// Disconnect the whole SSH connection, discarding queued channel output.
@@ -398,7 +413,7 @@ impl Output {
     pub fn disconnect(&mut self) {
         self.exited = true;
         self.disconnect = true;
-        self.chunks.clear();
+        drop(self.chunks.drain(..));
         self.bytes = 0;
     }
     /// Drain this channel's queued output, then silently close the connection.
@@ -793,11 +808,11 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     end_sent: bool,
     state: Option<Charge>,
     /// What goes down next, written into room for four packets that was
-    /// paid for before it was allocated ([`Self::output`]).
+    /// paid for before it was allocated.
     out: Option<ChargedBytes>,
     out_child: Option<(ChildId, u64)>,
-    flights: VecDeque<Flight>,
-    up: VecDeque<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>,
+    flights: ChargedDeque<Flight>,
+    up: ChargedDeque<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>,
     channels: Slots<Channel>,
     next_channel: u32,
     credit_turn: Option<ChildId>,
@@ -810,7 +825,7 @@ pub struct Ssh<H: Handler, T: PacketTransport = StandardTransport> {
     challenge: Option<(auth::Request, usize)>,
     failure: Option<Vec<u8>>,
     failure_ready: bool,
-    pending_packets: VecDeque<(u32, Owned<Vec<u8>>)>,
+    pending_packets: ChargedDeque<(u32, ChargedBytes)>,
 }
 
 /// SSH with one synchronous application adapter on every scoped channel.
@@ -846,8 +861,8 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             state: None,
             out: None,
             out_child: None,
-            flights: VecDeque::new(),
-            up: VecDeque::new(),
+            flights: ChargedDeque::new(&Budget::unlimited(), 128),
+            up: ChargedDeque::new(&Budget::unlimited(), 8),
             channels: Slots::new(limit),
             next_channel: 0,
             credit_turn: None,
@@ -860,7 +875,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             challenge: None,
             failure: None,
             failure_ready: false,
-            pending_packets: VecDeque::new(),
+            pending_packets: ChargedDeque::new(&Budget::unlimited(), 128),
         }
     }
     /// Run the configured Handler and Session policy on each channel.
@@ -915,25 +930,16 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
     fn reserve(&mut self, env: &Env<'_, Ended>) -> Result<(), Error> {
         if self.state.is_none() {
             // Authentication retains bounded request fields and challenge state.
-            let bytes = self.resident_bytes()
-                + 128 * std::mem::size_of::<Flight>()
-                + 128 * std::mem::size_of::<(u32, Owned<Vec<u8>>)>()
-                + 8 * std::mem::size_of::<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>();
+            let bytes = self.resident_bytes();
             let charge = env.budget().charge(bytes).ok_or(Error::Budget)?;
             self.channels =
                 Slots::with_budget(self.config.max_channels, env.budget()).ok_or(Error::Budget)?;
-            self.flights = VecDeque::with_capacity(128);
-            self.pending_packets = VecDeque::with_capacity(128);
-            self.up = VecDeque::with_capacity(8);
+            self.flights =
+                ChargedDeque::with_places(env.budget(), 128, 128).ok_or(Error::Budget)?;
+            self.pending_packets =
+                ChargedDeque::with_places(env.budget(), 128, 128).ok_or(Error::Budget)?;
+            self.up = ChargedDeque::with_places(env.budget(), 8, 8).ok_or(Error::Budget)?;
             self.state = Some(charge);
-        }
-        Ok(())
-    }
-    fn output(&mut self, env: &Env<'_, Ended>) -> Result<(), Error> {
-        if self.out.is_none() {
-            let room = ChargedBytes::with_capacity(env.budget(), 4 * ssh::MAX_PACKET)
-                .ok_or(Error::Budget)?;
-            self.out = Some(room);
         }
         Ok(())
     }
@@ -949,7 +955,12 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         env: &Env<'_, Ended>,
         write: impl FnOnce(&mut T, &mut Vec<u8>) -> Result<R, E>,
     ) -> Result<Result<R, E>, Error> {
-        self.output(env)?;
+        if self.out.is_none() {
+            self.out = Some(
+                ChargedBytes::with_capacity(env.budget(), 4 * ssh::MAX_PACKET)
+                    .ok_or(Error::Budget)?,
+            );
+        }
         let (Some(out), transport) = (self.out.as_mut(), &mut self.transport) else {
             return Err(TransportError::State.into());
         };
@@ -960,11 +971,10 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         }
     }
     fn write(&mut self, env: &Env<'_, Ended>, payload: &[u8]) -> Result<(), Error> {
-        self.output(env)?;
         if self
             .out
             .as_ref()
-            .is_none_or(|out| out.room() < ssh::MAX_PACKET)
+            .is_some_and(|out| out.room() < ssh::MAX_PACKET)
         {
             return Err(TransportError::State.into());
         }
@@ -1239,11 +1249,15 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                         closed: false,
                     })
                     .map_err(|_| TransportError::State)?;
-                self.up.push_back(MuxEvent::Opened(
-                    child,
-                    opening,
-                    max_packet.min(PACKET) as u64,
-                ));
+                assert!(
+                    self.up
+                        .push_back(MuxEvent::Opened(
+                            child,
+                            opening,
+                            max_packet.min(PACKET) as u64,
+                        ))
+                        .is_ok()
+                );
             }
             wire::Message::WindowAdjust { recipient, bytes } => {
                 let id = self.id(recipient)?;
@@ -1272,20 +1286,31 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     .budget()
                     .charge(ssh::MAX_PAYLOAD * 2)
                     .ok_or(Error::Budget)?;
-                self.up.push_back(MuxEvent::Child(
-                    id,
-                    ChannelEvent::Request {
-                        want_reply,
-                        request: Owned::new(request, charge),
-                    },
-                ));
+                assert!(
+                    self.up
+                        .push_back(MuxEvent::Child(
+                            id,
+                            ChannelEvent::Request {
+                                want_reply,
+                                request: Owned::new(request, charge),
+                            },
+                        ))
+                        .is_ok()
+                );
             }
             wire::Message::ChannelSuccess(recipient) | wire::Message::ChannelFailure(recipient) => {
                 let id = self.id(recipient)?;
-                self.up.push_back(MuxEvent::Child(
-                    id,
-                    ChannelEvent::Reply(matches!(message, wire::Message::ChannelSuccess(_))),
-                ));
+                assert!(
+                    self.up
+                        .push_back(MuxEvent::Child(
+                            id,
+                            ChannelEvent::Reply(matches!(
+                                message,
+                                wire::Message::ChannelSuccess(_)
+                            )),
+                        ))
+                        .is_ok()
+                );
             }
             wire::Message::Eof(recipient) => {
                 let id = self.id(recipient)?;
@@ -1294,10 +1319,14 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     return Err(TransportError::State.into());
                 }
                 channel.eof = true;
-                self.up.push_back(MuxEvent::Child(
-                    id,
-                    ChannelEvent::Stream(StreamEvent::Ended),
-                ));
+                assert!(
+                    self.up
+                        .push_back(MuxEvent::Child(
+                            id,
+                            ChannelEvent::Stream(StreamEvent::Ended),
+                        ))
+                        .is_ok()
+                );
             }
             wire::Message::Close(recipient) => {
                 let id = self.id(recipient)?;
@@ -1305,10 +1334,14 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 if !channel.closed {
                     self.send(env, &wire::Message::Close(channel.peer))?;
                 }
-                self.up.push_back(MuxEvent::Child(
-                    id,
-                    ChannelEvent::Stream(StreamEvent::Reset),
-                ));
+                assert!(
+                    self.up
+                        .push_back(MuxEvent::Child(
+                            id,
+                            ChannelEvent::Stream(StreamEvent::Reset),
+                        ))
+                        .is_ok()
+                );
             }
             _ => return Err(TransportError::State.into()),
         }
@@ -1349,13 +1382,17 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         if !data.repay(env.budget()) {
             return Err(Error::Budget);
         }
-        self.up.push_back(MuxEvent::Child(
-            id,
-            match kind {
-                Some(kind) => ChannelEvent::Extended { kind, data },
-                None => ChannelEvent::Stream(StreamEvent::Data(data)),
-            },
-        ));
+        assert!(
+            self.up
+                .push_back(MuxEvent::Child(
+                    id,
+                    match kind {
+                        Some(kind) => ChannelEvent::Extended { kind, data },
+                        None => ChannelEvent::Stream(StreamEvent::Data(data)),
+                    },
+                ))
+                .is_ok()
+        );
         Ok(())
     }
     fn packet(
@@ -1500,7 +1537,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                 } else {
                     let units = channel.window.min(channel.max_packet) as u64;
                     channel.granted = units;
-                    self.up.push_back(MuxEvent::Credit(id, units));
+                    assert!(self.up.push_back(MuxEvent::Credit(id, units)).is_ok());
                 }
                 return Ok(true);
             }
@@ -1557,12 +1594,13 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
             if self.pending_packets.len() >= 128 || held + payload.len() > OUTPUT_LIMIT {
                 return Err(TransportError::State.into());
             }
-            let charge = env
-                .budget()
-                .charge(payload.capacity())
+            let mut kept = ChargedBytes::with_capacity(env.budget(), payload.capacity())
                 .ok_or(Error::Budget)?;
+            kept.extend_within(&payload)
+                .expect("packet capacity covers its bytes");
             self.pending_packets
-                .push_back((sequence, Owned::new(payload, charge)));
+                .push_back((sequence, kept))
+                .map_err(|_| Error::Budget)?;
         }
         Ok(true)
     }
@@ -1585,10 +1623,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
     fn advance(&mut self, env: &mut Env<'_, Ended>) -> Result<bool, Error> {
         self.control.watch(env);
         let result = self.progress(env);
-        let bytes = self.resident_bytes()
-            + 128 * std::mem::size_of::<Flight>()
-            + 128 * std::mem::size_of::<(u32, Owned<Vec<u8>>)>()
-            + 8 * std::mem::size_of::<MuxEvent<ChannelPort, Top, Owned<channel::Opening>>>();
+        let bytes = self.resident_bytes();
         if let Some(charge) = &mut self.state {
             if bytes < charge.bytes() {
                 charge.shrink_to(bytes);
@@ -1637,10 +1672,14 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                         if let Some((id, bytes)) = flight.child
                             && self.channels.contains(id)
                         {
-                            self.up.push_back(MuxEvent::Child(
-                                id,
-                                ChannelEvent::Stream(StreamEvent::Written(bytes)),
-                            ));
+                            assert!(
+                                self.up
+                                    .push_back(MuxEvent::Child(
+                                        id,
+                                        ChannelEvent::Stream(StreamEvent::Written(bytes)),
+                                    ))
+                                    .is_ok()
+                            );
                         }
                     }
                     if n > 0 && self.up.len() >= 4 {
@@ -1688,7 +1727,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                     } else {
                         self.channels.remove(id);
                         self.refuse(env, peer)?;
-                        self.up.push_back(MuxEvent::Closed(id));
+                        assert!(self.up.push_back(MuxEvent::Closed(id)).is_ok());
                     }
                 }
             }
@@ -1715,7 +1754,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                                 self.next_channel = wire;
                             }
                             self.refuse(env, peer)?;
-                            self.up.push_back(MuxEvent::Closed(id));
+                            assert!(self.up.push_back(MuxEvent::Closed(id)).is_ok());
                         }
                     }
                     ChannelCommand::Stream(StreamCommand::Write(data)) => {
@@ -1735,10 +1774,14 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                     ChannelCommand::Stream(StreamCommand::Reset) | ChannelCommand::Close => {
                         self.channels.get_mut(id).unwrap().closed = true;
                         self.send(env, &wire::Message::Close(peer))?;
-                        self.up.push_back(MuxEvent::Child(
-                            id,
-                            ChannelEvent::Stream(StreamEvent::Reset),
-                        ));
+                        assert!(
+                            self.up
+                                .push_back(MuxEvent::Child(
+                                    id,
+                                    ChannelEvent::Stream(StreamEvent::Reset),
+                                ))
+                                .is_ok()
+                        );
                     }
                     ChannelCommand::Reply(accepted) => self.send(
                         env,
@@ -1804,10 +1847,14 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
     }
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         if let Some(bytes) = self.out.take_if(|out| !out.is_empty()) {
-            self.flights.push_back(Flight {
-                bytes: bytes.len(),
-                child: self.out_child.take(),
-            });
+            assert!(
+                self.flights
+                    .push_back(Flight {
+                        bytes: bytes.len(),
+                        child: self.out_child.take(),
+                    })
+                    .is_ok()
+            );
             return Some(StreamCommand::Write(Bytes::from_bytes(bytes)));
         }
         if self.ended && !self.end_sent {
@@ -2658,6 +2705,22 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[test]
+    fn refused_output_keeps_the_queue_and_budget_unchanged() {
+        let payload = b"terminal output";
+        let places = 1025 * size_of::<Chunk>();
+        for limit in [payload.len() - 1, places, places + payload.len() - 1] {
+            let budget = Budget::new(limit);
+            let mut output = Output::with_budget(budget.clone());
+            let before = budget.used();
+            assert!(output.write(payload).is_err());
+            assert!(output.chunks.is_empty());
+            assert_eq!(output.bytes, 0);
+            assert_eq!(budget.used(), before, "a refused write retains nothing");
+            assert!(budget.used() <= budget.limit());
+        }
     }
 
     #[test]

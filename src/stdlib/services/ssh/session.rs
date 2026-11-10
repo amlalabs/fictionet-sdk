@@ -361,7 +361,7 @@ impl<H: Handler> Layer for SessionLayer<H> {
             self.exit_stage += 1;
             return Some(match self.exit_stage {
                 1 if matches!(self.opening.kind, wire::OpenKind::Session) => {
-                    let charge = self.output.budget.as_ref()?.charge(0)?;
+                    let charge = self.output.budget.charge(0)?;
                     ChannelCommand::Request {
                         want_reply: false,
                         request: Owned::new(wire::SessionRequest::ExitStatus(status), charge),

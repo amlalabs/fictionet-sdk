@@ -229,14 +229,24 @@ fn partial_wire_completions_credit_each_child_write_once() {
     let Some(MuxEvent::Opened(child, _, _)) = layer.take_event() else {
         panic!("opening missing")
     };
-    layer.flights.push_back(Flight {
-        bytes: 2,
-        child: None,
-    });
-    layer.flights.push_back(Flight {
-        bytes: 5,
-        child: Some((child.id(), 3)),
-    });
+    assert!(
+        layer
+            .flights
+            .push_back(Flight {
+                bytes: 2,
+                child: None,
+            })
+            .is_ok()
+    );
+    assert!(
+        layer
+            .flights
+            .push_back(Flight {
+                bytes: 5,
+                child: Some((child.id(), 3)),
+            })
+            .is_ok()
+    );
     for n in [2, 4] {
         assert!(
             layer
