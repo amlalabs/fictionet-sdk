@@ -105,11 +105,16 @@ type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 /// The router's queues and its first few child places are charged to the
 /// budget from its first step. Further places and each child's inbox are
 /// charged as they grow, the places up to the limit and each inbox up to
-/// its bound, and the further places go once no child is left. A child
-/// whose storage the budget cannot hold is refused
-/// ([`ChildReport::Refused`]) and its siblings go on.
+/// its bound, and the further places go once no child is left. An opening
+/// whose place or window the budget cannot hold now is refused for want of
+/// memory ([`ChildReport::Refused`] with [`Closing::ResourceShortage`]),
+/// and its siblings go on. Once open, a child is never closed for memory
+/// (rule 9): each child asks through a [view](Budget::view) of its budget,
+/// and when that refuses, a command waits in the child's outbox, and an
+/// event goes back to the mux, until the budget frees and the child is
+/// visited again.
 ///
-/// The mux never waits for a child. Credit bounds a child's bytes, but not
+/// The mux never waits for a child, except for memory. Credit bounds a child's bytes, but not
 /// how many events it holds: many small pieces, completions and ends cost
 /// nothing. Each child holds at most 64 events and one urgent event. When an
 /// event finds its child's place full, the child is visited at once to
@@ -208,19 +213,20 @@ impl<B: Layer, K: Port> Places<B, K> {
     }
 
     /// Pays for the queues and the first [`FLOOR`] places the first time
-    /// anything arrives, then allocates them.
-    fn reserve(&mut self, budget: &Budget) -> Result<(), Overrun> {
+    /// anything arrives, then allocates them. Returns whether they are
+    /// paid for. A refusal changes nothing: what arrived waits for memory
+    /// (rule 9), and the refusal is the runner's to see, through `budget`.
+    fn reserve(&mut self, budget: &Budget) -> bool {
         if self.charge.is_some() {
-            return Ok(());
+            return true;
         }
-        let bytes = Self::place_bytes()
-            .checked_mul(FLOOR)
-            .and_then(|places| places.checked_add(Self::queue_bytes()))
-            .ok_or(Overrun::Budget)?;
-        self.charge = Some(budget.charge(bytes).ok_or(Overrun::Budget)?);
+        let Some(charge) = budget.charge(Self::place_bytes() * FLOOR + Self::queue_bytes()) else {
+            return false;
+        };
+        self.charge = Some(charge);
         self.up = VecDeque::with_capacity(QUEUE);
         self.grow_to(FLOOR);
-        Ok(())
+        true
     }
 
     /// Makes a place for one more child, at most `limit`. Returns whether
@@ -391,10 +397,10 @@ struct Kid<B: Layer> {
 impl<B: Layer> Kid<B> {
     /// After calls into the child that began with its budget's refusals at
     /// `since`: if a charge was refused meanwhile, the child is visited
-    /// again once its budget has room for it (rule 9). Its budget may not
-    /// be the stack's, which the runner above waits on, so the router
-    /// waits on it for the child, with the waiter made from `around`, what
-    /// the child runs in.
+    /// again once its budget has room for it (rule 9). The child asks
+    /// through a view of its own, which the runner above does not read,
+    /// so the router waits on it for the child, with the waiter made from
+    /// `around`, what the child runs in.
     fn wait_for_memory(&self, since: Refusals, around: Wakes<'_>) {
         if self.budget.refused_since(since) {
             let waiter = self.waiter.waiter(|| around.waker());
@@ -617,20 +623,18 @@ pub enum ChildReport<E, X> {
 }
 
 /// The mux sent a child more than the credit granted for it: a broken mux,
-/// so the whole connection stops.
+/// so the whole connection stops. Memory never stops it: what the budget
+/// cannot hold now waits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Overrun {
     /// The mux exceeded granted carrier credit.
     Credit(ChildId),
-    /// The connection cannot reserve routing storage.
-    Budget,
 }
 
 impl core::fmt::Display for Overrun {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::Credit(_) => "the mux sent a child more than its credit",
-            Self::Budget => "child routing exceeds the memory budget",
         })
     }
 }
@@ -966,10 +970,11 @@ where
                 return None;
             }
             if !command.reserve(&kid.budget) {
-                self.refuse(env, id, Closing::Failed);
-                return None;
-            }
-            if self.places.down.len() < QUEUE - RESERVE {
+                // Its budget cannot pay for the command now: the command
+                // waits in the outbox, and the child for memory
+                // (`wait_for_memory`, after the visit).
+                kid.outbox = Some(command);
+            } else if self.places.down.len() < QUEUE - RESERVE {
                 match command.admit_credit(kid.credit) {
                     Ok((prefix, rest)) => {
                         kid.credit -= prefix.credit();
@@ -1037,7 +1042,9 @@ where
         env: &mut Env<'_, Self::Report>,
         event: MuxEvent<B::Lower, K, O>,
     ) -> Result<Admit<MuxEvent<B::Lower, K, O>>, Overrun> {
-        self.places.reserve(env.budget())?;
+        if !self.places.reserve(env.budget()) {
+            return Ok(Admit::Blocked(event));
+        }
         match event {
             MuxEvent::Opened(child, opening, max_command) => {
                 let id = child.id();
@@ -1053,9 +1060,11 @@ where
                 // cannot hold now is refused for want of memory. Either is
                 // closed at once, its siblings and the connection
                 // untouched.
+                // The child asks through a view of its own, so what its
+                // budget refuses is its own record, not a sibling's.
                 let budget = self.budget_for.as_mut().map_or_else(
-                    || env.budget().clone(),
-                    |select| select(id, &opening, env.budget()),
+                    || env.budget().view(),
+                    |select| select(id, &opening, env.budget()).view(),
                 );
                 let reserved = if self.places.kids.len() >= self.limit {
                     Err(Closing::Prohibited)
@@ -1158,9 +1167,16 @@ where
                     if urgent {
                         kid.urgent = Some(event);
                     } else {
-                        if !event.reserve_receive(&kid.budget, &kid.window) {
-                            self.refuse(env, id, Closing::Failed);
-                            return Ok(Admit::Taken);
+                        // Its place in the inbox and its payload are paid
+                        // for first, both refusals changing nothing. The
+                        // inbox has room for it, so only memory refuses:
+                        // the event goes back to the mux and waits, the
+                        // child with it, until its budget frees (rule 9).
+                        let since = kid.budget.refusals();
+                        if !kid.inbox.reserve(1) || !event.reserve_receive(&kid.budget, &kid.window)
+                        {
+                            kid.wait_for_memory(since, env.wakes());
+                            return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
                         }
                         kid.granted -= cost;
                         // Credit the payload does not hold goes back when
@@ -1173,10 +1189,10 @@ where
                                 }
                                 None => true,
                             };
-                        if kid.inbox.push_back((event, retained)).is_err() {
-                            self.refuse(env, id, Closing::Failed);
-                            return Ok(Admit::Taken);
-                        }
+                        assert!(
+                            kid.inbox.push_back((event, retained)).is_ok(),
+                            "the place was reserved"
+                        );
                     }
                     self.ready.push(&mut self.places.kids, key);
                 }
@@ -1206,8 +1222,7 @@ where
         env: &mut Env<'_, Self::Report>,
         command: CommandOf<K>,
     ) -> Result<Admit<CommandOf<K>>, Overrun> {
-        self.places.reserve(env.budget())?;
-        if self.places.down.len() >= QUEUE {
+        if !self.places.reserve(env.budget()) || self.places.down.len() >= QUEUE {
             return Ok(Admit::Blocked(command));
         }
         self.places.down.push_back(MuxCommand::control(command));
@@ -1279,8 +1294,11 @@ where
 
     fn advance(&mut self, env: &mut Env<'_, Self::Report>) -> Result<bool, Overrun> {
         // The queues are the router's fixed state: an idle connection holds
-        // them from its first step.
-        self.places.reserve(env.budget())?;
+        // them from its first step. Until they are paid for, no child is
+        // open, so nothing can move.
+        if !self.places.reserve(env.budget()) {
+            return Ok(false);
+        }
         self.collect_wakes();
         // The children ready now, in list order, at most QUEUE of them. One
         // that stays ready goes to the end and waits for the next advance.
@@ -1525,8 +1543,12 @@ mod tests {
         ));
     }
 
+    /// An event whose payload the child's budget cannot pay for now goes
+    /// back to the mux unchanged, and the child stays open: nothing is
+    /// closed or reported. The release that makes room wakes the task, and
+    /// the event, offered again, is taken once.
     #[test]
-    fn an_uncharged_payload_that_does_not_fit_refuses_only_its_child() {
+    fn an_uncharged_payload_that_does_not_fit_waits_with_its_child_open() {
         let budget = Budget::new(4096);
         let child_budget = budget.clone();
         let children = Children::<Observe, Top, ()>::new(2, 8, |_, (), _| Some(Observe::default()))
@@ -1537,6 +1559,8 @@ mod tests {
             Budget::new(100_000),
             Instant::ZERO,
         );
+        let task = Arc::new(Task::default());
+        driver.set_waker(&Waker::from(task.clone()));
         let mut slots = Slots::new(2);
         let mut ids = Vec::new();
         for _ in 0..2 {
@@ -1550,13 +1574,43 @@ mod tests {
             let _ = driver.deliver(MuxEvent::Child(*id, payload())).unwrap();
             driver.run().unwrap();
         }
+        while driver.take_command().is_some() {}
+        let taken = driver.layer().child(ids[0]).unwrap().0;
         let rest = budget.charge(budget.limit() - budget.used()).unwrap();
-        assert!(matches!(
-            driver.deliver(MuxEvent::Child(ids[0], payload())),
-            Ok(Admit::Taken)
-        ));
-        assert!(driver.layer().child(ids[0]).is_none());
+        let Ok(Admit::Blocked(back)) = driver.deliver(MuxEvent::Child(ids[0], payload())) else {
+            panic!("a payload its budget refuses goes back to the mux")
+        };
+        assert!(
+            matches!(&back, MuxEvent::Child(id, ObservedEvent::Data { bytes, .. })
+                if *id == ids[0] && bytes.len() == 1),
+            "unchanged"
+        );
+        driver.run().unwrap();
+        assert!(
+            driver.layer().child(ids[0]).is_some(),
+            "the child stays open"
+        );
+        assert!(
+            std::iter::from_fn(|| driver.take_command())
+                .all(|command| !matches!(command.into_op(), super::super::MuxOp::Close(..))),
+            "nothing is closed"
+        );
+        assert!(
+            driver
+                .observations()
+                .drain()
+                .all(|report| !matches!(report, ChildReport::Refused(..))),
+            "nothing is refused"
+        );
+        assert_eq!(task.0.load(Ordering::Acquire), 0, "no memory freed yet");
         drop(rest);
+        assert!(
+            task.0.load(Ordering::Acquire) > 0,
+            "the release wakes the task"
+        );
+        assert!(matches!(driver.deliver(back), Ok(Admit::Taken)));
+        driver.run().unwrap();
+        assert_eq!(driver.layer().child(ids[0]).unwrap().0, taken + 1);
         let _ = driver.deliver(MuxEvent::Child(ids[1], payload())).unwrap();
         driver.run().unwrap();
         assert_eq!(driver.layer().child(ids[1]).unwrap().0, 2);
@@ -2047,6 +2101,73 @@ mod tests {
             child.wakers.iter().all(|w| w.will_wake(first)),
             "every call gets the child's one waker"
         );
+    }
+
+    /// A command whose payload the child's budget cannot pay for now stays
+    /// in the child's outbox, and the child stays open: nothing is closed
+    /// or reported. The release that makes room wakes the task with no
+    /// other event, and the command goes down once, unchanged.
+    #[test]
+    fn a_command_its_budget_refuses_waits_in_the_outbox_and_goes_once_memory_frees() {
+        let sandbox = Budget::new(4096);
+        let child_budget = sandbox.clone();
+        let payload = b"waits for memory";
+        let mut driver = Driver::new(
+            Children::<Reader, Top, ()>::new(1, 8, move |_, (), _| {
+                Some(Reader {
+                    writes: [StreamCommand::Write(Chunk::unpaid(payload.to_vec()))].into(),
+                    ..Reader::default()
+                })
+            })
+            .budgets(move |_, _, _| child_budget.clone()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let task = Arc::new(Task::default());
+        driver.set_waker(&Waker::from(task.clone()));
+        let woken = || task.0.load(Ordering::Acquire);
+        let child = Slots::new(1).insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 64)).unwrap();
+        assert!(driver.deliver(MuxEvent::Credit(id, 64)).unwrap().moved());
+        let hog = sandbox.charge(sandbox.limit() - sandbox.used()).unwrap();
+        /// Runs the stack and takes what it sends down: the bytes written.
+        fn down(driver: &mut Driver<Children<Reader, Top, ()>>, written: &mut Vec<u8>) {
+            for _ in 0..4 {
+                driver.run().unwrap();
+                while let Some(command) = driver.take_command() {
+                    match command.into_op() {
+                        super::super::MuxOp::Child(_, StreamCommand::Write(chunk)) => {
+                            written.extend_from_slice(&chunk)
+                        }
+                        super::super::MuxOp::Close(..) => panic!("the child was closed"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let mut written = Vec::new();
+        down(&mut driver, &mut written);
+        let layer = driver.layer();
+        let key = layer.key(id).expect("the child stays open");
+        assert!(layer.places.kids[key].outbox.is_some(), "the command waits");
+        assert!(written.is_empty(), "nothing unpaid goes down");
+        assert!(
+            driver
+                .observations()
+                .drain()
+                .all(|report| !matches!(report, ChildReport::Refused(..))),
+            "nothing is refused"
+        );
+        assert_eq!(woken(), 0, "no memory freed yet");
+        drop(hog);
+        assert!(woken() > 0, "the release wakes the task");
+        assert!(driver.woken());
+        down(&mut driver, &mut written);
+        assert_eq!(written, payload, "the command goes down once, unchanged");
+        let layer = driver.layer();
+        assert!(layer.places.kids[layer.key(id).unwrap()].outbox.is_none());
     }
 
     #[test]
@@ -2788,21 +2909,30 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
             Some(Reader::default())
         });
-        let budget = Budget::new(0);
+        let budget = Budget::new(100_000);
         let mut driver = Driver::new(
             children,
             Arc::new(SeededEntropy::new(Seed::from_u64(92))),
             budget.clone(),
             Instant::ZERO,
         );
+        let hog = budget.charge(budget.limit()).unwrap();
         let mut slots = Slots::new(1);
         let child = slots.insert(()).unwrap();
-        assert!(matches!(
-            driver.deliver(MuxEvent::Opened(child, (), 8)),
-            Err(Overrun::Budget)
-        ));
+        let id = child.id();
+        // With no room for the router's queues, the opening waits for
+        // memory: it goes back to the mux, and the connection goes on.
+        let Ok(Admit::Blocked(opening)) = driver.deliver(MuxEvent::Opened(child, (), 8)) else {
+            panic!("an opening the router cannot pay for goes back to the mux")
+        };
+        assert!(matches!(&opening, MuxEvent::Opened(child, ..) if child.id() == id));
         assert!(!called.load(Ordering::Relaxed));
+        assert!(driver.take_command().is_none(), "nothing is closed");
+        drop(hog);
         assert_eq!(budget.used(), 0);
+        assert!(matches!(driver.deliver(opening), Ok(Admit::Taken)));
+        assert!(called.load(Ordering::Relaxed));
+        assert!(driver.layer().child(id).is_some());
     }
 
     #[test]
