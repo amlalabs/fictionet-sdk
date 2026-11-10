@@ -422,8 +422,8 @@ use std::sync::{Arc, Mutex};
 const REQUESTS: usize = 2000;
 // Round the measured server totals per request up, including checkpoint
 // overhead. A whole additional allocation per request exceeds these bounds.
-const HTTP1_CEILING: usize = 39;
-const HTTP2_CEILING: usize = 64;
+const HTTP1_CEILING: usize = 28;
+const HTTP2_CEILING: usize = 63;
 
 fn split(h2: bool) {
     let server_thread = std::thread::current().id();
