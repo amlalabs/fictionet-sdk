@@ -489,10 +489,11 @@ explanation worth keeping it for.
 packet it has read and writes the next packet it sends into it, so in a
 steady exchange the buffers the peer's packets arrived in carry the
 answers, and the engine allocates no packet buffers. It keeps at most
-the egress allowance of buffers, none above 16 KiB, so the kept memory
-is bounded by a constant per engine. A whole IPv4 packet goes up from
-the IP layer in the chunk it came in, since reassembly would have handed
-it back unchanged. The engine's own socket ids, which it hands out in
+the egress allowance of buffers, none above the MTU (the cap since
+9bb16daad; this text said 16 KiB until the buffers round corrected it),
+so the kept memory is bounded by a constant per engine. A whole IPv4
+packet goes up from the IP layer in the chunk it came in, since
+reassembly would have handed it back unchanged. The engine's own socket ids, which it hands out in
 order, are hashed by one multiplication instead of SipHash; the maps
 keyed by the peer's addresses keep the keyed hash on purpose. HTTP bench
 43.36 G to 42.58 G instructions, TCP bulk 5.89 G to 5.71 G, round trips
@@ -574,9 +575,8 @@ included the round trips, so it is not comparable.
 ### What is left
 
 - The per-request allocations that remain: HTTP/2 header fields
-  (`Block::keep`, 4.5 per request) and response head encoding (a
-  `Vec<hpack::Field>` and a copy of the block per response);
-  `request_host`, which lowercases the authority into a new `String`;
+  (`Block::keep`, 4.5 per request); `request_host`, which lowercases
+  the authority into a new `String`;
   `http::Extensions` inserts in dispatch (two per request); `HeaderMap`
   growth in `to_request`; the two allocations of a job context per job;
   the two `Arc` wrappers per packet described above.
@@ -1053,3 +1053,86 @@ models, and demo callers. No full suite or Search demo tests were run.
 Kani, TLA+ and Lean were not run. The buffer design names no HTTP-specific
 Kani harness for this stage; its named buffer and TCP harnesses belong to
 their respective stages. The security review remains after integration.
+
+## The buffers round merge of November 10, 2026 (`comp/buf-integ`)
+
+Every stage of the buffers design was merged into `comp/buf-integ`, then
+`main` was merged in, and `main` was fast-forwarded to it. The stages:
+`comp/buf-measure` (S0), `comp/buf-locks` (S5a to S5d: the cable on
+`std::sync::mpsc`, `Ports` on an atomic bitmap, no `CURRENT`, no
+`TIMERS`, the run queue in slots), `comp/buf-slabs` (S5e),
+`comp/buf-core` (S1: `fictionet-buf`, the core `Packet`, pools),
+`comp/buf-tcp` (S2), `comp/buf-tls` (S3), `comp/buf-h1` (S4a),
+`comp/buf-h2` (S4b) and `comp/buf-jobs` (S4c). The HTTP/1 and HTTP/2
+stages share one field block, `protocols::fields::Fields`: a `web::Head`
+is that block with its pseudo-fields first, so an HTTP/2 head reaches the
+handler as the block HPACK decoded it into.
+
+The `Spare` text in the performance pass above said 16 KiB; the cap was
+the MTU from 9bb16daad, and the engine's `Spare` is now a 2048-byte
+`Pool`. Its "What is left" list named a response-head `Vec<hpack::Field>`
+that `comp/budget-integ` had already removed.
+
+### Method
+
+The base is `ab6fef46a`: the SDK code of `3db7a847e` with S0's split
+fixture, so both builds count the server thread alone and run the client
+on its own thread. The new build is `main` at the merge. Bench binaries,
+`perf stat -e instructions:u` per process, three interleaved runs with
+the order rotated, and the median, as in the budget leftovers merge
+above (`lo-bench-build.sh` and `lo-bench-measure.sh`). Divan counts the
+thread it runs on, so its allocation counts are the server's. The client
+side comes from `tests/it/allocations.rs`, which measures each thread
+with the test allocator over 2000 requests after 200 of warmup; the base
+figures there are S0's three runs on the same code.
+
+### Allocations per request
+
+| Protocol | Server, base | Server, after | Client, base | Client, after | Ceiling |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HTTP/1 | 38.0 | 24.2 | 20.7 | 14.1 | 25 (was 39) |
+| HTTP/2 | 63.0 | 32.4 | 29.7 | 23.2 | 33 (was 64) |
+
+Measured totals after the merge: HTTP/1 48,327 server and 28,209 client
+allocations, HTTP/2 64,714 to 64,717 server and 46,334 client, over three
+runs. The ceilings are the next whole allocation per request.
+
+`tests/it/budget_oracle.rs` passes for every stack. Worst bytes past the
+budget plus fixed state: HTTP/1 640 (slack 8 KiB), HTTP/2 none, SSH none,
+TCP none, TLS 0 (slack 1 KiB). Left after drop: none for TLS, SSH and TCP;
+HTTP/1 and HTTP/2 end 32 bytes under where they started.
+
+### The benches
+
+| Workload | Base (ab6fef46a) | After (main) |
+| --- | ---: | ---: |
+| HTTP bench process, instructions | 122.00 G | 138.85 G |
+| HTTP/1, 100,000 requests | 639 ms | 757.5 ms |
+| HTTP/2, 100,000 requests | 1.044 s | 1.446 s |
+| HTTP/1 server allocations (alloc, grow, shrink) | 3,700,112 + 118,894 + 18,853 | 2,418,903 + 10,200 + 10,176 |
+| HTTP/2 server allocations (alloc, grow, shrink) | 6,200,341 + 119,961 + 19,835 | 3,286,693 + 7,089 + 7,064 |
+| TCP bulk process, instructions | 14.29 G | 12.54 G |
+| TCP, one connection, 32 MiB | 32.27 ms | 34.44 ms |
+| TCP, ten connections, 4 MiB each | 47.66 ms | 47.71 ms |
+| TCP, one hundred connections, 1 MiB each | 208.0 ms | 172.3 ms |
+| TCP allocations, one connection | 88,856 | 25,781 |
+| TCP allocations, ten connections | 128,727 | 38,045 |
+| TCP allocations, one hundred connections | 479,872 | 165,929 |
+| Packets sent, one connection | 34,891 | 35,092 |
+| Packets sent, one hundred connections | 109,400 | 110,000 |
+
+Instruction counts repeated within 0.4 percent; times are Divan medians
+on a shared workstation. Server allocations fell by a third for HTTP/1
+and by half for HTTP/2, and TCP's by two thirds. TCP bulk takes 12 percent
+fewer instructions. The HTTP bench takes 14 percent more, and HTTP/2
+38 percent more time. A profile of both builds (`perf record -g`, both
+threads) puts the new cost in the buffer mechanics on every piece:
+`Chunk::drop` 5.0 percent of samples, dropping a `Charge` 2.3, `Pool::take`
+2.1, `PoolShared::recycle` 1.6, `Chunk::slice` and `Chunk::unique` 2.3,
+and the cable's `mpsc` send and receive 4.6. The TCP store sends slightly
+more packets than the ring did: 201 more on one connection, 600 on a
+hundred.
+
+Divan's peak live allocations are not comparable across the split: a
+cable's list block is allocated on the thread that sends and freed on the
+thread that receives, so the server thread's live count drifts.
