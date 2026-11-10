@@ -693,3 +693,93 @@ fn channel_output_waits_for_its_copies() {
     assert!(layer.out_pending());
     drop(elsewhere);
 }
+
+/// Challenges each keyboard-interactive login once, and accepts its
+/// answers.
+struct Challenging;
+impl Handler for Challenging {
+    type Session = tests::NoSession;
+    fn authenticate(&self, _: &Context<'_>, attempt: &AuthAttempt<'_>) -> AuthDecision {
+        if attempt.responses.is_some() {
+            return AuthDecision::Accept;
+        }
+        AuthDecision::Challenge {
+            name: String::new(),
+            instruction: String::new(),
+            prompts: vec![auth::Prompt {
+                text: "Password: ".into(),
+                echo: false,
+            }],
+        }
+    }
+    fn open(&self, _: &Context<'_>, _: &SessionRequest, _: &mut Output) -> Option<Self::Session> {
+        None
+    }
+}
+
+/// A challenged request is kept with the charge its parse made, for what
+/// it holds; the answers give it back, and once authenticated only the
+/// account name stays charged. An answer that comes without room waits,
+/// with the challenge still kept.
+#[test]
+fn a_challenge_keeps_its_request_charged_until_answered() {
+    let mut layer = Ssh::with_transport(
+        Arc::new(Config::new(
+            Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        )),
+        Arc::new(Challenging),
+        Arc::new(ConnInfo::default()),
+        Packets(transport::Negotiated {
+            kex: String::new(),
+            host: String::new(),
+            incoming: String::new(),
+            outgoing: String::new(),
+        }),
+    );
+    let budget = Budget::new(4 << 20);
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    assert!(layer.reserve(&budget) && layer.room(&budget));
+    layer.started = true;
+    let before = budget.used();
+    let user = "u".repeat(500);
+    let take = |layer: &mut Ssh<Challenging, Packets>, payload: &[u8], env: &mut Env<'_, Ended>| {
+        layer.packet(0, payload, env).unwrap()
+    };
+    assert!(matches!(
+        take(&mut layer, &service_request(), &mut env),
+        Handled::Done
+    ));
+    let start = userauth(
+        &user,
+        auth::Method::KeyboardInteractive {
+            language: String::new(),
+            submethods: String::new(),
+        },
+    );
+    assert!(matches!(take(&mut layer, &start, &mut env), Handled::Done));
+    let (request, count) = layer.challenge.as_ref().expect("challenged");
+    assert_eq!(*count, 1);
+    assert_eq!(request.charged(), Heap::heap(&**request));
+    let names = Heap::heap(&**layer.auth_user.as_ref().unwrap());
+    assert_eq!(budget.used(), before + request.charged() + names);
+    let answers = auth::Message::InfoResponse(vec![b"secret".to_vec()])
+        .to_bytes()
+        .unwrap();
+    let elsewhere = budget.charge(budget.limit() - budget.used()).unwrap();
+    assert!(matches!(
+        take(&mut layer, &answers, &mut env),
+        Handled::Waiting
+    ));
+    assert!(layer.challenge.is_some() && layer.user.is_none());
+    drop(elsewhere);
+    assert!(matches!(
+        take(&mut layer, &answers, &mut env),
+        Handled::Done
+    ));
+    assert!(layer.challenge.is_none());
+    let signed_in = layer.user.as_ref().expect("authenticated");
+    assert_eq!(budget.used(), before + Heap::heap(&**signed_in));
+}
