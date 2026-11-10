@@ -579,19 +579,27 @@ impl RequestStream {
                 return 0;
             }
             self.input = chunk.split_to(n);
+        } else if self.input.extend_within(&chunk[..n]).is_ok() {
+            // The block held has room: the bytes join it where it is.
+            chunk.advance(n);
         } else {
+            // A new block holds twice what is held, up to the limit, so a
+            // unit that arrives in many deliveries is copied a few times,
+            // not once a delivery; when the budget has no room for that,
+            // one of just what is needed.
             let need = self.input.len() + n;
-            let Some(mut joined) = (if need <= small.slot() {
-                small.take(budget, 0)
-            } else if need <= large.slot() {
-                large.take(budget, 0)
-            } else {
-                budget.charge(need).map(|charge| {
-                    fictionet::Chunk::paid(vec![0; need], charge)
-                        .expect("reserved input")
-                        .slice(0..0)
-                })
-            }) else {
+            let want = need.max(2 * self.input.len()).min(self.limit());
+            let block = |size: usize| {
+                if size <= small.slot() {
+                    small.take(budget, 0)
+                } else if size <= large.slot() {
+                    large.take(budget, 0)
+                } else {
+                    fictionet::Chunk::block(budget, 0, size)
+                }
+            };
+            let Some(mut joined) = block(want).or_else(|| (want > need).then(|| block(need))?)
+            else {
                 return 0;
             };
             joined.extend_within(&self.input).expect("reserved input");
@@ -4908,6 +4916,43 @@ mod tests {
             count = count.saturating_add(1);
         }
         assert_eq!(count, 5);
+    }
+
+    /// A head that arrives a byte a delivery is joined in a few blocks:
+    /// the bytes held move only when the block holding them is full, not
+    /// on every delivery, and the head reads whole at the end.
+    #[test]
+    fn a_head_arriving_a_byte_at_a_time_moves_a_few_times() {
+        let budget = fictionet::Budget::unlimited();
+        let small = fictionet::Pool::new(&budget, 2048, 4);
+        let large = fictionet::Pool::new(&budget, 16384 + 64, 2);
+        let mut events = RequestEvents::new();
+        events.storage(budget.clone(), small, large);
+        let mut stream = RequestStream::new(events);
+        let mut head = b"GET / HTTP/1.1\r\nHost: example.test\r\n".to_vec();
+        for field in 0..80 {
+            head.extend_from_slice(format!("x-pad-{field}: ").as_bytes());
+            head.extend_from_slice(&[b'a'; 700]);
+            head.extend_from_slice(b"\r\n");
+        }
+        head.extend_from_slice(b"\r\n");
+        let mut moves = 0;
+        let mut at = None;
+        for byte in &head {
+            let mut chunk = fictionet::Chunk::unpaid(vec![*byte]);
+            assert_eq!(stream.push(&mut chunk), 1);
+            let now = stream.unread().as_ptr();
+            if at != Some(now) {
+                moves += 1;
+                at = Some(now);
+            }
+        }
+        assert!(
+            moves <= 16,
+            "the head moved {moves} times in {} deliveries",
+            head.len()
+        );
+        assert!(matches!(stream.next(), Some(Ok(Event::Head(_)))));
     }
 
     #[test]
