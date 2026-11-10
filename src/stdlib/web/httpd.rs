@@ -247,14 +247,7 @@ impl Delivery {
 
     fn response(&mut self, parts: &http::response::Parts) {
         if let Some(observation) = &mut self.observation {
-            let headers = &parts.headers;
-            self.held += std::mem::size_of::<http::response::Parts>()
-                + (headers.capacity() + headers.len() - headers.keys_len())
-                    * std::mem::size_of::<(http::HeaderName, http::HeaderValue)>()
-                + headers
-                    .iter()
-                    .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
-                    .sum::<usize>();
+            self.held += response::response_held(parts);
             observation.response = Some(parts.clone());
         }
     }
