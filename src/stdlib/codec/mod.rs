@@ -247,11 +247,14 @@ pub mod crc32c;
 mod declarations;
 mod demux;
 pub mod dot_body;
-pub use fictionet::{codec_from, error_display, fixed_fields, open_enum, prefixed, text_wire};
+pub use fictionet::{
+    codec_from, error_display, fixed_fields, heap_of, open_enum, prefixed, text_wire,
+};
 pub mod field;
 mod frames;
 mod generated;
 pub mod head_body;
+mod heap;
 pub mod json_syntax;
 mod layout;
 mod lcg;
@@ -272,6 +275,9 @@ pub use combinators::{
 pub use crc32::crc32;
 pub use demux::Demux;
 pub use frames::{Frames, Prefixed, signed_frame_prefix};
+#[cfg(test)]
+pub(crate) use heap::assert_heap_bound;
+pub use heap::{Heap, HeapBound, most_list_places, most_places, parse_paid};
 pub use lcg::Lcg;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
 pub use reader::{Reader, Trailing, Truncated, be16, be24, be32, be64, le16, le24, le32, le64};

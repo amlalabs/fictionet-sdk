@@ -27,6 +27,7 @@ mod frames_codec;
 mod grpc_codec;
 mod h3_codec;
 mod handoff_codec;
+mod heap_measure;
 mod hpack_codec;
 mod http1;
 mod http2_grpc;
