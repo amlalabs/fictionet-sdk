@@ -352,3 +352,326 @@ closing and closed phases and checks ownership is returned intact.
 
 The unchanged `Lifecycle` baseline was rerun on November 9, 2026 and passed all
 configured invariants and liveness properties with 4,011,621 distinct states.
+
+## StreamRules.tla: RFC 9113's stream rules, and both state machines against them
+
+`Lifecycle.tla` checks the layer's streams against the code's own idea of
+section 5.1. This section adds the RFC side: `StreamRules.tla` is written
+from the text of RFC 9113 alone, and two models of the code instance it
+and check that each frame the client sends gets a reaction the RFC
+allows. `H2Streams.tla` follows the server layer `Http2`;
+`SessionStreams.tla` follows the sans-I/O `Session` in
+`src/stdlib/protocols/http2.rs`, which reads one direction for the
+dissector's style of use and for clients. The model headers name the
+source lines, at the commit that adds these models on
+`comp/fv-h2-streams`.
+
+`StreamRules.tla` keeps each stream's state (idle, open, half closed
+local or remote, closed) and how a closed stream closed: the server
+reset it, the client reset it, both ends sent END_STREAM, or the client
+skipped its identifier when it opened a higher one (section 5.1.1). It
+keeps the header block in progress, the last stream of the last GOAWAY,
+and the streams processed. A frame is a record of type, stream,
+END_STREAM, END_HEADERS and what is wrong with it, if anything: a
+priority that names its own stream, a PRIORITY of the wrong length, a
+header list over SETTINGS_MAX_HEADER_LIST_SIZE, or a fragment HPACK
+cannot decode. The reaction is one of: processed, waiting for
+CONTINUATION, discarded, a stream error with its code, a connection
+error with its code, a 431 with or without a reset after it, or a drain
+(GOAWAY with NO_ERROR). `Allowed(f)` is the set of reactions the RFC
+allows in the current state; `Effect` is what the frame and reaction do
+to the streams. Codes follow section 5.4: PROTOCOL_ERROR may stand for
+any more specific code, and a stream error may be a connection error,
+except that a stream error on an idle stream can only be a connection
+error (RST_STREAM must not name an idle stream, section 6.4).
+
+The spec is stricter than the RFC in two places, both because the code
+never needs the room: section 5.1 lets an endpoint stop ignoring frames
+on a stream it reset once "other signals" show the client saw the
+reset, and the code uses no such signal, so here a stream the server
+reset ignores its frames for good; and ENHANCE_YOUR_CALM (section 10.5)
+is allowed only on CONTINUATION and on an oversized header list, where
+the code uses it. Where a frame is malformed as well as out of place in
+a header block, section 5.4 lets the server report either error, and the
+spec allows any connection error for it. Reserved states are not
+modeled: a client cannot push,
+so a server never reaches them, and `PushRefused` checks the one rule
+that remains.
+
+Each implementation model keeps the RFC's view through a refinement
+mapping. For `H2Streams`, a stream is open or half closed (remote) while
+it is in `Http2::streams`, idle above `last_stream`, and closed at or
+below it; how a closed stream closed is a history variable the model's
+actions set; even streams are always idle. `SessionStreams` keeps
+`StreamRules`' own variables beside `Session` as a history, moved by
+`Effect` with the reaction `Session` gave, because `Session` does not
+see the server's half of a stream. Each rule is a separate TLC property,
+so each control names the one rule it breaks; `H2Streams` also checks
+`Refines`, the whole of `StreamRules`' `Next`, which includes the state
+transitions.
+
+| Property | RFC 9113 | Rule |
+| --- | --- | --- |
+| `IdleFrames` | 5.1 idle, 6.4 | DATA, RST_STREAM or WINDOW_UPDATE on an idle stream is a connection error PROTOCOL_ERROR |
+| `EvenHeaders` | 5.1, 5.1.1 | a client HEADERS on an even stream is a connection error |
+| `LowerIdHeaders` | 5.1.1 | HEADERS on a stream the client skipped (below one it opened) is a connection error |
+| `HalfClosedRemote` | 5.1 half closed (remote) | DATA or HEADERS after the client's END_STREAM is a stream error STREAM_CLOSED |
+| `ServerResetDiscarded` | 5.1 closed, 6.4 | every frame on a stream the server reset is processed as connection state needs, then discarded; only a frame that is an error of its own (out of place in a block, malformed, a push, a block HPACK cannot decode or over the header list limit) may end the connection |
+| `ClosedAfterEnd` | 5.1 closed | WINDOW_UPDATE and RST_STREAM after the server's END_STREAM or reset are no error |
+| `ClosedData` | 6.1 | DATA on a closed stream is a stream error STREAM_CLOSED, a connection error, or discarded |
+| `Concurrency` | 5.1.2 | a stream past SETTINGS_MAX_CONCURRENT_STREAMS is refused |
+| `NoRstForRst_` | 5.4.2 | RST_STREAM is never answered with RST_STREAM |
+| `GoawayRefuses` | 6.8 | a stream above the last stream of a GOAWAY sent is not processed |
+| `GoawayNeverGrows` | 6.8 | the last stream of a GOAWAY never grows |
+| `GoawayCovers` | 6.8 | each GOAWAY's last stream covers every stream processed |
+| `Interleave` | 4.3, 6.10 | inside a header block, any frame but CONTINUATION on the same stream is a connection error PROTOCOL_ERROR |
+| `ContWithoutBlock` | 6.10 | CONTINUATION without a block waiting is a connection error PROTOCOL_ERROR |
+| `Compression` | 4.3 | a block HPACK cannot decode is a connection error COMPRESSION_ERROR |
+| `BlocksDecoded` | 4.3, 10.5.1 | every block is decoded, discarded ones included, unless the connection ends |
+| `HeaderListSize` | 10.5.1, 5.1 | a header list over the limit is refused (431 or a reset); after a 431 that ends a request that ended, nothing more goes on the closed stream |
+| `PriorityAnyState` | 5.3.2, 6.3 | a well-formed PRIORITY is allowed in every state, idle and closed included, and changes nothing |
+| `PriorityMalformed` | 6.3 | PRIORITY of the wrong length is a stream error FRAME_SIZE_ERROR; one that depends on its own stream, PROTOCOL_ERROR (a connection error on an idle stream) |
+| `SelfDependentHeaders` | 5.3.1 of RFC 7540 | HEADERS whose priority names its own stream is a stream error PROTOCOL_ERROR |
+| `PushRefused_` | 8.4 | a PUSH_PROMISE from the client is a connection error PROTOCOL_ERROR |
+| `TrailersEnd_` | 8.1 | trailers without END_STREAM are a stream error |
+| `Refines` | all of the above | every step is a step of `StreamRules`, its state transitions included |
+
+The bounds: client streams 1 and 3 and the even stream 2, one stream at
+a time, four client frames of every kind (85 frames to choose from at
+each step), one CONTINUATION in a row before the count refuses, two
+places in the reset list (as many as the streams, so the bound of 50 is
+never reached; `H2Streams_kept_resetbound` shows it reached). Four
+frames reach every rule: the longest antecedent, a closed stream that a
+later HEADERS reuses, takes three. The other base configurations widen
+one dimension each.
+
+| Config | Setting | Result |
+| --- | --- | --- |
+| `H2Streams_base` | as above, with graceful shutdown, a child that may be refused on stream 1 and a child reset on stream 3 | passes: 1,443,423 states generated, 339,994 distinct, depth 9, 14 s |
+| `H2Streams_h2c_base` | after `Upgrade: h2c`: stream 1 begins half closed (remote), `last_stream` 1 | passes: 1,130,528 generated, 258,069 distinct, depth 9, 13 s |
+| `H2Streams_two_base` | streams 1, 3 and 5, two at once, three places in the reset list | passes: 2,397,895 generated, 470,241 distinct, depth 10, 33 s |
+| `H2Streams_cont_base` | two CONTINUATION frames in a row, five client frames | passes: 1,029,907 generated, 217,727 distinct, depth 8, 10 s |
+| `H2Streams_kept_resetbound` | one place in the reset list | fails by design: violates `ServerResetDiscarded` (4 states): a second reset forgets the first, whose late DATA is then reset |
+| `H2Streams_without_keepresets` | the reset list forgets an entry on a timer (the code before this model) | violates `ServerResetDiscarded` (4 states): a self-dependent HEADERS on stream 1 is reset, the timer fires, the CONTINUATION that ends its block ends the connection |
+| `H2Streams_without_listonlynew` | a reset of a stream already closed is remembered (the code before this model) | violates `LowerIdHeaders` (4 states): stream 3 skips 1, DATA on 1 is reset and remembered, HEADERS on 1 is ignored |
+| `H2Streams_without_end431` | RST_STREAM after every 431 (the code before this model) | violates `HeaderListSize` (2 states) |
+| `H2Streams_without_ignorelist` | frames on a reset stream are judged as on any other | violates `ServerResetDiscarded` (3 states): the same CONTINUATION ends the connection with no timer |
+| `H2Streams_without_evencheck` | `headers_on` takes an even stream | violates `EvenHeaders` (2 states) |
+| `H2Streams_without_belowlast` | `headers_on` takes a stream at or below `last_stream` | violates `LowerIdHeaders` (3 states) |
+| `H2Streams_without_recordlast` | `on_headers` does not record a new stream as `last_stream` | violates `GoawayCovers` (3 states): stream 1 taken, the GOAWAY of a later error names 0 |
+| `H2Streams_without_closedcheck` | a half-closed (remote) stream takes DATA and HEADERS | violates `HalfClosedRemote` (3 states) |
+| `H2Streams_without_idlecheck` | DATA, WINDOW_UPDATE and RST_STREAM on an idle stream are taken as on a closed one | violates `IdleFrames` (2 states) |
+| `H2Streams_without_wuclosedignore` | WINDOW_UPDATE on a closed stream not in the reset list ends the connection | violates `ClosedAfterEnd` (3 states): after a 431 closed stream 1 |
+| `H2Streams_without_closeddatarefused` | DATA on a closed stream is taken | violates `ClosedData` (3 states) |
+| `H2Streams_without_limit` | a stream past `Limits::streams` is admitted | violates `Concurrency` (3 states) |
+| `H2Streams_without_refusedraining` | a new stream is admitted while draining | violates `GoawayRefuses` (3 states) |
+| `H2Streams_without_mingoaway` | `goaway` sends `last_stream` as it is now | violates `GoawayNeverGrows` (4 states) |
+| `H2Streams_without_interleavecheck` | `read_fragment` takes any frame inside a block | violates `Interleave` (3 states) |
+| `H2Streams_without_contcheck` | a CONTINUATION without a block starts one | violates `ContWithoutBlock` (2 states) |
+| `H2Streams_without_compressioncheck` | a block HPACK cannot decode is taken | violates `Compression` (2 states) |
+| `H2Streams_without_decodefirst` | a block on a stream in the reset list is not decoded | violates `BlocksDecoded` (3 states) |
+| `H2Streams_without_priorityscope` | a PRIORITY the decoder refused is ignored | violates `PriorityMalformed` (2 states) |
+| `H2Streams_without_priorityidleok` | PRIORITY on an idle stream ends the connection | violates `PriorityAnyState` (2 states) |
+| `H2Streams_without_selfdep` | a self-dependent HEADERS is taken | violates `SelfDependentHeaders` (2 states) |
+| `H2Streams_without_pushrefused` | PUSH_PROMISE from the client is ignored | violates `PushRefused_` (2 states) |
+| `H2Streams_without_trailersend` | trailers without END_STREAM are taken | violates `TrailersEnd_` (3 states) |
+| `H2Streams_without_norstforrst` | the RST_STREAM arm answers with RST_STREAM | violates `NoRstForRst_` (3 states) |
+
+Every control lists every rule property (all but `Refines`, which would
+take any of them), and TLC reports the one in its first comment line.
+Each counterexample was read: it fails at the step the control changes,
+for the reason the comment gives. That the controls fail one step after
+the state they need also shows each base property's antecedent is
+reached in the base configuration.
+
+`SessionStreams.tla` checks the rules `Session` owns. Its module
+documentation gives the rest to the caller ("Idle-stream checks and
+stream ownership belong to the caller", "The caller coordinates request
+IDs"), so `IdleFrames`, `EvenHeaders`, `LowerIdHeaders`, `Concurrency`
+(its stream limit is a memory bound that stops the direction) and the
+GOAWAY rules are not checked here, nor `Refines` as a whole. `ClosedData`
+and `NoRstForRst_` are not listed: every DATA refusal of `Session` is a
+connection error, which `ClosedData` always allows, and `Session` sends
+nothing. Every error of `Session` stops the direction, a connection
+error in the RFC's terms. The caller's steps are the server's reset
+(`peer_reset`), the server's END_STREAM, which only the other direction
+reads, and `retire`. One stream state and one peer-reset id are kept, so
+both watermarks (`retired_before`, `reset_before`) move.
+
+| Config | Result |
+| --- | --- |
+| `SessionStreams_base` (streams 1 and 3, PRIORITY also on 2, four client frames) | passes: 97,391 states generated, 44,484 distinct, depth 9, 1 s |
+| `SessionStreams_without_pushfirst` (the code before this model) | violates `PushRefused_` (2 states): a PUSH_PROMISE without END_HEADERS draws no error |
+| `SessionStreams_without_resetdrops` | violates `ServerResetDiscarded` (4 states): DATA after `peer_reset` stops the direction |
+| `SessionStreams_without_closedcheck` | violates `HalfClosedRemote` (3 states) |
+| `SessionStreams_without_interleavecheck` | violates `Interleave` (3 states) |
+| `SessionStreams_without_decodefirst` | violates `BlocksDecoded` (4 states) |
+| `SessionStreams_without_trailersend` | violates `TrailersEnd_` (3 states) |
+| `SessionStreams_without_selfdep` | violates `SelfDependentHeaders` (2 states) |
+| `SessionStreams_without_contcheck` | violates `ContWithoutBlock` (2 states) |
+| `SessionStreams_without_compressioncheck` | violates `Compression` (2 states) |
+| `SessionStreams_without_priorityscope` | violates `PriorityMalformed` (2 states) |
+| `SessionStreams_without_priorityidleok` | violates `PriorityAnyState` (2 states) |
+
+### Frame rules in Kani
+
+The models take each frame as its decoded type. The rules that live in
+the frame decoder and the header-block reader are proved in Kani on the
+production code both `Http2` and `Session` read with
+(`kani/frames.rs`, compiled into `protocols/http2.rs`):
+
+| Harness | Proves | Time |
+| --- | --- | --- |
+| `frame_refusals_have_the_rfcs_code_and_scope` | for every frame type with a stream rule, any flags, any 31-bit stream (reserved bit set or not) and payloads of up to eight bytes: DATA, HEADERS, PRIORITY, RST_STREAM, PUSH_PROMISE and CONTINUATION on stream 0, and SETTINGS, PING and GOAWAY off it, are connection errors PROTOCOL_ERROR; RST_STREAM of the wrong length a connection error FRAME_SIZE_ERROR; PRIORITY of the wrong length a FRAME_SIZE_ERROR with stream scope, PRIORITY on its own stream a PROTOCOL_ERROR with stream scope, any other PRIORITY a frame; only PRIORITY and a zero WINDOW_UPDATE increment ever have stream scope | XX s |
+| `header_blocks_take_only_their_own_continuation` | after a HEADERS or PUSH_PROMISE without END_HEADERS on any stream, a frame of any other type, or CONTINUATION on any other stream, with END_STREAM on or off, is refused with PROTOCOL_ERROR; CONTINUATION with no block waiting is refused with PROTOCOL_ERROR, and leaves none waiting | XX s |
+
+Which scope reaches the wire is the caller's: `Http2::on_input` turns a
+stream-scope refusal into a reset on an open stream, a reset without
+remembering the stream on a closed one, nothing on a stream it reset,
+and a connection error on an idle stream or inside a header block,
+which `H2Streams.tla` checks.
+
+```sh
+cargo kani -p fictionet --harness frame_refusals_have_the_rfcs_code_and_scope
+cargo kani -p fictionet --harness header_blocks_take_only_their_own_continuation
+```
+
+### Stream rules: bugs fixed
+
+Each has a test that failed before its fix and passes after.
+
+1. **A stream the server reset was forgotten after one second.** Its
+   late frames were ignored only while the stream was in the reset
+   list, and `on_timer` dropped each entry a second after the reset.
+   Section 5.1 says frames on a stream the endpoint reset are processed
+   and discarded, and advises against a timer for deciding the client
+   saw the reset. A client on a slow path whose trailers came after the
+   second lost the whole connection: HEADERS on a stream at or below
+   `last_stream` is a connection error. The list now keeps its entries
+   with no timer. Test: `late_frames_on_a_reset_stream_are_ignored_however_late`
+   (before: GOAWAY with PROTOCOL_ERROR for the trailers). Model:
+   `H2Streams_without_keepresets`.
+2. **A full reset list remembered no new reset.** With 50 streams in
+   the list, the 51st reset was not recorded at all, so the stream most
+   likely to have frames in flight was the one not ignored. A full list
+   now forgets its oldest stream for the new one. Test:
+   `the_newest_reset_is_remembered_when_the_list_is_full` (before:
+   GOAWAY for HEADERS on the newest reset stream).
+3. **A reset of a stream already closed was remembered.** DATA on a
+   closed stream, and a malformed PRIORITY on one, are stream errors
+   (sections 6.1 and 6.3), and the reset put the stream in the list.
+   From then on the stream's frames were ignored, so HEADERS on a stream
+   the client had skipped, which section 5.1.1 makes a connection error,
+   was dropped, and such resets pushed the server's real resets out of
+   the list. These resets now go out by `reset_closed`, which does not
+   remember the stream. Test: `a_reset_of_a_closed_stream_leaves_it_closed`
+   (before: HEADERS on the skipped stream was ignored). Model:
+   `H2Streams_without_listonlynew`.
+4. **RST_STREAM followed a 431 on a closed stream.** A request whose
+   header list was over the limit got a 431 with END_STREAM, then
+   RST_STREAM with REFUSED_STREAM. When the request had ended (a GET,
+   the usual case), the 431 closed the stream, and section 5.1 allows
+   nothing but PRIORITY on a closed stream. The reset now follows only a
+   request still open; the refusal still counts toward the error-reset
+   limit. Test: `a_431_that_ends_a_request_that_ended_is_the_streams_last_frame`
+   in `tests/it/http2_server.rs` (before: RST_STREAM on stream 1 after
+   its 431); `repeated_header_refusals_exhaust_the_local_reset_limit` now
+   checks that no reset follows. Model: `H2Streams_without_end431`.
+5. **`Session` let a client PUSH_PROMISE through on a stream the server
+   reset.** A client-side `Session` refused a PUSH_PROMISE only once its
+   block ended, and after the check that drops header frames on a reset
+   stream, so one on such a stream was dropped without an error, and one
+   split into CONTINUATION was refused only at its end. Section 8.4 makes
+   a client PUSH_PROMISE a connection error on receipt. `Session::step`
+   now refuses it on its own frame. Test:
+   `a_client_push_promise_fails_on_its_own_frame` (before: no error).
+   Model: `SessionStreams_without_pushfirst`.
+
+### Stream rules: departures kept
+
+- **The reset list holds 50 streams.** A stream the server reset is
+  forgotten after 50 newer resets, and its late HEADERS then ends the
+  connection. The list is paid for at its bound when the connection
+  opens, so recording a reset never needs memory; 50 resets in one round
+  trip are rare outside abuse. `H2Streams_kept_resetbound` shows the
+  departure with a bound of 1.
+- **A run of CONTINUATION frames past a count ends the connection with
+  ENHANCE_YOUR_CALM** (`on_frame`: more than the header limit in whole
+  frames plus a quarter, and at least five). Section 6.10 allows any
+  number; section 10.5 lets an endpoint treat suspicious use as
+  ENHANCE_YOUR_CALM. It bounds the work a block of tiny frames costs;
+  the block's bytes have their own limit.
+- **A header block over the encoded limit ends the connection with
+  ENHANCE_YOUR_CALM** (`read_fragment`'s "header block exceeds limit").
+  Section 4.3 names COMPRESSION_ERROR for a block not decompressed; the
+  code reports the resource limit it hit, as section 5.4 lets an
+  endpoint report any of several errors. The connection ends either
+  way, so HPACK never falls out of step.
+- **HEADERS on a closed stream ends the connection with PROTOCOL_ERROR**,
+  the client's own reset stream included. This is the gap the
+  verification index lists. RFC 9113 allows it: section 5.1 lets an
+  endpoint treat any frame on a closed stream as a connection error
+  STREAM_CLOSED, section 5.4 lets PROTOCOL_ERROR stand for it, and HEADERS
+  reusing a stream identifier is also section 5.1.1's "unexpected stream
+  identifier". The stream error the index cites is RFC 7540's rule
+  ("after receiving a RST_STREAM ... MUST treat that as a stream error"),
+  which RFC 9113 dropped. Telling a reused stream from one the client
+  skipped would take a record of every stream, so the code is left as
+  it is, and `StreamRules` allows it.
+- **REFUSED_STREAM after a 431 to a request still open**, as h2 does.
+  Section 8.1 suggests NO_ERROR after a complete response; REFUSED_STREAM
+  is a stream error the RFC allows, and the 431 came from the HTTP/2
+  layer, not the application.
+- **`Session` stops the direction for every error**, stream errors
+  included (section 5.4.1 allows it), and leaves idle-stream checks,
+  stream identifiers, the stream limit and GOAWAY to its caller, as its
+  documentation says. It has no caller in the tree but its tests and the
+  fuzz target.
+
+### Stream rules: what the models leave out
+
+- Flow control and SETTINGS (the sections above), and the refusals they
+  drive in `on_data` and `on_headers`: a window exceeded, content-length,
+  a malformed request (all stream errors before `admit`).
+- Budgets, the error-reset limit of 1024 and the pending-reset limit of
+  20, `UP_LIMIT`, `OUT_LIMIT`; a frame waiting for memory (`held`).
+- Stream 0 and frame lengths other than PRIORITY's and RST_STREAM's,
+  which the frame decoder refuses before any of this (Kani above and the
+  tests in `protocols/http2.rs`); PING other than the shutdown PING's
+  acknowledgment; padding.
+- The connection's end of input, and SETTINGS before the first frame.
+- `H2Streams` has two client streams and an even one, one at a time,
+  and four frames (three streams, two at once, in `H2Streams_two_base`;
+  five frames in `H2Streams_cont_base`). A header block's content is the
+  four variants; HPACK itself is the sibling HPACK models'.
+- `SessionStreams` does not model the response direction
+  (`Session::server_side`), push from a server, informational
+  responses, or flow control.
+
+### After comp/buf-h2
+
+That branch reworks HTTP/2 framing and HPACK. `StreamRules.tla` follows
+the RFC alone and does not change. Recheck each implementation action
+against the function it follows, and update the line numbers in the
+model headers:
+
+- `H2Streams.Handle`: `Http2::on_frame` (the CONTINUATION count) and the
+  stream-scope arm of `Http2::on_input`.
+- `H2Streams.Dispatch`: `HeaderBlocks::read_fragment` (interleaving,
+  CONTINUATION without a block, decoding before any judgment, the
+  COMPRESSION_ERROR) and `InputState::read_headers`; if the rework
+  decodes blocks elsewhere, `BlocksDecoded` must still see every block
+  decoded before `headers_on`.
+- `H2Streams.OnHeaders`, `SelfHeaders`: `Http2::headers_on`,
+  `on_headers` (the 431 path) and the self-dependent arm of
+  `Http2::dispatch`.
+- `H2Streams.OnData`, `OnWu`, `OnRst`, `OnRefused`, `Act`: the DATA,
+  WINDOW_UPDATE, RST_STREAM, PING, GOAWAY and PUSH_PROMISE arms of
+  `Http2::dispatch`, `Http2::on_data`.
+- `H2Streams.Remember`, `WriteReset`, `ResetClosed`: `write_reset`,
+  `write_rst`, `reset_closed`, `ignored`.
+- `SessionStreams.Step`: `Session::step` and `Inputs::decode`'s scope;
+  `PeerReset`, `Retire`: `Session::peer_reset`, `retire`.
+- The Kani harnesses call `Inputs::decode` and `HeaderBlocks::read`; if
+  either is renamed or split, point the harnesses at the new functions
+  and rerun both.
