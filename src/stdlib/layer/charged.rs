@@ -369,6 +369,11 @@ impl<T> ChargedDeque<T> {
         self.items.iter()
     }
 
+    /// The items, first to last, to change in place.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.items.iter_mut()
+    }
+
     /// Takes the items in `range`. Their places stay paid for.
     pub fn drain(&mut self, range: impl RangeBounds<usize>) -> impl Iterator<Item = T> {
         self.items.drain(range)
@@ -385,6 +390,11 @@ impl<T> ChargedDeque<T> {
     /// The places allocated, filled or not.
     pub fn places(&self) -> usize {
         self.items.capacity()
+    }
+
+    /// The most items it holds.
+    pub fn most(&self) -> usize {
+        self.most
     }
 
     /// The bytes charged: the places times the size of an item.

@@ -50,8 +50,8 @@ where
         let mut driver = Driver::new(layer, Arc::new(fcx.clone()), Budget::unlimited(), fcx.now());
         driver.keep_observations(0);
         Self {
+            jobs: Jobs::new(driver.budget()),
             driver,
-            jobs: Jobs::new(),
             pending: VecDeque::new(),
         }
     }

@@ -85,8 +85,8 @@ where
         let buffer = budget.charge(READ);
         Live {
             conn,
+            jobs: Jobs::new(&budget),
             driver: Driver::new(stack, Arc::new(fcx.clone()), budget, fcx.now()),
-            jobs: Jobs::new(),
             buf: if buffer.is_some() {
                 vec![0; READ]
             } else {

@@ -371,7 +371,7 @@ where
     D: DatagramSocket,
 {
     let mut driver = Driver::new(stack, std::sync::Arc::new(fcx.clone()), budget, fcx.now());
-    let mut jobs = Jobs::new();
+    let mut jobs = Jobs::new(driver.budget());
     let mut input: Option<DatagramEvent<SocketAddr>> = None;
     let mut socket_closed = false;
     let mut rounds = 0u32;

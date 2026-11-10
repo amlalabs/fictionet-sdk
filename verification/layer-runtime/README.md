@@ -208,10 +208,13 @@ four-byte inputs and every split against a three-byte destination. Existing
 reservation and ownership harnesses use the bounded interface, and command
 extraction runs through `Driver` to supply the layer's budget and reports.
 
-The runtime job table reserves one initial slot and grows with retained work,
-up to its unchanged engine limit. Each growth is charged before asking the
-layer for another job. This lets small conversations run without reserving
-an entire unused job table; a zero-byte budget still extracts no work. The
+The runtime job table is a `ChargedDeque`: it grows with retained work, up
+to its unchanged engine limit, to twice its places (at least four) when the
+budget has room and by as many places as fit when it has not. A place is
+made and charged before the layer is asked for another job
+(`ChargedDeque::place`), and one place stays while the table is idle. This
+lets small conversations run without reserving an entire unused job table;
+a zero-byte budget still extracts no work. The
 bounded-intake and exhausted-storage Rust tests cover this allocation policy;
 the models abstract only job counts and cancellation.
 

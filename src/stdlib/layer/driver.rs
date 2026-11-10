@@ -1,10 +1,11 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Wake, Waker};
 
 use fictionet::Entropy;
-use fictionet::stdlib::layer::{Admit, Budget, Charge, CommandOf, Env, EventOf, Layer, Observe};
+use fictionet::stdlib::layer::{
+    Admit, Budget, Charge, ChargedDeque, CommandOf, Env, EventOf, Layer, Observe,
+};
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 
@@ -15,13 +16,14 @@ const KEPT: usize = 1024;
 
 /// A layer's reports, as many as there is room for, and a count of the
 /// ones there was no room for. Reports never hold up the protocol.
+///
+/// The store has a byte budget of its own, apart from the connection's:
+/// each report kept is charged what it holds, and the queue its places.
 #[derive(Debug)]
 pub struct Observations<E> {
-    kept: VecDeque<(E, Charge)>,
+    kept: ChargedDeque<(E, Charge)>,
     budget: Budget,
-    storage: Option<Charge>,
     heap_bytes: fn(&E) -> Option<usize>,
-    limit: usize,
     omitted: u64,
 }
 
@@ -29,23 +31,18 @@ impl<E> Observations<E> {
     /// An empty store with an item limit. Unmeasured reports are omitted;
     /// use [`bounded`](Self::bounded) to supply their allocation bound.
     pub fn new(limit: usize) -> Observations<E> {
-        Observations {
-            kept: VecDeque::new(),
-            budget: Budget::new(256 * 1024),
-            storage: None,
-            heap_bytes: |_| None,
-            limit,
-            omitted: 0,
-        }
+        Observations::bounded(limit, 256 * 1024, |_| None)
     }
 
     /// Bound report retention with a separate byte budget and an allocation
     /// size function. The function must include all retained backing storage.
     pub fn bounded(limit: usize, bytes: usize, heap_bytes: fn(&E) -> Option<usize>) -> Self {
+        let budget = Budget::new(bytes);
         Self {
-            budget: Budget::new(bytes),
+            kept: ChargedDeque::new(&budget, limit),
+            budget,
             heap_bytes,
-            ..Self::new(limit)
+            omitted: 0,
         }
     }
 
@@ -70,46 +67,16 @@ impl<E> Observations<E> {
     }
 }
 
-impl<E> Observations<E> {
-    /// Makes room for one more kept report: doubles the slots up to the
-    /// limit, or adds one when the budget has no room to double. Whatever
-    /// the event itself retains is already charged, so growth never takes
-    /// the room it needs. Nothing changes when no slot fits.
-    fn grow(&mut self) -> bool {
-        let len = self.kept.len();
-        if len < self.kept.capacity() {
-            return true;
-        }
-        let slot = std::mem::size_of::<(E, Charge)>();
-        let doubled = len.saturating_mul(2).max(1).min(self.limit);
-        let reserved = [doubled, len + 1].into_iter().find(|&slots| {
-            let Some(wanted) = slots.checked_mul(slot) else {
-                return false;
-            };
-            match &mut self.storage {
-                Some(charge) => charge.grow_to(wanted),
-                None => {
-                    self.storage = self.budget.charge(wanted);
-                    self.storage.is_some()
-                }
-            }
-        });
-        let Some(slots) = reserved else {
-            return false;
-        };
-        self.kept.reserve_exact(slots - len);
-        true
-    }
-}
-
 impl<E> Observe<E> for Observations<E> {
+    /// Charges what the report holds first, then its place, so the
+    /// queue's growth never takes the room the report needs.
     fn observe(&mut self, event: E) {
-        if self.kept.len() < self.limit
+        if self.kept.len() < self.kept.most()
             && let Some(bytes) = (self.heap_bytes)(&event)
             && let Some(charge) = self.budget.charge(bytes)
-            && self.grow()
+            && let Some(place) = self.kept.place()
         {
-            self.kept.push_back((event, charge));
+            place.push_back((event, charge));
             return;
         }
         self.omitted = self.omitted.saturating_add(1);
@@ -118,7 +85,7 @@ impl<E> Observe<E> for Observations<E> {
     /// A store that keeps no reports wants none made, so none is counted
     /// in [`omitted`](Self::omitted) either.
     fn interested(&self) -> bool {
-        self.limit > 0
+        self.kept.most() > 0
     }
 }
 
@@ -230,7 +197,7 @@ impl<L: Layer> Driver<L> {
     /// Keeps at most `limit` reports from now on. With none kept, the stack
     /// makes none ([`Env::observing`]).
     pub fn keep_observations(&mut self, limit: usize) {
-        self.observed.limit = limit;
+        self.observed.kept.set_most(limit);
     }
 
     /// The stack.
