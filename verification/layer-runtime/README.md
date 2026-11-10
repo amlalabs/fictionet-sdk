@@ -693,3 +693,33 @@ factory's `Stack` and `ObservedTls`) now make a new `Env` for their inner
 layer on every call through `Env::part`. `comp/fix-misc` gives each `Env`
 a waker, so every driver call marks its `Env` as in the stack, and every
 `Driver::run` clears the stack's wake flag first.
+
+## The runners on charged queues, and a cheaper `Env` (`comp/budget-runners`)
+
+The runners' job table and the driver's report store became charged
+queues, the runners wait for memory after a refused round, and the `Env`
+and waker costs above were cut:
+
+- `Env::part` lends the layer's own environment to its part, one level
+  of depth less while the part runs, instead of building a new one.
+- A driver call builds its `Env` in one step with the stack's waker
+  (`Env::in_stack`), and `Driver::run` builds one for all of its steps.
+- `Driver::run` reads the wake flag and clears it only when it is set.
+- `Driver::set_waker` compares the runner's waker with the driver's own
+  copy and locks only to change it.
+
+The HTTP bench process, `perf stat -e instructions:u`, three runs of each
+build, median. These bench binaries were built with the plain bench
+profile, without the frame pointers and line tables of the tables above,
+so only the differences between them compare.
+
+| Build | HTTP bench process, instructions |
+| --- | ---: |
+| b677d6fd5 (before) | 117.95 G |
+| Charged job table and report store, runner wake | 117.61 G |
+| Cheaper `Env` and waker | 117.40 G |
+
+The runs of each build repeated to within 0.05 percent. Together the
+changes take 0.47 percent off; the `Env` and waker changes alone take
+0.18 percent. That is less than the 2.6 percent the review fixes added,
+so most of that cost is not in building environments or in the wake flag.

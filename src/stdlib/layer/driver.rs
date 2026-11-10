@@ -115,6 +115,8 @@ pub struct Driver<L: Layer> {
     wake: Arc<StackWake>,
     /// `wake` as a waker, for the budget to wake when memory frees.
     stack: Waker,
+    /// The task `wake` wakes, as last set: the same as `wake.task`.
+    task: Option<Waker>,
 }
 
 /// What a layer's [`Env::waker`] wakes in the end, and what the budget
@@ -171,6 +173,7 @@ impl<L: Layer> Driver<L> {
             exhausted: false,
             stack: Waker::from(wake.clone()),
             wake,
+            task: None,
         }
     }
 
@@ -199,10 +202,13 @@ impl<L: Layer> Driver<L> {
     /// is polled. Until a runner says, a wake is only noted
     /// ([`woken`](Self::woken)).
     pub fn set_waker(&mut self, task: &Waker) {
-        let mut current = self.wake.task.lock();
-        if !current.as_ref().is_some_and(|w| w.will_wake(task)) {
-            *current = Some(task.clone());
+        // Runners say so on every poll, nearly always with the same task:
+        // compare with the driver's own copy, and lock only to change it.
+        if self.task.as_ref().is_some_and(|w| w.will_wake(task)) {
+            return;
         }
+        self.task = Some(task.clone());
+        *self.wake.task.lock() = Some(task.clone());
     }
 
     /// Whether a layer woke its [`Env::waker`] since the last
@@ -260,8 +266,13 @@ impl<L: Layer> Driver<L> {
         &mut self,
         event: EventOf<L::Lower>,
     ) -> Result<Admit<EventOf<L::Lower>>, L::Error> {
-        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-            .in_stack(&self.wake);
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         self.layer.on_event(&mut env, event)
     }
 
@@ -270,15 +281,25 @@ impl<L: Layer> Driver<L> {
         &mut self,
         command: CommandOf<L::Upper>,
     ) -> Result<Admit<CommandOf<L::Upper>>, L::Error> {
-        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-            .in_stack(&self.wake);
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         self.layer.on_command(&mut env, command)
     }
 
     /// Gives the stack the result of work it asked for.
     pub fn complete(&mut self, done: L::Done) -> Result<(), L::Error> {
-        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-            .in_stack(&self.wake);
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         self.layer.on_done(&mut env, done)
     }
 
@@ -287,13 +308,23 @@ impl<L: Layer> Driver<L> {
     /// after input or output has moved, or whenever [`exhausted`](Self::exhausted) is true.
     pub fn run(&mut self) -> Result<bool, L::Error> {
         // This run serves every wake before it, and sees what each woke
-        // for; one during it is noted again.
-        self.wake.woken.swap(false, Ordering::AcqRel);
+        // for; one during it is noted again. Most runs follow no wake, and
+        // reading the flag is cheaper than clearing it; a wake that the
+        // read misses leaves the flag set, and the runner runs again.
+        if self.wake.woken.load(Ordering::Relaxed) {
+            self.wake.woken.swap(false, Ordering::AcqRel);
+        }
         self.exhausted = true;
         let mut moved = false;
+        // One environment for every step: the time stands still in a run.
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         for _ in 0..self.steps {
-            let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-                .in_stack(&self.wake);
             let due = self.layer.deadline().filter(|(at, _)| *at <= self.now);
             let mut step = false;
             if let Some((_, timer)) = due {
@@ -320,8 +351,13 @@ impl<L: Layer> Driver<L> {
         &mut self,
         sink: impl FnMut(CommandOf<L::Lower>) -> Admit<CommandOf<L::Lower>>,
     ) -> bool {
-        let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-            .in_stack(&self.wake);
+        let mut env = Env::in_stack(
+            self.now,
+            &*self.entropy,
+            &self.budget,
+            &mut self.observed,
+            &self.wake,
+        );
         send(&mut self.below, || self.layer.take_command(&mut env), sink)
     }
 
@@ -329,8 +365,13 @@ impl<L: Layer> Driver<L> {
     /// the caller. A previously refused command is returned first.
     pub fn take_command(&mut self) -> Option<CommandOf<L::Lower>> {
         self.below.take().or_else(|| {
-            let mut env = Env::new(self.now, &*self.entropy, &self.budget, &mut self.observed)
-                .in_stack(&self.wake);
+            let mut env = Env::in_stack(
+                self.now,
+                &*self.entropy,
+                &self.budget,
+                &mut self.observed,
+                &self.wake,
+            );
             self.layer.take_command(&mut env)
         })
     }
