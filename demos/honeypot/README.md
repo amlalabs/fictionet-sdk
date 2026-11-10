@@ -259,6 +259,54 @@ in QEMU, including original Ethernet capture and graceful shutdown. Guest
 checks cover ephemeral and persistent TUN ownership and bidirectional IP traffic
 without adding routes. The harness also retains the in-memory and driver-level protocol checks.
 
+To exercise the deployed executable against a real Linux kernel client in a
+second VM, use an empty artifact directory:
+
+```sh
+systemd-run --user --scope -q --slice=fictionet-work.slice \
+  -p MemoryMax=10G -p MemorySwapMax=0 \
+  env CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-honeypot-vm \
+  cargo xtask-host honeypot-vm \
+  /home/souvik/Projects/amlalabs/.fictionet-comp-work/honeypot-vm-run
+```
+
+The task builds the executables and two initramfs images, then boots two QEMU
+guests with 2 GiB each. The sensor runs the actual
+`honeypot run --backend vfio --device 0000:00:03.0` executable. The attacker
+uses an `IPPROTO_MPTCP` socket to fetch the complete HTTP page, OpenSSH over
+ordinary TCP to authenticate with a fresh Ed25519 key and send its first command,
+and an ordinary kernel TCP connect to literal destination port zero. No packet
+fixtures implement those connections. The first SSH command is observed and
+disconnected without execution. MP_JOIN is outside this task's coverage.
+
+The only data connection is QEMU's Unix stream netdev between the two virtual
+cards. There is no slirp, TAP, bridge, host interface, management NIC, external
+route or public deployment. Each guest checks its network devices and routes,
+and requires external IPv4 and IPv6 TCP attempts to fail with `ENETUNREACH`.
+Only guest init loads modules, binds the VFIO device, or sets the attacker's
+interface address. The host only reads its kernel/module files and runs QEMU.
+All subprocesses inherit the command's memory scope. This task runs no full
+test suite and requires the existing raw NIC prerequisites, an MPTCP-enabled
+guest kernel, 9p modules, and host `ssh` and `ssh-keygen` binaries for packaging.
+
+Separate 9p shares export the sensor's actual `events-*.jsonl`, original
+`ethernet-*.pcapng`, derived `ip-*.pcapng`, and shutdown log under `sensor/`;
+the attacker's HTTP response, kernel MPTCP report and SSH log are under
+`attacker/`. Both directories contain `isolation.json`; QEMU commands and serial
+logs are at the artifact root. Keep the artifact directory private: it also
+contains the sensor's persistent identity and SSH host key.
+
+Success requires both guest exit devices to report success and a semantic check
+of the exported evidence. The checker correlates the client's kernel MPTCP
+token with the captured client key, validates the SYN, SYN-ACK and third ACK
+sequence numbers and both keys against JSON observations, checks DSS-bearing
+HTTP data against the bytes received by the kernel, resolves capture references,
+checks plain TCP SSH and its authenticated session, and matches the port-zero
+SYN and reset. Evidence admission, writing, synchronization and raw queue loss
+counters must remain zero; the final writer queue must drain. This validates
+the local two-guest path, not cloud filtering, Internet reachability, load
+capacity, or the unfinished XDP/AF_XDP backend.
+
 AF_XDP needs its own embedded redirector, correct queue coverage, bounded
 copy-mode transport, ownership and crash guards, and qualification on the
 actual guest NIC/driver/kernel combination. Native/generic and copy/zero-copy

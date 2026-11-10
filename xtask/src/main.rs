@@ -8,6 +8,8 @@ mod capture;
 mod dns_verify;
 mod gate;
 #[cfg(feature = "host-tools")]
+mod honeypot_vm;
+#[cfg(feature = "host-tools")]
 mod image;
 mod layer_verify;
 mod mptcp_verify;
@@ -52,6 +54,7 @@ fn main() -> Result {
         "ssh-connect"
             | "rawnic"
             | "egress"
+            | "honeypot-vm"
             | "search-web"
             | "search-requisites"
             | "search-capture"
@@ -81,6 +84,12 @@ async fn host(task: &str, mut args: impl Iterator<Item = String>) -> Result {
         return ssh_connect::run(&args.collect::<Vec<_>>()).await;
     }
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
+    if task == "honeypot-vm" {
+        if args.next().is_some() {
+            return Err("unexpected argument".into());
+        }
+        return honeypot_vm::run(downloads);
+    }
     if task == "rawnic" || task == "egress" {
         if args.next().is_some() {
             return Err("unexpected argument".into());
