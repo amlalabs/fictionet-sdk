@@ -88,10 +88,190 @@ answers. Theorems: `both_fields_refused`, `http10_transfer_encoding_refused`,
 `chunked_alone_is_chunked`, `unsupported_coding_refused` (a 501),
 `same_lengths_accepted`, `differing_lengths_refused`,
 `invalid_length_refused`, `invalid_length_after_same_refused` and
-`no_fields_no_body`: RFC 9112 sections 6.1 and 6.3.
+`no_fields_no_body`: RFC 9112 sections 6.1 and 6.3. It is tied to the
+decoder two ways (next section): `RequestTie.wire_framing_is_request`
+proves that for every head the byte-level decoder model accepts,
+`requestFraming` of that head's codings and lengths is the decoder's
+framing, and `framing.json` holds heads written from `requestFraming`'s
+inputs with its verdicts, which `tests/http1_vectors.rs` replays against
+`RequestEvents`.
 
 `lake build` is clean with no `sorry`; `Http/Axioms.lean` prints the axioms
 of every theorem above.
+
+## Lean: the HTTP/1 decoders against RFC 9112
+
+This part proves that request smuggling between the server and any front
+end that follows RFC 9112 is impossible for every request the server
+accepts, and ties the proof to the Rust code with reference vectors, in the
+DNS and MPTCP pattern.
+
+```sh
+cargo xtask http-verify lean      # lake build, then the axiom audit
+cargo xtask http-verify diff 1    # vectors of seed 1, replayed against Rust
+cargo xtask http-verify all       # lean, then diff for seeds 1 to 8
+```
+
+### The decoders, byte by byte, and the vectors
+
+`lean/Http/Wire.lean` writes `http1::RequestEvents` (the strict decoder
+`web/httpd/native.rs` runs on every connection) and `http1::ResponseEvents`
+as executable functions over bytes. Each definition names the function of
+`protocols/http1.rs` it follows: `codec::Lines` with CRLF endings,
+`Reader::head` with all four head limits, `split_head`, `header_parts`,
+`request_line`, `status_line`, `validate_target` with `core::net`'s IPv6
+parser, `validate_host`, `fields` (one walk with named steps:
+`clStep`, `teStep`, `connStep`, `fieldStep`), `request_framing`,
+`response_framing`, `head_size`, `Reader::begin`, `Reader::body` with its
+block size, and the strict `chunk_framing`. `request1` and `response1` read
+one message from the start of the bytes they are given, and `requests` and
+`responses` run them one after another as `Stream` does, so a theorem about
+one message holds for every message of a pipeline.
+
+`lean/Gen.lean` (`lake exe gen <dir> <seed>`) writes three files:
+
+| File | Expected values from | Inputs |
+| --- | --- | --- |
+| `requests.json` | `Wire.requests` | 66 fixed inputs (the smuggling shapes of RFC 9112 section 11.2 and each rule's edge), then 6,000 random ones: one to three requests, each with at most one fault in a chosen part (method, target, version, separators, Host, lengths, codings, a chunk size, a chunk end, the last chunk, a trailer, a field line, `Connection`), leading empty lines, small limits, then sometimes cut short or given one wrong byte; with and without the end of input |
+| `responses.json` | `Wire.responses` | 24 fixed inputs, then 4,000 random pipelines of responses to queued HEAD, CONNECT and other methods, with the same kinds of faults and close-delimited bodies |
+| `framing.json` | `Request.lean`'s `requestFraming` | 4,000 heads written from its abstract inputs (version, codings, `Content-Length` elements, split over one or two fields with empty elements), with the body its framing gives |
+
+`tests/http1_vectors.rs` replays each `requests` and `responses` vector
+twice, with the whole input pushed at once and in random pieces, and
+compares every event (head with method, target, version, status and end
+offset; body block; `Done` with its offset) and how the stream stops
+(waiting at an offset, ended at an offset, `Truncated`, or the
+`http1::Error`). A `framing` vector must give `requestFraming`'s refusal
+reason, or one message with the body it predicts.
+
+`cargo xtask http-verify all` on 2026-11-10: `lake build` passes and the
+43 theorems `Http/Axioms.lean` prints rest on `propext`, `Quot.sound` and
+`Classical.choice` at most; for each of seeds 1 to 8, 6,066 request,
+4,024 response and 4,000 framing vectors, 0 disagree (112,720 in all, each
+request and response vector replayed twice).
+
+The first run of `framing.json` found a disagreement in the generator, not
+the decoder: it wrote empty `Content-Length` list elements that the
+abstract input did not have. `Request.lean` reads an empty element as an
+invalid one, so the generator no longer writes them there.
+
+A model with DEL taken as a field byte (one rule changed in `fieldByte`)
+makes 118 of seed 1's vectors disagree (15 requests, 103 responses): the
+replay notices a one-rule change.
+
+### The RFC as a family of recipients
+
+`lean/Http/Rfc9112.lean` is written from the RFC text, not the code: lines
+(section 2.2), field lines (5.1) and obs-fold (5.2), the request line (3),
+`Transfer-Encoding` (6.1, 7) and `Content-Length` (RFC 9110 section 8.6),
+the body length algorithm (6.3, for requests and for responses), and
+chunked bodies (7.1, with extensions and trailers). Where the RFC lets a
+recipient choose, `Rfc.Choices` has a field, so `Rfc.request c` is one
+recipient for each choice of tolerances:
+
+| Field | RFC text |
+| --- | --- |
+| `lfAlone` | 2.2: a recipient MAY recognize a single LF as a line terminator |
+| `bareCrAsSp` | 2.2: a bare CR is invalid, or replaced with SP |
+| `consumeWsLines` | 2.2: a whitespace-led line after the start line is refused, or consumed |
+| `unfold` | 5.2: an obs-fold is refused, or replaced with SP |
+| `emptyLines` | 2.2: SHOULD ignore at least one empty line before the request line |
+| `wordsAnyWs` | 3: MAY parse the request line on whitespace-delimited words |
+| `teOverridesCl` | 6.1, 6.3 item 3: both fields: refuse, or let `Transfer-Encoding` win |
+| `clList` | RFC 9110 8.6: a repeated equal value is refused, or read as one |
+
+Chunk extensions are not read at all (a recipient MUST ignore unknown
+ones) and trailer fields are discarded (7.1.2), which only lets the family
+accept more.
+
+### What is proved
+
+Every theorem is over all inputs of any length, with no bound. `lake build`
+checks them and `Http/Axioms.lean` shows each rests on `propext`,
+`Quot.sound` and `Classical.choice` at most.
+
+| Theorem | File | Says |
+| --- | --- | --- |
+| `request_agrees` | `Body.lean` | For any input and any message `Wire.request1` reads to `Done` at offset `d`: every recipient `c` reads it with the same head end, method, framing, body bytes and `rest = input.drop d`, or refuses it; and it refuses it only if `c.emptyLines` is below 8 or `c.clList` is off. This is the no-smuggling theorem (RFC 9112 sections 2.2, 3, 5, 6.1, 6.3, 7.1, 11.2). |
+| `request_accepted` | `Body.lean` | Every recipient that skips eight empty lines and reads a repeated `Content-Length` (whatever its other tolerances) accepts the message with those boundaries, so the agreement is not empty. |
+| `head_agrees` | `Smuggling.lean` | The head part: the same head end, method and framing, for any accepted head. |
+| `framing_agrees` | `Smuggling.lean` | For any field list `fields` and `request_framing` accept, every recipient's section 6.3 algorithm gives the same framing (items 3 to 7). |
+| `runBody_spec`, `begin_spec` | `Body.lean` | From every decoder state, a body the decoder finishes is what every recipient reads: a length (6.3 item 6), chunks (7.1, the data of each chunk exactly, then the last chunk and the empty trailer section), or the rest of the stream (item 8). |
+| `wire_framing_is_request` | `RequestTie.lean` | `Request.lean`'s `requestFraming` of an accepted head's codings and lengths is the decoder's framing. |
+| `response_framing_agrees` | `Responses.lean` | For any response field list `fields` accepts, `response_framing` gives every recipient's framing: no body after HEAD, 1xx, 204, 304 or a 2xx to CONNECT (items 1, 2), chunked only when chunked is the final coding and the close otherwise (item 4), the length (6), the close (8). |
+| `te_and_cl_splits_the_family`, `bare_lf_splits_the_family`, `obs_fold_splits_the_family` | `Controls.lean` | On `Transfer-Encoding` with `Content-Length`, a bare LF, and an obs-fold, two recipients the RFC allows read the message differently. |
+| `te_and_cl_refused`, `bare_lf_refused`, `obs_fold_refused` | `Controls.lean` | The decoder refuses each of those inputs. A decoder that accepted one would contradict `request_agrees`. |
+
+The lemmas behind them: `Lines.lean` (what `readHead` ends: lines with CR
+LF and no LF inside, then an empty line; what `splitHead` reads from them),
+`Fields.lean` (the walk of `fields` projected onto the length and the
+coding state, and what it accepted), `Smuggling.lean` (an accepted field
+line or request line has no CR, LF or leading whitespace, and every
+recipient reads the same name, value, method and version from it; the
+RFC's character classes equal the decoder's).
+
+### Where the server departs from the RFC
+
+None of these lets two parsers disagree on a request the server accepts;
+each makes the server refuse something the RFC lets it accept. They are
+reported, not changed:
+
+- Chunk extensions are refused (`Error::ChunkExtension`, a 400), where
+  section 7.1.1 says a recipient MUST ignore unrecognized ones. The module
+  documentation says so; `ResponseEvents::skip_chunk_extras` is the
+  lenient mode for clients.
+- A non-empty trailer section is refused (`Error::Trailers`), where 7.1.2
+  lets a recipient discard trailer fields.
+- HTTP/1.x with a minor version other than 0 or 1 is refused
+  (`Error::Version`, a 400), where section 2.3 says a recipient SHOULD
+  read a higher minor version as the highest it implements.
+- A response whose codings do not end in `chunked`, or name `chunked`
+  twice, is refused by `ResponseEvents` (`Error::ChunkedNotLast`), where
+  6.3 item 4 reads it to the close.
+- A request line splits at single spaces only (section 3 allows any
+  whitespace, as a MAY); obs-fold, bare CR, whitespace-led lines,
+  `Transfer-Encoding` with `Content-Length`, and HTTP/1.0 with
+  `Transfer-Encoding` are refused, each one of the options the RFC gives.
+- The server does accept a repeated equal `Content-Length` (`1, 1`, or two
+  fields with `1`), which RFC 9110 section 8.6 allows. A front end that
+  uses its option to refuse it refuses the request; it cannot read other
+  boundaries (`request_agrees`).
+
+Every refusal answers 400 (501 for an unsupported coding) and closes the
+connection (`Http1::fail`), so no byte after a refused head is read as a
+request.
+
+### What these proofs leave out
+
+- `Wire.lean` is a model of the Rust code. The vectors tie it on 14,090
+  inputs per seed, in random pieces as well as whole; the proofs are about
+  the model.
+- The decoder model reads its whole input at once. Splitting the input is
+  covered by the replay in pieces and, per step, by the Kani harnesses
+  `*_are_independent_of_the_split` below.
+- The head limits refuse only; the theorems hold for any limits.
+  `validate_target` and the IPv6 parser are in the model for the vectors
+  and refuse only; no theorem is about them.
+- Responses are proved at the level of the framing decision; a response
+  head's bytes and a recipient's reading of them are covered by the
+  vectors, not by a theorem. `runBody_spec` is shared by both decoders.
+- The lenient decoders (`skip_chunk_extras`, `parse_lenient`, the capture
+  parser) and the whole-message decoders (`Requests`, `Responses`) are not
+  modeled.
+- What the server does after a refusal (the 400, the close) is in
+  `native.rs` and its tests; `Pipeline.tla` treats a failure as `Abort`.
+
+### After the `comp/buf-h1` merge
+
+That branch changes how a request head is held. The RFC behaviour modeled
+here does not depend on it, but these must be checked again: that
+`Wire.splitHead`, `headerParts`, `requestLine` and `requestHead` still
+follow `split_head`, `header_parts`/`header_spans`, `request_line`,
+`request_syntax` and `request_info`, in the same order of checks (the order
+decides which error the vectors expect); that `fields` still walks the
+fields once in order with the same steps; that `tests/http1_vectors.rs`
+still compiles against `RequestHead::method`, `target`, `version` and
+`RequestError::reason`; then `cargo xtask http-verify all`.
 
 ## TLA+: HTTP/2 stream states
 

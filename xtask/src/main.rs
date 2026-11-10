@@ -8,6 +8,7 @@ mod capture;
 mod dns_verify;
 mod gate;
 mod hpack_verify;
+mod http_verify;
 #[cfg(feature = "host-tools")]
 mod image;
 mod layer_verify;
@@ -36,7 +37,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + 
 fn main() -> Result {
     let mut args = std::env::args().skip(1);
     let task = args.next().ok_or(
-        "expected gate, dns-verify, mptcp-verify, hpack-verify, layer-verify or a host command",
+        "expected gate, dns-verify, http-verify, mptcp-verify, hpack-verify, layer-verify or a host command",
     )?;
     if task == "kani" {
         return gate::kani(&args.collect::<Vec<_>>());
@@ -52,6 +53,9 @@ fn main() -> Result {
     }
     if task == "hpack-verify" {
         return hpack_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "http-verify" {
+        return http_verify::run(&args.collect::<Vec<_>>());
     }
     if task == "dns-verify" {
         return dns_verify::run(&args.collect::<Vec<_>>());
