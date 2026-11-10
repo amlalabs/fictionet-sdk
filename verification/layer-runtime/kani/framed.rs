@@ -13,7 +13,7 @@
 
 extern crate alloc;
 
-use super::super::{BoundedDecode, BoundedWire, Framed, FramedError, Owned};
+use super::super::{BoundedDecode, BoundedWire, Framed, Owned};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -585,8 +585,88 @@ fn encoding_is_not_called_without_its_reservation() {
     let value = Owned::new(Large, budget.charge(0).unwrap());
     assert!(matches!(
         d.command(MessageCommand::Send(value)),
-        Err(FramedError::Budget)
+        Ok(Admit::Blocked(MessageCommand::Send(_)))
     ));
+    assert_eq!(budget.used(), 0);
+}
+
+#[kani::proof]
+#[kani::unwind(6)]
+fn a_refused_write_keeps_its_value_and_writes_once_after_release() {
+    let expected = Blob(kani::any::<[u8; 2]>().to_vec());
+    let budget = Budget::new(16);
+    let mut d = driver(Units, &budget);
+    let value = Owned::new(
+        expected.clone(),
+        budget.charge(expected.0.capacity()).unwrap(),
+    );
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    let used = budget.used();
+    let Admit::Blocked(MessageCommand::Send(value)) =
+        d.command(MessageCommand::Send(value)).unwrap()
+    else {
+        panic!("the value waits with its sender");
+    };
+    assert_eq!(*value, expected);
+    assert_eq!(budget.used(), used);
+    assert!(d.take_command().is_none());
+    drop(held);
+    assert!(matches!(
+        d.command(MessageCommand::Send(value)).unwrap(),
+        Admit::Taken
+    ));
+    let Some(StreamCommand::Write(bytes)) = d.take_command() else {
+        panic!("the reserved value is written");
+    };
+    assert_eq!(Blob::parse(&bytes).unwrap(), expected);
+    assert!(bytes.charged() >= bytes.len());
+    assert!(d.take_command().is_none());
+    drop(bytes);
+    drop(d);
+    assert_eq!(budget.used(), 0);
+}
+
+#[kani::proof]
+#[kani::unwind(6)]
+fn a_refused_packet_keeps_its_value_and_writes_once_after_release() {
+    use fictionet::stdlib::layer::{ChargedBytes, PacketCommand};
+    use fictionet::stdlib::network::packet;
+
+    let expected: [u8; 2] = kani::any();
+    let budget = Budget::new(16);
+    let mut d = Driver::new(
+        packet::Framed::new(),
+        Arc::new(NoEntropy),
+        budget.clone(),
+        Instant::ZERO,
+    );
+    let value = Chunk::from_bytes(ChargedBytes::copy_of(&budget, &expected).unwrap());
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    let used = budget.used();
+    let Admit::Blocked(PacketCommand::Send(value)) = d.command(PacketCommand::Send(value)).unwrap()
+    else {
+        panic!("the packet waits with its sender");
+    };
+    assert_eq!(&*value, &expected);
+    assert_eq!(budget.used(), used);
+    assert!(d.take_command().is_none());
+    drop(held);
+    assert!(matches!(
+        d.command(PacketCommand::Send(value)).unwrap(),
+        Admit::Taken
+    ));
+    let Some(StreamCommand::Write(bytes)) = d.take_command() else {
+        panic!("the reserved packet is written");
+    };
+    assert_eq!(
+        u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize,
+        expected.len()
+    );
+    assert_eq!(&bytes[4..], &expected);
+    assert!(bytes.charged() >= bytes.len());
+    assert!(d.take_command().is_none());
+    drop(bytes);
+    drop(d);
     assert_eq!(budget.used(), 0);
 }
 
