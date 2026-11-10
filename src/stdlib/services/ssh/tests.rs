@@ -1010,14 +1010,20 @@ fn what_the_peer_sent_before_our_close_arrived_is_dropped() {
     for message in late {
         take(&mut layer, message, &mut env).expect("the peer had not seen our CLOSE");
     }
-    assert!(layer.take_event().is_none(), "nothing reaches the retired child");
+    assert!(
+        layer.take_event().is_none(),
+        "nothing reaches the retired child"
+    );
     assert!(
         layer.take_command(&mut env).is_none(),
         "nothing is answered on a closed channel"
     );
     take(&mut layer, wire::Message::Close(0), &mut env).unwrap();
     assert!(!layer.channels.contains(child.id()));
-    assert!(layer.take_command(&mut env).is_none(), "CLOSE was sent once");
+    assert!(
+        layer.take_command(&mut env).is_none(),
+        "CLOSE was sent once"
+    );
 }
 
 /// Rejects every attempt after a delay.
@@ -1257,7 +1263,9 @@ fn a_signature_that_does_not_verify_is_answered_with_failure() {
         // Room for the reply, as each step makes sure of first.
         assert!(layer.room(&budget));
         assert!(matches!(
-            layer.packet(0, &payload, &mut env).expect("the connection goes on"),
+            layer
+                .packet(0, &payload, &mut env)
+                .expect("the connection goes on"),
             Handled::Done
         ));
         while let Some(StreamCommand::Write(bytes)) = layer.take_command(&mut env) {
