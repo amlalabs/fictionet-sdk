@@ -417,7 +417,7 @@ write clock alone:
 
 | Harness | Proves | Unwind | Checks | Result |
 | --- | --- | ---: | ---: | --- |
-| `the_idle_clock_stops_while_memory_waits` | over three settles at symbolic `u8` times, with symbolic `u8` limits and flags: the idle deadline is never earlier than an idle limit after the first settle that found the stream quiet since its last busy one (busy: output, input, work or memory); a settle that finds the stream waiting for memory leaves no idle deadline; a twin that never waits for memory keeps the same write clock | 4 | not run yet | not run yet |
+| `the_idle_clock_stops_while_memory_waits` | over three settles at symbolic `u8` times, with symbolic `u8` limits and flags: the idle deadline is never earlier than an idle limit after the first settle that found the stream quiet since its last busy one (busy: output, input, work or memory); a settle that finds the stream waiting for memory leaves no idle deadline; a twin that never waits for memory keeps the same write clock | 4 | 247 (3 unreachable) | all pass, 5.3 s (November 10, 2026) |
 
 The random model test `the_idle_deadline_never_falls_inside_a_wait_for_memory`
 (`lifetime.rs`) checks the same over 256 seeds of 64 steps, with the
@@ -683,3 +683,93 @@ Seven Rust regressions failed with the old drain order and passed after both
 runners drained those reports before returning. The final worker-storage
 backpressure change passed its targeted Rust tests; formal reruns stopped at
 the user's request before that change.
+
+## The runner and memory (November 10, 2026, `comp/fv-layer`)
+
+`StreamRunner.tla` described the runner before the budget redesign: a
+read whose charge the budget refused ended the run with
+`StreamEnd::Budget` after offering the stack a reset. The runner now
+waits for memory instead, and a run ends for memory only when a charge
+needs more than the budget's whole limit (`Starved`), without a reset. The
+model was rewritten to `live.rs` and `lifetime.rs` at main `3db7a847e`:
+
+- The budget is shared: `full` says it has no room now, `Fill` (at most
+  `Fills` times) and `Free` (fair) are the other connections' charges and
+  releases. A round's own refusals are those of the runner's view: the
+  read buffer paid for before a read, the copy that pays for bytes read
+  (refused, the buffer goes on with the bytes, which `InputKept` still
+  counts), and a charge of the stack's, which then takes no input in that
+  round. A refused round that settles registers the runner's wake, or
+  wakes it at once if the room is already there, and stops the idle clock.
+- The stack may ask for more than the whole limit: the run ends with
+  `Budget` at the end of that round, the stack hearing no reset.
+- A child of the stack may wait for memory on its own view; the release
+  that makes room wakes the runner through the child's waiter, and
+  `Layer::waits_for_memory` tells the runner the child waits.
+- The idle clock follows `Lifetime::settle`: it counts from the first
+  settle that finds the run waiting for its peer, and restarts on input.
+  Bytes written restart the write limit only, as `Lifetime::wrote` says;
+  the model before this pass restarted the idle clock on them too, as the
+  runner before `Lifetime` did.
+
+`IdleNeedsQuiet` now counts memory, the stack's or a child's, as not
+waiting for the peer. `ResetHeardOnBreak` says a starved run hears no
+reset; `EndsAreEarned` says a `Budget` end comes only from a need past the
+limit. New switches, each with a control: `MemoryStopsIdle`,
+`ChildWaitTold`, `WakeOnRelease`, `StarvedEnds`.
+
+`StreamRunner_base.cfg` keeps the old configuration's sizes with the
+budget never full, and `StreamRunner_memory.cfg` turns memory on (one
+fill, a stack that may starve, a child that may wait) with the stack's
+timer, resets and a stalled peer off, so the run finishes in reasonable
+time on a shared machine. The old controls run on the base; the four new
+ones on the memory configuration.
+
+`StreamRunner_without_childwaittold.cfg` is the runner as it was: its
+counterexample is a bug, fixed in this pass (see
+`verification/layer/VERIFICATION.md`, "the runner's idle clock ran while
+a child waited for memory"). Shortest trace: the run waits two ticks for
+its peer, the budget fills, a round has the child begin to wait for
+memory, and the settle that follows ends the input as idle while the
+child waits.
+
+TLC 2.19, two workers, a 2 GiB heap under a 3 GiB scope, November 10,
+2026, on the code as fixed; each counterexample was read.
+
+| Config | Generated | Distinct | Depth | Result |
+| --- | ---: | ---: | ---: | --- |
+| `StreamRunner_memory.cfg` | 16,735,332 | 163,658 | 50 | every invariant and `Terminates` pass |
+| `StreamRunner_without_childwaittold.cfg` | 11,389,660 | 83,629 | | `IdleNeedsQuiet` violated, the trace above |
+| `StreamRunner_without_memorystopsidle.cfg` | 1,279,234 | 15,482 | | `IdleNeedsQuiet` violated: a round refused for memory settles and the idle limit ends the input while the stack waits |
+| `StreamRunner_without_wakeonrelease.cfg` | 1,165,027 | 13,866 | | `Terminates` violated: the runner waits for memory with no deadline, memory frees, and nothing wakes it |
+| `StreamRunner_without_starvedends.cfg` | 689,976 | 8,806 | | `Terminates` violated: a starved stack is refused in every round and the runner sleeps with no deadline and no wake |
+
+The other configurations (`StreamRunner_base.cfg`, `_halfclose` and the
+eleven older controls) were queued behind other work on the shared
+machine; their results are added below as they finish.
+
+The model as it stood before this pass was also rerun unchanged:
+`StreamRunner_base.cfg` passed with 27,865,057 generated and 185,569
+distinct states (depth 45), as recorded before; `_halfclose` passed and
+`_without_finishinput` violated `FinishNeedsInput`. The rest of its
+controls were not rerun, the model being replaced.
+
+`DatagramRunner.tla`, unchanged, rerun:
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `DatagramRunner_base.cfg` | 56,180 | 9,828 | all pass |
+| `DatagramRunner_without_deadlineinwait.cfg` | 46,426 | 8,650 | `TimerFires` violated |
+| `DatagramRunner_without_droponbudgetmiss.cfg` | 31 | 14 | `ReturnHasReason` violated |
+| `DatagramRunner_without_endclosesoutput.cfg` | 159 | 42 | `NothingAfterEnd` violated |
+| `DatagramRunner_without_oneconversation.cfg` | 1,593 | 322 | `InOrderOnce` violated |
+
+`DatagramRunner.tla` was not changed. Its one budget path, a received
+datagram the budget cannot pay for being dropped and reported, is still
+the code's (`run_datagrams`, `DatagramReport::Dropped`). It does not have
+the stack's own refusals, the wait for memory or `DatagramEnd::Budget`;
+those are the same `driver.refusals()`, `starved_since` and
+`wake_when_freed` calls as the stream runner's, checked there and by
+`a_datagram_stack_refused_memory_runs_again_when_it_frees` and
+`a_datagram_stack_needing_more_than_the_limit_ends_starved_at_once`. Its
+header's line numbers are those of `e2858ccc4`.

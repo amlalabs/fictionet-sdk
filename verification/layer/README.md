@@ -60,6 +60,18 @@ reservation release and independent sibling admission.
 | `Children_without_wakeoncredit.cfg` | credit from the mux does not ready the child: violates `CommandsGo` |
 | `Children_without_keepwaiting.cfg` | a child whose command finds the queue full is not kept ready: violates `CommandsGo` |
 | `Children_without_wakeonrelease.cfg` | released payload does not ready its child: violates `CreditReturns` |
+| `BudgetWake_base.cfg` | the budget's wake, one atomic step at a time, four runners on views of one budget (one needing more than the limit), every runner holding only for a while: `WithinLimit`, `StarvedNeverWaits`, `AllServed` |
+| `BudgetWake_spin_base.cfg` | the same where a runner may hold its memory for ever: `NoSpin` (no runner is woken over and over while nothing frees) and `WakeWhenRoom` (no runner is left asleep for good while the room covers its need) |
+| `BudgetWake_without_owedwake.cfg` | `wake_when_freed` as it was before this pass, waking only the asker when the room already covers the least refused need: violates `NoSpin` |
+| `BudgetWake_without_wokenmark.cfg` | the asker ignores a release that woke the runners since its mark: violates `WakeWhenRoom` |
+| `BudgetWake_without_recheck.cfg` | no last try after noting the need and no room check when asking: violates `WakeWhenRoom` |
+| `BudgetWake_lasttry_alone.cfg`, `BudgetWake_roomcheck_alone.cfg` | each of the two without the other: both pass, each covers the race the other closes |
+| `ChildMemory_base.cfg` | `Children`'s memory rules for three children on views of one budget (one needing more than the limit), with other connections charging and releasing: `CauseMatches`, `MemoryClosesNothing`, `StarvedClosesAlone`, `WaitTold`, `ChildWakes`, `TellEnds` |
+| `ChildMemory_without_waitonrefusal.cfg` | a refusal within the limit closes the child, as before the leftovers: violates `MemoryClosesNothing` |
+| `ChildMemory_without_ownview.cfg` | children charge the stack's view: a child's need past the limit ends the run: violates `StarvedClosesAlone` |
+| `ChildMemory_without_samecause.cfg` | `Refused` reports a memory refusal as prohibited: violates `CauseMatches` |
+| `ChildMemory_without_wakeonrelease.cfg` | the release does not wake a waiting child: violates `ChildWakes` |
+| `ChildMemory_without_tellevent.cfg` | a wait begun by an event's charge is not told to the runner: violates `WaitTold` |
 
 Run one with TLC (JDK 11 or later):
 
