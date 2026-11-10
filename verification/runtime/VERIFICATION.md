@@ -232,6 +232,23 @@ and transfer contexts needed later into their result. Lease metadata is
 fixed context-owned storage, like region metadata: active jobs are bounded
 by the job limit and retained contexts keep their metadata after cancellation.
 
+A retired job's region and lease go to the runner's next job only from the
+model's `borrowed = 0` and `live = 0`, and only when nothing else holds
+either: `Cx::retire_job_context` keeps them when the region's `Arc` is
+unique and the lease renews through `Arc::get_mut` (no borrowed context,
+no nested job's lease, no cancel wait), and `Region::renew` also needs the
+region made in the parent it is renewed under, with that parent not
+renewed since (`renewals` and `made_in`: a renewal starts a region with no
+children, so one made before is out of its reach). Any other retired
+context is cancelled, as before. The tests are
+`a_renewed_region_is_new_and_still_its_parents_child`,
+`a_region_made_before_its_parent_was_renewed_is_not_renewed`,
+`a_renewed_lease_is_its_new_jobs_alone`, the job tests
+`a_drained_jobs_context_goes_to_the_next_job_as_new` and
+`a_context_still_held_goes_to_no_later_job`, and the allocation counts in
+`tests/it/open_allocations.rs`. The TLA model is unchanged and was not
+rerun.
+
 `JobContext_base.cfg` passes both invariants: 98 generated states, 31 distinct,
 depth 6. `JobContext_without_borrow.cfg` violates `BorrowKeepsAdmission` with
 a borrow, a returned result, and premature retirement (24 distinct states to

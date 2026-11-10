@@ -491,7 +491,7 @@ mod tests {
                 }),
             );
             let mut conn = slot.lock().take().expect("the takeover ran");
-            let region = fcx.job_context();
+            let region = fcx.job_context(None);
             conn.write(&region, b"hello").await.unwrap();
             region.cancel();
             assert_eq!(conn.flush(&region).await, Err(ConnError::Cancelled));
@@ -541,7 +541,7 @@ mod tests {
             let mut cx = Context::from_waker(Waker::noop());
             let mut buf = [0; 8];
             assert!(conn.poll_read(&fcx, &mut cx, &mut buf).is_pending());
-            let region = fcx.job_context();
+            let region = fcx.job_context(None);
             region.cancel();
             assert_eq!(
                 conn.poll_read(&region, &mut cx, &mut buf),
@@ -561,7 +561,7 @@ mod tests {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (mut tunnel, mut conn) = kept(&fcx);
             assert!(fill(&fcx, &mut tunnel, &mut conn) > 0);
-            let region = fcx.job_context();
+            let region = fcx.job_context(None);
             region.cancel();
             let mut cx = Context::from_waker(Waker::noop());
             assert_eq!(

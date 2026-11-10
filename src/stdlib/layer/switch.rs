@@ -340,6 +340,13 @@ where
         }
     }
 
+    fn waits_for_memory(&self) -> bool {
+        match &self.phase {
+            Phase::First(a) => a.waits_for_memory(),
+            Phase::Then(b) => b.waits_for_memory(),
+        }
+    }
+
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
         match &self.phase {
             Phase::First(a) => a.deadline().map(|(at, t)| (at, Side::Lower(t))),

@@ -12,7 +12,8 @@
 //! The measure is the capacities of what a value owns, recursively: a
 //! `String` or a `Vec<u8>` holds its capacity, a `Vec<T>` its places and
 //! what each item holds, a `Box<T>` the `T` and what it holds. Scalars,
-//! arrays of them and borrowed values hold nothing. A struct sums its
+//! arrays of them hold nothing; a borrowed value has no measure of its
+//! own, since its owner holds what it points to. A struct sums its
 //! fields with [`heap_of!`](fictionet::heap_of), which names every field,
 //! so a field added later and left out does not compile.
 
@@ -87,10 +88,15 @@ holds_nothing!(
     f64,
 );
 
-/// A borrowed value owns nothing.
-impl<T: ?Sized> Heap for &T {
+/// A value with its charge holds what the value holds: the charge is
+/// counted where it was made, not on the heap. Measured through a
+/// reference too, so `owned.heap()` is the value's measure however the
+/// owner is reached. There is no measure for a borrow: a borrowed value is
+/// its owner's to measure, and a blanket one would answer 0 for a
+/// reference to an owned value.
+impl<T: Heap> Heap for Owned<T> {
     fn heap(&self) -> usize {
-        0
+        (**self).heap()
     }
 }
 
@@ -487,6 +493,38 @@ mod tests {
         let failed = parse_paid(&budget, b"no colon", Tagged::parse);
         assert!(matches!(failed, Some(Err(()))));
         assert_eq!(budget.used(), 0, "a failed parse holds nothing");
+    }
+
+    /// A value with its charge measures what the value holds, however it
+    /// is reached: by value, through a reference, through a reference to
+    /// a reference, or as a generic `Heap`. Each equals the charge a paid
+    /// parse leaves it.
+    #[test]
+    fn an_owned_value_measures_its_value_through_any_reference() {
+        fn measured<T: Heap>(value: &T) -> usize {
+            value.heap()
+        }
+        let rng = SeededEntropy::new(Seed::from_u64(13));
+        let budget = Budget::unlimited();
+        let mut holding = 0;
+        for input in tagged_inputs(&rng) {
+            let paid = parse_paid(&budget, &input, Tagged::parse)
+                .expect("an unlimited budget has room")
+                .expect("the inputs parse");
+            holding += usize::from(paid.charged() > 0);
+            let by_ref: &Owned<Tagged> = &paid;
+            let by_ref_ref: &&Owned<Tagged> = &by_ref;
+            for measure in [
+                paid.heap(),
+                by_ref.heap(),
+                by_ref_ref.heap(),
+                measured(&paid),
+                measured(by_ref),
+            ] {
+                assert_eq!(measure, paid.charged());
+            }
+        }
+        assert!(holding > 0, "some values hold something");
     }
 
     /// A message whose first byte says its kind: `n` holds nothing, `s`

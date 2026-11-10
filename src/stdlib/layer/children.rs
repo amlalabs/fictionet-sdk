@@ -147,17 +147,20 @@ where
     armed: u64,
     limit: usize,
     window: u64,
+    /// How many open children wait for memory.
+    waiting: usize,
     /// The children and the router's queues, with what pays for them.
     places: Places<B, K>,
 }
 
 /// The router's storage, paid for as one: its two queues, and for each
 /// child place a place in every table, which are the children, their ids
-/// in order, the deadline heap, the wake queue and a closing place in the
-/// command queue. The places grow only here, every table together or none:
-/// the growth is charged first, as a charged queue grows, by doubling when
-/// the budget has room and by as many places as it has room for when not.
-/// They go back together too.
+/// in order, the deadline heap, the wake queue, a closing place in the
+/// command queue, and what a closed child leaves for the next ([`Spare`]).
+/// The places grow only here, every table together or none: the growth is
+/// charged first, as a charged queue grows, by doubling when the budget
+/// has room and by as many places as it has room for when not. They go
+/// back together too.
 struct Places<B: Layer, K: Port> {
     /// The open children, each at a key that stays its own while it is open.
     kids: Slab<Kid<B>>,
@@ -173,6 +176,9 @@ struct Places<B: Layer, K: Port> {
     down: VecDeque<MuxCommand<B::Lower, K>>,
     /// Control events for above.
     up: VecDeque<EventOf<K>>,
+    /// What closed children left, at most one for each place no child
+    /// fills, taken by the next children opened.
+    spares: Vec<Spare>,
     /// The child places paid for, which every table holds.
     count: usize,
     /// What pays for the queues and the places: `None` until the first
@@ -194,6 +200,7 @@ impl<B: Layer, K: Port> Places<B, K> {
             }),
             down: VecDeque::new(),
             up: VecDeque::new(),
+            spares: Vec::new(),
             count: 0,
             charge: None,
         }
@@ -206,17 +213,32 @@ impl<B: Layer, K: Port> Places<B, K> {
 
     /// One child place: the child itself, a vacant place's next key
     /// included, its wake state with its two counts, its place in the wake
-    /// queue, its id in order, its place in the deadline heap, and its
-    /// closing place in the command queue.
+    /// queue, its id in order, its place in the deadline heap, its closing
+    /// place in the command queue, and its place among the spares with
+    /// what a child's other parts hold behind their counts: its budget's
+    /// record, its work's lifetime and its receive window's charge.
     fn place_bytes() -> usize {
+        let counted = |bytes: usize| 2 * size_of::<usize>() + bytes;
         size_of::<Kid<B>>()
             + size_of::<usize>()
-            + size_of::<ChildWake>()
-            + 2 * size_of::<usize>()
+            + counted(size_of::<ChildWake>())
             + size_of::<usize>()
             + size_of::<(ChildId, usize)>()
             + size_of::<usize>()
             + size_of::<MuxCommand<B::Lower, K>>()
+            + size_of::<Spare>()
+            + Budget::VIEW_BYTES
+            + counted(size_of::<AtomicBool>())
+            + counted(size_of::<Charge>())
+    }
+
+    /// Keeps what a closed child left for the next child opened, while a
+    /// place no child fills has room for it. Within the places paid for,
+    /// so nothing grows.
+    fn keep(&mut self, spare: Spare) {
+        if self.spares.len() < self.count - self.kids.len() {
+            self.spares.push(spare);
+        }
     }
 
     /// Pays for the queues and the first [`FLOOR`] places the first time
@@ -265,6 +287,7 @@ impl<B: Layer, K: Port> Places<B, K> {
         keys.reserve_exact(count - queued);
         drop(keys);
         self.down.reserve_exact(QUEUE + count - self.down.len());
+        self.spares.reserve_exact(count - self.spares.len());
         self.count = count;
     }
 
@@ -287,6 +310,9 @@ impl<B: Layer, K: Port> Places<B, K> {
         // Closed children left the wake queue, so it is empty.
         *self.woken.keys.lock() = Vec::with_capacity(count);
         self.down.shrink_to(QUEUE + count);
+        let mut spares = Vec::with_capacity(count);
+        spares.extend(self.spares.drain(..).take(count));
+        self.spares = spares;
         self.count = count;
         charge.shrink_to(Self::queue_bytes() + count * Self::place_bytes());
     }
@@ -399,9 +425,80 @@ struct Kid<B: Layer> {
     credit: u64,
     /// A command of the layer's that waits for credit.
     outbox: Option<CommandOf<B::Lower>>,
+    /// It waits for memory ([`Kid::wait_for_memory`]).
+    memory: bool,
+}
+
+/// What a closed child leaves for the next child opened, so that opening
+/// a child allocates nothing once children have come and gone: the state
+/// its wakes go through, its budget's record of refusals, its work's
+/// lifetime, and the place of its receive window. The next child uses
+/// each part again only if nothing else holds it then: a part something
+/// still holds (a waker the closed child's work kept, a lease of its
+/// credit, a charge made through its view) stays that holder's, and the
+/// new child gets a new one, so nothing of a closed child's reaches the
+/// next. None of it holds memory of the budget's, so an idle router holds
+/// what it held before its first child.
+struct Spare {
+    wake: Arc<ChildWake>,
+    /// The closed child's view of its budget.
+    budget: Budget,
+    /// Cancelled when its child closed.
+    owner: WorkOwner,
+    /// Kept only if nothing else held it when its child closed, its charge
+    /// given back then: a window holds its child's bytes until the last
+    /// chunk made in it goes, as ever, and never while it waits here.
+    window: Option<Arc<Charge>>,
 }
 
 impl<B: Layer> Kid<B> {
+    /// The child closed: its work's lifetime ends, and what can serve the
+    /// next child is kept, a kept window holding a charge of nothing on
+    /// `idle`, the router's own budget, in place of the child's.
+    fn retire(self, idle: &Budget) -> (Child, Spare) {
+        let Kid {
+            id: _,
+            handle,
+            owner,
+            urgent,
+            layer,
+            budget,
+            inbox,
+            wake,
+            waiter,
+            links: _,
+            due,
+            armed: _,
+            heap: _,
+            mut window,
+            lent: _,
+            max_command: _,
+            granted: _,
+            owed: _,
+            credit: _,
+            outbox,
+            memory: _,
+        } = self;
+        owner.cancel();
+        // The rest of the child goes first, its layer and its chunks among
+        // them, so a window nothing else holds after is the router's alone.
+        drop((urgent, layer, inbox, waiter, due, outbox));
+        let kept = match Arc::get_mut(&mut window) {
+            Some(charge) => {
+                *charge = Charge::nothing(idle);
+                true
+            }
+            None => false,
+        };
+        let spare = Spare {
+            wake,
+            budget,
+            owner,
+            window: kept.then_some(window),
+        };
+        (handle, spare)
+    }
+
     /// After calls into the child that began with its budget's refusals at
     /// `since`: if a charge was refused meanwhile, the child is visited
     /// again once its budget has room for it (rule 9). The child asks
@@ -411,13 +508,30 @@ impl<B: Layer> Kid<B> {
     /// whole limit is met by no release: the child is starved, nothing
     /// waits, and the caller closes it as failed, as the runner ends a
     /// stack that needs more than its limit.
+    ///
+    /// The child waits for memory from a refusal until calls that
+    /// `retried` (a visit, which advances its layer, where a layer tries a
+    /// refused charge again) meet none, and while a part of its layer
+    /// waits on a view of its own. `waiting` counts the children that
+    /// wait, which the router reports to its runner
+    /// ([`Layer::waits_for_memory`]), so their wait is not idle.
     #[must_use]
-    fn wait_for_memory(&self, since: Refusals, around: Wakes<'_>) -> Option<Starved> {
+    fn wait_for_memory(
+        &mut self,
+        since: Refusals,
+        around: Wakes<'_>,
+        retried: bool,
+        waiting: &mut usize,
+    ) -> Option<Starved> {
         let starved = self.budget.starved_since(since);
-        if starved.is_none() && self.budget.refused_since(since) {
+        let refused = starved.is_none() && self.budget.refused_since(since);
+        if refused {
             let waiter = self.waiter.waiter(|| around.waker());
             self.budget.wake_when_freed(waiter, since);
         }
+        let was = self.memory;
+        self.memory = refused || self.layer.waits_for_memory() || (was && !retried);
+        *waiting = (*waiting + usize::from(self.memory)) - usize::from(was);
         starved
     }
 }
@@ -468,6 +582,22 @@ impl ChildWake {
             queue,
             task: Mutex::new(None),
         }
+    }
+
+    /// `this`, a closed child's, made the wake state of a new child at
+    /// `key`, as [`new`](Self::new) makes one, when nothing else holds it:
+    /// no waker the closed child's work kept, no lease of its credit, no
+    /// waiter of its budget. `None` while something holds it, which keeps
+    /// it, so nothing of the closed child's ever reaches the new one.
+    fn renewed(mut this: Arc<Self>, key: usize) -> Option<Arc<Self>> {
+        let wake = Arc::get_mut(&mut this)?;
+        wake.key = key;
+        *wake.released.get_mut() = 0;
+        *wake.calling.get_mut() = false;
+        *wake.woken.get_mut() = false;
+        *wake.closed.get_mut() = false;
+        *wake.task.get_mut() = None;
+        Some(this)
     }
 
     // A release is never lost. Every call ends by clearing `calling` and is
@@ -681,6 +811,7 @@ where
             armed: 0,
             limit,
             window,
+            waiting: 0,
             places: Places::new(),
         }
     }
@@ -729,7 +860,29 @@ where
         }
         let kid = self.places.kids.remove(key);
         kid.wake.close();
+        self.waiting -= usize::from(kid.memory);
         Some(kid)
+    }
+
+    /// Keeps what `kid`, which [`remove`](Self::remove) took out, leaves
+    /// for the next child, and hands back its handle for its close.
+    fn retire(&mut self, kid: Kid<B>) -> Child {
+        let idle = self
+            .places
+            .charge
+            .as_ref()
+            .expect("a child was opened, so the places are paid for")
+            .budget()
+            .clone();
+        let (handle, spare) = kid.retire(&idle);
+        self.places.keep(spare);
+        handle
+    }
+
+    /// Takes child `id` out and retires it, handing back its handle.
+    fn close(&mut self, id: ChildId) -> Option<Child> {
+        let kid = self.remove(id)?;
+        Some(self.retire(kid))
     }
 
     /// Child `key` was called: its layer may have work, its deadline is
@@ -858,12 +1011,10 @@ where
         id: ChildId,
         error: B::Error,
     ) {
-        if let Some(kid) = self.remove(id) {
+        if let Some(handle) = self.close(id) {
             // Closing is bounded by the mux's own limit on children: the
             // mux keeps the slot until it takes this command.
-            self.places
-                .down
-                .push_back(kid.handle.close(Closing::Failed));
+            self.places.down.push_back(handle.close(Closing::Failed));
             env.report(ChildReport::Failed(id, error));
         }
     }
@@ -876,8 +1027,8 @@ where
         id: ChildId,
         why: Closing,
     ) {
-        if let Some(kid) = self.remove(id) {
-            self.places.down.push_back(kid.handle.close(why));
+        if let Some(handle) = self.close(id) {
+            self.places.down.push_back(handle.close(why));
             env.report(ChildReport::Refused(id, why));
         }
     }
@@ -904,9 +1055,12 @@ where
         let Some((moved, waiting)) = self.visit_kid(env, key) else {
             return true;
         };
-        let kid = &self.places.kids[key];
+        let kid = &mut self.places.kids[key];
         let id = kid.id;
-        if kid.wait_for_memory(since, env.wakes()).is_some() {
+        if kid
+            .wait_for_memory(since, env.wakes(), true, &mut self.waiting)
+            .is_some()
+        {
             self.refuse(env, id, Closing::Failed);
             return true;
         }
@@ -1030,8 +1184,8 @@ where
         }
         if self.close_finished && output_idle && kid.layer.is_terminal() {
             if self.places.down.len() < QUEUE {
-                let kid = self.remove(id).expect("visited child");
-                self.places.down.push_back(kid.handle.close(Closing::Done));
+                let handle = self.close(id).expect("visited child");
+                self.places.down.push_back(handle.close(Closing::Done));
                 return None;
             }
             waiting = true;
@@ -1079,19 +1233,29 @@ where
                 // closed at once, its siblings and the connection
                 // untouched.
                 // The child asks through a view of its own, so what its
-                // budget refuses is its own record, not a sibling's.
-                let budget = self.budget_for.as_mut().map_or_else(
-                    || env.budget().view(),
-                    |select| select(id, &opening, env.budget()).view(),
-                );
+                // budget refuses is its own record, not a sibling's. What
+                // a closed child left serves it where nothing else holds
+                // it ([`Spare`]).
+                let selected = match &mut self.budget_for {
+                    Some(select) => select(id, &opening, env.budget()),
+                    None => env.budget().clone(),
+                };
+                let (budget, kept_wake, owner, kept_window) = match self.places.spares.pop() {
+                    Some(Spare {
+                        wake,
+                        budget,
+                        owner,
+                        window,
+                    }) => (selected.view_in(budget), Some(wake), owner, window),
+                    None => (selected.view(), None, WorkOwner::new(), None),
+                };
                 let reserved = if self.places.kids.len() >= self.limit {
                     Err(Closing::Prohibited)
+                } else if !self.places.make_room(self.limit) {
+                    Err(Closing::ResourceShortage)
                 } else {
-                    self.places
-                        .make_room(self.limit)
-                        .then(|| budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?))
-                        .flatten()
-                        .map(Arc::new)
+                    EventOf::<B::Lower>::receive_bytes(self.window)
+                        .and_then(|bytes| budget.charge(bytes))
                         .ok_or(Closing::ResourceShortage)
                 };
                 let made = reserved.and_then(|window| {
@@ -1101,16 +1265,42 @@ where
                 let (window, layer) = match made {
                     Ok(made) => made,
                     Err(why) => {
+                        // Nothing of it went to a child, so it is kept as
+                        // it was, for the next.
+                        if let Some(wake) = kept_wake {
+                            self.places.keep(Spare {
+                                wake,
+                                budget,
+                                owner,
+                                window: kept_window,
+                            });
+                        }
                         self.places.down.push_back(child.close(why));
                         env.report(ChildReport::Refused(id, why));
                         return Ok(Admit::Taken);
                     }
                 };
+                // A kept window is the router's alone: no one could reach
+                // it since its child closed.
+                let window = match kept_window {
+                    Some(mut kept) => match Arc::get_mut(&mut kept) {
+                        Some(place) => {
+                            *place = window;
+                            kept
+                        }
+                        None => Arc::new(window),
+                    },
+                    None => Arc::new(window),
+                };
+                let mut owner = owner;
+                owner.renew();
                 let due = layer.deadline();
                 assert!(env.fits_below(&layer), "composition is too deep");
                 let place = self.places.kids.vacant_entry();
                 let key = place.key();
-                let wake = Arc::new(ChildWake::new(key, self.places.woken.clone()));
+                let wake = kept_wake
+                    .and_then(|wake| ChildWake::renewed(wake, key))
+                    .unwrap_or_else(|| Arc::new(ChildWake::new(key, self.places.woken.clone())));
                 let waiter = ChildWaker::new(wake.clone());
                 place.insert(Kid {
                     id,
@@ -1122,7 +1312,7 @@ where
                     layer,
                     inbox: ChargedDeque::new(&budget, QUEUE),
                     budget,
-                    owner: WorkOwner::new(),
+                    owner,
                     urgent: None,
                     wake,
                     waiter,
@@ -1133,6 +1323,7 @@ where
                     owed: self.window,
                     credit: 0,
                     outbox: None,
+                    memory: false,
                 });
                 let at = self
                     .places
@@ -1158,7 +1349,8 @@ where
                         ) {
                             env.report(ChildReport::Failed(id, error));
                         }
-                        self.places.down.push_back(kid.handle.close(Closing::Done));
+                        let handle = self.retire(kid);
+                        self.places.down.push_back(handle.close(Closing::Done));
                     }
                     return Ok(Admit::Taken);
                 }
@@ -1195,7 +1387,10 @@ where
                         let since = kid.budget.refusals();
                         if !kid.inbox.reserve(1) || !event.reserve_receive(&kid.budget, &kid.window)
                         {
-                            if kid.wait_for_memory(since, env.wakes()).is_none() {
+                            if kid
+                                .wait_for_memory(since, env.wakes(), false, &mut self.waiting)
+                                .is_none()
+                            {
                                 return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
                             }
                             self.refuse(env, id, Closing::Failed);
@@ -1228,7 +1423,8 @@ where
                 }
             }
             MuxEvent::Closed(id) => {
-                self.remove(id);
+                // The mux closed it: its handle has nothing left to say.
+                self.close(id);
             }
             MuxEvent::Control(event) => {
                 if self.places.up.len() >= QUEUE {
@@ -1276,7 +1472,7 @@ where
         match result {
             Ok(fired) => {
                 if self.places.kids[key]
-                    .wait_for_memory(since, env.wakes())
+                    .wait_for_memory(since, env.wakes(), false, &mut self.waiting)
                     .is_some()
                 {
                     self.refuse(env, id, Closing::Failed);
@@ -1314,7 +1510,7 @@ where
         match result {
             Ok(()) => {
                 if self.places.kids[key]
-                    .wait_for_memory(since, env.wakes())
+                    .wait_for_memory(since, env.wakes(), false, &mut self.waiting)
                     .is_some()
                 {
                     self.refuse(env, id, Closing::Failed);
@@ -1398,6 +1594,12 @@ where
             .map(|(_, kid)| kid.layer.depth())
             .max()
             .unwrap_or(0)
+    }
+
+    /// Whether an open child waits for memory on its own view
+    /// ([`Kid::wait_for_memory`]), which the runner does not read.
+    fn waits_for_memory(&self) -> bool {
+        self.waiting > 0
     }
 
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
@@ -2288,6 +2490,78 @@ mod tests {
         );
     }
 
+    /// The router waits for memory exactly while one of its children does
+    /// on that child's own view: from the refusal, through calls that do
+    /// not try again, until a visit finds room, or until the child that
+    /// waits is gone. Its siblings' state makes no difference.
+    #[test]
+    fn the_router_waits_for_memory_while_a_child_does() {
+        let sandbox = Budget::new(4096);
+        let child_budget = sandbox.clone();
+        let want = 1024;
+        let wants = Arc::new(std::sync::Mutex::new(vec![want, 0, want]));
+        let mut driver = Driver::new(
+            Children::<Hungry, Top, ()>::new(3, 8, move |_, (), _| {
+                Some(Hungry {
+                    want: wants.lock().unwrap().remove(0),
+                    held: None,
+                    tries: 0,
+                    wakers: Vec::new(),
+                })
+            })
+            .budgets(move |_, _, _| child_budget.clone()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(3);
+        let mut open = |driver: &mut Driver<Children<Hungry, Top, ()>>| {
+            let child = slots.insert(()).unwrap();
+            let id = child.id();
+            let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+            id
+        };
+        let (a, b) = (open(&mut driver), open(&mut driver));
+        assert!(!driver.layer().waits_for_memory(), "nothing refused yet");
+        let hog = sandbox
+            .charge(sandbox.limit() - sandbox.used() - want + 1)
+            .unwrap();
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        assert!(driver.layer().child(a).unwrap().held.is_none());
+        assert!(
+            driver.layer().child(b).unwrap().held.is_some(),
+            "b wants nothing"
+        );
+        assert!(driver.layer().waits_for_memory(), "a waits");
+        // Credit for the waiting child is a call that tries nothing again
+        // until its visit, which still finds no room.
+        let _ = driver.deliver(MuxEvent::Credit(a, 1)).unwrap();
+        assert!(driver.layer().waits_for_memory());
+        driver.run().unwrap();
+        assert!(driver.layer().waits_for_memory(), "still no room");
+        // b closing changes nothing; a closing ends the wait.
+        let _ = driver.deliver(MuxEvent::Closed(b)).unwrap();
+        assert!(driver.layer().waits_for_memory());
+        let _ = driver.deliver(MuxEvent::Closed(a)).unwrap();
+        assert!(
+            !driver.layer().waits_for_memory(),
+            "the waiting child is gone"
+        );
+        // A third child waits, and a visit with room ends its wait. What
+        // the closed children held went back, so the room is taken again.
+        let c = open(&mut driver);
+        let more = sandbox
+            .charge(sandbox.limit() - sandbox.used() - want + 1)
+            .unwrap();
+        driver.run().unwrap();
+        assert!(driver.layer().waits_for_memory(), "c waits");
+        drop((hog, more));
+        driver.run().unwrap();
+        assert!(driver.layer().child(c).unwrap().held.is_some());
+        assert!(!driver.layer().waits_for_memory(), "c has its memory");
+    }
+
     /// A command whose payload the child's budget cannot pay for now stays
     /// in the child's outbox, and the child stays open: nothing is closed
     /// or reported. The release that makes room wakes the task with no
@@ -3084,6 +3358,122 @@ mod tests {
             kept.upgrade().is_none(),
             "the window went back with the child"
         );
+    }
+
+    /// A child that puts the bytes it takes where the test can keep them
+    /// after the child has closed.
+    struct Keeper(Arc<std::sync::Mutex<Vec<Chunk>>>);
+
+    impl Layer for Keeper {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            if let StreamEvent::Data(chunk) = event {
+                self.0.lock().unwrap().push(chunk);
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// What a closed child left that something still holds never serves
+    /// the next child: bytes it took, kept past its close with their
+    /// credit lease and their window, give that credit back to no one,
+    /// and the next child, opened in the same place, gets credit only
+    /// for itself. Once nothing holds them, children that come and go
+    /// share nothing either: each gets exactly its own window's credit.
+    #[test]
+    fn a_closed_childs_parts_still_held_never_reach_the_next_child() {
+        let kept = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stash = kept.clone();
+        let mut driver = Driver::new(
+            Children::<Keeper, Top, ()>::new(1, 8, move |_, (), _| Some(Keeper(stash.clone()))),
+            Arc::new(SeededEntropy::new(Seed::from_u64(98))),
+            Budget::new(100_000),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(1);
+        // Every credit the router gives child `id`.
+        let credit = |driver: &mut Driver<Children<Keeper, Top, ()>>, id: ChildId| {
+            std::iter::from_fn(|| driver.take_command())
+                .map(|command| match command.into_op() {
+                    super::super::MuxOp::Window(found, units, _)
+                    | super::super::MuxOp::Credit(found, units) => {
+                        assert_eq!(found, id, "credit for a child that is open");
+                        units
+                    }
+                    _ => 0,
+                })
+                .sum::<u64>()
+        };
+        let open = |driver: &mut Driver<Children<Keeper, Top, ()>>, slots: &mut Slots<()>| {
+            let child = slots.insert(()).unwrap();
+            let id = child.id();
+            let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+            driver.run().unwrap();
+            (id, credit(driver, id))
+        };
+        let close =
+            |driver: &mut Driver<Children<Keeper, Top, ()>>, slots: &mut Slots<()>, id: ChildId| {
+                let _ = driver.deliver(MuxEvent::Closed(id)).unwrap();
+                slots.remove(id);
+                driver.run().unwrap();
+                while driver.take_command().is_some() {}
+            };
+        let (first, granted) = open(&mut driver, &mut slots);
+        assert_eq!(granted, 8);
+        let _ = driver
+            .deliver(MuxEvent::Child(
+                first,
+                StreamEvent::Data(Chunk::unpaid(vec![1; 4])),
+            ))
+            .unwrap();
+        driver.run().unwrap();
+        assert_eq!(kept.lock().unwrap().len(), 1, "the child took the bytes");
+        close(&mut driver, &mut slots, first);
+        let (second, granted) = open(&mut driver, &mut slots);
+        assert_eq!(granted, 8, "the next child's own window");
+        // The first child's bytes go now: their credit is the first
+        // child's, which is closed.
+        kept.lock().unwrap().clear();
+        driver.run().unwrap();
+        assert_eq!(
+            credit(&mut driver, second),
+            0,
+            "no credit the child did not free"
+        );
+        // With nothing held, each child that comes and goes gets its own
+        // window's credit and no more.
+        let mut open_now = second;
+        for _ in 0..4 {
+            close(&mut driver, &mut slots, open_now);
+            let (next, granted) = open(&mut driver, &mut slots);
+            assert_eq!(granted, 8);
+            driver.run().unwrap();
+            assert_eq!(credit(&mut driver, next), 0);
+            open_now = next;
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@ mod listen;
 mod mail_codec;
 mod media_codec;
 mod messaging_codec;
+mod open_allocations;
 mod packet_composition;
 mod packets;
 mod protocol_primitives;

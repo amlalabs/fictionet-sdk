@@ -31,7 +31,7 @@ pub struct Session<L> {
     memory: bool,
 }
 
-impl<L> Session<L> {
+impl<L: Layer> Session<L> {
     /// Applies the stream adapter's idle and stalled-write policy: one
     /// policy decides for both. When a write stalls past its limit the
     /// application hears a reset and the session asks the transport for
@@ -56,7 +56,7 @@ impl<L> Session<L> {
             output: self.pending > 0,
             input: self.refused || self.event.is_some(),
             work: self.jobs.load(Ordering::Relaxed) > 0,
-            memory: self.memory,
+            memory: self.memory || self.layer.waits_for_memory(),
         }
     }
 
@@ -145,6 +145,9 @@ where
     }
     fn depth(&self) -> usize {
         1 + self.layer.depth()
+    }
+    fn waits_for_memory(&self) -> bool {
+        self.layer.waits_for_memory()
     }
     fn is_terminal(&self) -> bool {
         self.reset
@@ -595,6 +598,113 @@ pub(super) mod tests {
             .layer
             .input_ended
             .expect("the idle limit runs once the application has its memory");
+        assert!(
+            ended.since_start() >= freed + idle,
+            "input ended at {:?}, within the idle limit of the memory coming",
+            ended.since_start()
+        );
+    }
+
+    /// Asks for `want` bytes on each advance through a view of the budget
+    /// of its own, as a child of a router does, and says it waits for
+    /// memory while that view is refused. Notes when its input ended.
+    struct OwnView {
+        want: usize,
+        view: Option<Budget>,
+        held: Option<Charge>,
+        input_ended: Option<Instant>,
+    }
+    impl Layer for OwnView {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+        fn waits_for_memory(&self) -> bool {
+            self.view.is_some() && self.held.is_none()
+        }
+        fn on_event(
+            &mut self,
+            env: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            if matches!(event, StreamEvent::Ended) {
+                self.input_ended.get_or_insert(env.now());
+            }
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+        fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+            if self.held.is_some() {
+                return Ok(false);
+            }
+            let view = self.view.get_or_insert_with(|| env.budget().view());
+            self.held = view.charge(self.want);
+            Ok(self.held.is_some())
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// A part of the application that waits for memory on a view of its
+    /// own, which the session's budget never sees refused, is waiting all
+    /// the same: the idle limit does not count while it waits, and counts
+    /// from when it got its memory.
+    #[test]
+    fn the_idle_clock_waits_while_a_part_waits_on_its_own_view() {
+        let idle = Duration::from_millis(300);
+        let budget = Budget::new(1024);
+        let hog = budget.charge(budget.limit() - 100).unwrap();
+        let mut session = Harness::with_budget(
+            Seed::from_u64(2),
+            Session::new(
+                OwnView {
+                    want: 512,
+                    view: None,
+                    held: None,
+                    input_ended: None,
+                },
+                StreamLimits {
+                    idle: Some(idle),
+                    write_timeout: None,
+                },
+                Instant::ZERO,
+            ),
+            budget.clone(),
+        );
+        session.settle().unwrap();
+        session.advance(idle * 10).unwrap();
+        assert!(session.layer().layer.held.is_none(), "no room yet");
+        assert!(session.layer().waits_for_memory(), "the part's wait shows");
+        assert_eq!(
+            session.layer().layer.input_ended,
+            None,
+            "the idle limit ran while a part waited for memory"
+        );
+
+        let freed = idle * 10;
+        drop(hog);
+        session.settle().unwrap();
+        assert!(session.layer().layer.held.is_some(), "the retry fits");
+        assert!(!session.layer().waits_for_memory());
+        session.advance(idle * 10).unwrap();
+        let ended = session
+            .layer()
+            .layer
+            .input_ended
+            .expect("the idle limit runs once the part has its memory");
         assert!(
             ended.since_start() >= freed + idle,
             "input ended at {:?}, within the idle limit of the memory coming",

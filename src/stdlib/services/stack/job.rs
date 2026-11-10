@@ -153,8 +153,20 @@ impl Job for Infallible {
 /// budget refuses, the first included, leaves the work with the stack:
 /// the refusal is recorded in the stack's view, so its runner waits for
 /// memory and takes the work once a place fits.
+///
+/// Each piece of work runs in a context of its own: a region inside the
+/// runner's, which its tasks run in, and a lease that tells when the
+/// contexts it lent out are gone. A drained job's context that nothing
+/// else holds waits for the next job ([`Cx::retire_job_context`]), so a
+/// runner whose jobs come and go allocates them for its first jobs only.
+/// Like a running job's, they are the context's fixed metadata, outside
+/// the budget; no more wait than places the table keeps and no job fills.
+/// The table gives places back once it holds a quarter of them or fewer,
+/// keeping twice what it holds, so jobs that come and go one by one
+/// neither grow nor shrink it.
 pub(crate) struct Jobs<W> {
     running: ChargedDeque<Running<W>>,
+    spare: Vec<Cx>,
 }
 
 // The job count and intake are engine limits, independent of carrier credit.
@@ -181,6 +193,7 @@ impl<W: Job> Jobs<W> {
     pub(crate) fn new(budget: &Budget) -> Jobs<W> {
         Jobs {
             running: ChargedDeque::new(budget, JOBS),
+            spare: Vec::new(),
         }
     }
 
@@ -244,8 +257,11 @@ impl<W: Job> Jobs<W> {
         let before = self.running.len();
         let mut i = 0;
         while let Some(running) = self.running.get_mut(i) {
-            if running.work.is_some() && running.region.is_none() {
-                running.region = fcx.map(Cx::job_context);
+            if running.work.is_some()
+                && running.region.is_none()
+                && let Some(fcx) = fcx
+            {
+                running.region = Some(fcx.job_context(self.spare.pop()));
             }
             // Work whose owner ended, or whose own region was cancelled or
             // failed, is never polled again: a task of its that failed
@@ -276,11 +292,13 @@ impl<W: Job> Jobs<W> {
                         && region.region.poll_done(cx).is_ready()
                 });
             if drained {
-                if let Some(region) = &running.region
-                    && let Some(error) = region.region.take_error()
-                    && let Some(parent) = fcx
-                {
-                    parent.region.fail(error);
+                if let Some(region) = running.region.take() {
+                    if let Some(error) = region.region.take_error()
+                        && let Some(parent) = fcx
+                    {
+                        parent.region.fail(error);
+                    }
+                    self.spare.extend(region.retire_job_context());
                 }
                 self.running.remove(i);
                 finished = true;
@@ -289,11 +307,26 @@ impl<W: Job> Jobs<W> {
             }
         }
         if self.running.len() < before {
-            // Keep the places an idle table made for its first check of
-            // the stack's work, so a burst that ends leaves it as it was.
-            self.running.shrink_to(FIRST_PLACES);
+            self.give_back();
         }
         Ok(finished)
+    }
+
+    /// Gives back places once a quarter of them or fewer hold work,
+    /// keeping twice what is held and at least the places an idle table
+    /// made for its first check of the stack's work, so a burst that ends
+    /// leaves it as it was. Spare contexts go with the places.
+    fn give_back(&mut self) {
+        let held = self.running.len();
+        if held.saturating_mul(4) <= self.running.places() {
+            self.running
+                .shrink_to(held.saturating_mul(2).max(FIRST_PLACES));
+        }
+        let free = self.running.places() - held;
+        if self.spare.len() > free {
+            self.spare.truncate(free);
+            self.spare.shrink_to(free);
+        }
     }
 }
 
@@ -713,6 +746,195 @@ mod tests {
         assert_eq!(driver.layer().extracted, 0);
         assert_eq!(driver.layer().polls.load(Ordering::Relaxed), 0);
         assert_eq!(driver.layer().drops.load(Ordering::Relaxed), 0);
+    }
+
+    /// What a [`Note`] saw of the context it ran in: where its region
+    /// is, and whether that region was cancelled.
+    type Seen = Arc<fictionet::sync::Mutex<Vec<(usize, bool)>>>;
+
+    /// A job that notes the context it runs in. With `lent`, it keeps a
+    /// clone of that context there and waits; without, it is done at once.
+    struct Note {
+        seen: Seen,
+        lent: Option<Arc<fictionet::sync::Mutex<Vec<Cx>>>>,
+    }
+
+    impl Job for Note {
+        type Done = ();
+        fn poll(&mut self, fcx: Option<&Cx>, _: &mut Context<'_>) -> Poll<()> {
+            let fcx = fcx.expect("the jobs run in a world");
+            self.seen
+                .lock()
+                .push((Arc::as_ptr(&fcx.region).addr(), fcx.is_cancelled()));
+            match &self.lent {
+                Some(lent) => {
+                    lent.lock().push(fcx.clone());
+                    Poll::Pending
+                }
+                None => Poll::Ready(()),
+            }
+        }
+    }
+
+    /// Hands over one [`Note`] each time `next` is set, owned by `owner`.
+    struct Notes {
+        owner: WorkOwner,
+        next: Option<bool>,
+        seen: Seen,
+        lent: Arc<fictionet::sync::Mutex<Vec<Cx>>>,
+    }
+
+    impl Layer for Notes {
+        type Lower = Top;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = OwnedWork<Note>;
+        type Done = ();
+        type Error = Infallible;
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            e: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match e {}
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<Infallible> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+        fn take_work(&mut self) -> Option<Self::Work> {
+            let lend = self.next.take()?;
+            Some(self.owner.own(Note {
+                seen: self.seen.clone(),
+                lent: lend.then(|| self.lent.clone()),
+            }))
+        }
+    }
+
+    fn notes() -> Driver<Notes> {
+        Driver::new(
+            Notes {
+                owner: WorkOwner::new(),
+                next: None,
+                seen: Seen::default(),
+                lent: Arc::default(),
+            },
+            Arc::new(SeededEntropy::new(Seed::from_u64(0))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        )
+    }
+
+    /// Hands over one note, lent or not, and polls the jobs once.
+    async fn one(
+        fcx: &Cx,
+        driver: &mut Driver<Notes>,
+        jobs: &mut Jobs<OwnedWork<Note>>,
+        lend: bool,
+    ) {
+        driver.layer_mut().next = Some(lend);
+        assert!(jobs.take(driver));
+        poll_jobs(fcx, jobs).await;
+    }
+
+    async fn poll_jobs(fcx: &Cx, jobs: &mut Jobs<OwnedWork<Note>>) {
+        std::future::poll_fn(|cx| {
+            Poll::Ready(jobs.poll(Some(fcx), cx, |_| Ok::<_, Infallible>(())))
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A job that ran and ended, lending nothing, leaves its context to
+    /// the next job, which finds it as new: not cancelled, even after the
+    /// job before it was cancelled by its owner.
+    #[test]
+    fn a_drained_jobs_context_goes_to_the_next_job_as_new() {
+        fictionet::block_on(fictionet::lab(Seed::from_u64(16), |fcx| async move {
+            let mut driver = notes();
+            let mut jobs = Jobs::new(driver.budget());
+            for _ in 0..4 {
+                one(&fcx, &mut driver, &mut jobs, false).await;
+                assert!(jobs.is_empty(), "a job done at once drains at once");
+            }
+            let seen = driver.layer().seen.clone();
+            let first = seen.lock()[0].0;
+            assert!(
+                seen.lock()
+                    .iter()
+                    .all(|&(region, cancelled)| region == first && !cancelled)
+            );
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A job whose context is still held when it drains, here because it
+    /// lent a clone and its owner cancelled it, leaves nothing to a later
+    /// job: the context it lent sees its job over, and the next job runs
+    /// in a context of its own, which is not cancelled.
+    #[test]
+    fn a_context_still_held_goes_to_no_later_job() {
+        fictionet::block_on(fictionet::lab(Seed::from_u64(17), |fcx| async move {
+            let mut driver = notes();
+            let mut jobs = Jobs::new(driver.budget());
+            one(&fcx, &mut driver, &mut jobs, true).await;
+            assert_eq!(jobs.len(), 1, "a lent job waits");
+            driver.layer().owner.cancel();
+            poll_jobs(&fcx, &mut jobs).await;
+            assert!(jobs.is_empty(), "a cancelled job drains with its tasks");
+            driver.layer_mut().owner = WorkOwner::new();
+            one(&fcx, &mut driver, &mut jobs, false).await;
+            let seen = driver.layer().seen.lock().clone();
+            let lent = driver.layer().lent.lock().pop().expect("the context lent");
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].0, Arc::as_ptr(&lent.region).addr());
+            assert_ne!(seen[1].0, seen[0].0, "the held context went to no one");
+            assert!(lent.is_cancelled(), "what holds it sees its job over");
+            assert!(!seen[1].1, "the next job's context is its own");
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// Jobs that come and go at a steady number neither grow nor shrink
+    /// the table, and once all are gone it keeps what an idle table keeps.
+    #[test]
+    fn steady_jobs_neither_grow_nor_shrink_the_table() {
+        let budget = Budget::unlimited();
+        let mut driver = driver(budget.clone());
+        driver.layer_mut().remaining = Some(10);
+        let mut jobs = Jobs::new(&budget);
+        assert!(jobs.take(&mut driver));
+        assert!(jobs.take(&mut driver));
+        assert_eq!(jobs.len(), 10);
+        let mut cx = Context::from_waker(Waker::noop());
+        let places = jobs.running.places();
+        for _ in 0..64 {
+            // The oldest job ends and one more comes.
+            jobs.running.get_mut(0).unwrap().work = None;
+            jobs.poll(None, &mut cx, |_| Ok::<_, Infallible>(()))
+                .unwrap();
+            assert_eq!(jobs.len(), 9);
+            driver.layer_mut().remaining = Some(1);
+            assert!(jobs.take(&mut driver));
+            assert_eq!(jobs.running.places(), places);
+        }
+        driver.layer().owner.cancel();
+        jobs.poll(None, &mut cx, |_| Ok::<_, Infallible>(()))
+            .unwrap();
+        assert!(jobs.is_empty());
+        assert_eq!(jobs.running.places(), FIRST_PLACES);
     }
 
     #[test]

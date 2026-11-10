@@ -108,12 +108,16 @@ pub struct Cx {
 /// Like region metadata, this fixed allocation belongs to the context,
 /// separately from charged carrier storage. Active jobs are bounded by the
 /// runner's limit; retained contexts keep their metadata after cancellation.
+/// The runner gives a drained job's lease, with its region, to its next
+/// job when nothing else holds either ([`Cx::retire_job_context`]).
 pub(crate) struct ContextLease(Arc<ContextLeaseState>);
 
 struct ContextLeaseState {
     references: AtomicUsize,
     waiter: crate::sync::Mutex<Option<Waker>>,
-    _parent: Option<ContextLease>,
+    /// Kept borrowed while this lease lives: a nested job keeps its
+    /// parent's context borrowed.
+    parent: Option<ContextLease>,
 }
 
 impl ContextLease {
@@ -121,8 +125,21 @@ impl ContextLease {
         Self(Arc::new(ContextLeaseState {
             references: AtomicUsize::new(1),
             waiter: crate::sync::Mutex::new(None),
-            _parent: parent,
+            parent,
         }))
+    }
+
+    /// Makes this lease the lease of a new job under `parent`, when
+    /// nothing else holds it: no borrowed context and no nested job's
+    /// lease. Returns whether it could; otherwise nothing changes.
+    fn renew(&mut self, parent: Option<ContextLease>) -> bool {
+        let Some(state) = Arc::get_mut(&mut self.0) else {
+            return false;
+        };
+        *state.references.get_mut() = 1;
+        *state.waiter.get_mut() = None;
+        state.parent = parent;
+        true
     }
 
     fn poll_unborrowed(&self, cx: &mut Context<'_>) -> Poll<()> {
@@ -162,12 +179,50 @@ impl Drop for ContextLease {
 }
 
 impl Cx {
-    pub(crate) fn job_context(&self) -> Cx {
+    /// A context for one job of the runner whose context this is: a
+    /// region of its own inside this one, which the job's tasks run in and
+    /// whose failure ends the job, and a lease that tells the runner when
+    /// the contexts the job lent out are gone. `spare`, the context of an
+    /// earlier job of the same runner ([`retire_job_context`]), is used
+    /// again when it was made under this context, so a runner whose jobs
+    /// come and go allocates for its first jobs only. Otherwise, or with
+    /// no spare, both are made new.
+    ///
+    /// [`retire_job_context`]: Cx::retire_job_context
+    pub(crate) fn job_context(&self, spare: Option<Cx>) -> Cx {
+        if let Some(mut spare) = spare
+            && Arc::ptr_eq(&spare.run, &self.run)
+            && spare.region.renew(&self.region)
+            && let Some(lease) = &mut spare.job_lease
+            && lease.renew(self.job_lease.clone())
+        {
+            return spare;
+        }
         Cx {
             run: self.run.clone(),
             region: self.region.child(),
             job_lease: Some(ContextLease::new(self.job_lease.clone())),
         }
+    }
+
+    /// The context of a job whose tasks have all ended, kept for the
+    /// runner's next job ([`job_context`](Cx::job_context)) when nothing
+    /// else holds its region or its lease: no task, no context the job
+    /// lent out, no nested job, no wait registered with it. So no one can
+    /// see the next job's work through it. Otherwise its region is
+    /// cancelled, so whatever still holds it sees its job over, and there
+    /// is nothing to keep.
+    pub(crate) fn retire_job_context(mut self) -> Option<Cx> {
+        if Arc::strong_count(&self.region) == 1
+            && self
+                .job_lease
+                .as_mut()
+                .is_some_and(|lease| lease.renew(None))
+        {
+            return Some(self);
+        }
+        self.region.cancel();
+        None
     }
 
     pub(crate) fn poll_job_context_released(&self, cx: &mut Context<'_>) -> Poll<()> {
@@ -678,5 +733,28 @@ mod context_lease_tests {
         assert!(parent.poll_unborrowed(&mut cx).is_pending());
         drop(borrowed);
         assert!(parent.poll_unborrowed(&mut cx).is_ready());
+    }
+
+    /// A lease is renewed only while nothing else holds it, and then for
+    /// its new job alone: borrowed once, it is unborrowed again, and it
+    /// keeps its new parent borrowed while it lives, not its old one.
+    #[test]
+    fn a_renewed_lease_is_its_new_jobs_alone() {
+        let old = ContextLease::new(None);
+        let new = ContextLease::new(None);
+        let mut lease = ContextLease::new(Some(old.clone()));
+        let borrowed = lease.clone();
+        assert!(!lease.renew(Some(new.clone())), "a borrowed lease");
+        drop(borrowed);
+        assert!(lease.renew(Some(new.clone())));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(lease.poll_unborrowed(&mut cx).is_ready());
+        assert!(
+            old.poll_unborrowed(&mut cx).is_ready(),
+            "the old parent is free"
+        );
+        assert!(new.poll_unborrowed(&mut cx).is_pending());
+        drop(lease);
+        assert!(new.poll_unborrowed(&mut cx).is_ready());
     }
 }

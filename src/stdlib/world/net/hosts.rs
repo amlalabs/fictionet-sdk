@@ -2060,6 +2060,9 @@ impl Layer for ObservedTls {
     fn is_terminal(&self) -> bool {
         self.stack.is_terminal()
     }
+    fn waits_for_memory(&self) -> bool {
+        self.stack.waits_for_memory()
+    }
     fn on_event(
         &mut self,
         env: &mut fictionet::stdlib::layer::Env<'_, Self::Report>,

@@ -3386,6 +3386,44 @@ mod tests {
         assert!(!harness.ended());
     }
 
+    /// Every head a child opens with carries its charge inside it, on the
+    /// stream an `Upgrade: h2c` brought and on one a HEADERS frame opened:
+    /// what is charged covers what the head holds, and goes with the head.
+    #[test]
+    fn every_opening_carries_the_charge_of_its_head() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/upgraded")
+            .version(Version::HTTP_2)
+            .body(())
+            .unwrap();
+        // Each head's path, what it is charged, and what it holds.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = seen.clone();
+        let server = Chain::new(
+            Http2::upgraded(Limits::default(), &[], request, None),
+            Children::new(8, Http2::WINDOW, move |_, opening: Opening, _| {
+                noted.lock().unwrap().push((
+                    String::from_utf8_lossy(opening.head.path().unwrap_or_default()).into_owned(),
+                    opening.head.fields().charged(),
+                    opening.head.fields().capacity(),
+                ));
+                Some(Sink::reading(true))
+            }),
+        );
+        let mut harness = Harness::new(fictionet::Seed::from_u64(1), server);
+        harness.push(&client_preface()).unwrap();
+        harness.push(&headers_without_end(3)).unwrap();
+        let seen = seen.lock().unwrap();
+        let paths: Vec<&str> = seen.iter().map(|(path, ..)| path.as_str()).collect();
+        assert_eq!(paths, ["/upgraded", "/"], "both streams opened");
+        for (path, charged, held) in seen.iter() {
+            assert!(*held > 0, "{path}: a head holds something");
+            assert!(charged >= held, "{path}: {charged} charged, {held} held");
+        }
+    }
+
     /// `POST /` over HTTP as one HEADERS frame on `stream`, its body to
     /// come.
     fn headers_without_end(stream: u32) -> Vec<u8> {
