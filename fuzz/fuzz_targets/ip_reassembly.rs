@@ -146,11 +146,11 @@ fuzz_target!(|steps: Vec<Step>| {
     for p in fictionet::fuzzing::reassemble(packets) {
         // A whole packet sorts without trouble, and its header gives its
         // true length: no IP packet is longer than its length field can say.
-        let _ = fictionet::fuzzing::sort(&p.0);
-        let said = match p.0[0] >> 4 {
-            4 => u16::from_be_bytes([p.0[2], p.0[3]]) as usize,
-            _ => 40 + u16::from_be_bytes([p.0[4], p.0[5]]) as usize,
+        let _ = fictionet::fuzzing::sort(&p);
+        let said = match p[0] >> 4 {
+            4 => u16::from_be_bytes([p[2], p[3]]) as usize,
+            _ => 40 + u16::from_be_bytes([p[4], p[5]]) as usize,
         };
-        assert_eq!(said, p.0.len(), "the header says {said} bytes");
+        assert_eq!(said, p.len(), "the header says {said} bytes");
     }
 });
