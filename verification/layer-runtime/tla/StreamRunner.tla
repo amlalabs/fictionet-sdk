@@ -69,10 +69,12 @@ CONSTANTS PeerBytes,      \* bytes the peer sends in all
           Fills,          \* times the others may fill the budget; 0 for never
           StackMayStarve, \* the stack may ask for more than the budget's whole limit
           ChildMayWait,   \* a child of the stack may wait for memory on its own view
+          StackMaySpeak,  \* the stack may write a byte of its own when its timer fires
           ReadOnlyWhenTakenRule, \* read only if `input.is_none()`
           ReportOnceRule,        \* `unreported = 0` once delivered
           StallResetOnProgress,  \* `stalled_since = None` on bytes taken
           IdleResetOnRead,       \* `took_input`: `idle_from = None` on bytes read
+          IdleResetOnWrite,      \* `wrote`: `idle_from = None` on bytes written
           ResetOnBreak,          \* `broken` offers StreamEvent::Reset
           WriteBeforeEnd,        \* the layer hands writes before its End (framed.rs:183-195)
           KeepPartialRest,       \* `Admit::Partial(rest) => input = Some(rest)`
@@ -287,6 +289,7 @@ Round ==
         early \in (IF StackMayEndEarly /\ sEnd = "no" /\ ~heardReset THEN BOOLEAN ELSE {FALSE}),
         stackRefuses \in (IF full THEN BOOLEAN ELSE {FALSE}),
         starve \in (IF StackMayStarve /\ ~starving THEN BOOLEAN ELSE {FALSE}),
+        speak \in (IF StackMaySpeak THEN BOOLEAN ELSE {FALSE}),
         childBegins \in (IF ChildMayWait /\ full /\ ~childWaits /\ sEnd = "no" /\ ~heardReset
                          THEN BOOLEAN ELSE {FALSE}) :
      LET got == rd > 0
@@ -322,7 +325,8 @@ Round ==
          fires == sTimer1 # None /\ sTimer1 <= now
          askEnd == (ended1 \/ early) /\ sEnd = "no" /\ ~heardReset /\ ~childWaits1
          runMoved == fires \/ sbuf1 > 0 \/ askEnd \/ askReset \/ childGets
-         sout1 == IF sEnd = "no" THEN sout + sbuf1 ELSE sout
+         \* a stack that speaks on its timer queues a byte of its own
+         sout1 == IF sEnd = "no" THEN sout + sbuf1 + (IF speak /\ fires THEN 1 ELSE 0) ELSE sout
          sEnd1 == IF askEnd THEN "asked" ELSE sEnd
          sReset1 == IF askReset THEN "asked" ELSE sReset
          \* `send_below`, live.rs:296-340
@@ -367,14 +371,15 @@ Round ==
      /\ shut' = (shut \/ p.pshut)
      \* live.rs:344-366: what the transport took is owed to the stack.
      /\ written' = (IF m1 /\ ReportOnceRule THEN 0 ELSE written) + p.pw
-     \* `wrote` (live.rs:354) restarts only the write limit
+     \* `wrote` (live.rs:354) restarts the write limit, and the idle clock below
      /\ stalledSince' = IF (p.pw > 0 /\ StallResetOnProgress) \/ p.hk = "none"
                         THEN None ELSE stalledSince
+     \* `took_input` (live.rs:238) and `wrote` (live.rs:354): a byte read or
+     \* written restarts the idle clock from the next settle
+     /\ idleFrom' = IF (got /\ IdleResetOnRead) \/ (p.pw > 0 /\ IdleResetOnWrite)
+                    THEN None ELSE idleFrom
+     /\ quietFrom' = IF got \/ p.pw > 0 THEN None ELSE quietFrom
      /\ stuckFrom' = IF p.pw > 0 THEN now ELSE stuckFrom
-     \* `took_input` (live.rs:238): the idle clock counts again from the
-     \* next settle; the peer spoke
-     /\ idleFrom' = IF got /\ IdleResetOnRead THEN None ELSE idleFrom
-     /\ quietFrom' = IF got THEN None ELSE quietFrom
      /\ IF p.preset
         THEN /\ pc' = "done" /\ ret' = "reset"
              /\ sOver' = over1 /\ UNCHANGED <<offeredReset, heardReset>>
@@ -538,8 +543,8 @@ WrittenOnce == reported + written = transportTook
 (* The end of the stack's direction goes out after every byte it wrote.   *)
 EndAfterWrites == shut => transportTook = stackOut + sout
 
-(* The idle limit ends input only after the peer had the whole idle time  *)
-(* to speak while the runner waited for it with nothing to write, and     *)
+(* The idle limit ends input only after no byte moved either way for the *)
+(* whole idle time while the runner waited with nothing to write, and    *)
 (* neither the stack nor a child of it waited for memory meanwhile.       *)
 IdleNeedsQuiet == ~earlyIdle
 

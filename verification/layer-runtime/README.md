@@ -24,7 +24,10 @@ export CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 # StreamRunner_memory.cfg (memory that runs out and frees, a stack that
 # may need more than the limit, a child that waits) must pass; its
 # controls are _without_childwaittold, _memorystopsidle (IdleNeedsQuiet),
-# _wakeonrelease and _starvedends (Terminates).
+# _wakeonrelease and _starvedends (Terminates). StreamRunner_speaks.cfg
+# (a stack that writes on its own timer) must pass; its control
+# _without_idleresetonwrite is the old rule, bytes written not restarting
+# the idle clock.
 cd verification/layer-runtime/tla
 systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p MemorySwapMax=0 \
   ~/.cache/adorably-fv/jdk/bin/java -Xmx2g -cp ~/.cache/adorably-fv/tla2tools.jar \

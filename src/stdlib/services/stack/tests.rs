@@ -323,6 +323,124 @@ fn the_idle_clock_restarts_when_the_stack_takes_input_again() {
     );
 }
 
+/// What [`Ticks`] saw: when it last wrote, and when its input ended.
+type TickSeen = Arc<fictionet::sync::Mutex<(Option<Instant>, Option<Instant>)>>;
+
+/// Writes one byte every `every` on its own timer, `left` times, then
+/// ends its direction. Notes when it last wrote and when its input ended.
+struct Ticks {
+    every: Duration,
+    left: usize,
+    next: Option<Instant>,
+    due: bool,
+    seen: TickSeen,
+    end_sent: bool,
+}
+
+impl Layer for Ticks {
+    type Lower = ByteStream;
+    type Upper = Top;
+    type Report = Infallible;
+    type Timer = ();
+    type Work = Infallible;
+    type Done = Infallible;
+    type Error = Infallible;
+
+    fn on_event(
+        &mut self,
+        env: &mut Env<'_, Infallible>,
+        event: StreamEvent,
+    ) -> Result<Admit<StreamEvent>, Infallible> {
+        if matches!(event, StreamEvent::Ended) {
+            self.seen.lock().1.get_or_insert(env.now());
+        }
+        Ok(Admit::Taken)
+    }
+
+    fn on_command(
+        &mut self,
+        _env: &mut Env<'_, Infallible>,
+        command: Infallible,
+    ) -> Result<Admit<Infallible>, Infallible> {
+        match command {}
+    }
+
+    fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+        if self.left > 0 && self.next.is_none() && !self.due {
+            self.next = Some(env.now() + self.every);
+        }
+        Ok(false)
+    }
+
+    fn on_timer(&mut self, _env: &mut Env<'_, Infallible>, _timer: ()) -> Result<bool, Infallible> {
+        self.next = None;
+        self.due = true;
+        Ok(true)
+    }
+
+    fn deadline(&self) -> Option<(Instant, ())> {
+        self.next.map(|at| (at, ()))
+    }
+
+    fn take_command(&mut self, env: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
+        if self.due {
+            self.due = false;
+            self.left -= 1;
+            self.seen.lock().0 = Some(env.now());
+            return Some(StreamCommand::Write(Chunk::unpaid(vec![b'.'])));
+        }
+        if self.left == 0 && !self.end_sent {
+            self.end_sent = true;
+            return Some(StreamCommand::End);
+        }
+        None
+    }
+
+    fn take_event(&mut self) -> Option<Infallible> {
+        None
+    }
+}
+
+/// A connection is idle only when no byte moved either way: one whose
+/// stack keeps sending, more often than the idle limit, to a client that
+/// never speaks, is not ended as idle while it sends.
+#[test]
+fn a_connection_that_only_sends_is_never_idle() {
+    let idle = Duration::from_millis(300);
+    let every = Duration::from_millis(200);
+    let limits = StreamLimits {
+        idle: Some(idle),
+        ..StreamLimits::default()
+    };
+    let seen: TickSeen = Arc::default();
+    let kept = seen.clone();
+    let ticks = move || Ticks {
+        every,
+        left: 5,
+        next: None,
+        due: false,
+        seen: kept,
+        end_sent: false,
+    };
+    let client = |fcx: Cx, tcp: tcp::Endpoint| async move {
+        let mut conn = tcp.connect(&fcx, server_addr()).await?;
+        let got = read_to_end(&fcx, &mut conn).await?;
+        assert_eq!(got.len(), 5, "every byte arrives");
+        Ok(())
+    };
+    let ended = serve_one(limits, Budget::unlimited(), ticks, client);
+    let (last, over) = *seen.lock();
+    let (last, over) = (last.expect("it wrote"), over.expect("input ended"));
+    assert!(
+        over >= last,
+        "input ended at {:?}, while the stack was still sending (last byte at {:?})",
+        over.since_start(),
+        last.since_start()
+    );
+    // The client closes once it has every byte: the run finishes, never idle.
+    assert_eq!(ended, Ok(StreamEnd::Finished));
+}
+
 /// Bytes from the client start the idle time again, even when the stack
 /// writes nothing back: a client that speaks just inside the limit keeps
 /// its connection for a whole limit after it last spoke.

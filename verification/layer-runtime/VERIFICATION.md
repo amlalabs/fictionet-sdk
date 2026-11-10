@@ -707,10 +707,8 @@ model was rewritten to `live.rs` and `lifetime.rs` at main `3db7a847e`:
   that makes room wakes the runner through the child's waiter, and
   `Layer::waits_for_memory` tells the runner the child waits.
 - The idle clock follows `Lifetime::settle`: it counts from the first
-  settle that finds the run waiting for its peer, and restarts on input.
-  Bytes written restart the write limit only, as `Lifetime::wrote` says;
-  the model before this pass restarted the idle clock on them too, as the
-  runner before `Lifetime` did.
+  settle that finds nothing outstanding, and any byte read or written
+  restarts it (see "One idle rule" below).
 
 `IdleNeedsQuiet` now counts memory, the stack's or a child's, as not
 waiting for the peer. `ResetHeardOnBreak` says a starved run hears no
@@ -783,3 +781,52 @@ those are the same `driver.refusals()`, `starved_since` and
 `a_datagram_stack_refused_memory_runs_again_when_it_frees` and
 `a_datagram_stack_needing_more_than_the_limit_ends_starved_at_once`. Its
 header's line numbers are those of `e2858ccc4`.
+
+## One idle rule (November 10, 2026, `comp/fv-layer`)
+
+A connection is idle only when no byte moved in either direction and
+nothing is outstanding: no output held, no input held, no work, no wait
+for memory. Any byte read or written restarts the idle clock. Before
+this, `Lifetime::wrote` restarted only the write limit, so a stack that
+kept sending to a peer that said nothing had its input ended as idle
+while it sent. `Lifetime::wrote` now restarts both clocks; `Live` and
+`Session` already call it for every byte that goes out, so both follow
+the rule. `StreamLimits::idle` and `Lifetime` say so.
+
+- Test: `a_connection_that_only_sends_is_never_idle`
+  (`services/stack/tests.rs`). A stack writes one byte every 200 ms, five
+  times, to a client that only reads, under an idle limit of 300 ms. Under
+  the old rule its input ended at 300 ms, while it was still sending (last
+  byte at 1 s); under the new one the run finishes when the client closes,
+  after the last byte.
+- `lifetime.rs`'s random model test and the Kani harness
+  `the_idle_clock_stops_while_memory_waits` now count a byte read or
+  written as busy: the idle deadline is never earlier than an idle limit
+  after the first settle that found the stream quiet since its last byte
+  or outstanding work. The harness reads or writes before each of its
+  three settles, symbolically.
+- `StreamRunner.tla`: `IdleResetOnWrite` restarts the idle clock on bytes
+  the transport took, and `IdleNeedsQuiet` counts them as activity. The
+  model's stack only echoed, so a byte never went out without input or
+  held output just before it; `StackMaySpeak` lets it write a byte of its
+  own when its timer fires, and `StreamRunner_speaks.cfg` turns it on.
+  `StreamRunner_without_idleresetonwrite.cfg` is the old rule.
+
+Results, November 10, 2026, one heavy job at a time (Cargo and Kani
+under 8 GiB, TLC under 3 GiB with two workers and a 2 GiB heap):
+
+- `a_connection_that_only_sends_is_never_idle`: fails under the old rule
+  ("input ended at 300ms, while the stack was still sending (last byte at
+  1s)"), passes under the new; all 63 `services::stack` tests pass.
+- `the_idle_clock_stops_while_memory_waits` (Kani): 269 checks (3
+  unreachable), all pass, 4.6 s.
+
+| Config | Generated | Distinct | Depth | Result |
+| --- | ---: | ---: | ---: | --- |
+| `StreamRunner_speaks.cfg` | 5,605,390 | 44,224 | 51 | every invariant and `Terminates` pass |
+| `StreamRunner_without_idleresetonwrite.cfg` | 2,323,600 | 16,446 | 13 | `IdleNeedsQuiet` violated: the stack's own byte goes out at 1, quiet starts then, and the idle limit counted from 0 ends the input at 2 |
+| `StreamRunner_memory.cfg` | 16,735,332 | 163,658 | 50 | all pass (before `StackMaySpeak` was added; with it off the model is the same) |
+| `StreamRunner_without_idleresetonread.cfg` | 1,401,753 | 18,780 | 9 | `IdleNeedsQuiet` violated |
+| `StreamRunner_without_restartidleonwait.cfg` | 949,474 | 13,287 | 8 | `IdleNeedsQuiet` violated |
+| `StreamRunner_without_childwaittold.cfg` | 1,242,266 | 14,784 | 8 | `IdleNeedsQuiet` violated |
+| `StreamRunner_without_memorystopsidle.cfg` | 1,280,202 | 15,499 | 7 | `IdleNeedsQuiet` violated |
