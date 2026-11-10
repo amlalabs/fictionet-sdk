@@ -50,7 +50,7 @@ The divergences from upstream are:
   `CommonState::sendable_tls_len` says how many bytes `write_tls` has
   queued, so the layer allocates exactly that, and
   `Reader::take_first_chunk` hands over the decrypted plaintext in the
-  buffer that holds it instead of copying it out.
+  buffer its record arrived in instead of copying it out.
   `CommonState::take_sendable_tls_chunk` transfers the sole whole queued
   ciphertext buffer when its capacity fits a caller's limit. Multiple
   chunks, partially consumed chunks and oversized allocations stay queued
@@ -76,6 +76,20 @@ The divergences from upstream are:
   and is refused by the budget is dropped and fails the connection with
   `Error::BudgetExhausted`. Without a budget nothing is charged and every
   growth fits, as upstream.
+- A connection holds no buffer it does not need. `read_tls` reads no
+  further than the end of the record arriving, into a buffer of exactly
+  that record's size (its header first, then the rest), and reads nothing
+  more while a whole record waits for `process_new_packets`, failing with
+  `ErrorKind::Other`. Upstream reads 4 KiB at a time into a buffer it
+  keeps. Application data is decrypted in place, and once the record has
+  been authenticated its plaintext stays in that buffer, moved to the
+  front, which joins the plaintext queue with its charge; the next record
+  starts a buffer of its own. There is no separate copy of the plaintext.
+  A buffer is freed, not just emptied, once nothing is in it: the receive
+  buffer once its records are processed, each queue (and its places) once
+  drained, and the handshake joiner's spans once a flight is handed out.
+  An idle connection holds no buffer at all. Records that fail trial
+  decryption leave the buffer at once.
 
 The fork retains upstream `no_std` support and builds for
 `wasm32-unknown-unknown`. Fictionet configures ring's browser randomness

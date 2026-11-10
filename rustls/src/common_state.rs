@@ -52,7 +52,12 @@ pub struct CommonState {
     pub(crate) has_seen_eof: bool,
     pub(crate) peer_certificates: Option<CertificateChain<'static>>,
     message_fragmenter: MessageFragmenter,
+    /// Plaintext received and not yet read: the records it arrived in,
+    /// decrypted where they were read.
     pub(crate) received_plaintext: ChunkVecBuffer,
+    /// The state just took the plaintext of the application data record
+    /// being processed, which the connection keeps.
+    pub(crate) plaintext_kept: bool,
     pub(crate) sendable_tls: ChunkVecBuffer,
     /// A key update notification encrypted and paid for in `sendable_tls`,
     /// with what was paid, waiting to go before the next record.
@@ -103,6 +108,7 @@ impl CommonState {
             peer_certificates: None,
             message_fragmenter: MessageFragmenter::default(),
             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
+            plaintext_kept: false,
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
             queued_key_update_message: None,
             account: None,
@@ -187,12 +193,12 @@ impl CommonState {
         reserved
     }
 
-    /// Charges room for the plaintext of a record whose payload is `len`
-    /// bytes, before it is decrypted: its plaintext is no longer. `false`,
-    /// charging nothing, if the budget has no room; [`Self::wants_budget`]
-    /// then says so.
-    pub(crate) fn reserve_plaintext(&mut self, len: usize) -> bool {
-        let reserved = self.received_plaintext.reserve(len, 1);
+    /// Charges room for a place in the plaintext queue before a record is
+    /// decrypted: its plaintext stays in the record's own buffer, which is
+    /// paid for already. `false`, charging nothing, if the budget has no
+    /// room; [`Self::wants_budget`] then says so.
+    pub(crate) fn reserve_plaintext(&mut self) -> bool {
+        let reserved = self.received_plaintext.reserve(0, 1);
         self.wants_budget |= !reserved;
         reserved
     }
@@ -719,18 +725,11 @@ impl CommonState {
         }
     }
 
-    /// Queues decrypted application data, paid for by the room charged
-    /// before its record was decrypted.
-    pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) -> Result<(), Error> {
+    /// Takes the plaintext of the application data record being processed:
+    /// the connection keeps it, in the buffer the record arrived in.
+    pub(crate) fn accept_received_plaintext(&mut self) {
         self.temper_counters.received_app_data();
-        let bytes = bytes.bytes();
-        match self
-            .received_plaintext
-            .append_with(bytes.len(), || bytes.to_vec())
-        {
-            true => Ok(()),
-            false => Err(Error::BudgetExhausted),
-        }
+        self.plaintext_kept = true;
     }
 
     #[cfg(feature = "tls12")]

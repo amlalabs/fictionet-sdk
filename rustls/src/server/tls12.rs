@@ -911,9 +911,7 @@ impl State<ServerConnectionData> for ExpectTraffic {
         Self: 'm,
     {
         match m.payload {
-            MessagePayload::ApplicationData(payload) => {
-                cx.common.take_received_plaintext(payload)?
-            }
+            MessagePayload::ApplicationData(_) => cx.common.accept_received_plaintext(),
             payload => {
                 return Err(inappropriate_message(
                     &payload,

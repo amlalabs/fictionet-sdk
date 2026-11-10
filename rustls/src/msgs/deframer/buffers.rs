@@ -4,9 +4,9 @@ use core::ops::Range;
 #[cfg(feature = "std")]
 use std::io;
 
-use crate::budget::Paid;
+use crate::budget::{Paid, PaidBytes};
 #[cfg(feature = "std")]
-use crate::msgs::message::MAX_WIRE_SIZE;
+use crate::msgs::message::{HEADER_SIZE, MAX_WIRE_SIZE};
 
 /// Conversion from a slice within a larger buffer into
 /// a `Range` offset within.
@@ -223,6 +223,32 @@ impl DeframerVecBuffer {
         } else if taken >= self.used {
             self.used = 0;
         }
+        self.release_if_empty();
+    }
+
+    /// Frees the allocation once nothing is buffered, giving back its
+    /// charge: an idle connection holds no receive buffer.
+    fn release_if_empty(&mut self) {
+        if self.used == 0 && self.buf.capacity() != 0 {
+            let capacity = self.buf.capacity();
+            self.buf = Vec::new();
+            self.paid.shrink_by(capacity);
+        }
+    }
+
+    /// Takes everything buffered out, with the charge that pays for it,
+    /// leaving the buffer empty and unallocated. Everything buffered is one
+    /// record (after any records skipped before it), whose plaintext was
+    /// decrypted in place at `plaintext`: the plaintext leaves in the buffer
+    /// it arrived in, moved to its front, and nothing is copied out.
+    pub(crate) fn take_plaintext(&mut self, plaintext: Range<usize>) -> PaidBytes {
+        debug_assert!(plaintext.end <= self.used);
+        let mut bytes = mem::take(&mut self.buf);
+        self.used = 0;
+        bytes.truncate(plaintext.end);
+        bytes.drain(..plaintext.start);
+        let charge = self.paid.split(bytes.capacity());
+        PaidBytes::new(bytes, charge)
     }
 
     pub(crate) fn filled_mut(&mut self) -> &mut [u8] {
@@ -236,76 +262,91 @@ impl DeframerVecBuffer {
 
 #[cfg(feature = "std")]
 impl DeframerVecBuffer {
-    /// Read some bytes from `rd`, and add them to the buffer.
+    /// Reads bytes from `rd` up to the end of the record arriving, and no
+    /// further. The buffer holds the parts of a handshake message being
+    /// joined, which end at `joined`, and after them at most one record:
+    /// the one arriving. It grows to exactly what that record takes, paid
+    /// for before it grows: its header first, then the rest once the header
+    /// says how long the record is.
     ///
-    /// Fails with [`io::ErrorKind::OutOfMemory`], having read nothing, if the
-    /// buffer must grow for the read and the budget has no room.
-    pub(crate) fn read(&mut self, rd: &mut dyn io::Read, in_handshake: bool) -> io::Result<usize> {
-        match self.prepare_read(in_handshake) {
-            Ok(()) => {}
-            Err(NoRoom::Full) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "message buffer full",
-                ));
+    /// Fails, having read nothing, with [`io::ErrorKind::OutOfMemory`] if
+    /// the buffer must grow and the budget has no room,
+    /// [`io::ErrorKind::InvalidData`] if it holds the most it may, and
+    /// [`io::ErrorKind::Other`] if a whole record is buffered: it must be
+    /// processed first.
+    pub(crate) fn read(
+        &mut self,
+        rd: &mut dyn io::Read,
+        joined: usize,
+        joining: bool,
+    ) -> io::Result<usize> {
+        let mut read = 0;
+        let result = loop {
+            if let Err(no_room) = self.prepare_read(joined, joining) {
+                break match read {
+                    0 => Err(no_room.into()),
+                    _ => Ok(read),
+                };
             }
-            Err(NoRoom::Unpaid) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "no budget for the received records",
-                ));
+            let n = match rd.read(&mut self.buf[self.used..]) {
+                Ok(n) => n,
+                Err(_) if read > 0 => break Ok(read),
+                Err(error) => break Err(error),
+            };
+            self.used += n;
+            read += n;
+            // A short read has taken what `rd` had; a full one has
+            // completed the header, which says how much more to read, or
+            // the record.
+            if n == 0 || self.used < self.buf.len() {
+                break Ok(read);
             }
-        }
-
-        // Try to do the largest reads possible. Note that if
-        // we get a message with a length field out of range here,
-        // we do a zero length read.  That looks like an EOF to
-        // the next layer up, which is fine.
-        let new_bytes = rd.read(&mut self.buf[self.used..])?;
-        self.used += new_bytes;
-        Ok(new_bytes)
+        };
+        self.release_if_empty();
+        result
     }
 
-    /// Resize the internal `buf` if necessary for reading more bytes.
-    fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), NoRoom> {
+    /// Sizes `buf` to exactly what the record arriving takes, or its header
+    /// while that is incomplete.
+    fn prepare_read(&mut self, joined: usize, joining: bool) -> Result<(), NoRoom> {
         /// TLS allows for handshake messages of up to 16MB.  We
         /// restrict that to 64KB to limit potential for denial-of-
         /// service.
-        const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
+        const MAX_HANDSHAKE_SIZE: usize = 0xffff;
 
-        const READ_SIZE: usize = 4096;
-
-        // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
-        // by varying the maximum allowed buffer size here based on whether a prefix of a
-        // handshake payload is currently being buffered. Given that the first read of such a
-        // payload will only ever be 4k bytes, the next time we come around here we allow a
-        // larger buffer size. Once the large message and any following handshake messages in
-        // the same flight have been consumed, `pop()` will call `discard()` to reset `used`.
-        // At this point, the buffer resizing logic below should reduce the buffer size.
-        let allow_max = match is_joining_hs {
-            true => MAX_HANDSHAKE_SIZE as usize,
+        // We allow a maximum of 64k of buffered data for handshake messages
+        // only: the parts of the message joined so far stay in the buffer
+        // ahead of the record arriving.
+        let allow_max = match joining {
+            true => MAX_HANDSHAKE_SIZE,
             false => MAX_WIRE_SIZE,
         };
 
+        let end = self.arriving_end(joined).ok_or(NoRoom::Waiting)?;
         if self.used >= allow_max {
             return Err(NoRoom::Full);
         }
 
-        // If we can and need to increase the buffer size to allow a 4k read, do so. After
-        // dealing with a large handshake message (exceeding `OutboundOpaqueMessage::MAX_WIRE_SIZE`),
-        // make sure to reduce the buffer size again (large messages should be rare).
-        // Also, reduce the buffer size if there are neither full nor partial messages in it,
-        // which usually means that the other side suspended sending data.
-        // The capacity is exactly what is asked for, so that it is exactly
-        // what is paid for.
-        let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
-        if (need_capacity > self.buf.len() || self.used == 0 || self.buf.len() > allow_max)
-            && !self.resize(need_capacity)
-        {
+        // A record whose header claims more than may be buffered is read up
+        // to the limit; processing it fails on the header.
+        let need = Ord::min(end, allow_max);
+        if need != self.buf.len() && !self.resize(need) {
             return Err(NoRoom::Unpaid);
         }
 
         Ok(())
+    }
+
+    /// Where the record arriving after `from` ends, or where its header
+    /// does while that is incomplete. `None` if the record after `from` is
+    /// whole: it waits to be processed.
+    fn arriving_end(&self, from: usize) -> Option<usize> {
+        let rest = self.filled().get(from..).unwrap_or_default();
+        let Some(header) = rest.get(..HEADER_SIZE) else {
+            return Some(from + HEADER_SIZE);
+        };
+        let end = from + HEADER_SIZE + usize::from(u16::from_be_bytes([header[3], header[4]]));
+        (end > self.used).then_some(end)
     }
 
     /// Append `bytes` to the end of this buffer.
@@ -332,6 +373,25 @@ enum NoRoom {
     Full,
     /// The buffer must grow, and the budget has no room.
     Unpaid,
+    /// A whole record is buffered, waiting to be processed.
+    Waiting,
+}
+
+#[cfg(feature = "std")]
+impl From<NoRoom> for io::Error {
+    fn from(no_room: NoRoom) -> Self {
+        match no_room {
+            NoRoom::Full => Self::new(io::ErrorKind::InvalidData, "message buffer full"),
+            NoRoom::Unpaid => Self::new(
+                io::ErrorKind::OutOfMemory,
+                "no budget for the received records",
+            ),
+            NoRoom::Waiting => Self::new(
+                io::ErrorKind::Other,
+                "a received record waits for process_new_packets",
+            ),
+        }
+    }
 }
 
 /// A borrowed version of [`DeframerVecBuffer`] that tracks discard operations
