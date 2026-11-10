@@ -8,7 +8,7 @@ use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
     Admit, Budget, Charge, ChargedDeque, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer,
-    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Top, Waiter, WorkOwner,
+    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Refusals, Top, Waiter, WorkOwner,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -252,6 +252,17 @@ struct Kid<B: Layer> {
     credit: u64,
     /// A command of the layer's that waits for credit.
     outbox: Option<CommandOf<B::Lower>>,
+}
+
+impl<B: Layer> Kid<B> {
+    /// After calls into the child that began with its budget's refusals at
+    /// `since`: if a charge was refused meanwhile, the child is visited
+    /// again once its budget has room for it (rule 9). Its budget may not
+    /// be the stack's, which the runner above waits on, so the router
+    /// waits on it for the child.
+    fn wait_for_memory(&self, since: Refusals) {
+        self.budget.wake_when_freed(&self.waiter, since);
+    }
 }
 
 /// What reaches a child from outside `Children`'s calls into it: receive
@@ -811,9 +822,11 @@ where
     /// queue had no room for what it has to send.
     fn visit(&mut self, env: &mut Env<'_, ChildReport<B::Report, B::Error>>, key: usize) -> bool {
         self.ready.unlink(&mut self.kids, key);
+        let since = self.kids[key].budget.refusals();
         let Some((moved, waiting)) = self.visit_kid(env, key) else {
             return true;
         };
+        self.kids[key].wait_for_memory(since);
         self.called(key, moved || waiting, false);
         moved
     }
@@ -1134,6 +1147,7 @@ where
             return Ok(false);
         };
         let kid = &mut self.kids[key];
+        let since = kid.budget.refusals();
         let layer = &mut kid.layer;
         let result = kid.wake.call(|| {
             env.scoped_child(
@@ -1147,6 +1161,7 @@ where
         // due at the same time, so theirs fire first.
         match result {
             Ok(fired) => {
+                self.kids[key].wait_for_memory(since);
                 self.called(key, true, true);
                 Ok(fired)
             }
@@ -1166,6 +1181,7 @@ where
             return Ok(());
         };
         let kid = &mut self.kids[key];
+        let since = kid.budget.refusals();
         let layer = &mut kid.layer;
         let result = kid.wake.call(|| {
             env.scoped_child(
@@ -1176,7 +1192,10 @@ where
             )
         });
         match result {
-            Ok(()) => self.called(key, true, false),
+            Ok(()) => {
+                self.kids[key].wait_for_memory(since);
+                self.called(key, true, false);
+            }
             Err(e) => self.fail(env, id, e),
         }
         Ok(())
@@ -1836,6 +1855,120 @@ mod tests {
             driver.take_command().unwrap().into_op(),
             super::super::MuxOp::Child(found, StreamCommand::Write(_)) if found == id
         ));
+    }
+
+    /// A child that asks its budget for `want` bytes on each advance until
+    /// it gets them (rule 9), and keeps the waker of each call.
+    struct Hungry {
+        want: usize,
+        held: Option<Charge>,
+        tries: usize,
+        wakers: Vec<Waker>,
+    }
+
+    impl Layer for Hungry {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = ();
+        type Timer = ();
+        type Work = ();
+        type Done = ();
+        type Error = Infallible;
+        fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Infallible> {
+            self.wakers.push(env.waker());
+            if self.held.is_some() {
+                return Ok(false);
+            }
+            self.tries += 1;
+            self.held = env.budget().charge(self.want);
+            Ok(self.held.is_some())
+        }
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            _: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            Ok(Admit::Taken)
+        }
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, ()>,
+            c: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match c {}
+        }
+        fn take_command(&mut self, _: &mut Env<'_, ()>) -> Option<StreamCommand> {
+            None
+        }
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// A child charges a budget of its own, not the stack's, which the
+    /// runner above waits on. When that budget refuses it, the router waits
+    /// on it for the child, with the one waker the child has: the release
+    /// that leaves room wakes the runner and gets the child visited, with
+    /// no other event.
+    #[test]
+    fn a_child_refused_by_its_own_budget_is_visited_when_that_budget_frees() {
+        let sandbox = Budget::new(4096);
+        let child_budget = sandbox.clone();
+        let want = 1024;
+        let mut driver = Driver::new(
+            Children::<Hungry, Top, ()>::new(1, 8, move |_, (), _| {
+                Some(Hungry {
+                    want,
+                    held: None,
+                    tries: 0,
+                    wakers: Vec::new(),
+                })
+            })
+            .budgets(move |_, _, _| child_budget.clone()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let task = Arc::new(Task::default());
+        driver.set_waker(&Waker::from(task.clone()));
+        let woken = || task.0.load(Ordering::Acquire);
+        let child = Slots::new(1).insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+        // The sandbox has less room than the child wants.
+        let hog = sandbox
+            .charge(sandbox.limit() - sandbox.used() - want + 1)
+            .unwrap();
+        // Rounds as a runner makes them, until nothing moves.
+        for _ in 0..4 {
+            let since = driver.refusals();
+            driver.run().unwrap();
+            while driver.take_command().is_some() {}
+            driver.wake_when_freed(since);
+        }
+        let tries = driver.layer().child(id).unwrap().tries;
+        assert!(tries > 0 && driver.layer().child(id).unwrap().held.is_none());
+        driver.run().unwrap();
+        assert_eq!(
+            driver.layer().child(id).unwrap().tries,
+            tries,
+            "a refused child waits"
+        );
+        assert_eq!(woken(), 0, "no memory freed yet");
+
+        // Memory frees on the child's budget, not the stack's.
+        drop(hog);
+        assert_eq!(woken(), 1, "the release wakes the runner once");
+        assert!(driver.woken());
+        driver.run().unwrap();
+        let child = driver.layer().child(id).unwrap();
+        assert!(child.tries > tries, "the child is visited again");
+        assert!(child.held.is_some(), "and gets its memory");
+        let first = &child.wakers[0];
+        assert!(
+            child.wakers.iter().all(|w| w.will_wake(first)),
+            "every call gets the child's one waker"
+        );
     }
 
     #[test]

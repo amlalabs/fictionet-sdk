@@ -169,7 +169,8 @@
 //! 9. **A refused charge waits for memory.** It leaves the layer ready to
 //!    try again on its next [`advance`](Layer::advance), and the runner
 //!    wakes the stack once memory frees enough for it
-//!    ([`Driver::wake_when_freed`]).
+//!    ([`Driver::wake_when_freed`]). [`Children`] waits the same way for
+//!    a child on the child's own budget.
 //!
 //! Every entry point is synchronous: it never awaits, reads a socket, reads
 //! a clock, or starts a task. The time, the entropy and the budget come in
