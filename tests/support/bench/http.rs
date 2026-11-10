@@ -47,7 +47,7 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
     sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)] as f64 / 1000.0
 }
 
-struct HttpRun {
+pub struct HttpRun {
     rps: f64,
     p50: f64,
     p99: f64,
@@ -83,7 +83,7 @@ pub fn bench(bencher: divan::Bencher, case: HttpCase) {
     let result = Arc::new(Mutex::new(None));
     bencher
         .counter(divan::counter::ItemsCount::new(case.requests))
-        .with_inputs(|| http_world(case, result.clone()))
+        .with_inputs(|| world(case, result.clone(), World::measure))
         .bench_local_values(World::measure);
     if let Some(r) = result.lock().unwrap().take() {
         eprintln!(
@@ -142,111 +142,149 @@ fn certs(
     (roots, leaf.chain, leaf.key)
 }
 
-/// One Sites world with `case.sandboxes` sandboxes, each holding one TLS
-/// connection to `bench.test` and sending `case.requests / sandboxes`
-/// requests on it, one at a time.
-fn http_world(case: HttpCase, result: Arc<Mutex<Option<HttpRun>>>) -> World {
+/// Builds the server on the calling thread and measures the client on its
+/// own thread. Both scopes exclude connection setup, warmup, and teardown.
+/// Each sandbox holds one TLS connection, warms it with 200 requests, then
+/// sends its share of `case.requests`, one request at a time.
+pub fn world(
+    case: HttpCase,
+    result: Arc<Mutex<Option<HttpRun>>>,
+    measure_client: impl FnOnce(World) -> World + Send + 'static,
+) -> World {
+    assert!(case.sandboxes > 0);
+    assert!(case.requests > 0 && case.requests.is_multiple_of(case.sandboxes));
     let (attacher, attachments) = fictionet::attachments();
-    World::new(move |fcx, checkpoint| async move {
-        let (roots, chain, key) = certs(&fcx);
-        let roots = Arc::new(roots);
-        let config = Arc::new(tls::CertifiedKey { chain, key });
-        let page = Page(Bytes::from(vec![b'x'; case.body]));
-        let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), move |_| {
-            Some(
-                web::SiteConfig::handler(fictionet_extras::httpd::tower(page.clone()))
-                    .tls(config.clone()),
-            )
-        });
-        sites.start(&fcx, attachments)?;
-        let machines: Vec<Machine> = (0..case.sandboxes)
-            .map(|i| {
-                machine(
-                    &fcx,
-                    &attacher,
-                    &format!("sandbox{i}"),
-                    Ipv4Addr::new(10, 0, 0, 2 + i as u8),
+    World::with_options(
+        fictionet::Seed::from_u64(41),
+        move |fcx, checkpoint| async move {
+            let (roots, chain, key) = certs(&fcx);
+            let roots = Arc::new(roots);
+            let config = Arc::new(tls::CertifiedKey { chain, key });
+            let page = Page(Bytes::from(vec![b'x'; case.body]));
+            let sites = web::Sites::new(fictionet_extras::network::cdn_pools(), move |_| {
+                Some(
+                    web::SiteConfig::handler(fictionet_extras::httpd::tower(page.clone()))
+                        .tls(config.clone()),
                 )
-            })
-            .collect();
-        let addr = lookup(&fcx, &machines[0], "bench.test").await;
-        for i in 1..case.sites {
-            lookup(&fcx, &machines[0], &format!("site{i}.test")).await;
-        }
-        let mut clients = Vec::new();
-        for m in &machines {
-            let conn = m
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), 443))
-                .await?;
-            let alpn: &[u8] = if case.h2 { b"h2" } else { b"http/1.1" };
-            let mut t = TlsClient::new(
-                &fcx,
-                conn,
-                &roots,
-                "bench.test",
-                &[alpn],
-                SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000),
-            )
-            .unwrap();
-            t.handshake(&fcx)
-                .await
-                .map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
-            let mut c = Client::new(&fcx, t, case.h2).await;
-            for _ in 0..100 {
-                c.get().await;
-            }
-            clients.push(c);
-        }
-        let each = case.requests / case.sandboxes;
-        let lat = Arc::new(Mutex::new(Vec::with_capacity(case.requests)));
-        checkpoint.wait().await;
-        let cpu0 = cpu_us();
-        let start = Instant::now();
-        let mut tasks = Vec::new();
-        for mut c in clients {
-            let lat = lat.clone();
-            tasks.push(fcx.spawn(move |_| async move {
-                let mut samples = Vec::with_capacity(each);
-                for _ in 0..each {
-                    let t = Instant::now();
-                    let (status, version, len) = c.get().await;
-                    assert_eq!(status, StatusCode::OK);
-                    assert_eq!(len, case.body);
-                    assert_eq!(
-                        version,
-                        if case.h2 {
-                            Version::HTTP_2
-                        } else {
-                            Version::HTTP_11
+            });
+            sites.start(&fcx, attachments)?;
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(0);
+            let client = std::thread::spawn(move || {
+                let world = World::with_options(
+                    fictionet::Seed::from_u64(42),
+                    move |fcx, checkpoint| async move {
+                        let machines: Vec<Machine> = (0..case.sandboxes)
+                            .map(|i| {
+                                machine(
+                                    &fcx,
+                                    &attacher,
+                                    &format!("sandbox{i}"),
+                                    Ipv4Addr::new(10, 0, 0, 2 + i as u8),
+                                )
+                            })
+                            .collect();
+                        let addr = lookup(&fcx, &machines[0], "bench.test").await;
+                        for i in 1..case.sites {
+                            lookup(&fcx, &machines[0], &format!("site{i}.test")).await;
                         }
-                    );
-                    samples.push(t.elapsed().as_nanos() as u64);
-                }
-                lat.lock().unwrap().extend(samples);
-                Ok(())
-            }));
-        }
-        for t in tasks {
-            t.join(&fcx).await?;
-        }
-        let secs = start.elapsed().as_secs_f64();
-        let cpu1 = cpu_us() - cpu0;
-        checkpoint.wait().await;
-        let mut l = lat.lock().unwrap();
-        l.sort_unstable();
-        let total = l.len();
-        *result.lock().unwrap() = Some(HttpRun {
-            rps: total as f64 / secs,
-            p50: percentile(&l, 0.5),
-            p99: percentile(&l, 0.99),
-            max: percentile(&l, 1.0),
-            cpu_per_request: cpu1 as f64 / total as f64,
-        });
-        drop(l);
-        fcx.cancel();
-        Ok(())
-    })
+                        let mut clients = Vec::new();
+                        for m in &machines {
+                            let conn = m
+                                .tcp
+                                .connect(&fcx, SocketAddr::new(addr.into(), 443))
+                                .await?;
+                            let alpn: &[u8] = if case.h2 { b"h2" } else { b"http/1.1" };
+                            let mut t = TlsClient::new(
+                                &fcx,
+                                conn,
+                                &roots,
+                                "bench.test",
+                                &[alpn],
+                                SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000),
+                            )
+                            .unwrap();
+                            t.handshake(&fcx)
+                                .await
+                                .map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
+                            let mut c = Client::new(&fcx, t, case.h2).await;
+                            for _ in 0..200 {
+                                let (status, _, len) = c.get().await;
+                                assert_eq!(status, StatusCode::OK);
+                                assert_eq!(len, case.body);
+                            }
+                            clients.push(c);
+                        }
+                        let each = case.requests / case.sandboxes;
+                        let lat = Arc::new(Mutex::new(Vec::with_capacity(case.requests)));
+                        checkpoint.wait().await;
+                        let cpu0 = cpu_us();
+                        let start = Instant::now();
+                        let mut tasks = Vec::new();
+                        for mut c in clients {
+                            let lat = lat.clone();
+                            tasks.push(fcx.spawn(move |_| async move {
+                                let mut samples = Vec::with_capacity(each);
+                                for _ in 0..each {
+                                    let t = Instant::now();
+                                    let (status, version, len) = c.get().await;
+                                    assert_eq!(status, StatusCode::OK);
+                                    assert_eq!(len, case.body);
+                                    assert_eq!(
+                                        version,
+                                        if case.h2 {
+                                            Version::HTTP_2
+                                        } else {
+                                            Version::HTTP_11
+                                        }
+                                    );
+                                    samples.push(t.elapsed().as_nanos() as u64);
+                                }
+                                lat.lock().unwrap().extend(samples);
+                                Ok(())
+                            }));
+                        }
+                        for t in tasks {
+                            t.join(&fcx).await?;
+                        }
+                        let secs = start.elapsed().as_secs_f64();
+                        let cpu1 = cpu_us() - cpu0;
+                        checkpoint.wait().await;
+                        let mut l = lat.lock().unwrap();
+                        l.sort_unstable();
+                        let total = l.len();
+                        *result.lock().unwrap() = Some(HttpRun {
+                            rps: total as f64 / secs,
+                            p50: percentile(&l, 0.5),
+                            p99: percentile(&l, 0.99),
+                            max: percentile(&l, 1.0),
+                            cpu_per_request: cpu1 as f64 / total as f64,
+                        });
+                        drop(l);
+                        fcx.cancel();
+                        Ok(())
+                    },
+                );
+                ready_tx.send(()).unwrap();
+                start_rx.recv().unwrap();
+                let world = measure_client(world);
+                done_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                drop(world);
+            });
+            ready_rx.await.unwrap();
+            checkpoint.wait().await;
+            start_tx.send(()).unwrap();
+            done_rx.await.unwrap();
+            checkpoint.wait().await;
+            finish_tx.send(()).unwrap();
+            client.join().unwrap();
+            fcx.cancel();
+            Ok(())
+        },
+    )
 }
 
 // A hyper client over a `Connection`.
