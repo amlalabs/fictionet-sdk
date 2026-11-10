@@ -1938,8 +1938,9 @@ mod memory {
     use std::time::Duration;
 
     use fictionet::stdlib::layer::{
-        Admit, Budget, ByteStream, Charge, DatagramCommand, DatagramEvent, Datagrams, Env, Layer,
-        Starved, StreamCommand, StreamEvent, Top,
+        Admit, Budget, ByteStream, Chain, Charge, Children, DatagramCommand, DatagramEvent,
+        Datagrams, Env, Layer, Mux, MuxCommand, MuxEvent, Slots, Starved, StreamCommand,
+        StreamEvent, Top,
     };
     use fictionet::stdlib::network::{ConnError, ConnInfo, Connection, DatagramSocket};
     use fictionet::sync::Mutex;
@@ -2192,6 +2193,99 @@ mod memory {
                 "the release woke the run, with no timer"
             );
             run.join(&fcx).await?;
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A connection that carries one child, opened at once, and notes
+    /// when its input ended.
+    struct OneChild {
+        opened: Option<MuxEvent<ByteStream, Top, ()>>,
+        ended: Got,
+    }
+
+    impl OneChild {
+        fn new(ended: Got) -> OneChild {
+            let child = Slots::new(1).insert(()).unwrap();
+            OneChild {
+                opened: Some(MuxEvent::Opened(child, (), u64::MAX)),
+                ended,
+            }
+        }
+    }
+
+    impl Layer for OneChild {
+        type Lower = ByteStream;
+        type Upper = Mux<ByteStream, Top, ()>;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+
+        fn on_event(
+            &mut self,
+            env: &mut Env<'_, Infallible>,
+            event: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            if matches!(event, StreamEvent::Ended) {
+                self.ended.lock().get_or_insert(env.now());
+            }
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            _: MuxCommand<ByteStream, Top>,
+        ) -> Result<Admit<MuxCommand<ByteStream, Top>>, Infallible> {
+            Ok(Admit::Taken)
+        }
+
+        fn take_command(&mut self, _: &mut Env<'_, Infallible>) -> Option<StreamCommand> {
+            None
+        }
+
+        fn take_event(&mut self) -> Option<MuxEvent<ByteStream, Top, ()>> {
+            self.opened.take()
+        }
+    }
+
+    /// A child of a multiplexed connection that waits for memory asks
+    /// through a view of its own, which the runner does not read. Its
+    /// wait is still not idle: an idle limit far shorter than the wait
+    /// does not end the connection's input while the child waits, and
+    /// the release gets the child its memory at once.
+    #[test]
+    fn a_child_waiting_for_memory_keeps_its_connection_from_idling() {
+        block_on(lab(Seed::from_u64(10), |fcx| async move {
+            let (budget, hog) = tight();
+            let got = Got::default();
+            let ended = Got::default();
+            let child = got.clone();
+            let stack = Chain::new(
+                OneChild::new(ended.clone()),
+                Children::new(1, 8, move |_, (), _| Some(Hungry::new(child.clone()))),
+            );
+            let _run = fcx.spawn(move |fcx| async move {
+                let limits = StreamLimits {
+                    idle: Some(Duration::from_millis(10)),
+                    write_timeout: None,
+                };
+                let info = ConnInfo::default();
+                let _ = stream(&fcx, Silent, &info, stack, budget, limits, |_| {}).await;
+                Ok(())
+            });
+            let freed = free_after_refusal(&fcx, hog, &got).await?;
+            assert_eq!(*got.lock(), Some(freed), "the release woke the child");
+            let ended = *ended.lock();
+            assert!(
+                ended.is_none_or(|at| at >= freed),
+                "the idle limit ran while the child waited: input ended at {ended:?}, memory came at {freed:?}"
+            );
+            // The run waits on a silent connection for good: stop it.
+            fcx.cancel();
             Ok(())
         }))
         .unwrap();

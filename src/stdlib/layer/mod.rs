@@ -388,6 +388,18 @@ pub trait Layer: Sized {
         false
     }
 
+    /// Whether a part of this layer waits for memory on a budget view of
+    /// its own, which the runner does not read: a child of [`Children`]
+    /// whose charge its view refused, until a later call into it finds
+    /// room. The runner counts it as its own wait for memory, so the
+    /// connection's idle limit does not count while it lasts (rule 9). A
+    /// layer that charges only through the [`Env`]'s budget leaves this
+    /// `false`; a layer made of others answers for them, as it does for
+    /// [`depth`](Self::depth).
+    fn waits_for_memory(&self) -> bool {
+        false
+    }
+
     /// The port this layer runs over.
     type Lower: Port;
     /// The port this layer offers.

@@ -75,7 +75,9 @@ pub(super) struct Live<L: Layer<Lower = ByteStream>, C> {
     /// The budget refused the stack a charge in the last round that
     /// settled: the stack waits for memory, and the release that makes
     /// room wakes it. The same refusal that registers the wake stops the
-    /// idle clock, so the two never disagree.
+    /// idle clock, so the two never disagree. A part of the stack that
+    /// waits on a view of its own ([`Layer::waits_for_memory`]) registered
+    /// its own wake, and stops the clock the same way.
     memory: bool,
     /// How the run ended, once it has.
     stopped: Option<StreamEnd>,
@@ -376,8 +378,11 @@ where
             }
 
             // The limits, as of now. A charge refused in this round has the
-            // stack wait for memory below, and that wait is not idle.
-            self.memory = self.driver.budget().refused_since(refusals);
+            // stack wait for memory below, and that wait is not idle; nor
+            // is a part's that waits on a view of its own, such as a child
+            // of a multiplexed connection.
+            self.memory = self.driver.budget().refused_since(refusals)
+                || self.driver.layer().waits_for_memory();
             self.lifetime.settle(now, self.outstanding());
             match self.lifetime.due(now) {
                 Some(Expiry::Stalled) => {

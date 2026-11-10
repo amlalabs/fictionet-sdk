@@ -413,7 +413,12 @@ It moved here from the serving engine with its proof:
 `Lifetime` keeps the idle and write limits for the stream runner and
 `Session`. A stream that waits for memory is not waiting for its peer, so
 `Outstanding::memory` stops the idle clock as work does, and leaves the
-write clock alone:
+write clock alone. The runners set it from a refusal through their own
+view in the round that settles, or from `Layer::waits_for_memory`: a
+`Children` router answers it for each child that waits on a view of its
+own, from that child's refusal until a visit finds room or the child
+closes (`the_router_waits_for_memory_while_a_child_does`,
+`a_child_waiting_for_memory_keeps_its_connection_from_idling`):
 
 | Harness | Proves | Unwind | Checks | Result |
 | --- | --- | ---: | ---: | --- |

@@ -147,6 +147,8 @@ where
     armed: u64,
     limit: usize,
     window: u64,
+    /// How many open children wait for memory.
+    waiting: usize,
     /// The children and the router's queues, with what pays for them.
     places: Places<B, K>,
 }
@@ -423,6 +425,8 @@ struct Kid<B: Layer> {
     credit: u64,
     /// A command of the layer's that waits for credit.
     outbox: Option<CommandOf<B::Lower>>,
+    /// It waits for memory ([`Kid::wait_for_memory`]).
+    memory: bool,
 }
 
 /// What a closed child leaves for the next child opened, so that opening
@@ -473,6 +477,7 @@ impl<B: Layer> Kid<B> {
             owed: _,
             credit: _,
             outbox,
+            memory: _,
         } = self;
         owner.cancel();
         // The rest of the child goes first, its layer and its chunks among
@@ -503,13 +508,30 @@ impl<B: Layer> Kid<B> {
     /// whole limit is met by no release: the child is starved, nothing
     /// waits, and the caller closes it as failed, as the runner ends a
     /// stack that needs more than its limit.
+    ///
+    /// The child waits for memory from a refusal until calls that
+    /// `retried` (a visit, which advances its layer, where a layer tries a
+    /// refused charge again) meet none, and while a part of its layer
+    /// waits on a view of its own. `waiting` counts the children that
+    /// wait, which the router reports to its runner
+    /// ([`Layer::waits_for_memory`]), so their wait is not idle.
     #[must_use]
-    fn wait_for_memory(&self, since: Refusals, around: Wakes<'_>) -> Option<Starved> {
+    fn wait_for_memory(
+        &mut self,
+        since: Refusals,
+        around: Wakes<'_>,
+        retried: bool,
+        waiting: &mut usize,
+    ) -> Option<Starved> {
         let starved = self.budget.starved_since(since);
-        if starved.is_none() && self.budget.refused_since(since) {
+        let refused = starved.is_none() && self.budget.refused_since(since);
+        if refused {
             let waiter = self.waiter.waiter(|| around.waker());
             self.budget.wake_when_freed(waiter, since);
         }
+        let was = self.memory;
+        self.memory = refused || self.layer.waits_for_memory() || (was && !retried);
+        *waiting = (*waiting + usize::from(self.memory)) - usize::from(was);
         starved
     }
 }
@@ -789,6 +811,7 @@ where
             armed: 0,
             limit,
             window,
+            waiting: 0,
             places: Places::new(),
         }
     }
@@ -837,6 +860,7 @@ where
         }
         let kid = self.places.kids.remove(key);
         kid.wake.close();
+        self.waiting -= usize::from(kid.memory);
         Some(kid)
     }
 
@@ -1031,9 +1055,12 @@ where
         let Some((moved, waiting)) = self.visit_kid(env, key) else {
             return true;
         };
-        let kid = &self.places.kids[key];
+        let kid = &mut self.places.kids[key];
         let id = kid.id;
-        if kid.wait_for_memory(since, env.wakes()).is_some() {
+        if kid
+            .wait_for_memory(since, env.wakes(), true, &mut self.waiting)
+            .is_some()
+        {
             self.refuse(env, id, Closing::Failed);
             return true;
         }
@@ -1296,6 +1323,7 @@ where
                     owed: self.window,
                     credit: 0,
                     outbox: None,
+                    memory: false,
                 });
                 let at = self
                     .places
@@ -1359,7 +1387,10 @@ where
                         let since = kid.budget.refusals();
                         if !kid.inbox.reserve(1) || !event.reserve_receive(&kid.budget, &kid.window)
                         {
-                            if kid.wait_for_memory(since, env.wakes()).is_none() {
+                            if kid
+                                .wait_for_memory(since, env.wakes(), false, &mut self.waiting)
+                                .is_none()
+                            {
                                 return Ok(Admit::Blocked(MuxEvent::Child(id, event)));
                             }
                             self.refuse(env, id, Closing::Failed);
@@ -1441,7 +1472,7 @@ where
         match result {
             Ok(fired) => {
                 if self.places.kids[key]
-                    .wait_for_memory(since, env.wakes())
+                    .wait_for_memory(since, env.wakes(), false, &mut self.waiting)
                     .is_some()
                 {
                     self.refuse(env, id, Closing::Failed);
@@ -1479,7 +1510,7 @@ where
         match result {
             Ok(()) => {
                 if self.places.kids[key]
-                    .wait_for_memory(since, env.wakes())
+                    .wait_for_memory(since, env.wakes(), false, &mut self.waiting)
                     .is_some()
                 {
                     self.refuse(env, id, Closing::Failed);
@@ -1563,6 +1594,12 @@ where
             .map(|(_, kid)| kid.layer.depth())
             .max()
             .unwrap_or(0)
+    }
+
+    /// Whether an open child waits for memory on its own view
+    /// ([`Kid::wait_for_memory`]), which the runner does not read.
+    fn waits_for_memory(&self) -> bool {
+        self.waiting > 0
     }
 
     fn deadline(&self) -> Option<(Instant, Self::Timer)> {
@@ -2451,6 +2488,78 @@ mod tests {
             child.wakers.iter().all(|w| w.will_wake(first)),
             "every call gets the child's one waker"
         );
+    }
+
+    /// The router waits for memory exactly while one of its children does
+    /// on that child's own view: from the refusal, through calls that do
+    /// not try again, until a visit finds room, or until the child that
+    /// waits is gone. Its siblings' state makes no difference.
+    #[test]
+    fn the_router_waits_for_memory_while_a_child_does() {
+        let sandbox = Budget::new(4096);
+        let child_budget = sandbox.clone();
+        let want = 1024;
+        let wants = Arc::new(std::sync::Mutex::new(vec![want, 0, want]));
+        let mut driver = Driver::new(
+            Children::<Hungry, Top, ()>::new(3, 8, move |_, (), _| {
+                Some(Hungry {
+                    want: wants.lock().unwrap().remove(0),
+                    held: None,
+                    tries: 0,
+                    wakers: Vec::new(),
+                })
+            })
+            .budgets(move |_, _, _| child_budget.clone()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(91))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(3);
+        let mut open = |driver: &mut Driver<Children<Hungry, Top, ()>>| {
+            let child = slots.insert(()).unwrap();
+            let id = child.id();
+            let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+            id
+        };
+        let (a, b) = (open(&mut driver), open(&mut driver));
+        assert!(!driver.layer().waits_for_memory(), "nothing refused yet");
+        let hog = sandbox
+            .charge(sandbox.limit() - sandbox.used() - want + 1)
+            .unwrap();
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        assert!(driver.layer().child(a).unwrap().held.is_none());
+        assert!(
+            driver.layer().child(b).unwrap().held.is_some(),
+            "b wants nothing"
+        );
+        assert!(driver.layer().waits_for_memory(), "a waits");
+        // Credit for the waiting child is a call that tries nothing again
+        // until its visit, which still finds no room.
+        let _ = driver.deliver(MuxEvent::Credit(a, 1)).unwrap();
+        assert!(driver.layer().waits_for_memory());
+        driver.run().unwrap();
+        assert!(driver.layer().waits_for_memory(), "still no room");
+        // b closing changes nothing; a closing ends the wait.
+        let _ = driver.deliver(MuxEvent::Closed(b)).unwrap();
+        assert!(driver.layer().waits_for_memory());
+        let _ = driver.deliver(MuxEvent::Closed(a)).unwrap();
+        assert!(
+            !driver.layer().waits_for_memory(),
+            "the waiting child is gone"
+        );
+        // A third child waits, and a visit with room ends its wait. What
+        // the closed children held went back, so the room is taken again.
+        let c = open(&mut driver);
+        let more = sandbox
+            .charge(sandbox.limit() - sandbox.used() - want + 1)
+            .unwrap();
+        driver.run().unwrap();
+        assert!(driver.layer().waits_for_memory(), "c waits");
+        drop((hog, more));
+        driver.run().unwrap();
+        assert!(driver.layer().child(c).unwrap().held.is_some());
+        assert!(!driver.layer().waits_for_memory(), "c has its memory");
     }
 
     /// A command whose payload the child's budget cannot pay for now stays
