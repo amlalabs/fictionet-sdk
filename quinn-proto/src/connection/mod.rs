@@ -481,6 +481,16 @@ impl Connection {
             return Some(challenge);
         }
 
+        if !self.path.validated {
+            segment_size = (segment_size as u64).min(self.path.amplification_budget()) as usize;
+            if segment_size < self.predict_1rtt_overhead(None) + 32 {
+                return None;
+            }
+        }
+        // Path validation may use a smaller datagram when amplification
+        // credit cannot pay for the usual padding. Initials may not.
+        let padding = min_mtu.min(segment_size as u16);
+
         // If we need to send a probe, make sure we have something to send.
         for space in SpaceId::iter() {
             let request_immediate_ack =
@@ -534,6 +544,10 @@ impl Connection {
         // so we cannot trivially rewrite it to take advantage of `SpaceId::iter()`.
         while space_idx < spaces.len() {
             let space_id = spaces[space_idx];
+            if padding < min_mtu && space_id != SpaceId::Data {
+                space_idx += 1;
+                continue;
+            }
             // Number of bytes available for frames if this is a 1-RTT packet. We're guaranteed to
             // be able to send an individual frame at least this large in the next 1-RTT
             // packet. This could be generalized to support every space, but it's only needed to
@@ -578,7 +592,13 @@ impl Connection {
             } else {
                 unreachable!("tried to send {:?} packet without keys", space_id)
             };
-            if !coalesce || buf_capacity - buf_end < MIN_PACKET_SPACE + tag_len {
+            let min_packet_space =
+                if space_id == SpaceId::Data && self.spaces[SpaceId::Data].crypto.is_some() {
+                    self.predict_1rtt_overhead(Some(pn)) - tag_len + 32
+                } else {
+                    MIN_PACKET_SPACE
+                };
+            if !coalesce || buf_capacity - buf_end < min_packet_space + tag_len {
                 // We need to send 1 more datagram and extend the buffer for that.
 
                 // Is 1 more datagram allowed?
@@ -588,14 +608,11 @@ impl Connection {
                 }
 
                 // Anti-amplification is only based on `total_sent`, which gets
-                // updated at the end of this method. Therefore we pass the amount
-                // of bytes for datagrams that are already created, as well as 1 byte
-                // for starting another datagram. If there is any anti-amplification
-                // budget left, we always allow a full MTU to be sent
-                // (see https://github.com/quinn-rs/quinn/issues/1082)
+                // updated at the end of this method. Include every datagram
+                // already built and the full next segment, including padding.
                 if self
                     .path
-                    .anti_amplification_blocked(segment_size as u64 * (num_datagrams as u64) + 1)
+                    .anti_amplification_blocked(buf_capacity as u64 + segment_size as u64)
                 {
                     trace!("blocked by anti-amplification");
                     break;
@@ -643,7 +660,7 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        builder.pad_to(min_mtu);
+                        builder.pad_to(padding);
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -752,7 +769,7 @@ impl Connection {
                 }
             }
 
-            debug_assert!(buf_capacity - buf.len() >= MIN_PACKET_SPACE);
+            debug_assert!(buf_capacity - buf.len() >= min_packet_space);
 
             //
             // From here on, we've determined that a packet will definitely be sent.
@@ -918,7 +935,7 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                builder.pad_to(min_mtu);
+                builder.pad_to(padding);
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `min_mtu`,
@@ -947,7 +964,7 @@ impl Connection {
         self.app_limited = buf.is_empty() && !congestion_blocked;
 
         // Send MTU probe if necessary
-        if buf.is_empty() && self.state.is_established() {
+        if buf.is_empty() && self.state.is_established() && self.path.validated {
             let space_id = SpaceId::Data;
             let probe_size = self
                 .path
@@ -2017,14 +2034,14 @@ impl Connection {
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
         packet_number: u64,
+        first_packet_len: usize,
         packet: InitialPacket,
         remaining: Option<BytesMut>,
     ) -> Result<(), ConnectionError> {
         let span = trace_span!("first recv");
         let _guard = span.enter();
         debug_assert!(self.side.is_server());
-        let len = packet.header_data.len() + packet.payload.len();
-        self.path.total_recvd = len as u64;
+        self.path.total_recvd = first_packet_len as u64;
 
         match self.state {
             State::Handshake(ref mut state) => {

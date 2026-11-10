@@ -2786,6 +2786,51 @@ fn server_can_send_3_inital_packets() {
     );
 }
 
+#[test]
+fn unvalidated_handshake_never_exceeds_received_credit() {
+    let _guard = subscribe();
+    for mtu in [1200, 1280, 1400, 1500] {
+        for gso in [false, true] {
+            let (cert, key) = big_cert_and_key();
+            let mut server = server_config_with_cert(cert.clone(), key);
+            let mut transport = TransportConfig::default();
+            transport.initial_mtu(mtu).enable_segmentation_offload(gso);
+            server.transport_config(Arc::new(transport));
+            let mut client = client_config_with_certs(vec![cert]);
+            let mut transport = TransportConfig::default();
+            transport.initial_mtu(1200);
+            client.transport_config(Arc::new(transport));
+            let mut pair = Pair::new(Default::default(), server);
+            pair.mtu = 1500;
+            let client_ch = pair.begin_connect(client);
+            pair.drive_client();
+            let received: usize = pair.server.inbound.iter().map(|(_, _, b)| b.len()).sum();
+            assert!(received >= 1200);
+            pair.drive_server();
+            assert_eq!(
+                pair.server
+                    .connections
+                    .values()
+                    .next()
+                    .unwrap()
+                    .total_recvd(),
+                received as u64
+            );
+            let sent: usize = pair.client.inbound.iter().map(|(_, _, b)| b.len()).sum();
+            assert!(sent > 0);
+            assert!(
+                sent <= 3 * received,
+                "mtu {mtu}, gso {gso}: sent {sent} on {received}"
+            );
+            pair.drive();
+            assert!(
+                std::iter::from_fn(|| pair.client_conn_mut(client_ch).poll())
+                    .any(|event| matches!(event, Event::Connected))
+            );
+        }
+    }
+}
+
 /// Generate a big fat certificate that can't fit inside the initial anti-amplification limit
 fn big_cert_and_key() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(

@@ -155,4 +155,4 @@ version = "1"
 [lints.rust.unexpected_cfgs]
 level = "warn"
 priority = 0
-check-cfg = ["cfg(fuzzing)"]
+check-cfg = ["cfg(fuzzing)", "cfg(kani)"]

@@ -157,7 +157,11 @@ impl PathData {
     /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
     /// received enough data from the peer to permit sending `bytes_to_send` additional bytes
     pub(super) fn anti_amplification_blocked(&self, bytes_to_send: u64) -> bool {
-        !self.validated && self.total_recvd * 3 < self.total_sent + bytes_to_send
+        !self.validated && bytes_to_send > self.amplification_budget()
+    }
+
+    pub(super) fn amplification_budget(&self) -> u64 {
+        amplification_budget(self.total_recvd, self.total_sent)
     }
 
     /// Returns the path's current MTU
@@ -213,6 +217,17 @@ impl PathData {
         self.generation
     }
 }
+
+/// Remaining unvalidated-path allowance, without overflowing either counter.
+fn amplification_budget(received: u64, sent: u64) -> u64 {
+    (u128::from(received) * 3)
+        .saturating_sub(u128::from(sent))
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(kani)]
+#[path = "../../../verification/quic/kani/amplification.rs"]
+mod amplification_proofs;
 
 /// Congestion metrics as described in [`recovery_metrics_updated`].
 ///

@@ -602,6 +602,7 @@ impl Endpoint {
             });
         }
 
+        let first_packet_len = incoming.packet.header_data.len() + incoming.packet.payload.len();
         if incoming
             .crypto
             .packet
@@ -671,6 +672,7 @@ impl Endpoint {
             incoming.addresses.remote,
             incoming.ecn,
             packet_number,
+            first_packet_len,
             incoming.packet,
             incoming.rest,
         ) {
