@@ -3,6 +3,7 @@
 
 mod assembler;
 #[cfg(test)]
+#[path = "../../../verification/tcp-store/ring.rs"]
 mod ring_buffer;
 
 pub(crate) use self::assembler::Assembler;

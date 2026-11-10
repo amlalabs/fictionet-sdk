@@ -15,10 +15,10 @@ unsafe_code = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [dependencies]
-managed = { version = "0.8", default-features = false, features = ["std"] }
 byteorder = { version = "1.0", default-features = false }
 fictionet-buf = { path = "../buf" }
 
 [dev-dependencies]
+managed = { version = "0.8", default-features = false, features = ["std"] }
 # Randomized segment assembler tests.
 rand = "0.8"
