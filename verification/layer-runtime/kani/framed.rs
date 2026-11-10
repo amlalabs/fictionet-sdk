@@ -642,7 +642,9 @@ fn a_refused_packet_keeps_its_value_and_writes_once_after_release() {
         budget.clone(),
         Instant::ZERO,
     );
-    let value = Chunk::from(ChargedBytes::copy_of(&budget, &expected).unwrap());
+    let value = fictionet::Packet::from_chunk(Chunk::from(
+        ChargedBytes::copy_of(&budget, &expected).unwrap(),
+    ));
     let held = budget.charge(budget.limit() - budget.used()).unwrap();
     let used = budget.used();
     let Admit::Blocked(PacketCommand::Send(value)) = d.command(PacketCommand::Send(value)).unwrap()

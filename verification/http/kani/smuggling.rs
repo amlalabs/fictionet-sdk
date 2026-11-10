@@ -569,7 +569,7 @@ fn pipeline<const N: usize>(payload: [u8; 3]) {
     reader.begin(framing, false);
     let mut used = PIPELINE_HEAD;
     if N > 0 {
-        match reader.body::<()>(&wire[used..], false) {
+        match reader.body::<()>(&wire[used..], false, false) {
             Ok(Some(Step::Item(BorrowedEvent::Body(body), count))) => {
                 assert!(body == &payload[..N]);
                 assert!(count == N);
@@ -579,11 +579,14 @@ fn pipeline<const N: usize>(payload: [u8; 3]) {
         }
     }
     assert!(matches!(
-        reader.body::<()>(&wire[used..], false),
+        reader.body::<()>(&wire[used..], false, false),
         Ok(Some(Step::Item(BorrowedEvent::Done, 0)))
     ));
     assert!(used == next);
-    assert!(matches!(reader.body::<()>(&wire[used..], false), Ok(None)));
+    assert!(matches!(
+        reader.body::<()>(&wire[used..], false, false),
+        Ok(None)
+    ));
     assert_eq!(reader.head(&wire[used..]), Ok(Some(5)));
 }
 

@@ -459,7 +459,7 @@ fn a_charge_becomes_bounded_vector_places() {
             assert_eq!(budget.used(), 0);
             continue;
         };
-        let mut vector = charge.into_vec::<u16>();
+        let mut vector = ChargedVec::<u16>::from_charge(charge);
         let places = bytes / size_of::<u16>();
         assert_eq!(vector.places(), places);
         assert_eq!(budget.used(), places * size_of::<u16>());
