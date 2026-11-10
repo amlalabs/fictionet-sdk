@@ -1,6 +1,8 @@
-//! Kani proofs over the write accounting of `TlsLayer`: `produced`,
-//! `delivered`, `pending_plaintext`, `fence` and `credit`, through the real
-//! `on_event`, `on_command`, `advance`, `take_command` and `take_event`.
+//! Kani proofs over the write accounting of `TlsLayer`: the ciphertext
+//! emitted and completed, the plaintext write waiting for its ciphertext
+//! (`plaintext_completion`, with its fence) and the completed plaintext
+//! owed above, through the real `on_event`, `on_command`, `advance`,
+//! `take_command` and `take_event`.
 //! Compiled only under `cargo kani`, as a child module of `tls::layer`.
 //!
 //! rustls itself is too large for CBMC, so no harness builds a
@@ -43,19 +45,40 @@ const LIMIT: u64 = 1 << 62;
 /// and its ciphertext not yet all delivered.
 fn accounting() -> ManuallyDrop<TlsLayer> {
     let mut layer = fresh();
-    layer.produced = kani::any();
-    layer.delivered = kani::any();
-    kani::assume(layer.delivered <= layer.produced && layer.produced <= LIMIT);
-    layer.pending_plaintext = kani::any();
-    kani::assume(layer.pending_plaintext <= CHUNK);
-    layer.fence = kani::any();
-    if let Some(fence) = layer.fence {
-        kani::assume(layer.pending_plaintext != 0);
-        kani::assume(layer.delivered < fence && fence <= layer.produced);
+    layer.ciphertext_emitted = kani::any();
+    layer.ciphertext_completed = kani::any();
+    kani::assume(
+        layer.ciphertext_completed <= layer.ciphertext_emitted && layer.ciphertext_emitted <= LIMIT,
+    );
+    let pending: usize = kani::any();
+    kani::assume(pending <= CHUNK);
+    let end: Option<u64> = kani::any();
+    if let Some(end) = end {
+        kani::assume(pending != 0);
+        kani::assume(layer.ciphertext_completed < end && end <= layer.ciphertext_emitted);
     }
-    layer.credit = kani::any();
-    kani::assume(layer.credit <= LIMIT);
+    layer.plaintext_completion = (pending != 0).then_some(PlaintextCompletion {
+        plaintext_bytes: pending,
+        ciphertext_end: end,
+    });
+    layer.completed_plaintext_bytes = kani::any();
+    kani::assume(layer.completed_plaintext_bytes <= LIMIT);
     layer
+}
+
+/// The plaintext bytes of the write waiting for its ciphertext, or 0.
+fn pending(layer: &TlsLayer) -> usize {
+    layer
+        .plaintext_completion
+        .map_or(0, |completion| completion.plaintext_bytes)
+}
+
+/// Where the waiting write's ciphertext ends, once rustls has written it
+/// all: the fence its completion waits for.
+fn fence(layer: &TlsLayer) -> Option<u64> {
+    layer
+        .plaintext_completion
+        .and_then(|completion| completion.ciphertext_end)
 }
 
 /// A completion from below: refused, changing nothing, when it is more
@@ -69,45 +92,49 @@ fn a_completion_credits_the_pending_write_once_at_its_fence() {
     let mut observed = Observations::new(0);
     let mut env = Env::new(Instant::ZERO, &NoEntropy, &budget, &mut observed);
     let mut layer = accounting();
-    let (produced, delivered) = (layer.produced, layer.delivered);
-    let (pending, fence, credit) = (layer.pending_plaintext, layer.fence, layer.credit);
+    let (produced, delivered) = (layer.ciphertext_emitted, layer.ciphertext_completed);
+    let (waiting, fenced, credit) = (
+        pending(&layer),
+        fence(&layer),
+        layer.completed_plaintext_bytes,
+    );
     let n: u64 = kani::any();
 
     let result = layer.on_event(&mut env, StreamEvent::Written(n));
 
-    assert_eq!(layer.produced, produced);
+    assert_eq!(layer.ciphertext_emitted, produced);
     if n > produced - delivered {
         assert!(result.is_err());
-        assert_eq!(layer.delivered, delivered);
-        assert_eq!(layer.pending_plaintext, pending);
-        assert_eq!(layer.fence, fence);
-        assert_eq!(layer.credit, credit);
+        assert_eq!(layer.ciphertext_completed, delivered);
+        assert_eq!(pending(&layer), waiting);
+        assert_eq!(fence(&layer), fenced);
+        assert_eq!(layer.completed_plaintext_bytes, credit);
     } else {
         assert!(matches!(result, Ok(Admit::Taken)));
-        assert_eq!(layer.delivered, delivered + n);
-        assert!(layer.delivered <= layer.produced);
-        if fence.is_some_and(|f| delivered + n >= f) {
-            assert_eq!(layer.credit, credit + pending as u64);
-            assert_eq!(layer.pending_plaintext, 0);
-            assert_eq!(layer.fence, None);
+        assert_eq!(layer.ciphertext_completed, delivered + n);
+        assert!(layer.ciphertext_completed <= layer.ciphertext_emitted);
+        if fenced.is_some_and(|f| delivered + n >= f) {
+            assert_eq!(layer.completed_plaintext_bytes, credit + waiting as u64);
+            assert_eq!(pending(&layer), 0);
+            assert_eq!(fence(&layer), None);
         } else {
-            assert_eq!(layer.credit, credit);
-            assert_eq!(layer.pending_plaintext, pending);
-            assert_eq!(layer.fence, fence);
+            assert_eq!(layer.completed_plaintext_bytes, credit);
+            assert_eq!(pending(&layer), waiting);
+            assert_eq!(fence(&layer), fenced);
         }
     }
     assert_eq!(
-        layer.credit + layer.pending_plaintext as u64,
-        credit + pending as u64
+        layer.completed_plaintext_bytes + pending(&layer) as u64,
+        credit + waiting as u64
     );
 
-    let owed = layer.credit;
+    let owed = layer.completed_plaintext_bytes;
     match layer.take_event() {
         Some(StreamEvent::Written(m)) => assert!(owed != 0 && m == owed),
         None => assert_eq!(owed, 0),
         Some(_) => panic!("an event the layer never queued"),
     }
-    assert_eq!(layer.credit, 0);
+    assert_eq!(layer.completed_plaintext_bytes, 0);
     assert!(layer.take_event().is_none());
 }
 
@@ -133,13 +160,16 @@ fn a_write_is_acknowledged_once_after_its_ciphertext_completes() {
     let c: u64 = kani::any();
     kani::assume(start <= LIMIT && c != 0 && c <= LIMIT);
     let end = start + c;
-    layer.delivered = start;
-    layer.produced = end;
+    layer.ciphertext_completed = start;
+    layer.ciphertext_emitted = end;
     let p: usize = kani::any();
     kani::assume(p != 0 && p <= CHUNK);
-    // on_command accepted p bytes (layer.rs:461); advance fenced them.
-    layer.pending_plaintext = p;
-    layer.fence = Some(end);
+    // on_command accepted p bytes; advance fenced them where rustls had
+    // nothing more to write.
+    layer.plaintext_completion = Some(PlaintextCompletion {
+        plaintext_bytes: p,
+        ciphertext_end: Some(end),
+    });
 
     let mut out = c; // taken by the driver, not yet completed
     let mut acked: u64 = 0;
@@ -161,16 +191,16 @@ fn a_write_is_acknowledged_once_after_its_ciphertext_completes() {
             },
         }
         assert_eq!(
-            acked + layer.credit + layer.pending_plaintext as u64,
+            acked + layer.completed_plaintext_bytes + pending(&layer) as u64,
             p as u64
         );
-        assert!(layer.delivered <= layer.produced);
-        if acked + layer.credit != 0 {
-            assert!(layer.delivered >= end);
+        assert!(layer.ciphertext_completed <= layer.ciphertext_emitted);
+        if acked + layer.completed_plaintext_bytes != 0 {
+            assert!(layer.ciphertext_completed >= end);
         } else {
-            assert!(layer.delivered < end);
+            assert!(layer.ciphertext_completed < end);
         }
-        assert_eq!(layer.produced, layer.delivered + out);
+        assert_eq!(layer.ciphertext_emitted, layer.ciphertext_completed + out);
     }
 }
 
@@ -189,18 +219,18 @@ fn a_reset_drops_what_is_owed_and_sends_only_a_reset() {
         layer.on_command(&mut env, StreamCommand::Reset),
         Ok(Admit::Taken)
     ));
-    assert_eq!((layer.credit, layer.pending_plaintext), (0, 0));
-    assert_eq!(layer.fence, None);
-    assert_eq!(layer.delivered, layer.produced);
+    assert_eq!((layer.completed_plaintext_bytes, pending(&layer)), (0, 0));
+    assert_eq!(fence(&layer), None);
+    assert_eq!(layer.ciphertext_completed, layer.ciphertext_emitted);
     assert!(!layer.output_pending());
 
     let n: u64 = kani::any();
-    let delivered = layer.delivered;
+    let delivered = layer.ciphertext_completed;
     assert!(matches!(
         layer.on_event(&mut env, StreamEvent::Written(n)),
         Ok(Admit::Closed(StreamEvent::Written(m))) if m == n
     ));
-    assert_eq!(layer.delivered, delivered);
+    assert_eq!(layer.ciphertext_completed, delivered);
     assert!(layer.take_event().is_none());
 
     assert!(matches!(layer.advance(&mut env), Ok(true)));

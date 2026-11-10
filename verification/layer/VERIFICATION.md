@@ -924,3 +924,73 @@ along with the named unit test: a release that wakes nobody
 trims before it pays (`a_refused_repay_reallocates_and_releases_nothing`), and
 a runner that asks after memory was freed left waiting
 (`a_runner_that_asks_after_memory_freed_is_woken_at_once`).
+
+## Kani on main `3db7a847e` (November 10, 2026)
+
+The crate stopped compiling under Kani after the budget rounds, so none of
+the harnesses above could run. `charge_within_takes_what_fits_or_nothing`
+compared two `Refusals`, which have no equality; it now asks
+`budget.refused_since(mark)`, the same property. The TLS proof needed new
+field names (see `verification/tls/VERIFICATION.md`). With those two
+changes `cargo kani -p fictionet -Z stubbing` compiles again.
+
+Each harness was then run alone, as
+`cargo kani -p fictionet -Z stubbing --exact --harness stdlib::layer::proofs::<name>`,
+under an 8 GB memory cap without swap and four Cargo build jobs. Times
+are CBMC's verification time; for the runs that did not finish, the wall
+time until the kernel stopped them at the cap.
+
+| Harness | Result |
+| --- | --- |
+| `slots_refuse_past_the_limit` | all pass, 3.8 s |
+| `slots_never_answer_a_stale_id` | all pass, 25.1 s |
+| `slots_never_answer_another_connections_id` | all pass, 3.1 s |
+| `timers_in_order_three_names` | all pass, 0.9 s |
+| `timers_get_three_names` | all pass, 0.8 s |
+| `timers_in_order_first_armed_again` | all pass, 1.6 s |
+| `timers_in_order_second_armed_again` | all pass, 1.5 s |
+| `timers_in_order_first_armed_twice` | all pass, 1.4 s |
+| `timers_in_order_one_name_three_times` | all pass, 1.2 s |
+| `timers_cancel_fire_and_retain_touch_one_name` | all pass, 196.6 s |
+| `work_cancellation_stays_with_its_owner` | all pass, 0.2 s |
+| `charges_split_and_drop_within_the_limit` | out of memory, 140 s |
+| `charges_sum_to_the_budget_and_never_pass_its_limit` | out of memory, 98 s |
+| `charge_within_takes_what_fits_or_nothing` | out of memory, 103 s |
+| `transfer_within_one_budget_never_raises_used` | out of memory, 166 s |
+| `a_release_after_a_refusal_wakes_once` | out of memory, 111 s |
+| `a_view_records_only_its_own_refusals` | out of memory, 121 s |
+| `starved_is_a_need_over_the_limit_and_never_wakes` | out of memory, 104 s |
+| `a_charge_becomes_bounded_vector_places` | out of memory, 99 s |
+| `charged_bytes_capacity_is_its_charge` | out of memory, 103 s |
+| `a_refused_growth_changes_nothing` | out of memory, 92 s |
+| `a_chunk_cursor_keeps_the_rest_in_place` | out of memory, 98 s |
+| `a_chunk_cursor_never_passes_the_end` | out of memory, 91 s |
+| `stream_credit_splits_keep_the_allocation_owned` | out of memory, 998 s |
+| `a_shared_chunk_edit_preserves_ownership_and_budget` | out of memory, 80 s |
+
+No harness failed a check. Fourteen did not finish: every harness that
+charges a budget or drops a chunk ran CBMC out of memory while it was
+still building the formula, the two chunk cursor harnesses included,
+which passed in under a second before the budget redesign.
+
+The CBMC logs show where the memory goes. `Budget::release` became a
+compare-exchange loop (`AtomicUsize::try_update`) followed by the wake of
+every runner on the budget's list, `Mutex<Vec<Arc<dyn Waits>>>`. Where a
+harness charges on some paths and not on others, CBMC merges the paths,
+and a count read after the merge is no longer a constant to it, though
+the solver still knows its value. So CBMC cannot tell that the exchange
+succeeds or that the list is empty: it unrolls the retry loop and the
+mutex's contended loop to the unwind bound, and expands the wake and the
+drop of each listed runner. Those are calls through `dyn Waits` and
+through a waker's raw vtable, which CBMC resolves to every function of
+the same shape; among them is the recursive drop of `std::io::Error`, and
+unrolling that recursion is what fills the memory. Dropping any budget
+reaches the same list through the drop of `BudgetInner`.
+
+Two changes were tried and taken back, since neither let a harness finish:
+`try_update` replaced by a strong compare-exchange loop, and stubs that
+ran that loop once and replaced the wake with a proof that the list is
+empty. With both, `a_chunk_cursor_keeps_the_rest_in_place` still ran out
+of memory in the mutex's contended loop and in the drop of the list. The
+harnesses need the budget's wake path in a shape CBMC can bound, which is
+a change to `budget.rs`, not to the proofs.
