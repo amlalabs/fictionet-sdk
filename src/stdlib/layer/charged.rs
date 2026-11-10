@@ -516,12 +516,46 @@ impl<K: Ord, V> BoundedMap<K, V> {
         self.map.get_mut(key)
     }
 
+    /// The key stored for `key`, with its value.
+    pub fn get_key_value<Q: Ord + ?Sized>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        K: std::borrow::Borrow<Q>,
+    {
+        self.map.get_key_value(key)
+    }
+
     /// Takes the value under `key`.
     pub fn remove<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<V>
     where
         K: std::borrow::Borrow<Q>,
     {
         self.map.remove(key)
+    }
+
+    /// The entry with the least key.
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        self.map.first_key_value()
+    }
+
+    /// Takes the entry with the least key.
+    pub fn pop_first(&mut self) -> Option<(K, V)> {
+        self.map.pop_first()
+    }
+
+    /// The entries whose keys are in `range`, in key order.
+    pub fn range<Q, R>(&self, range: R) -> std::collections::btree_map::Range<'_, K, V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        self.map.range(range)
+    }
+
+    /// Takes every entry. The charge stays, paying for the entries the
+    /// map may hold again.
+    pub fn clear(&mut self) {
+        self.map.clear();
     }
 
     /// How many entries it holds.
@@ -1452,5 +1486,34 @@ mod tests {
         assert_eq!(budget.used(), 0);
         let none = Budget::new(BoundedMap::<u32, [u8; 40]>::storage(3).unwrap() - 1);
         assert!(BoundedMap::<u32, [u8; 40]>::new(&none, 3).is_none());
+    }
+
+    #[test]
+    fn taking_from_a_bounded_map_frees_places_but_keeps_the_charge() {
+        let budget = Budget::new(1 << 16);
+        let mut map = BoundedMap::new(&budget, 3).unwrap();
+        let charged = budget.used();
+        for key in [5u32, 1, 3] {
+            assert_eq!(map.insert(key, key * 10), Ok(None));
+        }
+        assert_eq!(map.first_key_value(), Some((&1, &10)));
+        assert_eq!(map.get_key_value(&3), Some((&3, &30)));
+        assert_eq!(
+            map.range(2..).map(|(k, _)| *k).collect::<Vec<_>>(),
+            [3, 5],
+            "a range is in key order"
+        );
+        assert_eq!(map.pop_first(), Some((1, 10)));
+        assert_eq!(map.insert(7, 70), Ok(None), "the popped place is free");
+        assert_eq!(map.insert(8, 80), Err((8, 80)));
+        map.clear();
+        assert!(map.is_empty());
+        assert_eq!(budget.used(), charged, "the charge pays for the places");
+        for key in 0..3u32 {
+            assert_eq!(map.insert(key, key), Ok(None));
+        }
+        assert_eq!(budget.used(), charged);
+        drop(map);
+        assert_eq!(budget.used(), 0);
     }
 }
