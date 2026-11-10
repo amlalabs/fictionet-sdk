@@ -72,7 +72,7 @@
 //! let mut ip = Driver::new(IpLayer::host(), entropy, Budget::unlimited(), Instant::ZERO);
 //! let udp = [0, 1, 0, 53, 0, 8, 0, 0];
 //! let packet = ip::packet("10.0.0.2".parse()?, "10.0.0.1".parse()?, protocol::UDP, &udp);
-//! assert!(matches!(ip.deliver(PacketEvent::Packet(packet.into_chunk())), Ok(Admit::Taken)));
+//! assert!(matches!(ip.deliver(PacketEvent::Packet(packet)), Ok(Admit::Taken)));
 //! ip.send_above(|event| {
 //!     let PacketEvent::Packet(packet) = event else { unreachable!() };
 //!     assert_eq!(packet.sort(), Sort::Transport(Transport::Udp));

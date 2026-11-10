@@ -176,7 +176,8 @@
 //! use std::convert::Infallible;
 //! use fictionet::{Attachments, Cx, Result};
 //! use fictionet::stdlib::layer::{Admit, ByteStream, Env, Layer, StreamCommand, StreamEvent, Top};
-//! use fictionet::stdlib::web::httpd::{tower, Server};
+//! use fictionet::stdlib::web::httpd::Server;
+//! use fictionet_extras::httpd::tower;
 //! use fictionet::stdlib::world::net::Net;
 //!
 //! /// Sends back every byte it gets, and ends its side when the client
