@@ -1964,7 +1964,7 @@ impl Layer for Http2 {
                 }
                 Ok(Admit::Taken)
             }
-            MuxOp::Close(child) => {
+            MuxOp::Close(child, _) => {
                 // The children refused or dropped this exchange: its stream
                 // is refused, or reset if its response had begun.
                 if let Some(&id) = self.children.as_ref().and_then(|c| c.get(child))
@@ -2591,11 +2591,15 @@ mod tests {
             let mut slots = Slots::new(1);
             let child = slots.insert(()).unwrap();
             let id = child.id();
-            let answer = driver.command(child.close()).unwrap();
+            let answer = driver
+                .command(child.close(fictionet::stdlib::layer::Closing::Done))
+                .unwrap();
             let Admit::Closed(command) = answer else {
                 panic!("closed input must return ownership")
             };
-            assert!(matches!(command.into_op(), MuxOp::Close(found) if found == id));
+            assert!(
+                matches!(command.into_op(), MuxOp::Close(found, fictionet::stdlib::layer::Closing::Done) if found == id)
+            );
         }
     }
 

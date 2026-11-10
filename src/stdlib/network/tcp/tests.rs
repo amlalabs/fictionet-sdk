@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use fictionet::stdlib::layer::Closing;
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet::stdlib::network::ip::{set_header_checksum, transport_checksum};
 use fictionet::stdlib::test_support::rounds;
@@ -4369,7 +4370,7 @@ mod layer {
     fn closing_a_child_closes_the_connection_and_says_it_is_gone() {
         let (mut server, mut client, (s, _), (c, _)) = connected();
         let s_id = s.id();
-        let close: Command = s.close();
+        let close: Command = s.close(Closing::Done);
         assert!(matches!(server.command(close), Ok(Admit::Taken)));
         let mut fins = 0;
         let (_, at_client) = exchange(&mut server, &mut client, |p| {
@@ -4383,7 +4384,7 @@ mod layer {
                 .any(|e| matches!(e, MuxEvent::Child(id, StreamEvent::Ended) if *id == c.id())),
             "the client sees the end of the stream"
         );
-        let close: Command = c.close();
+        let close: Command = c.close(Closing::Done);
         assert!(matches!(client.command(close), Ok(Admit::Taken)));
         let (at_server, _) = exchange(&mut server, &mut client, |_| true);
         assert!(
@@ -4621,7 +4622,7 @@ mod layer {
         let end: Command = s.send(StreamCommand::End);
         assert!(matches!(server.command(end), Ok(Admit::Taken)));
         let _ = exchange(&mut server, &mut client, |_| true);
-        let close: Command = c.close();
+        let close: Command = c.close(Closing::Done);
         assert!(matches!(client.command(close), Ok(Admit::Taken)));
         let (at_server, _) = exchange(&mut server, &mut client, |_| true);
         let h = server.layer().upper().socket_of(s.id());
@@ -4675,7 +4676,7 @@ mod layer {
         let end: Command = s.send(StreamCommand::End);
         assert!(matches!(server.command(end), Ok(Admit::Taken)));
         let _ = exchange(&mut server, &mut client, |_| true);
-        let close: Command = c.close();
+        let close: Command = c.close(Closing::Done);
         assert!(matches!(client.command(close), Ok(Admit::Taken)));
         let _ = exchange(&mut server, &mut client, |_| true);
         let h = server.layer().upper().socket_of(s.id());
@@ -4709,7 +4710,7 @@ mod layer {
         let (mut server, mut client, (s, _), (c, _)) = connected();
         let id = s.id();
         let token = hold(&mut server, id);
-        let close: Command = s.close();
+        let close: Command = s.close(Closing::Done);
         assert!(matches!(server.command(close), Ok(Admit::Taken)));
         let (at_server, _) = exchange(&mut server, &mut client, |_| true);
         let h = server.layer().upper().socket_of(id);
@@ -4723,7 +4724,7 @@ mod layer {
             2,
             "a closing connection still counts"
         );
-        let close: Command = c.close();
+        let close: Command = c.close(Closing::Done);
         assert!(matches!(client.command(close), Ok(Admit::Taken)));
         let (at_server, _) = exchange(&mut server, &mut client, |_| true);
         assert!(said_gone(&at_server, id), "TIME-WAIT is gone");

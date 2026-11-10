@@ -463,7 +463,7 @@ impl Layer for UdpLayer {
                     self.wake(id);
                 }
             }
-            MuxOp::Close(id) => {
+            MuxOp::Close(id, _) => {
                 self.close(id);
             }
             MuxOp::Child(id, DatagramCommand::End) => {

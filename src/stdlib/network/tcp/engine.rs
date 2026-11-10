@@ -2882,7 +2882,7 @@ impl Layer for TcpLayer {
             }
             MuxOp::Credit(id, units) => self.credit(env, id, units, None),
             MuxOp::Window(id, units, window) => self.credit(env, id, units, Some(window)),
-            MuxOp::Close(id) => {
+            MuxOp::Close(id, _) => {
                 if let Some(h) = self.open_socket(id) {
                     self.orphan(h, false);
                 }

@@ -797,7 +797,7 @@ impl Layer for Toy {
             MuxOp::Child(id, _)
             | MuxOp::Credit(id, _)
             | MuxOp::Window(id, ..)
-            | MuxOp::Close(id) => Some(*id),
+            | MuxOp::Close(id, _) => Some(*id),
             MuxOp::Control(_) => None,
         };
         // A child that is gone takes nothing, and never will.
@@ -829,7 +829,7 @@ impl Layer for Toy {
                 self.out
                     .extend(frame(CREDIT, lane.peer, &units.to_be_bytes()));
             }
-            MuxOp::Close(id) => {
+            MuxOp::Close(id, _) => {
                 let lane = self.lanes.remove(id).expect("checked above");
                 self.by_peer.remove(&lane.peer);
                 self.out.extend(frame(CLOSE, lane.peer, &[]));

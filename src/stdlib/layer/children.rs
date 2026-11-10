@@ -10,8 +10,8 @@ use std::sync::{
 use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
-    Admit, Budget, Charge, ChargedDeque, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer,
-    Mux, MuxCommand, MuxEvent, OwnedWork, Port, Refusals, Top, Waiter, WorkOwner,
+    Admit, Budget, Charge, ChargedDeque, Child, ChildId, Closing, CommandOf, Credited, Env,
+    EventOf, Layer, Mux, MuxCommand, MuxEvent, OwnedWork, Port, Refusals, Top, Waiter, WorkOwner,
 };
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
@@ -611,9 +611,9 @@ pub enum ChildReport<E, X> {
     Event(ChildId, E),
     /// A child's layer failed. The child was closed; its siblings go on.
     Failed(ChildId, X),
-    /// A child exceeded admission limits or produced an impossible atomic
-    /// command. It was closed at once.
-    Refused(ChildId),
+    /// A child was not taken, or broke its limits once taken, and was
+    /// closed at once for the cause given, the one its close carried.
+    Refused(ChildId, Closing),
 }
 
 /// The mux sent a child more than the credit granted for it: a broken mux,
@@ -844,17 +844,24 @@ where
         if let Some(kid) = self.remove(id) {
             // Closing is bounded by the mux's own limit on children: the
             // mux keeps the slot until it takes this command.
-            self.places.down.push_back(kid.handle.close());
+            self.places
+                .down
+                .push_back(kid.handle.close(Closing::Failed));
             env.report(ChildReport::Failed(id, error));
         }
     }
 
-    /// Closes a child that broke its limits and reports it. Dropping it
-    /// cancels its work.
-    fn refuse(&mut self, env: &mut Env<'_, ChildReport<B::Report, B::Error>>, id: ChildId) {
+    /// Closes a child that broke its limits, for the cause `why`, and
+    /// reports it with that cause. Dropping it cancels its work.
+    fn refuse(
+        &mut self,
+        env: &mut Env<'_, ChildReport<B::Report, B::Error>>,
+        id: ChildId,
+        why: Closing,
+    ) {
         if let Some(kid) = self.remove(id) {
-            self.places.down.push_back(kid.handle.close());
-            env.report(ChildReport::Refused(id));
+            self.places.down.push_back(kid.handle.close(why));
+            env.report(ChildReport::Refused(id, why));
         }
     }
 
@@ -955,11 +962,11 @@ where
         let mut waiting = false;
         if let Some(mut command) = kid.outbox.take() {
             if !command.splittable() && command.credit() > kid.max_command {
-                self.refuse(env, id);
+                self.refuse(env, id, Closing::Failed);
                 return None;
             }
             if !command.reserve(&kid.budget) {
-                self.refuse(env, id);
+                self.refuse(env, id, Closing::Failed);
                 return None;
             }
             if self.places.down.len() < QUEUE - RESERVE {
@@ -1001,7 +1008,7 @@ where
         if self.close_finished && output_idle && kid.layer.is_terminal() {
             if self.places.down.len() < QUEUE {
                 let kid = self.remove(id).expect("visited child");
-                self.places.down.push_back(kid.handle.close());
+                self.places.down.push_back(kid.handle.close(Closing::Done));
                 return None;
             }
             waiting = true;
@@ -1041,29 +1048,36 @@ where
                         max_command,
                     )));
                 }
-                // A child past the limit, or one whose storage the budget
-                // cannot hold, is refused: closed at once, its siblings
-                // and the connection untouched.
+                // A child past the limit, or one the application says no
+                // to, is prohibited; one whose place or window the budget
+                // cannot hold now is refused for want of memory. Either is
+                // closed at once, its siblings and the connection
+                // untouched.
                 let budget = self.budget_for.as_mut().map_or_else(
                     || env.budget().clone(),
                     |select| select(id, &opening, env.budget()),
                 );
-                let reserved = (self.places.kids.len() < self.limit
-                    && self.places.make_room(self.limit))
-                .then(|| {
-                    let window = budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
-                    Some(Arc::new(window))
-                })
-                .flatten();
-                let Some(window) = reserved else {
-                    self.places.down.push_back(child.close());
-                    env.report(ChildReport::Refused(id));
-                    return Ok(Admit::Taken);
+                let reserved = if self.places.kids.len() >= self.limit {
+                    Err(Closing::Prohibited)
+                } else {
+                    self.places
+                        .make_room(self.limit)
+                        .then(|| budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?))
+                        .flatten()
+                        .map(Arc::new)
+                        .ok_or(Closing::ResourceShortage)
                 };
-                let Some(layer) = (self.make)(id, opening, &budget) else {
-                    self.places.down.push_back(child.close());
-                    env.report(ChildReport::Refused(id));
-                    return Ok(Admit::Taken);
+                let made = reserved.and_then(|window| {
+                    let layer = (self.make)(id, opening, &budget).ok_or(Closing::Prohibited)?;
+                    Ok((window, layer))
+                });
+                let (window, layer) = match made {
+                    Ok(made) => made,
+                    Err(why) => {
+                        self.places.down.push_back(child.close(why));
+                        env.report(ChildReport::Refused(id, why));
+                        return Ok(Admit::Taken);
+                    }
                 };
                 let due = layer.deadline();
                 assert!(env.fits_below(&layer), "composition is too deep");
@@ -1117,7 +1131,7 @@ where
                         ) {
                             env.report(ChildReport::Failed(id, error));
                         }
-                        self.places.down.push_back(kid.handle.close());
+                        self.places.down.push_back(kid.handle.close(Closing::Done));
                     }
                     return Ok(Admit::Taken);
                 }
@@ -1136,7 +1150,7 @@ where
                 if self.full(id, urgent) {
                     self.visit(env, key);
                     if self.full(id, urgent) {
-                        self.refuse(env, id);
+                        self.refuse(env, id, Closing::Failed);
                     }
                 }
                 if let Some(key) = self.key(id) {
@@ -1145,7 +1159,7 @@ where
                         kid.urgent = Some(event);
                     } else {
                         if !event.reserve_receive(&kid.budget, &kid.window) {
-                            self.refuse(env, id);
+                            self.refuse(env, id, Closing::Failed);
                             return Ok(Admit::Taken);
                         }
                         kid.granted -= cost;
@@ -1160,7 +1174,7 @@ where
                                 None => true,
                             };
                         if kid.inbox.push_back((event, retained)).is_err() {
-                            self.refuse(env, id);
+                            self.refuse(env, id, Closing::Failed);
                             return Ok(Admit::Taken);
                         }
                     }
@@ -1318,7 +1332,7 @@ where
     fn report_bytes(report: &Self::Report) -> Option<usize> {
         match report {
             ChildReport::Event(_, event) => B::report_bytes(event),
-            ChildReport::Refused(_) => Some(0),
+            ChildReport::Refused(..) => Some(0),
             ChildReport::Failed(_, _) => None,
         }
     }
@@ -1582,7 +1596,8 @@ mod tests {
                     bytes.extend_from_slice(&chunk);
                 }
                 super::super::MuxOp::Child(_, StreamCommand::End) => ended = true,
-                super::super::MuxOp::Close(_) => {
+                super::super::MuxOp::Close(_, why) => {
+                    assert_eq!(why, Closing::Done, "a finished child is done");
                     assert!(ended);
                     closed = true;
                 }
@@ -2101,11 +2116,107 @@ mod tests {
         assert!(driver.layer().child(id).is_none());
         assert_eq!(budget.used(), 0);
         assert!(matches!(driver.take_command().unwrap().into_op(),
-            super::super::MuxOp::Close(found) if found == id));
+            super::super::MuxOp::Close(found, Closing::Prohibited) if found == id));
         let accepted = slots.insert(()).unwrap();
         let id = accepted.id();
         let _ = driver.deliver(MuxEvent::Opened(accepted, true, 8)).unwrap();
         assert!(driver.layer().child(id).is_some());
+    }
+
+    /// Opens [`FLOOR`] children, so the places are full, lets `squeeze`
+    /// hold what it wants of the stack's budget and the children's, and
+    /// opens one more, which the application allows or not. Returns the
+    /// cause its close carried and the cause its report gave.
+    fn refused_opening(
+        limit: usize,
+        allowed: bool,
+        squeeze: impl FnOnce(&Budget, &Budget) -> Option<Charge>,
+    ) -> (Closing, Closing) {
+        let kids = Budget::new(100_000);
+        let held = kids.clone();
+        let children = Children::<Reader, Top, bool>::new(limit, 8, |_, allowed, _| {
+            allowed.then(Reader::default)
+        })
+        .budgets(move |_, _, _| held.clone());
+        let stack = Budget::new(100_000);
+        let mut driver = Driver::new(
+            children,
+            Arc::new(SeededEntropy::new(Seed::from_u64(97))),
+            stack.clone(),
+            Instant::ZERO,
+        );
+        let mut slots = Slots::new(FLOOR + 1);
+        for _ in 0..FLOOR {
+            let child = slots.insert(()).unwrap();
+            let _ = driver.deliver(MuxEvent::Opened(child, true, 8)).unwrap();
+        }
+        driver.run().unwrap();
+        while driver.take_command().is_some() {}
+        assert_eq!(driver.layer().ids().count(), FLOOR);
+        let _held = squeeze(&stack, &kids);
+        let child = slots.insert(()).unwrap();
+        let id = child.id();
+        assert!(matches!(
+            driver.deliver(MuxEvent::Opened(child, allowed, 8)),
+            Ok(Admit::Taken)
+        ));
+        assert!(
+            driver.layer().child(id).is_none(),
+            "the opening was refused"
+        );
+        let closed = std::iter::from_fn(|| driver.take_command())
+            .find_map(|command| match command.into_op() {
+                super::super::MuxOp::Close(found, why) if found == id => Some(why),
+                _ => None,
+            })
+            .expect("the refused child is closed");
+        let reported = driver
+            .observations()
+            .drain()
+            .find_map(|report| match report {
+                ChildReport::Refused(found, why) if found == id => Some(why),
+                _ => None,
+            })
+            .expect("the refused child is reported");
+        (closed, reported)
+    }
+
+    /// Each opening Children refuses reports the cause its close carries:
+    /// one past the limit on children, or one the application says no to,
+    /// is prohibited; one whose window or place the budget cannot hold now
+    /// is refused for want of memory.
+    #[test]
+    fn a_refused_opening_reports_the_cause_its_close_carries() {
+        let fill = |budget: &Budget| budget.charge(budget.limit() - budget.used());
+        let cases = [
+            (
+                "count",
+                refused_opening(FLOOR, true, |_, _| None),
+                Closing::Prohibited,
+            ),
+            (
+                "factory",
+                refused_opening(8, false, |_, _| None),
+                Closing::Prohibited,
+            ),
+            (
+                "window",
+                refused_opening(8, true, |_, kids| fill(kids)),
+                Closing::ResourceShortage,
+            ),
+            (
+                "places",
+                refused_opening(8, true, |stack, _| fill(stack)),
+                Closing::ResourceShortage,
+            ),
+        ];
+        for (case, (closed, reported), cause) in cases {
+            assert_eq!(
+                closed, reported,
+                "{case}: the report gives the close's cause"
+            );
+            assert_eq!(closed, cause, "{case}");
+        }
     }
 
     #[test]
@@ -2288,7 +2399,8 @@ mod tests {
         assert_eq!(driver.layer().child(ready).unwrap().taken, 2 * rounds);
         let mut closed = Vec::new();
         while let Some(command) = driver.take_command() {
-            if let MuxOp::Close(id) = command.into_op() {
+            if let MuxOp::Close(id, why) = command.into_op() {
+                assert_eq!(why, Closing::Failed, "an overloaded child failed");
                 closed.push(id);
             }
         }
@@ -2298,7 +2410,10 @@ mod tests {
             .observations()
             .drain()
             .filter_map(|report| match report {
-                ChildReport::Refused(id) => Some(id),
+                ChildReport::Refused(id, why) => {
+                    assert_eq!(why, Closing::Failed);
+                    Some(id)
+                }
                 _ => None,
             })
             .collect();
@@ -2512,7 +2627,7 @@ mod tests {
         ));
         assert!(driver.layer().child(b).is_none());
         assert!(
-            matches!(driver.take_command().unwrap().into_op(), crate::stdlib::layer::MuxOp::Close(id) if id == b)
+            matches!(driver.take_command().unwrap().into_op(), crate::stdlib::layer::MuxOp::Close(id, Closing::ResourceShortage) if id == b)
         );
         assert_eq!(made.load(Ordering::Relaxed), 1);
         drop(other);
@@ -2740,7 +2855,7 @@ mod tests {
         driver.run().unwrap();
         assert!(driver.layer().child(id).is_none());
         assert!(
-            matches!(driver.take_command().unwrap().into_op(), MuxOp::Close(actual) if actual == id)
+            matches!(driver.take_command().unwrap().into_op(), MuxOp::Close(actual, Closing::Failed) if actual == id)
         );
     }
 }

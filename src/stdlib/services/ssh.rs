@@ -1753,7 +1753,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                         .ok_or(TransportError::State)?;
                 }
             }
-            MuxOp::Close(id) => {
+            MuxOp::Close(id, _) => {
                 if let Some(channel) = self.channels.get_mut(id)
                     && !channel.closed
                 {

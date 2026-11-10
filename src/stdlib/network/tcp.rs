@@ -67,8 +67,9 @@ use smoltcp::wire::{Ipv4Packet, TcpOption as WireOption, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Child, ChildId, Chunk, Driver, MessageCommand, MessageEvent,
-    Messages, MuxCommand, MuxEvent, MuxOp, PacketCommand, PacketEvent, StreamCommand, StreamEvent,
+    Admit, Budget, ByteStream, Child, ChildId, Chunk, Closing, Driver, MessageCommand,
+    MessageEvent, Messages, MuxCommand, MuxEvent, MuxOp, PacketCommand, PacketEvent, StreamCommand,
+    StreamEvent,
 };
 use fictionet::stdlib::network::ip::{
     Header, Ipv4Option, Ipv4Reply, checksum, encode_ipv4_options, ipv4_options,
@@ -1605,7 +1606,7 @@ impl Host {
             );
             for child in strays {
                 controls.push_back(TcpControl::Abort(child.id()));
-                if let Err(never) = tcp.command(child.close()) {
+                if let Err(never) = tcp.command(child.close(Closing::Done)) {
                     match never {}
                 }
             }
@@ -1756,7 +1757,7 @@ impl Drop for Connecting<'_> {
             && let Some(mut link) = host.routes.links.remove(&self.id)
         {
             link.retire(&mut host.routes.wakeups);
-            host.command(link.child.close());
+            host.command(link.child.close(Closing::Done));
         }
     }
 }
@@ -2067,7 +2068,7 @@ impl Drop for Listener {
             if let Some(mut link) = host.routes.links.remove(&id) {
                 link.retire(&mut host.routes.wakeups);
                 host.control(TcpControl::Abort(id));
-                host.command(link.child.close());
+                host.command(link.child.close(Closing::Done));
             }
         }
     }
@@ -2238,7 +2239,7 @@ impl Drop for TcpConnection {
         if self.abort || !link.inbox.is_empty() {
             host.control(TcpControl::Abort(self.id));
         }
-        host.command(link.child.close());
+        host.command(link.child.close(Closing::Done));
     }
 }
 

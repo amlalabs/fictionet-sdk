@@ -1107,7 +1107,7 @@ impl Layer for StreamChild {
                 assert_eq!(child, self.child);
                 self.receive_credit += n;
             }
-            MuxOp::Close(child) => {
+            MuxOp::Close(child, _) => {
                 self.slots.remove(child);
                 self.outgoing = Some(StreamCommand::Reset);
             }
