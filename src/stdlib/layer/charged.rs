@@ -1682,8 +1682,7 @@ mod tests {
             for b in 0..2 {
                 let limit = self.budgets[b].limit();
                 let mut refusing = None;
-                for v in 0..2 {
-                    let mark = marks[b][v];
+                for (v, mark) in marks[b].into_iter().enumerate() {
                     if self.askers[b][v].refused_since(mark.real) {
                         let Some((on, by, need)) = acted.need else {
                             panic!("a call the model thought fit was refused");
