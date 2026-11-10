@@ -70,18 +70,35 @@ def firstIndex (p : Entry → Bool) : List Entry → Nat → Nat
   | [], _ => 0
   | e :: es, i => if p e then i else firstIndex p es (i + 1)
 
+/-- The first entry, static then dynamic, whose name and value are the field's. -/
+def exactIndex (d : Dyn) (f : Field) : Nat :=
+  firstIndex (fun e => e.name == f.name && e.value == f.value) (staticEntries ++ d.entries) 1
+
+/-- The first entry, static then dynamic, whose name is the field's. -/
+def nameIndex (d : Dyn) (f : Field) : Nat :=
+  firstIndex (fun e => e.name == f.name) (staticEntries ++ d.entries) 1
+
+/-- A string as the policy codes it. -/
+def Policy.lit (pol : Policy) (s : Bytes) : Lit := ⟨pol.huff s, s⟩
+
+/-- A literal's indexing: never-indexed fields stay so (section 7.1.3); others
+are added when the policy says and the table can hold anything. -/
+def chooseIx (pol : Policy) (max : Nat) (f : Field) : Indexing :=
+  if f.never then .never else if pol.index ∧ max ≠ 0 then .incremental else .without
+
+/-- A literal's name: an entry's, when the policy refers to names and one matches. -/
+def chooseName (pol : Policy) (d : Dyn) (f : Field) : WName :=
+  if pol.useName ∧ nameIndex d f ≠ 0 then .index (nameIndex d f) else .literal (pol.lit f.name)
+
 /-- The representation the policy chooses for a field, given the table. -/
 def chooseRep (pol : Policy) (max : Nat) (d : Dyn) (f : Field) : WRep :=
-  let all := staticEntries ++ d.entries
-  let exact := firstIndex (fun e => e.name == f.name && e.value == f.value) all 1
-  let named := firstIndex (fun e => e.name == f.name) all 1
-  let lit := fun s => Lit.mk (pol.huff s) s
-  if pol.useIndex ∧ !f.never ∧ exact ≠ 0 then .indexed exact
-  else
-    let ix := if f.never then Indexing.never
-              else if pol.index ∧ max ≠ 0 then .incremental else .without
-    let n := if pol.useName ∧ named ≠ 0 then WName.index named else .literal (lit f.name)
-    .literal n (lit f.value) ix
+  if pol.useIndex ∧ !f.never ∧ exactIndex d f ≠ 0 then .indexed (exactIndex d f)
+  else .literal (chooseName pol d f) (pol.lit f.value) (chooseIx pol max f)
+
+/-- Whether a representation adds its field to the table. -/
+def WRep.adds : WRep → Bool
+  | .literal _ _ .incremental => true
+  | _ => false
 
 /-- The size updates a block starts with: the least size chosen since the last
 block, then the current maximum when it differs (section 4.2). -/
@@ -96,16 +113,14 @@ def chooseAll (pol : Policy) (max : Nat) : Dyn → List Field → List WRep × D
   | d, [] => ([], d)
   | d, f :: fs =>
     let w := chooseRep pol max d f
-    let d' := match w with
-      | .literal _ v .incremental => d.insert max ⟨f.name, v.s⟩
-      | _ => d
-    let rest := chooseAll pol max d' fs
+    let rest := chooseAll pol max (if w.adds then d.insert max ⟨f.name, f.value⟩ else d) fs
     (w :: rest.1, rest.2)
 
 /-- A block: its representations and the encoder after it. -/
 def Encoder.block (enc : Encoder) (pol : Policy) (fs : List Field) : List WRep × Encoder :=
-  let (ws, d) := chooseAll pol enc.max enc.dyn fs
-  (enc.updates ++ ws, { enc with dyn := d, pending := none })
+  (enc.updates ++ (chooseAll pol enc.max enc.dyn fs).1,
+   { enc with dyn := (chooseAll pol enc.max enc.dyn fs).2, pending := none })
+
 
 /-- `encode_block`'s check: at most `maxHeaders` fields, no string past
 `maxString`, at most `maxDecoded` octets in all. -/

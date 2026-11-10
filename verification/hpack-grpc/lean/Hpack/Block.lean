@@ -312,12 +312,17 @@ def resolveName (d : Dyn) : Name → Option Bytes
   | .literal s => some s
   | .index i => (lookup d i).map (·.name)
 
+/-- Whether a size update is above the reduction still owed. -/
+def overOwed : Option Nat → Nat → Bool
+  | some m, size => decide (m < size)
+  | none, _ => false
+
 /-- Section 6's processing of one representation. -/
 def applyRep (st : St) : Rep → Except Err St
   | .update size =>
     if st.updates = 2 ∨ (st.updates = 1 ∧ size < st.previous) then .error .sizeUpdateOrder
     else if st.dec.settings < size then .error .tableSize
-    else if (match st.dec.required with | some m => decide (m < size) | none => false) then
+    else if overOwed st.dec.required size then
       .error .missingSizeUpdate
     else .ok { st with
       dec := { st.dec with required := none, max := size, dyn := st.dec.dyn.evict size }
@@ -350,11 +355,10 @@ after it. -/
 def decodeBlock (d : Decoder) (bs : Bytes) : Except Err (List Field × Decoder) :=
   if maxBlock < bs.length then .error .blockTooLong
   else
-    let parsed := parseBlock false bs
-    match applyAll (St.start d) parsed.1 with
+    match applyAll (St.start d) (parseBlock false bs).1 with
     | .error e => .error e
     | .ok st =>
-      match parsed.2 with
+      match (parseBlock false bs).2 with
       | some e => .error e
       | none => if st.dec.required.isSome then .error .missingSizeUpdate
                 else .ok (st.out.reverse, st.dec)
@@ -430,10 +434,13 @@ def WRep.isUpdate : WRep → Bool
 def writeBlock (ws : List WRep) : Bytes := ws.flatMap writeRep
 
 /-- What a written representation reads back as. -/
+def WName.toName : WName → Name
+  | .literal l => .literal l.s
+  | .index i => .index i
+
 def WRep.rep : WRep → Rep
   | .indexed i => .indexed i
   | .update n => .update n
-  | .literal (.literal l) v ix => .literal (.literal l.s) v.s ix
-  | .literal (.index i) v ix => .literal (.index i) v.s ix
+  | .literal n v ix => .literal n.toName v.s ix
 
 end Hpack
