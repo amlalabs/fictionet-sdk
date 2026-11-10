@@ -1841,3 +1841,263 @@ mod flush {
         .unwrap();
     }
 }
+
+/// A charge the budget refuses is tried again when memory frees, with no
+/// input, output or timer to wake the runner.
+mod memory {
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use fictionet::stdlib::layer::{
+        Admit, Budget, ByteStream, Charge, DatagramCommand, DatagramEvent, Datagrams, Env, Layer,
+        StreamCommand, StreamEvent, Top,
+    };
+    use fictionet::stdlib::network::{ConnError, ConnInfo, Connection, DatagramSocket};
+    use fictionet::sync::Mutex;
+    use fictionet::time::Instant;
+    use fictionet::{Cx, RecvError, Seed, block_on, lab};
+
+    use super::super::{StreamEnd, StreamLimits, datagrams, stream};
+
+    /// The bytes each stack asks for, more than the room left at first.
+    const WANT: usize = 128 * 1024;
+
+    /// A connection that never has anything to read and never takes a
+    /// write: nothing on it ever wakes the runner.
+    struct Silent;
+
+    impl Connection for Silent {
+        fn poll_read(
+            &mut self,
+            _: &Cx,
+            _: &mut Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            Poll::Pending
+        }
+
+        fn poll_write(
+            &mut self,
+            _: &Cx,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A socket that never receives.
+    struct Quiet;
+
+    impl DatagramSocket for Quiet {
+        async fn recv(&mut self, _: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
+            std::future::pending().await
+        }
+
+        fn send_to(&mut self, _: &[u8], _: SocketAddr) {}
+    }
+
+    /// When a stack got its memory.
+    type Got = Arc<Mutex<Option<Instant>>>;
+
+    /// Asks the budget for [`WANT`] bytes on each advance until it gets
+    /// them (rule 9), then notes when and ends its direction.
+    struct Hungry {
+        held: Option<Charge>,
+        got: Got,
+        ended: bool,
+    }
+
+    impl Hungry {
+        fn new(got: Got) -> Hungry {
+            Hungry {
+                held: None,
+                got,
+                ended: false,
+            }
+        }
+
+        fn try_charge<E>(&mut self, env: &mut Env<'_, E>) -> bool {
+            if self.held.is_some() {
+                return false;
+            }
+            self.held = env.budget().charge(WANT);
+            if self.held.is_some() {
+                *self.got.lock() = Some(env.now());
+            }
+            self.held.is_some()
+        }
+
+        /// The end, once, after the memory came.
+        fn end(&mut self) -> bool {
+            let end = self.held.is_some() && !self.ended;
+            self.ended |= end;
+            end
+        }
+    }
+
+    impl Layer for Hungry {
+        type Lower = ByteStream;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+
+        fn is_terminal(&self) -> bool {
+            self.held.is_some()
+        }
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            _: StreamEvent,
+        ) -> Result<Admit<StreamEvent>, Infallible> {
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+
+        fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+            Ok(self.try_charge(env))
+        }
+
+        fn take_command(&mut self, _: &mut Env<'_, Infallible>) -> Option<StreamCommand> {
+            self.end().then_some(StreamCommand::End)
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// The same over datagrams.
+    struct HungryDatagrams(Hungry);
+
+    impl Layer for HungryDatagrams {
+        type Lower = Datagrams<SocketAddr>;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            _: DatagramEvent<SocketAddr>,
+        ) -> Result<Admit<DatagramEvent<SocketAddr>>, Infallible> {
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+
+        fn advance(&mut self, env: &mut Env<'_, Infallible>) -> Result<bool, Infallible> {
+            Ok(self.0.try_charge(env))
+        }
+
+        fn take_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+        ) -> Option<DatagramCommand<SocketAddr>> {
+            self.0.end().then_some(DatagramCommand::End)
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+
+    /// A budget with room for a runner's own read buffer and job table
+    /// but not for [`WANT`], and the charge that takes the rest.
+    fn tight() -> (Budget, Charge) {
+        let budget = Budget::new(4 * WANT);
+        let hog = budget.charge(budget.limit() - WANT / 2).unwrap();
+        (budget, hog)
+    }
+
+    /// Lets the stack run and be refused, frees memory, and returns when
+    /// the stack got its memory and when memory was freed.
+    async fn free_after_refusal(fcx: &Cx, hog: Charge, got: &Got) -> fictionet::Result<Instant> {
+        fcx.sleep(Duration::from_secs(1)).await?;
+        assert!(got.lock().is_none(), "no room for the stack yet");
+        let freed = fcx.now();
+        drop(hog);
+        fcx.sleep(Duration::from_secs(1)).await?;
+        Ok(freed)
+    }
+
+    #[test]
+    fn a_stream_stack_refused_memory_runs_again_when_it_frees() {
+        block_on(lab(Seed::from_u64(5), |fcx| async move {
+            let (budget, hog) = tight();
+            let got = Got::default();
+            let stack = Hungry::new(got.clone());
+            let run = fcx.spawn(move |fcx| async move {
+                let limits = StreamLimits {
+                    idle: None,
+                    write_timeout: None,
+                };
+                let info = ConnInfo::default();
+                let end = stream(&fcx, Silent, &info, stack, budget, limits, |_| {}).await;
+                assert_eq!(end.ok(), Some(StreamEnd::Finished));
+                Ok(())
+            });
+            let freed = free_after_refusal(&fcx, hog, &got).await?;
+            assert_eq!(
+                *got.lock(),
+                Some(freed),
+                "the release woke the run, with no timer"
+            );
+            run.join(&fcx).await?;
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_datagram_stack_refused_memory_runs_again_when_it_frees() {
+        block_on(lab(Seed::from_u64(6), |fcx| async move {
+            let (budget, hog) = tight();
+            let got = Got::default();
+            let stack = HungryDatagrams(Hungry::new(got.clone()));
+            let local = SocketAddr::from(([10, 9, 0, 1], 53));
+            let run = fcx.spawn(move |fcx| async move {
+                datagrams(&fcx, Quiet, local, stack, budget, |_| {})
+                    .await
+                    .expect("the stack ends the conversation");
+                Ok(())
+            });
+            let freed = free_after_refusal(&fcx, hog, &got).await?;
+            assert_eq!(
+                *got.lock(),
+                Some(freed),
+                "the release woke the run, with no timer"
+            );
+            run.join(&fcx).await?;
+            Ok(())
+        }))
+        .unwrap();
+    }
+}

@@ -40,7 +40,9 @@ pub(crate) enum Halt {
 /// far as the connection takes it, flushes the connection and reports each
 /// byte flushed once as [`StreamEvent::Written`], polls the stack's work
 /// and gives back what finished, fires the stack's due timers, and keeps
-/// the limits. Then it waits for whichever of those can move next. The stack stays synchronous:
+/// the limits. Then it waits for whichever of those can move next, or, if
+/// the budget refused a charge in the last round, for memory to free. The
+/// stack stays synchronous:
 /// this only translates readiness, so it behaves the same here as in a
 /// [`Harness`](fictionet::stdlib::layer::Harness).
 ///
@@ -199,6 +201,10 @@ where
         // every round below runs the stack.
         self.driver.set_waker(cx.waker());
         for _ in 0..ROUNDS {
+            // A charge refused in a round that moved something is tried
+            // again in the next; one refused in the round that waits is
+            // tried again when memory frees.
+            let refusals = self.driver.refusals();
             // Read first, so input that came with a failed write is not
             // left behind.
             let mut read_failed = None;
@@ -385,11 +391,15 @@ where
                 if let Some(timer) = &mut self.timer {
                     timer.clear();
                 }
+                self.driver.wake_when_freed(refusals);
                 return Poll::Pending;
             };
             let timer = self.timer.get_or_insert_with(|| Timer::new(fcx));
             match timer.poll_until(cx, at) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    self.driver.wake_when_freed(refusals);
+                    return Poll::Pending;
+                }
                 Poll::Ready(Ok(())) => {}
                 // Its region was cancelled: the next round arms a timer in
                 // the region of this poll.
