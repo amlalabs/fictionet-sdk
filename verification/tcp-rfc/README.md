@@ -100,7 +100,13 @@ and `Engine_default` with it off.
   wraparound, the 2^31 point, every state and control) and
   `smoltcp/src/socket/tcp/rfc_vectors.rs` sets a socket to each vector's
   state, feeds the segment through `process`, and compares the reply and
-  the next state. See [`lean/README.md`](lean/README.md).
+  the next state, once with the challenge-ACK rate limit open and once
+  closed. The last run: 61 theorems, the 41 headline ones on Lean's own
+  axioms only; 746,960 vectors a seed (696,960 at the boundaries, 50,000
+  drawn) for each of seeds 1 to 8, none in disagreement. The Lean model
+  names the same departures, and also `textOnSynDropped` for the text on a
+  SYN-ACK that the TLA+ model lists below as a SHOULD not followed. See
+  [`lean/README.md`](lean/README.md).
 
 ## What it found
 
