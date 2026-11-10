@@ -1,7 +1,7 @@
 //! Storing tokens sent from servers in NEW_TOKEN frames and using them in subsequent connections
 
 use std::{
-    collections::{HashMap, VecDeque, hash_map},
+    collections::{hash_map, HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 

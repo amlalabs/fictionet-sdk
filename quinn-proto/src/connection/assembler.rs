@@ -1,6 +1,6 @@
 use std::{
-    cmp::{Ordering, max},
-    collections::{BinaryHeap, binary_heap::PeekMut},
+    cmp::{max, Ordering},
+    collections::{binary_heap::PeekMut, BinaryHeap},
     mem,
 };
 

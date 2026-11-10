@@ -1,5 +1,5 @@
 use std::{
-    collections::{VecDeque, hash_map},
+    collections::{hash_map, VecDeque},
     convert::TryFrom,
     mem,
 };
@@ -13,11 +13,11 @@ use super::{
     StreamHalf, ThinRetransmits,
 };
 use crate::{
-    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
+    Dir, Side, StreamId, TransportError, VarInt, MAX_STREAM_COUNT,
 };
 
 /// Wrapper around `Recv` that facilitates reusing `Recv` instances
@@ -550,7 +550,8 @@ impl StreamsState {
             self.sent_max_remote[dir as usize] = self.max_remote[dir as usize];
             trace!(
                 value = self.max_remote[dir as usize],
-                "MAX_STREAMS ({:?})", dir
+                "MAX_STREAMS ({:?})",
+                dir
             );
             buf.write(match dir {
                 Dir::Uni => frame::FrameType::MAX_STREAMS_UNI,
@@ -1056,8 +1057,8 @@ pub(super) fn get_or_insert_recv(
 mod tests {
     use super::*;
     use crate::{
-        ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError,
-        connection::State as ConnState, connection::Streams,
+        connection::State as ConnState, connection::Streams, ReadableError, RecvStream, SendStream,
+        TransportErrorCode, WriteError,
     };
     use bytes::Bytes;
 
@@ -1519,12 +1520,10 @@ mod tests {
 
         let error_code = 0u32.into();
         stream.state.received_stop_sending(id, error_code);
-        assert!(
-            stream
-                .state
-                .events
-                .contains(&StreamEvent::Stopped { id, error_code })
-        );
+        assert!(stream
+            .state
+            .events
+            .contains(&StreamEvent::Stopped { id, error_code }));
         stream.state.events.clear();
 
         assert_eq!(stream.write(&[]), Err(WriteError::Stopped(error_code)));

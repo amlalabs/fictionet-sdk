@@ -8,11 +8,11 @@ use bytes::{Buf, BufMut, Bytes};
 use rand::{Rng, RngExt};
 
 use crate::{
-    Duration, RESET_TOKEN_SIZE, ServerConfig, SystemTime, UNIX_EPOCH,
     coding::{BufExt, BufMutExt},
     crypto::{HandshakeTokenKey, HmacKey},
     packet::InitialHeader,
     shared::ConnectionId,
+    Duration, ServerConfig, SystemTime, RESET_TOKEN_SIZE, UNIX_EPOCH,
 };
 
 /// Responsible for limiting clients' ability to reuse validation tokens
@@ -407,11 +407,9 @@ impl fmt::Display for ResetToken {
     }
 }
 
-#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+#[cfg(all(test, feature = "ring"))]
 mod test {
     use super::*;
-    #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
-    use aws_lc_rs::hkdf;
     #[cfg(feature = "ring")]
     use ring::hkdf;
 
@@ -429,8 +427,8 @@ mod test {
 
     #[test]
     fn retry_token_sanity() {
-        use crate::MAX_CID_SIZE;
         use crate::cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator};
+        use crate::MAX_CID_SIZE;
         use crate::{Duration, UNIX_EPOCH};
 
         use std::net::Ipv6Addr;

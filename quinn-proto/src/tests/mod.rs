@@ -6,31 +6,27 @@ use std::{
 };
 
 use assert_matches::assert_matches;
-#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
-use aws_lc_rs::hmac;
 use bytes::{Bytes, BytesMut};
 use hex_literal::hex;
 use rand::Rng;
 #[cfg(feature = "ring")]
 use ring::hmac;
-#[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
-use rustls::crypto::aws_lc_rs::default_provider;
 #[cfg(feature = "rustls-ring")]
 use rustls::crypto::ring::default_provider;
 use rustls::{
-    AlertDescription, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     server::WebPkiClientVerifier,
+    AlertDescription, RootCertStore,
 };
 use tracing::info;
 
 use super::*;
 use crate::{
-    Duration, Instant,
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     crypto::rustls::QuicServerConfig,
     frame::FrameStruct,
     transport_parameters::TransportParameters,
+    Duration, Instant,
 };
 mod util;
 use util::*;
@@ -70,11 +66,10 @@ fn pending_incoming_survives_server_config_change() {
 
         pair.server.set_server_config(replacement);
         // Retransmitted Initials must still be buffered after the configuration changes.
-        assert!(
-            pair.server
-                .handle(received, pair.client.addr, None, ecn, data, &mut response)
-                .is_none()
-        );
+        assert!(pair
+            .server
+            .handle(received, pair.client.addr, None, ecn, data, &mut response)
+            .is_none());
         let server_ch = pair.server.try_accept(incoming, pair.time).unwrap();
         pair.drive();
         for (endpoint, ch) in [(&mut pair.client, client_ch), (&mut pair.server, server_ch)] {
@@ -1962,8 +1957,8 @@ fn cid_rotation() {
     let mut stop = pair.time;
     let end = pair.time + 5 * CID_TIMEOUT;
 
-    use crate::LOC_CID_COUNT;
     use crate::cid_queue::CidQueue;
+    use crate::LOC_CID_COUNT;
     let mut active_cid_num = CidQueue::LEN as u64 + 1;
     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
     let mut left_bound = 0;
@@ -2010,8 +2005,8 @@ fn cid_retirement() {
     assert!(!pair.server_conn_mut(server_ch).is_closed());
     assert_matches!(pair.client_conn_mut(client_ch).active_rem_cid_seq(), 1);
 
-    use crate::LOC_CID_COUNT;
     use crate::cid_queue::CidQueue;
+    use crate::LOC_CID_COUNT;
     let mut active_cid_num = CidQueue::LEN as u64;
     active_cid_num = active_cid_num.min(LOC_CID_COUNT);
 
@@ -4213,10 +4208,8 @@ fn path_changes_unblock_oversized_datagrams() {
             pair.server_datagrams(server_ch).send_buffer_space(),
             empty_space
         );
-        assert!(
-            iter::from_fn(|| pair.server_conn_mut(server_ch).poll())
-                .any(|event| matches!(event, Event::DatagramsUnblocked))
-        );
+        assert!(iter::from_fn(|| pair.server_conn_mut(server_ch).poll())
+            .any(|event| matches!(event, Event::DatagramsUnblocked)));
 
         let small = Bytes::from_static(b"small");
         pair.server_datagrams(server_ch)

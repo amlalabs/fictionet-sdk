@@ -8,8 +8,8 @@ use qlog::streamer::QlogStreamer;
 #[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{
-    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-    connection::qlog::QlogSink,
+    congestion, connection::qlog::QlogSink, Duration, VarInt, VarIntBoundsExceeded, INITIAL_MTU,
+    MAX_UDP_PAYLOAD,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -365,8 +365,8 @@ impl Default for TransportConfig {
     fn default() -> Self {
         const EXPECTED_RTT: u32 = 100; // ms
         const MAX_STREAM_BANDWIDTH: u32 = 12500 * 1000; // bytes/s
-        // Window size needed to avoid pipeline
-        // stalls
+                                                        // Window size needed to avoid pipeline
+                                                        // stalls
         const STREAM_RWND: u32 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT;
 
         Self {

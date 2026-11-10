@@ -331,10 +331,9 @@ mod test {
             old.push((token, issued));
             let old_idx = rng.random_range(0..old.len());
             let (old_token, old_issued) = old[old_idx];
-            assert!(
-                log.check_and_insert(old_token, old_issued, lifetime)
-                    .is_err()
-            );
+            assert!(log
+                .check_and_insert(old_token, old_issued, lifetime)
+                .is_err());
         }
         assert!(accepted > 0);
     }

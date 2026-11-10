@@ -1,7 +1,7 @@
 use std::{
     cmp,
     cmp::Ordering,
-    collections::{BTreeMap, btree_map},
+    collections::{btree_map, BTreeMap},
     ops::{
         Bound::{Excluded, Included},
         Range,

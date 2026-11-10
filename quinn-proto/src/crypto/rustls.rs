@@ -1,7 +1,5 @@
 use std::{any::Any, io, str, sync::Arc};
 
-#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
-use aws_lc_rs::aead;
 use bytes::BytesMut;
 #[cfg(feature = "ring")]
 use ring::aead;
@@ -9,20 +7,19 @@ pub use rustls::Error;
 #[cfg(feature = "__rustls-post-quantum-test")]
 use rustls::NamedGroup;
 use rustls::{
-    self, CipherSuite,
+    self,
     client::danger::ServerCertVerifier,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
     quic::{Connection, HeaderProtectionKey, KeyChange, PacketKey, Secrets, Suite, Version},
+    CipherSuite,
 };
-#[cfg(feature = "platform-verifier")]
-use rustls_platform_verifier::BuilderVerifierExt;
 
 use crate::{
-    ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
     crypto::{
         self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, UnsupportedVersion,
     },
     transport_parameters::TransportParameters,
+    ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
 };
 
 impl From<Side> for rustls::Side {
@@ -273,7 +270,7 @@ pub struct HandshakeData {
 /// A QUIC-compatible TLS client configuration
 ///
 /// Quinn implicitly constructs a `QuicClientConfig` with reasonable defaults within
-/// [`ClientConfig::with_root_certificates()`][root_certs] and [`ClientConfig::with_platform_verifier()`][platform].
+/// [`ClientConfig::with_root_certificates()`][root_certs].
 /// Alternatively, `QuicClientConfig`'s [`TryFrom`] implementation can be used to wrap around a
 /// custom [`rustls::ClientConfig`], in which case care should be taken around certain points:
 ///
@@ -287,31 +284,12 @@ pub struct HandshakeData {
 /// 256 server names.
 ///
 /// [root_certs]: crate::config::ClientConfig::with_root_certificates()
-/// [platform]: crate::config::ClientConfig::with_platform_verifier()
 pub struct QuicClientConfig {
     pub(crate) inner: Arc<rustls::ClientConfig>,
     initial: Suite,
 }
 
 impl QuicClientConfig {
-    #[cfg(feature = "platform-verifier")]
-    pub(crate) fn with_platform_verifier() -> Result<Self, Error> {
-        // Keep in sync with `inner()` below
-        let mut inner = rustls::ClientConfig::builder_with_provider(configured_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap() // The default providers support TLS 1.3
-            .with_platform_verifier()?
-            .with_no_client_auth();
-
-        inner.enable_early_data = true;
-        Ok(Self {
-            // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
-            initial: initial_suite_from_provider(inner.crypto_provider())
-                .expect("no initial cipher suite found"),
-            inner: Arc::new(inner),
-        })
-    }
-
     /// Initialize a sane QUIC-compatible TLS client configuration
     ///
     /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
@@ -340,7 +318,6 @@ impl QuicClientConfig {
     }
 
     pub(crate) fn inner(verifier: Arc<dyn ServerCertVerifier>) -> rustls::ClientConfig {
-        // Keep in sync with `with_platform_verifier()` above
         let mut config = rustls::ClientConfig::builder_with_provider(configured_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap() // The default providers support TLS 1.3
@@ -580,8 +557,6 @@ pub(crate) fn initial_suite_from_provider(
 }
 
 pub(crate) fn configured_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
     #[cfg(feature = "rustls-ring")]
     let provider = rustls::crypto::ring::default_provider();
     Arc::new(provider)

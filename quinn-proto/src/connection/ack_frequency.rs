@@ -1,8 +1,8 @@
-use crate::Duration;
 use crate::connection::spaces::PendingAcks;
 use crate::frame::AckFrequency;
 use crate::transport_parameters::TransportParameters;
-use crate::{AckFrequencyConfig, TIMER_GRANULARITY, TransportError, VarInt};
+use crate::Duration;
+use crate::{AckFrequencyConfig, TransportError, VarInt, TIMER_GRANULARITY};
 
 /// State associated to ACK frequency
 pub(super) struct AckFrequencyState {

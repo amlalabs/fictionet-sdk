@@ -22,24 +22,13 @@ repository = "https://github.com/quinn-rs/quinn"
 
 [package.metadata.docs.rs]
 features = [
-    "rustls-aws-lc-rs",
     "rustls-ring",
-    "platform-verifier",
     "log",
     "rustls-log",
 ]
 
 [features]
 __rustls-post-quantum-test = []
-aws-lc-rs = [
-    "dep:aws-lc-rs",
-    "aws-lc-rs?/aws-lc-sys",
-    "aws-lc-rs?/prebuilt-nasm",
-]
-aws-lc-rs-fips = [
-    "aws-lc-rs",
-    "aws-lc-rs?/fips",
-]
 bloom = ["dep:fastbloom"]
 default = [
     "rustls-ring",
@@ -47,19 +36,9 @@ default = [
     "bloom",
 ]
 log = ["tracing/log"]
-platform-verifier = ["dep:rustls-platform-verifier"]
 qlog = ["dep:qlog"]
 ring = ["dep:ring"]
 rustls = ["rustls-ring"]
-rustls-aws-lc-rs = [
-    "dep:rustls",
-    "rustls?/aws-lc-rs",
-    "aws-lc-rs",
-]
-rustls-aws-lc-rs-fips = [
-    "rustls-aws-lc-rs",
-    "aws-lc-rs-fips",
-]
 rustls-log = ["rustls?/logging"]
 rustls-ring = [
     "dep:rustls",
@@ -76,10 +55,6 @@ version = "1.0.1"
 features = ["derive"]
 optional = true
 
-[dependencies.aws-lc-rs]
-version = "1.9"
-optional = true
-default-features = false
 
 [dependencies.bytes]
 version = "1"
@@ -110,14 +85,12 @@ optional = true
 version = "2"
 
 [dependencies.rustls]
-version = "0.23.5"
+package = "fictionet-rustls"
+path = "../rustls"
 features = ["std"]
 optional = true
 default-features = false
 
-[dependencies.rustls-platform-verifier]
-version = "0.7"
-optional = true
 
 [dependencies.slab]
 version = "0.4.6"
