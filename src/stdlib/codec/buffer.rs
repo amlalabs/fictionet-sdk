@@ -73,6 +73,12 @@ impl Buffer {
     pub fn allocated(&self) -> usize {
         self.buf.capacity()
     }
+    /// The most [`allocated`](Self::allocated) reaches while the limit
+    /// stays at most what it is now: twice the limit, since storage grows
+    /// to at most that.
+    pub fn most_allocated(&self) -> usize {
+        self.limit.saturating_mul(2)
+    }
 
     /// Compacts unread bytes and releases spare input capacity.
     /// Preserves the offset and invalidates any outstanding spare offer.
