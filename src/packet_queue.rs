@@ -13,7 +13,7 @@ pub struct PacketQueue {
 
 /// What a queued packet costs: the memory it retains plus its place in the
 /// queue. Admission and release both use this.
-fn charge(packet: &Packet) -> Option<usize> {
+pub(crate) fn charge(packet: &Packet) -> Option<usize> {
     packet.0.capacity().checked_add(PACKET_COST)
 }
 

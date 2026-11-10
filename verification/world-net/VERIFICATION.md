@@ -61,14 +61,20 @@ an edit closes a port left with no prefix; `CountLengths` is whether
 | `Table_nolengths` | `BestIsLongest` | violated as expected, 2 states |
 
 **`Cable.tla`**: a cable's two ends (`cable::pair`, `End::send`,
-`End::poll_recv`, `End::drop`), each with a queue up to `MaxQueued` and a
-parked receiver. `DropWakesPeer` is whether dropping an end wakes the
-other's receiver, as the code does.
+`End::poll_recv`, `End::drop`), each direction a lock-free queue up to
+`MaxQueued` with the receiver's parked waker (`sync::Parked`). A send
+queues, then looks at the parked flag; a receiver that finds the queue
+empty parks, then looks once more before it returns Pending.
+`RecheckAfterPark` is whether it looks once more, and `DropWakesPeer`
+whether dropping an end wakes the other's parked receiver, as the code
+does. The model was rewritten for the lock-free cable on branch
+`comp/buf-locks` and has not been run with TLC yet.
 
 | Config | Checks | Result |
 |---|---|---|
-| `Cable_base` | `NothingForTheParked`, `ClosedAfterDrain`, `NoQueueForTheDropped`, `ClosedMeansDropped`; liveness `LearnsClosed` | passes: 325 states, 72 distinct, depth 7 |
-| `Cable_dropsilent` | `NothingForTheParked`, `LearnsClosed` | violated as expected. TLC stops at the first violation, `NothingForTheParked` after `Recv`, `Drop` (27 states, 19 distinct on November 9, 2026). Checked alone, `LearnsClosed` is violated too (317 states, 72 distinct) |
+| `Cable_base` | `TypeOK`, `FlagHasWaker`, `WakeIsComing`, `ClosedAfterDrain`, `NoQueueForTheDropped`, `ClosedMeansDropped`; liveness `WakeAfterPark`, `LearnsClosed` | not run yet |
+| `Cable_norecheck` (`RecheckAfterPark = FALSE`) | `WakeIsComing`, `WakeAfterPark` | not run yet; expected to fail: a packet sent between the receiver's look and its park finds the flag down |
+| `Cable_dropsilent` (`DropWakesPeer = FALSE`) | `WakeIsComing`, `LearnsClosed` | not run yet; expected to fail: the parked receiver at the other end never hears the close |
 
 ### Kani (over the production code)
 
@@ -181,11 +187,12 @@ clippy with `-D warnings` and rustfmt are clean.
   queue, the deadline, the 64-packet budget, and cancellation are outside
   it.
 - `Cable.tla` counts packets against `MaxQueued`. The code charges bytes
-  plus `PACKET_COST` against `Cable::limit` (`PacketQueue::fits`), and a
-  `pair()` has no limit. `End::drop` locks the two directions one after
-  the other. The model takes it as one step, which loses nothing: a send
-  or poll at the other end in between sees the state before or after, as
-  in the model. The name guard a cable carries for `Attacher` is outside
+  plus `PACKET_COST` against `Cable::limit` with an atomic counter
+  (`Direction::reserve`), and a `pair()` has no limit. The model's steps
+  are atomic and interleave in one order; the code gets that order from
+  the two `SeqCst` fences in `Parked::park` and `Parked::wake`, which TLC
+  does not check. The `std::sync::mpsc` queue is taken as a correct
+  lock-free FIFO. The name guard a cable carries for `Attacher` is outside
   the model.
 - `Table.tla` has one address family. The code keys `lengths` by family
   and length, and `best` ranges over the destination's family only.
