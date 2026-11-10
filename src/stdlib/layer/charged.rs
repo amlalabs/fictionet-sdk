@@ -242,7 +242,7 @@ fn more_places(places: usize, most: usize) -> usize {
 /// when the budget has room for no more. Returns the places to add, or
 /// `None`, changing nothing, when not even `wanted` fits or `wanted`
 /// passes `most`.
-fn charge_places(
+pub(super) fn charge_places(
     charge: &mut Charge,
     places: usize,
     wanted: usize,
