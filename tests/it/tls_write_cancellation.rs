@@ -57,8 +57,12 @@ async fn client<C: Connection>(
             break;
         }
         let n = conn.read(fcx, &mut buf).await?;
-        tls.read_tls(&mut &buf[..n])?;
-        tls.process_new_packets()?;
+        // rustls reads a record at a time.
+        let mut rest = &buf[..n];
+        while !rest.is_empty() {
+            tls.read_tls(&mut rest)?;
+            tls.process_new_packets()?;
+        }
     }
     drain.recv(fcx).await?;
     let mut sink = Vec::new();

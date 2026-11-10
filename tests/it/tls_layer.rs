@@ -425,24 +425,26 @@ fn transport_eof_waits_for_buffered_plaintext() {
         let (mut server, mut client) = handshake(config, client_config, 0);
         let message = vec![42; 16 * 1024 + 32];
         client.writer().write_all(&message)?;
-        let mut event = StreamEvent::Data(Chunk::unpaid(client_output(&mut client)));
-        loop {
-            match server.driver().deliver(event)? {
-                Admit::Taken => break,
-                Admit::Partial(rest) => event = rest,
-                other => panic!("ciphertext unexpectedly refused: {other:?}"),
-            }
-        }
-        // End input before letting the layer hand plaintext to the application.
-        let mut eof = Some(StreamEvent::Ended);
+        // The two records, then the end of input, each delivered as soon as
+        // the layer takes it: the layer takes a record only once the one
+        // before has gone up, and the end arrives while the last record's
+        // plaintext is still buffered, before the application has it.
+        let mut input = std::collections::VecDeque::from([
+            StreamEvent::Data(Chunk::unpaid(client_output(&mut client))),
+            StreamEvent::Ended,
+        ]);
         let mut plaintext = Vec::new();
         let mut ends = 0;
         for _ in 0..32 {
-            if let Some(event) = eof.take() {
+            while let Some(event) = input.pop_front() {
                 match server.driver().deliver(event)? {
                     Admit::Taken => {}
-                    Admit::Blocked(event) => eof = Some(event),
-                    other => panic!("EOF unexpectedly refused: {other:?}"),
+                    Admit::Partial(rest) => input.push_front(rest),
+                    Admit::Blocked(rest) => {
+                        input.push_front(rest);
+                        break;
+                    }
+                    other => panic!("input unexpectedly refused: {other:?}"),
                 }
             }
             server.driver().run()?;
@@ -459,7 +461,7 @@ fn transport_eof_waits_for_buffered_plaintext() {
         }
         assert_eq!(plaintext, message);
         assert_eq!(ends, 1);
-        assert!(eof.is_none());
+        assert!(input.is_empty());
         assert!(matches!(
             server
                 .driver()
