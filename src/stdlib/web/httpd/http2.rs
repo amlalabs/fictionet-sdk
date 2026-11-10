@@ -635,6 +635,11 @@ impl Http2 {
     }
 
     fn push_piece(&mut self, env: &mut Env<'_, Report>, piece: Piece) -> bool {
+        // Once the connection is closing, its last frame is queued: a
+        // GOAWAY for an error ends the connection (RFC 9113 section 5.4.1).
+        if self.phase != Phase::Open {
+            return false;
+        }
         let bytes = piece.bytes as usize;
         // A place stays free behind every piece for the last GOAWAY.
         if !self.sent.reserve(2) || self.sent.push_back(piece).is_err() {
@@ -4379,6 +4384,41 @@ mod tests {
         );
         assert!(harness.ended());
         assert_eq!(harness.layer().upper().ids().count(), 0);
+    }
+
+    /// The budget runs out as graceful shutdown writes its first GOAWAY:
+    /// the connection ends with GOAWAY `ENHANCE_YOUR_CALM`, and the
+    /// shutdown's PING does not follow it (RFC 9113 section 5.4.1: GOAWAY
+    /// is the last frame of a connection that ends for an error).
+    #[test]
+    fn a_refusal_during_graceful_shutdown_writes_nothing_after_its_goaway() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let budget = Budget::new(1 << 24);
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(16, 1, |_, _, _| Some(Sink::reading(false))),
+        );
+        let mut harness =
+            Harness::with_budget(fictionet::Seed::from_u64(9), server, budget.clone());
+        harness.push(&client_preface()).unwrap();
+        let mut input = Vec::new();
+        for stream in (1..8).step_by(2) {
+            input.extend(headers_without_end(stream));
+        }
+        harness.push(&input).unwrap();
+        harness.take_output();
+        let _rest = budget.charge(budget.limit() - budget.used()).unwrap();
+        harness.driver().layer_mut().lower_mut().graceful_shutdown();
+        harness.settle().unwrap();
+        let output = frames(&harness.take_output());
+        let last = output.iter().position(
+            |f| matches!(f, Frame::GoAway(g) if g.code == ErrorCode::EnhanceYourCalm as u32),
+        );
+        let Some(last) = last else {
+            panic!("no GOAWAY ENHANCE_YOUR_CALM: {output:?}");
+        };
+        assert_eq!(last + 1, output.len(), "{output:?}");
+        assert!(harness.ended());
     }
 
     /// A response head larger than several frames goes out as HEADERS and
