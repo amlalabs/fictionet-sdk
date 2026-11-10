@@ -147,7 +147,7 @@
 //!   `IFF_NO_PI` and no offloads. `Mirror::set_up` sets the VM's device down,
 //!   turns IPv6 off on both devices, so the namespace adds no link-local
 //!   address of its own, and brings attach's device up. It adds an ingress
-//!   qdisc to each with a `matchall` filter and a `mirred` action that
+//!   qdisc to each with a `basic` filter and a `mirred` action that
 //!   redirects every frame out of the other device, and brings the VM's
 //!   device up last. While it is down, the kernel refuses the VM program's
 //!   writes with `EIO`, so no frame reaches the namespace's IP stack before
