@@ -78,6 +78,11 @@ Segments == [seq : Seq, ack : Seq \cup {None}, ctl : Controls,
              len : 0..MaxText]
 \* RST and SYN carry no text here: RFC 5961 answers them whatever they
 \* carry, and the code drops both texts unread.
+\* (IsPeer tests one segment without building the set, which RfcTrace's
+\* large N needs.)
+IsPeer(s) == /\ s.seq \in Seq /\ (s.ack \in Seq \/ s.ack = None)
+             /\ s.ctl \in Controls /\ s.len \in 0..MaxText
+             /\ (s.ctl \in {"RST", "SYN"} => s.len = 0)
 Peer == {s \in Segments : s.ctl \in {"RST", "SYN"} => s.len = 0}
 SegLen(s) == s.len + (IF s.ctl \in {"SYN", "FIN"} THEN 1 ELSE 0)
 NoSeg == [seq |-> None, ack |-> None, ctl |-> "NONE", len |-> 0]
@@ -313,7 +318,7 @@ SyncArrive(s) ==
 
 Arrive(s) ==
   /\ st # "Closed"
-  /\ s \in Peer
+  /\ IsPeer(s)
   /\ st \in {"Listen", "SynSent"} /\ s.ctl = "SYN" => s.seq = IRS
   /\ CASE st = "Listen" ->
             IF s.ctl = "SYN" /\ s.ack = None THEN ListenSyn(s)
