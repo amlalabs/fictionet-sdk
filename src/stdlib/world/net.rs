@@ -137,7 +137,8 @@
 //!   says otherwise. A connection that would pass it is closed. The stack
 //!   runner charges its read buffer and the bytes the stack has not taken,
 //!   each layer charges what it holds, and HTTP/2 charges retained request
-//!   heads and bodies (see [`httpd`]).
+//!   heads and bodies (see [`httpd`]). The packets a sandbox sends through
+//!   `fictionet attach` are paid from its budget while anything keeps them.
 //!   A [`PortServer`] of your own charges what it chooses. A sandbox has one
 //!   budget for both its addresses, from when it attaches until it
 //!   detaches. A route ([`Net::route`]) has none.
@@ -225,7 +226,11 @@ pub struct Limits {
     pub write_timeout: Duration,
     /// Bytes held by the service layer for one sandbox, all services
     /// together: see [`Budget`]. Excludes TCP buffers and the state rustls
-    /// keeps itself; TLS's own buffers count. Default 256 MiB.
+    /// keeps itself; TLS's own buffers count. The blocks the sandbox's
+    /// packets arrive in from `fictionet attach` are paid from it too, for
+    /// as long as anything keeps them, a TCP buffer included: with no room
+    /// the world reads no more of its packets until memory frees, and a
+    /// budget too small for one block (2 KiB) detaches it. Default 256 MiB.
     pub sandbox_budget: usize,
 }
 

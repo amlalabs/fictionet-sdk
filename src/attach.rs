@@ -8,7 +8,7 @@ use crate::cable::pair_with_guard;
 use crate::cx::CancelWait;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::listen::SocketLink;
-use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
+use crate::{Budget, Cancelled, Cx, End, Interface, Packet, RecvError};
 
 /// One attached sandbox: its name, and the [`Interface`] that carries its
 /// packets.
@@ -61,6 +61,20 @@ impl Attachment {
     /// packet code can read it here, and drop or fragment larger packets.
     pub fn mtu(&self) -> u16 {
         self.mtu
+    }
+
+    /// Pays for the sandbox's packets from now on with `budget`, the
+    /// sandbox's own: the blocks a connection from attach reads them into,
+    /// and so every piece of them a stack keeps. When it has no room, the
+    /// connection reads nothing until memory frees. An interface from
+    /// [`Attacher::attach`] carries packets as their sender made them, and
+    /// whoever keeps one pays for it.
+    pub(crate) fn pay_from(&mut self, budget: &Budget) {
+        match &mut self.link {
+            Link::Cable(_) => {}
+            #[cfg(not(target_arch = "wasm32"))]
+            Link::Socket(link) => link.pay_from(budget),
+        }
     }
 
     /// Whether the sandbox is known to have detached already.

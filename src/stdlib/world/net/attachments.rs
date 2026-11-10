@@ -228,9 +228,9 @@ impl Context {
         _lan: &str,
         segment: &Lan<Box<dyn Interface>>,
         addr: IpAddr,
-        sandbox: Attachment,
+        mut sandbox: Attachment,
     ) {
-        let attached = Arc::new(Attached::new(self, fcx, Arc::from(name), Some(addr)));
+        let attached = Arc::new(Attached::new(self, fcx, &mut sandbox, Some(addr)));
         let hooks = &self.hooks;
         let me = Sandbox {
             id: attached.owner,
@@ -404,13 +404,19 @@ struct Attached {
 }
 
 impl Attached {
-    fn new(context: &Arc<Context>, fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
+    /// `sandbox` attached: it gets its budget, which pays for its packets
+    /// from now on.
+    fn new(
+        context: &Arc<Context>,
+        fcx: &Cx,
+        sandbox: &mut Attachment,
+        fixed: Option<IpAddr>,
+    ) -> Attached {
+        let name: Arc<str> = Arc::from(sandbox.name());
         let owner = context.bindings.new_owner();
-        context
-            .hooks
-            .attached
-            .lock()
-            .insert(owner, Some(Budget::new(context.sandbox_budget)));
+        let budget = Budget::new(context.sandbox_budget);
+        sandbox.pay_from(&budget);
+        context.hooks.attached.lock().insert(owner, Some(budget));
         context.hooks.attachment(
             fcx,
             Sandbox {
@@ -500,11 +506,11 @@ impl Interface for Member {
 /// One sandbox's filter, between its attachment and the router.
 pub(super) async fn filter(
     fcx: Cx,
-    sandbox: Attachment,
+    mut sandbox: Attachment,
     context: Arc<Context>,
 ) -> fictionet::Result {
-    let name: Arc<str> = Arc::from(sandbox.name());
-    let attached = Attached::new(&context, &fcx, name.clone(), None);
+    let attached = Attached::new(&context, &fcx, &mut sandbox, None);
+    let name = attached.name.clone();
     let mut f = Filter {
         context: context.clone(),
         owner: attached.owner,

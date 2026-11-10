@@ -13,6 +13,7 @@ use crate::cx::CancelWait;
 use crate::relay::unix::cvt;
 use crate::relay::{self, Message, PacketQueue, unix};
 use crate::{Attacher, Attachment, Budget, Chunk, Cx, Packet, Pool, RecvError};
+use fictionet_buf::Waiter;
 
 /// Where a world listens for attachments.
 ///
@@ -662,8 +663,9 @@ pub(crate) struct SocketLink {
     /// The blocks packets are read into. A packet goes to the world in its
     /// block, which comes back here when the world drops it.
     pool: Pool,
-    /// What the blocks are paid from until the world takes them in, which
-    /// charges its own budget instead.
+    /// What the blocks are paid from: the sandbox's budget once the world
+    /// gives it ([`pay_from`](Self::pay_from)), for as long as anything
+    /// keeps a block, and nothing limits them before.
     memory: Budget,
     /// Where a packet longer than a block is read past the block.
     buf: Vec<u8>,
@@ -676,6 +678,14 @@ pub(crate) struct SocketLink {
 }
 
 impl SocketLink {
+    /// Reads packets into blocks paid from `budget` from now on, through a
+    /// view of it, so that a refusal here is not taken for another
+    /// holder's. Blocks already taken go back to the pool they came from.
+    pub(crate) fn pay_from(&mut self, budget: &Budget) {
+        self.memory = budget.view();
+        self.pool = Pool::new(&self.memory, PACKET_SLOT, POOLED);
+    }
+
     /// Whether attach is known to have closed the connection.
     pub(crate) fn peer_gone(&self) -> bool {
         self.closed || self.slot.name.lock().is_none()
@@ -712,10 +722,18 @@ impl SocketLink {
         let fd = self.slot.fd.as_raw_fd();
         let mut registered = false;
         loop {
-            let mut block = self
-                .pool
-                .take(&self.memory, 0)
-                .expect("an unlimited budget never refuses");
+            let since = self.memory.refusals();
+            let Some(mut block) = self.pool.take(&self.memory, 0) else {
+                if self.memory.starved_since(since).is_some() {
+                    // A budget smaller than one block never reads a packet.
+                    self.close();
+                    return Poll::Ready(Err(RecvError::Closed));
+                }
+                // The packets wait in the socket until memory frees.
+                self.memory
+                    .wake_when_freed(&Waiter::new(cx.waker().clone()), since);
+                return Poll::Pending;
+            };
             let room = block.room();
             let mut got = Ok(0);
             block.fill(|head| {
@@ -1025,6 +1043,48 @@ mod tests {
                 "the same block, read into again"
             );
             assert_eq!(agent.recv(&fcx).await?, long[..]);
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// Once the world gives the sandbox's budget, the block a packet is
+    /// read into is paid from it for as long as anything keeps it; with no
+    /// room left the link reads nothing more until memory frees.
+    #[test]
+    fn packets_from_attach_are_paid_from_the_sandboxs_budget() {
+        let (attacher, mut attachments) = attachments();
+        let listening = listen(socket("paid"), attacher).unwrap();
+        let client = Client::hello(&listening.path, "agent");
+        assert_eq!(client.recv(), [relay::ACCEPT]);
+        let packets: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 100]).collect();
+        for bytes in &packets {
+            unix::send_parts(client.0.as_raw_fd(), &[&[relay::PACKET], bytes], false).unwrap();
+        }
+        block_on(run(Seed::from_u64(0), move |fcx| async move {
+            let mut agent = attachments.get(&fcx, "agent").await?;
+            let budget = Budget::new(2 * PACKET_SLOT);
+            agent.pay_from(&budget);
+            let first = agent.recv(&fcx).await?;
+            assert_eq!(first, packets[0][..]);
+            assert!(
+                budget.used() >= first.chunk().capacity(),
+                "a packet kept is not paid from the sandbox's budget"
+            );
+            let second = agent.recv(&fcx).await?;
+            assert_eq!(second, packets[1][..]);
+            let mut third = std::pin::pin!(agent.recv(&fcx));
+            poll_fn(|cx| {
+                assert!(
+                    third.as_mut().poll(cx).is_pending(),
+                    "a packet read with the budget full"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            drop(first);
+            assert_eq!(third.await?, packets[2][..]);
+            drop(second);
             Ok(())
         }))
         .unwrap();
