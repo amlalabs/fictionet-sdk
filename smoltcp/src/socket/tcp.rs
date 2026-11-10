@@ -2324,7 +2324,8 @@ impl Socket {
 
         let payload_len = payload.len();
         if payload_len == 0 {
-            if control == TcpControl::Fin {
+            if fin_taken {
+                self.end_rx_at(payload_offset);
                 self.receive_fin(cx.now());
             }
             return dropped_probe.then(|| self.ack_reply(cx, ip_repr, repr));
@@ -2351,12 +2352,9 @@ impl Socket {
             self.assembler = assembled;
             return Some(self.ack_reply(cx, ip_repr, repr));
         }
-        // The remote's FIN ends the stream at its sequence number: text held
-        // past it is the remote's error and is never read.
         let contig_len = if fin_taken {
             let end = payload_offset + payload_len;
-            self.assembler = Assembler::new();
-            self.rx.end_at(end);
+            self.end_rx_at(end);
             contig_len.min(end)
         } else {
             contig_len
@@ -2407,6 +2405,14 @@ impl Socket {
         } else {
             None
         }
+    }
+
+    /// The remote's FIN ends the stream `end` bytes past the first byte
+    /// not yet ready: text held past it is the remote's error and is never
+    /// read, so the store drops it and the assembler forgets its ranges.
+    fn end_rx_at(&mut self, end: usize) {
+        self.assembler = Assembler::new();
+        self.rx.end_at(end);
     }
 
     /// Consumes the FIN's sequence number once all preceding text has
@@ -13382,6 +13388,40 @@ pub(crate) mod test {
         let mut bytes = [0; 4];
         assert_eq!(s.recv_slice(&mut bytes), Ok(2));
         assert_eq!(&bytes[..2], b"ab");
+        assert_eq!(s.recv_slice(&mut bytes), Err(RecvError::Finished));
+    }
+
+    /// Text held out of order past the peer's FIN is dropped when the FIN
+    /// comes in a segment with no text too: the store keeps nothing past
+    /// it, and no range past it is left to acknowledge selectively.
+    #[test]
+    fn test_text_held_past_a_bare_fin_is_dropped() {
+        let mut s = socket_established();
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 5,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"xy"[..],
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.rx.waiting().count(), 1);
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state, State::CloseWait);
+        assert_eq!(s.rx.waiting().count(), 0, "nothing past the FIN is kept");
+        assert!(s.assembler.is_empty(), "a range past the FIN is kept");
+        let mut bytes = [0; 4];
         assert_eq!(s.recv_slice(&mut bytes), Err(RecvError::Finished));
     }
 }
