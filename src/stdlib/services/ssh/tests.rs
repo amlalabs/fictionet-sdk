@@ -1,5 +1,5 @@
 use super::*;
-use crate::stdlib::layer::Observations;
+use crate::stdlib::layer::{ChildReport, Observations};
 
 // A packet boundary with completed negotiation, for connection-layer tests.
 struct Packets(transport::Negotiated);
@@ -402,7 +402,9 @@ fn open(sender: u32) -> Vec<u8> {
 
 /// A channel the budget cannot hold now is refused for resource shortage,
 /// without taking a channel number. The connection goes on and opens the
-/// next channel once memory frees.
+/// next channel once memory frees. A channel the children above refuse
+/// gets the cause they give: resource shortage for memory, prohibited for
+/// their limit on channels.
 #[test]
 fn a_channel_without_memory_is_refused_and_the_connection_goes_on() {
     let mut layer = layer();
@@ -435,10 +437,171 @@ fn a_channel_without_memory_is_refused_and_the_connection_goes_on() {
     drop((packet, elsewhere));
     assert!(layer.room(&budget));
     paid(&mut layer, 1, &open(4), &mut env).unwrap();
-    let Some(MuxEvent::Opened(_, opening, _)) = layer.take_event() else {
+    let Some(MuxEvent::Opened(child, opening, max)) = layer.take_event() else {
         panic!("opening missing")
     };
     assert_eq!(opening.channel, 0);
+    // A channel the children above refuse for want of memory is refused
+    // for resource shortage too; one past their limit is prohibited.
+    let full = Budget::new(4096);
+    let squeezed = full.clone();
+    let no_memory = children(8).budgets(move |_, _, _| squeezed.clone());
+    let elsewhere = full.charge(full.limit()).unwrap();
+    let opened = MuxEvent::Opened(child, opening, max);
+    assert_eq!(
+        refused(&mut layer, &mut env, no_memory, opened),
+        (4, Closing::ResourceShortage)
+    );
+    drop(elsewhere);
+    paid(&mut layer, 2, &open(5), &mut env).unwrap();
+    let opened = layer.take_event().expect("opening missing");
+    assert_eq!(
+        refused(&mut layer, &mut env, children(0), opened),
+        (1, Closing::Prohibited)
+    );
+    assert!(layer.channels.is_empty());
+    assert!(!layer.is_terminal());
+}
+
+/// A channel layer that takes everything and says nothing.
+struct Quiet;
+impl Layer for Quiet {
+    type Lower = ChannelPort;
+    type Upper = Top;
+    type Report = ();
+    type Timer = ();
+    type Work = ();
+    type Done = ();
+    type Error = std::convert::Infallible;
+    fn on_event(
+        &mut self,
+        _: &mut Env<'_, ()>,
+        _: ChannelEvent,
+    ) -> Result<Admit<ChannelEvent>, std::convert::Infallible> {
+        Ok(Admit::Taken)
+    }
+    fn on_command(
+        &mut self,
+        _: &mut Env<'_, ()>,
+        command: std::convert::Infallible,
+    ) -> Result<Admit<std::convert::Infallible>, std::convert::Infallible> {
+        match command {}
+    }
+    fn take_command(&mut self, _: &mut Env<'_, ()>) -> Option<ChannelCommand> {
+        None
+    }
+    fn take_event(&mut self) -> Option<std::convert::Infallible> {
+        None
+    }
+}
+
+type QuietChildren = crate::stdlib::layer::Driver<Children<Quiet, Top, Owned<channel::Opening>>>;
+
+/// Children of at most `limit` channels, as a connection's sessions are.
+fn children(limit: usize) -> Children<Quiet, Top, Owned<channel::Opening>> {
+    Children::new(limit, u64::from(WINDOW), |_, _, _| Some(Quiet))
+}
+
+/// Hands the connection's `opened` channel to `children`, which refuse
+/// it, and their close to the connection. Returns the reason the peer
+/// was told and the cause Children reported.
+fn refused(
+    layer: &mut Ssh<tests::Observed, Packets>,
+    env: &mut Env<'_, Ended>,
+    children: Children<Quiet, Top, Owned<channel::Opening>>,
+    opened: MuxEvent<ChannelPort, Top, Owned<channel::Opening>>,
+) -> (u32, Closing) {
+    let mut driver: QuietChildren = crate::stdlib::layer::Driver::new(
+        children,
+        Arc::new(crate::SeededEntropy::new(crate::Seed::from_u64(2))),
+        Budget::new(1 << 20),
+        Instant::ZERO,
+    );
+    assert!(matches!(driver.deliver(opened), Ok(Admit::Taken)));
+    let reported = driver
+        .observations()
+        .drain()
+        .find_map(|report| match report {
+            ChildReport::Refused(_, why) => Some(why),
+            _ => None,
+        })
+        .expect("Children reported the refusal");
+    let close = driver.take_command().expect("Children closed the channel");
+    let MuxOp::Close(id, why) = *close.op() else {
+        panic!("Children closed the channel")
+    };
+    assert_eq!(why, reported, "the close carries the reported cause");
+    assert!(layer.on_command(env, close).unwrap().moved());
+    assert!(matches!(layer.take_event(), Some(MuxEvent::Closed(gone)) if gone == id));
+    let Some(StreamCommand::Write(reply)) = layer.take_command(env) else {
+        panic!("refusal missing")
+    };
+    let wire::Message::ChannelOpenFailure { reason, .. } = wire::Message::parse(&reply).unwrap()
+    else {
+        panic!("the peer is told the channel is refused")
+    };
+    (reason, reported)
+}
+
+/// A channel the children take and then give up on before it is
+/// confirmed is refused as failed to connect; one confirmed is closed,
+/// whatever the cause, since CLOSE carries none.
+#[test]
+fn a_failed_channel_is_refused_before_confirmation_and_closed_after() {
+    let mut layer = layer();
+    let budget = Budget::unlimited();
+    let entropy = crate::SeededEntropy::new(crate::Seed::from_u64(1));
+    let mut observations = Observations::new(8);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut observations);
+    assert!(layer.reserve(&budget) && layer.room(&budget));
+    layer.started = true;
+    layer.user = Some("guest".into());
+    fn take_opened(
+        layer: &mut Ssh<tests::Observed, Packets>,
+        sender: u32,
+        env: &mut Env<'_, Ended>,
+    ) -> crate::stdlib::layer::Child {
+        paid(layer, sender, &open(sender), env).unwrap();
+        let Some(MuxEvent::Opened(child, _, _)) = layer.take_event() else {
+            panic!("opening missing")
+        };
+        child
+    }
+    let unconfirmed = take_opened(&mut layer, 3, &mut env);
+    let id = unconfirmed.id();
+    assert!(
+        layer
+            .on_command(&mut env, unconfirmed.close(Closing::Failed))
+            .unwrap()
+            .moved()
+    );
+    assert!(matches!(layer.take_event(), Some(MuxEvent::Closed(gone)) if gone == id));
+    let Some(StreamCommand::Write(reply)) = layer.take_command(&mut env) else {
+        panic!("refusal missing")
+    };
+    assert!(matches!(
+        wire::Message::parse(&reply).unwrap(),
+        wire::Message::ChannelOpenFailure {
+            recipient: 3,
+            reason: 2,
+            ..
+        }
+    ));
+    let confirmed = take_opened(&mut layer, 4, &mut env);
+    layer.channels.get_mut(confirmed.id()).unwrap().confirmed = true;
+    assert!(
+        layer
+            .on_command(&mut env, confirmed.close(Closing::Failed))
+            .unwrap()
+            .moved()
+    );
+    let Some(StreamCommand::Write(reply)) = layer.take_command(&mut env) else {
+        panic!("close missing")
+    };
+    assert!(matches!(
+        wire::Message::parse(&reply).unwrap(),
+        wire::Message::Close(4)
+    ));
 }
 
 /// A decoded packet the budget cannot pay to process waits, unparsed and

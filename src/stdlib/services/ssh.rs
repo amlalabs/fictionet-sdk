@@ -18,8 +18,8 @@ use crate::Cx;
 use crate::stdlib::codec::Wire;
 use crate::stdlib::layer::{
     Admit, Budget, ByteStream, Chain, Charge, ChargedBytes, ChargedDeque, ChildId, Children,
-    Chunk as Bytes, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots, StreamCommand,
-    StreamEvent, Timers, Top, WriteFailure,
+    Chunk as Bytes, Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Owned, Slots,
+    StreamCommand, StreamEvent, Timers, Top, WriteFailure,
 };
 use crate::stdlib::protocols::ssh::transport::{HostKey, TransportError};
 use crate::stdlib::protocols::ssh::{self, auth, connection as wire};
@@ -52,15 +52,6 @@ const STATE: usize = 6 * ssh::MAX_PAYLOAD;
 const PARSE: usize = 64;
 /// What the request of a CHANNEL_REQUEST holds while its channel takes it.
 const REQUEST: usize = 2 * ssh::MAX_PAYLOAD;
-
-/// Why a channel open is refused (RFC 4254 section 5.1).
-#[derive(Clone, Copy, Debug)]
-enum Refusal {
-    /// Past the channel limit, or refused by the application.
-    Prohibited,
-    /// No memory for the channel now; the connection goes on.
-    ResourceShortage,
-}
 
 /// An authentication method from RFCs 4252 and 4256.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1264,12 +1255,12 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     return Err(TransportError::State.into());
                 }
                 if self.channels.len() == self.config.max_channels || max_packet == 0 {
-                    return self.refuse(sender, Refusal::Prohibited);
+                    return self.refuse(sender, Closing::Prohibited);
                 }
                 // A channel the budget cannot hold now is refused; the
                 // connection and its other channels go on.
                 let Some(charge) = env.budget().charge(ssh::MAX_PAYLOAD * 2) else {
-                    return self.refuse(sender, Refusal::ResourceShortage);
+                    return self.refuse(sender, Closing::ResourceShortage);
                 };
                 let wire = self.next_channel;
                 self.next_channel = wire.checked_add(1).ok_or(TransportError::State)?;
@@ -1372,10 +1363,17 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
         }
         Ok(())
     }
-    fn refuse(&mut self, peer: u32, why: Refusal) -> Result<(), Error> {
+    /// Refuses the peer's channel `peer`, not yet confirmed, telling it
+    /// `why` as RFC 4254 section 5.1 spells it: prohibited (1) past the
+    /// channel limit or when the application says no or is done before
+    /// taking it, resource shortage (4) when there is no memory for it
+    /// now, and connect failed (2) when it was taken and failed before it
+    /// could be confirmed.
+    fn refuse(&mut self, peer: u32, why: Closing) -> Result<(), Error> {
         let (reason, description) = match why {
-            Refusal::Prohibited => (1, "Channel refused"),
-            Refusal::ResourceShortage => (4, "Resource shortage"),
+            Closing::Prohibited | Closing::Done => (1, "Channel refused"),
+            Closing::ResourceShortage => (4, "Resource shortage"),
+            Closing::Failed => (2, "Channel failed"),
         };
         self.send(&wire::Message::ChannelOpenFailure {
             recipient: peer,
@@ -1753,7 +1751,10 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                         .ok_or(TransportError::State)?;
                 }
             }
-            MuxOp::Close(id, _) => {
+            MuxOp::Close(id, why) => {
+                // A confirmed channel closes, whatever the cause: CLOSE
+                // carries none. One not yet confirmed is refused with the
+                // receiver's cause.
                 if let Some(channel) = self.channels.get_mut(id)
                     && !channel.closed
                 {
@@ -1763,7 +1764,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                         self.send(&wire::Message::Close(peer))?;
                     } else {
                         self.channels.remove(id);
-                        self.refuse(peer, Refusal::Prohibited)?;
+                        self.refuse(peer, why)?;
                         self.raise(MuxEvent::Closed(id))?;
                     }
                 }
@@ -1790,7 +1791,7 @@ impl<H: Handler, T: PacketTransport> Layer for Ssh<H, T> {
                             if self.next_channel == wire + 1 {
                                 self.next_channel = wire;
                             }
-                            self.refuse(peer, Refusal::Prohibited)?;
+                            self.refuse(peer, Closing::Prohibited)?;
                             self.raise(MuxEvent::Closed(id))?;
                         }
                     }
