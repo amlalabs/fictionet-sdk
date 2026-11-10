@@ -1,6 +1,10 @@
 name = "http_verification"
 version = "0.1.0"
-defaultTargets = ["Http"]
+defaultTargets = ["Http", "gen"]
 
 [[lean_lib]]
 name = "Http"
+
+[[lean_exe]]
+name = "gen"
+root = "Gen"
