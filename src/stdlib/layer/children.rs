@@ -7,7 +7,7 @@ use std::sync::{
 use std::task::{Wake, Waker};
 
 use fictionet::stdlib::layer::{
-    Admit, Budget, Charge, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer, Mux,
+    Admit, Budget, Charge, ChargedDeque, Child, ChildId, CommandOf, Credited, Env, EventOf, Layer, Mux,
     MuxCommand, MuxEvent, OwnedWork, Port, Top, WorkOwner,
 };
 use fictionet::sync::Mutex;
@@ -228,9 +228,7 @@ struct Kid<B: Layer> {
     layer: B,
     budget: Budget,
     /// Events the mux sent within credit that the layer has not taken.
-    inbox: VecDeque<(EventOf<B::Lower>, bool)>,
-    /// What the inbox is charged: its places, grown as events wait.
-    storage: Charge,
+    inbox: ChargedDeque<(EventOf<B::Lower>, bool)>,
     wake: Arc<ChildWake>,
     /// Its places in the ready and work lists.
     links: [Link; 2],
@@ -871,10 +869,12 @@ where
                     if !retained {
                         kid.owed += cost - rest.credit().min(cost);
                     }
-                    kid.inbox.push_front((rest, retained));
+                    assert!(kid.inbox.push_front((rest, retained)).is_ok());
                     moved = true;
                 }
-                Ok(Admit::Blocked(event)) => kid.inbox.push_front((event, retained)),
+                Ok(Admit::Blocked(event)) => {
+                    assert!(kid.inbox.push_front((event, retained)).is_ok());
+                }
                 Err(e) => {
                     self.fail(env, id, e);
                     return None;
@@ -977,14 +977,12 @@ where
                 );
                 let reserved = (self.kids.len() < self.limit && self.make_room())
                     .then(|| {
-                        // The inbox grows as events wait in it (`admit`).
-                        let storage = budget.charge(0)?;
                         let window =
                             budget.charge(EventOf::<B::Lower>::receive_bytes(self.window)?)?;
-                        Some((storage, Arc::new(window)))
+                        Some(Arc::new(window))
                     })
                     .flatten();
-                let Some((storage, window)) = reserved else {
+                let Some(window) = reserved else {
                     self.down.push_back(child.close());
                     env.report(ChildReport::Refused(id));
                     return Ok(Admit::Taken);
@@ -1006,11 +1004,10 @@ where
                     armed: 0,
                     heap: None,
                     layer,
+                    inbox: ChargedDeque::new(&budget, QUEUE),
                     budget,
                     owner: WorkOwner::new(),
                     urgent: None,
-                    inbox: VecDeque::new(),
-                    storage,
                     wake: Arc::new(ChildWake::new(key, self.woken.clone())),
                     window,
                     max_command,
@@ -1069,17 +1066,6 @@ where
                     if urgent {
                         kid.urgent = Some(event);
                     } else {
-                        if kid.inbox.len() == kid.inbox.capacity() {
-                            // Charge the inbox's growth before it grows; a
-                            // child the budget cannot hold is refused.
-                            let places = (kid.inbox.capacity() * 2).clamp(4, QUEUE);
-                            let bytes = places * size_of::<(EventOf<B::Lower>, bool)>();
-                            if !kid.storage.grow_to(bytes) {
-                                self.refuse(env, id);
-                                return Ok(Admit::Taken);
-                            }
-                            kid.inbox.reserve_exact(places - kid.inbox.len());
-                        }
                         if !event.reserve_receive(&kid.budget, &kid.window) {
                             self.refuse(env, id);
                             return Ok(Admit::Taken);
@@ -1095,7 +1081,10 @@ where
                                 }
                                 None => true,
                             };
-                        kid.inbox.push_back((event, retained));
+                        if kid.inbox.push_back((event, retained)).is_err() {
+                            self.refuse(env, id);
+                            return Ok(Admit::Taken);
+                        }
                     }
                     self.ready.push(&mut self.kids, key);
                 }
