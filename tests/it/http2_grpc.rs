@@ -139,7 +139,9 @@ impl Stack {
                 ));
             }
             http2::Event::Settings(s) => self.h2[1 - dir].peer_settings(&s).unwrap(),
-            http2::Event::WindowUpdate(w) => self.h2[1 - dir].peer_window_update(&w).unwrap(),
+            http2::Event::WindowUpdate(w) => {
+                self.h2[1 - dir].peer_window_update(&w).unwrap();
+            }
             http2::Event::Reset { stream, .. } => {
                 self.h2[1 - dir].peer_reset(stream);
                 self.calls.remove(&(dir, stream));

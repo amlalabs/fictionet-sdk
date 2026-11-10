@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Version};
 
@@ -37,8 +37,7 @@ pub use respond::{Http2Server, Respond, Responder, Work as RespondWork};
 /// HTTP/2 connection deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Timer {
-    /// The SETTINGS acknowledgment deadline, or the end of a reset
-    /// stream's hold.
+    /// The SETTINGS acknowledgment deadline.
     Deadline,
 }
 
@@ -52,7 +51,6 @@ pub enum Report {
     Budget,
 }
 
-const RESET_LIFETIME: Duration = Duration::from_secs(1);
 const RESET_MAX: usize = 50;
 const PENDING_RESET_MAX: usize = 20;
 const ERROR_RESET_MAX: usize = 1024;
@@ -94,8 +92,8 @@ const KEEP: usize = 8;
 /// [`Responder::http2`] puts a [`Respond`] on each stream, answering with a
 /// [`Handler`](super::Handler); [`Grpc`] serves gRPC calls on a stream.
 ///
-/// After the server resets a stream, it ignores that stream's late HEADERS
-/// and DATA for one second, and holds at most 50 such streams. A client
+/// After the server resets a stream, it ignores that stream's late frames,
+/// remembering the last 50 streams it reset. A client
 /// that makes the server reset more than 1024 streams for its errors, or
 /// resets more than 20 streams the server has not taken in yet, loses the
 /// connection with `ENHANCE_YOUR_CALM`. Everything the connection holds is
@@ -122,8 +120,8 @@ pub struct Http2 {
     encoder: hpack::Encoder,
     streams: BTreeMap<u32, Stream>,
     children: Option<Slots<u32>>,
-    /// Streams the server reset a moment ago, at most [`RESET_MAX`].
-    resets: ChargedDeque<(u32, Instant)>,
+    /// The streams the server reset, oldest first, at most [`RESET_MAX`].
+    resets: ChargedDeque<u32>,
     recv_window: i32,
     /// The DATA bytes all streams hold for their children: they count
     /// against the connection's receive window.
@@ -635,6 +633,11 @@ impl Http2 {
     }
 
     fn push_piece(&mut self, env: &mut Env<'_, Report>, piece: Piece) -> bool {
+        // Once the connection is closing, its last frame is queued: a
+        // GOAWAY for an error ends the connection (RFC 9113 section 5.4.1).
+        if self.phase != Phase::Open {
+            return false;
+        }
         let bytes = piece.bytes as usize;
         // A place stays free behind every piece for the last GOAWAY.
         if !self.sent.reserve(2) || self.sent.push_back(piece).is_err() {
@@ -770,12 +773,29 @@ impl Http2 {
         self.close();
     }
 
-    /// Resets stream `id` and ignores its late frames for a while. Not an
+    /// Resets stream `id`, open or new, and ignores its late frames. Not an
     /// error of the client's: it does not count toward the reset limit.
     fn write_reset(&mut self, env: &mut Env<'_, Report>, id: u32, code: ErrorCode) {
         if self.streams.contains_key(&id) {
             self.end_stream(id, Ending::Reset(code));
         }
+        self.write_rst(env, id, code);
+        // The client may have sent frames on the stream before it saw the
+        // reset; they are discarded however late they come (RFC 9113
+        // section 5.1, which advises against a timer for this). A closed
+        // connection reads no more frames to ignore. The list has places
+        // for its most, paid for at the start: once full, it forgets its
+        // oldest stream for this one.
+        if self.phase == Phase::Open && !self.ignored(id) {
+            if self.resets.len() == RESET_MAX {
+                self.resets.pop_front();
+            }
+            let _ = self.resets.push_back(id);
+        }
+    }
+
+    /// Queues RST_STREAM for stream `id`.
+    fn write_rst(&mut self, env: &mut Env<'_, Report>, id: u32, code: ErrorCode) {
         self.frame_for(
             env,
             wire::HEADER_LEN + 4,
@@ -787,12 +807,6 @@ impl Http2 {
             id,
             false,
         );
-        // A closed connection reads no more frames to ignore. The list has
-        // places for its most, paid for at the start: once full, it
-        // remembers no more.
-        if self.phase == Phase::Open && !self.ignored(id) {
-            let _ = self.resets.push_back((id, env.now() + RESET_LIFETIME));
-        }
     }
 
     /// Resets stream `id` for the client's error. Too many such resets end
@@ -804,6 +818,26 @@ impl Http2 {
         code: ErrorCode,
     ) -> Result<(), wire::Error> {
         self.write_reset(env, id, code);
+        self.client_error()
+    }
+
+    /// Resets stream `id`, closed already, for the client's error: a frame
+    /// the RFC answers with a stream error even on a closed stream
+    /// (sections 6.1 and 6.3). The stream is not remembered: the client
+    /// has no frames in flight that this reset would excuse, so it stays
+    /// closed as it was (section 5.1).
+    fn reset_closed(
+        &mut self,
+        env: &mut Env<'_, Report>,
+        id: u32,
+        code: ErrorCode,
+    ) -> Result<(), wire::Error> {
+        self.write_rst(env, id, code);
+        self.client_error()
+    }
+
+    /// Counts a refusal for the client's error. Too many end the connection.
+    fn client_error(&mut self) -> Result<(), wire::Error> {
         self.error_resets += 1;
         if self.error_resets > ERROR_RESET_MAX {
             return Err(problem(
@@ -815,7 +849,7 @@ impl Http2 {
     }
 
     fn ignored(&self, id: u32) -> bool {
-        self.resets.iter().any(|(s, _)| *s == id)
+        self.resets.iter().any(|&s| s == id)
     }
 
     // -----------------------------------------------------------------------
@@ -1188,6 +1222,13 @@ impl Http2 {
             if !self.header_block(env, id, head, true) {
                 return Ok(());
             }
+            // The 431 ends the stream from the server's side. After a
+            // request that ended, the stream is closed, and nothing but
+            // PRIORITY may follow on it (RFC 9113 section 5.1); a request
+            // still open is reset, so its body stops.
+            if read.end {
+                return self.client_error();
+            }
             return self.reset(env, id, ErrorCode::RefusedStream);
         }
         let Some(request) = request(block, self.limits) else {
@@ -1231,7 +1272,7 @@ impl Http2 {
             if id > self.last_stream || id & 1 == 0 {
                 return Err(problem(ErrorCode::ProtocolError, "data on an idle stream"));
             }
-            return self.reset(env, id, ErrorCode::StreamClosed);
+            return self.reset_closed(env, id, ErrorCode::StreamClosed);
         };
         let receive = &mut stream.receive;
         if receive.closed {
@@ -1276,7 +1317,14 @@ impl Http2 {
             1 => self.encoder.set_settings_limit(setting.value as usize),
             4 => {
                 let initial = setting.value as i32;
-                for (&id, stream) in self.streams.iter_mut() {
+                // The change moves the windows of streams that may still
+                // send (RFC 9113 section 6.9.2). One whose END_STREAM is
+                // framed sends no more DATA, and its window is left alone.
+                let sending = self
+                    .streams
+                    .iter_mut()
+                    .filter(|(_, stream)| !matches!(stream.response.reply, Reply::Ended));
+                for (&id, stream) in sending {
                     stream.response.window = shifted(stream.response.window, self.initial, initial)
                         .ok_or_else(|| {
                             problem(ErrorCode::FlowControlError, "initial window overflow")
@@ -1491,8 +1539,10 @@ impl Http2 {
                     // The server reset this stream a moment ago, so it
                     // ignores the stream's late frames (section 5.1).
                     Ok(())
-                } else if priority || self.streams.contains_key(&header.stream) {
+                } else if self.streams.contains_key(&header.stream) {
                     self.reset(env, header.stream, error.code)
+                } else if priority {
+                    self.reset_closed(env, header.stream, error.code)
                 } else {
                     Ok(())
                 }
@@ -2079,12 +2129,7 @@ impl Layer for Http2 {
             );
             return Ok(true);
         }
-        let mut forgot = false;
-        while self.resets.front().is_some_and(|(_, at)| *at <= now) {
-            self.resets.pop_front();
-            forgot = true;
-        }
-        Ok(forgot)
+        Ok(false)
     }
 
     fn advance(&mut self, env: &mut Env<'_, Report>) -> Result<bool, Infallible> {
@@ -2178,13 +2223,7 @@ impl Layer for Http2 {
         if self.phase != Phase::Open {
             return None;
         }
-        self.resets
-            .front()
-            .map(|(_, at)| *at)
-            .into_iter()
-            .chain(self.settings_deadline)
-            .min()
-            .map(|at| (at, Timer::Deadline))
+        self.settings_deadline.map(|at| (at, Timer::Deadline))
     }
 }
 
@@ -2567,6 +2606,7 @@ mod tests {
     use std::pin::pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
+    use std::time::Duration;
 
     struct StalledBody {
         input: bytes::Bytes,
@@ -3282,6 +3322,64 @@ mod tests {
         );
     }
 
+    /// A stream whose response has ended has no active send window: a
+    /// change of initial window that would take that window past 2^31 - 1
+    /// leaves it alone, and is no error (RFC 9113 section 6.9.2 applies the
+    /// change to streams open or half closed (remote) only).
+    #[test]
+    fn an_initial_window_change_leaves_ended_responses_alone() {
+        let mut harness = answering(BODY.to_vec(), BODY.len(), Budget::new(1 << 24));
+        harness.push(&client_preface()).unwrap();
+        harness.take_output();
+        // The response to stream 1 is framed to its END_STREAM, but the
+        // transport has not taken it yet: the stream is still known.
+        harness.withhold();
+        let mut encoder = hpack::Encoder::new(4096);
+        harness.push(&get(&mut encoder, 1, "/")).unwrap();
+        // Its send window, raised to exactly 2^31 - 1.
+        let mut input = Vec::new();
+        write(
+            &wire::WindowUpdate {
+                stream: 1,
+                flags: 0,
+                increment: wire::MAX_WINDOW - (WINDOW as u32 - BODY.len() as u32),
+            },
+            &mut input,
+        );
+        write(
+            &wire::Settings {
+                flags: 0,
+                entries: vec![wire::Setting {
+                    id: 4,
+                    value: WINDOW as u32 + 1,
+                }],
+            },
+            &mut input,
+        );
+        harness.push(&input).unwrap();
+        harness.allow_all().unwrap();
+        let output = frames(harness.output());
+        assert!(
+            !output.iter().any(|f| matches!(f, Frame::GoAway(_))),
+            "{output:?}"
+        );
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Settings(s) if s.flags & 1 != 0)),
+            "{output:?}"
+        );
+        let body: Vec<u8> = output
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data(d) if d.stream == 1 => Some(d.data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(body, BODY);
+    }
+
     const BODY: &[u8] = b"hello";
 
     /// A stream's child installed in place of [`Respond`]: with a request
@@ -3533,6 +3631,80 @@ mod tests {
             assert_eq!(frames(&push(&mut harness, &late)), [], "{late:?}");
         }
         assert!(!harness.ended());
+    }
+
+    /// A DATA frame of one byte on `stream`.
+    fn data(stream: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write(
+            &wire::Data {
+                stream,
+                flags: 0,
+                data: vec![0],
+                padding: None,
+            },
+            &mut bytes,
+        );
+        bytes
+    }
+
+    #[test]
+    fn late_frames_on_a_reset_stream_are_ignored_however_late() {
+        // RFC 9113 section 5.1: frames on a stream the server reset are
+        // discarded, and a timer is no signal that the client saw the
+        // reset. A client on a slow path sends trailers after a second.
+        let mut harness = harness();
+        push(&mut harness, &client_preface());
+        let output = frames(&push(&mut harness, &post(1, true)));
+        assert!(
+            output
+                .iter()
+                .any(|f| matches!(f, Frame::Reset(r) if r.stream == 1))
+        );
+        harness.advance(Duration::from_secs(5)).unwrap();
+        for late in [post(1, false), data(1)] {
+            assert_eq!(frames(&push(&mut harness, &late)), [], "{late:?}");
+        }
+        assert!(!harness.ended());
+    }
+
+    #[test]
+    fn the_newest_reset_is_remembered_when_the_list_is_full() {
+        let mut harness = harness();
+        push(&mut harness, &client_preface());
+        let streams: Vec<u32> = (0..RESET_MAX as u32 + 1).map(|n| 2 * n + 1).collect();
+        for &stream in &streams {
+            let output = frames(&push(&mut harness, &post(stream, true)));
+            assert!(
+                output
+                    .iter()
+                    .any(|f| matches!(f, Frame::Reset(r) if r.stream == stream))
+            );
+        }
+        let newest = *streams.last().unwrap();
+        assert_eq!(frames(&push(&mut harness, &post(newest, false))), []);
+        assert!(!harness.ended());
+    }
+
+    #[test]
+    fn a_reset_of_a_closed_stream_leaves_it_closed() {
+        // Stream 3 skips stream 1, which closes (RFC 9113 section 5.1.1).
+        // DATA on it is a stream error (section 6.1), but the reset is not
+        // one the client can have frames in flight for: HEADERS on stream 1
+        // is still an identifier below one already used.
+        let mut harness = harness();
+        push(&mut harness, &client_preface());
+        push(&mut harness, &post(3, false));
+        let output = frames(&push(&mut harness, &data(1)));
+        assert!(output.iter().any(|f| matches!(f, Frame::Reset(r)
+            if r.stream == 1 && r.code == ErrorCode::StreamClosed as u32)));
+        let output = frames(&push(&mut harness, &post(1, false)));
+        assert!(
+            output.iter().any(|f| matches!(f, Frame::GoAway(g)
+                if g.code == ErrorCode::ProtocolError as u32)),
+            "{output:?}"
+        );
+        assert!(harness.ended());
     }
 
     /// A server whose streams answer `GET` with `body`, charging `budget`.
@@ -4379,6 +4551,41 @@ mod tests {
         );
         assert!(harness.ended());
         assert_eq!(harness.layer().upper().ids().count(), 0);
+    }
+
+    /// The budget runs out as graceful shutdown writes its first GOAWAY:
+    /// the connection ends with GOAWAY `ENHANCE_YOUR_CALM`, and the
+    /// shutdown's PING does not follow it (RFC 9113 section 5.4.1: GOAWAY
+    /// is the last frame of a connection that ends for an error).
+    #[test]
+    fn a_refusal_during_graceful_shutdown_writes_nothing_after_its_goaway() {
+        use fictionet::stdlib::layer::{Chain, Children};
+        let budget = Budget::new(1 << 24);
+        let server = Chain::new(
+            Http2::new(Limits::default()),
+            Children::new(16, 1, |_, _, _| Some(Sink::reading(false))),
+        );
+        let mut harness =
+            Harness::with_budget(fictionet::Seed::from_u64(9), server, budget.clone());
+        harness.push(&client_preface()).unwrap();
+        let mut input = Vec::new();
+        for stream in (1..8).step_by(2) {
+            input.extend(headers_without_end(stream));
+        }
+        harness.push(&input).unwrap();
+        harness.take_output();
+        let _rest = budget.charge(budget.limit() - budget.used()).unwrap();
+        harness.driver().layer_mut().lower_mut().graceful_shutdown();
+        harness.settle().unwrap();
+        let output = frames(&harness.take_output());
+        let last = output.iter().position(
+            |f| matches!(f, Frame::GoAway(g) if g.code == ErrorCode::EnhanceYourCalm as u32),
+        );
+        let Some(last) = last else {
+            panic!("no GOAWAY ENHANCE_YOUR_CALM: {output:?}");
+        };
+        assert_eq!(last + 1, output.len(), "{output:?}");
+        assert!(harness.ended());
     }
 
     /// A response head larger than several frames goes out as HEADERS and

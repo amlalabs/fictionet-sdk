@@ -1,15 +1,17 @@
 #![deny(unsafe_code)]
 
 //! Host tooling for demo images and offline web captures, and the
-//! verification of Fictionet's DNS, MPTCP and layer routing.
+//! verification of Fictionet's DNS, MPTCP, HPACK and layer routing.
 
 #[cfg(feature = "host-tools")]
 mod capture;
 mod dns_verify;
 mod gate;
+mod hpack_verify;
 #[cfg(feature = "host-tools")]
 mod image;
 mod layer_verify;
+mod lean_vectors;
 mod mptcp_verify;
 #[cfg(feature = "host-tools")]
 mod rawnic;
@@ -30,9 +32,9 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + 
 
 fn main() -> Result {
     let mut args = std::env::args().skip(1);
-    let task = args
-        .next()
-        .ok_or("expected gate, dns-verify, mptcp-verify, layer-verify or a host command")?;
+    let task = args.next().ok_or(
+        "expected gate, dns-verify, mptcp-verify, hpack-verify, layer-verify or a host command",
+    )?;
     if task == "kani" {
         return gate::kani(&args.collect::<Vec<_>>());
     }
@@ -44,6 +46,9 @@ fn main() -> Result {
     }
     if task == "tcp-rfc-verify" {
         return tcp_rfc_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "hpack-verify" {
+        return hpack_verify::run(&args.collect::<Vec<_>>());
     }
     if task == "dns-verify" {
         return dns_verify::run(&args.collect::<Vec<_>>());

@@ -178,5 +178,10 @@ required-features = ["web-proxy", "tokio"]
 name = "mptcp_vectors"
 test = false
 
+# Lean emits these vectors through cargo xtask hpack-verify.
+[[test]]
+name = "hpack_vectors"
+test = false
+
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
