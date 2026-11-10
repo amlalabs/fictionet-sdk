@@ -434,3 +434,33 @@ fn many_writes_fit_in_bounded_chunks() {
     store.ack(model.len());
     assert!(store.is_empty() && store.descriptors() == 0);
 }
+
+/// Sending a short write must leave its gathering block writable while
+/// the packet is in flight, so subsequent short writes can share the tail.
+#[test]
+fn short_writes_gather_while_packets_are_in_flight() {
+    let mut store = TxStore::new(4 * SLOT, Budget::unlimited());
+    let mut packets = Vec::new();
+    let mut expected = Vec::new();
+    for i in 0..SEGMENTS {
+        let bytes = vec![byte(i); 7];
+        let offset = expected.len();
+        store.push(paid(&bytes)).unwrap();
+        expected.extend_from_slice(&bytes);
+        let mut piece = store.piece(offset, bytes.len()).unwrap();
+        let packet = piece
+            .in_place(40, |packet| packet[..40].fill(0))
+            .unwrap_or_else(|| paid(piece.bytes()));
+        packets.push(packet);
+        assert!(store.descriptors() <= expected.len().div_ceil(SLOT));
+    }
+    let mut actual = Vec::new();
+    while actual.len() < store.len() {
+        actual.extend_from_slice(store.bytes(actual.len(), MSS));
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(
+        packets.iter().map(|p| p.len()).sum::<usize>(),
+        expected.len()
+    );
+}

@@ -352,10 +352,6 @@ pub(super) fn exchange(
     );
     let (mut server_jobs, mut client_jobs) = (Polling::new(), Polling::new());
     let mut serial = 0;
-    // Packets on the way to the server and to the client: a link carries
-    // both ways at once, so what a receiver sends while it takes a burst
-    // waits here for its turn instead of holding the burst up.
-    let mut carried: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
     for tick in 0..10000 {
         for direction in [false, true] {
             let (from, to, jobs) = if direction {
@@ -367,9 +363,7 @@ pub(super) fn exchange(
             from.run().unwrap();
             jobs.work(from).unwrap();
             from.run().unwrap();
-            // Index 0 goes to the server, 1 to the client.
-            let (toward, back) = (usize::from(direction), usize::from(!direction));
-            let mut packets = std::mem::take(&mut carried[toward]);
+            let mut packets = Vec::new();
             from.send_below(|command| {
                 if let PacketCommand::Send(bytes) = command {
                     packets.extend(fragments(&bytes, &mut serial));
@@ -381,16 +375,7 @@ pub(super) fn exchange(
                 loop {
                     to.run().unwrap();
                     match to.deliver(event).unwrap() {
-                        Admit::Blocked(again) => {
-                            event = again;
-                            // The receiver may be waiting to send.
-                            to.send_below(|command| {
-                                if let PacketCommand::Send(bytes) = command {
-                                    carried[back].extend(fragments(&bytes, &mut serial));
-                                }
-                                Admit::Taken
-                            });
-                        }
+                        Admit::Blocked(back) => event = back,
                         _ => break,
                     }
                 }

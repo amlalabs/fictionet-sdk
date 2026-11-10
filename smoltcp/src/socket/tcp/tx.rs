@@ -29,6 +29,9 @@ pub(crate) struct TxStore {
     capacity: usize,
     queued: usize,
     chunks: VecDeque<Chunk>,
+    /// The last chunk is a block gathering short writes. Sending it must
+    /// not share its backing while it still has room for another write.
+    gathering: bool,
     budget: Budget,
 }
 
@@ -38,6 +41,7 @@ impl TxStore {
             capacity,
             queued: 0,
             chunks: VecDeque::with_capacity(SEGMENTS),
+            gathering: false,
             budget,
         }
     }
@@ -85,6 +89,7 @@ impl TxStore {
     pub(crate) fn clear(&mut self) {
         self.chunks.clear();
         self.queued = 0;
+        self.gathering = false;
     }
 
     /// Queues all of `chunk` after what is queued, or none of it: back,
@@ -118,6 +123,7 @@ impl TxStore {
             })
             .flatten();
         self.queued += chunk.len();
+        self.gathering = gathered.is_some();
         self.chunks.push_back(gathered.unwrap_or(chunk));
         Ok(())
     }
@@ -160,9 +166,15 @@ impl TxStore {
     /// that holds them, to send. `None` when there are none.
     pub(crate) fn piece(&mut self, offset: usize, len: usize) -> Option<Piece<'_>> {
         let (i, at) = self.locate(offset)?;
+        let gathering = self.gathering && i + 1 == self.chunks.len();
         let chunk = &mut self.chunks[i];
         let range = at..chunk.len().min(at + len);
-        (!range.is_empty()).then_some(Piece { chunk, range })
+        let writable_tail = gathering && chunk.room() > 0;
+        (!range.is_empty()).then_some(Piece {
+            chunk,
+            range,
+            writable_tail,
+        })
     }
 
     /// Lets go of the first `bytes` queued, which the peer acknowledged.
@@ -190,6 +202,7 @@ impl TxStore {
 pub struct Piece<'a> {
     chunk: &'a mut Chunk,
     range: Range<usize>,
+    writable_tail: bool,
 }
 
 impl Piece<'_> {
@@ -212,9 +225,10 @@ impl Piece<'_> {
     /// and writes the header. The socket keeps its view of the payload.
     /// `None`, calling nothing, otherwise: when another piece shares the
     /// chunk, such as the packet of an earlier send still on its way, the
-    /// headroom is never written.
+    /// headroom is never written. A gathering tail with room stays unique
+    /// so later short writes can append while earlier packets are in flight.
     pub fn in_place(&mut self, header: usize, write: impl FnOnce(&mut [u8])) -> Option<Chunk> {
-        if self.range != (0..self.chunk.len()) {
+        if self.writable_tail || self.range != (0..self.chunk.len()) {
             return None;
         }
         self.chunk.prepend(header)?;
