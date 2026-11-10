@@ -1,7 +1,8 @@
 ----------------------------- MODULE Timers -----------------------------
 \* The host wake driver of a real run, src/timer.rs: each real Clock owns
 \* one Driver. Driver::set gives it the clock's earliest deadline, or none,
-\* and notifies its thread; the thread (native::Shared::run) sleeps on a
+\* and notifies its thread when that deadline is earlier than the one it
+\* held; the thread (native::Shared::run) sleeps on a
 \* Condvar until that deadline, forgets it and wakes the clock; dropping
 \* the clock closes the driver and the thread ends. The thread starts with
 \* the first deadline. Clock::arm calls set only when the earliest deadline
@@ -37,12 +38,15 @@ Init ==
 \* The lock is free while the thread sleeps or wakes the clock.
 Unlocked == thread # "running"
 
-\* Driver::set, from the clock. The first deadline starts the thread.
+\* Driver::set, from the clock. The first deadline starts the thread. Only
+\* an earlier deadline, or one where none was, notifies the thread.
+Earlier(d) == d # 0 /\ (deadline = 0 \/ d < deadline)
+
 Set(d) ==
     /\ Unlocked /\ ~closed
     /\ deadline' = d
     /\ thread' = IF thread = "unstarted" /\ d # 0 THEN "running" ELSE thread
-    /\ notified' = (notified \/ Notify)
+    /\ notified' = (notified \/ (Notify /\ Earlier(d)))
     /\ UNCHANGED <<now, planned, closed>>
 
 \* The clock is dropped, and its driver with it.
@@ -109,9 +113,11 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 \* Properties.
 
 \* The thread never sleeps past the deadline it holds: while it sleeps with
-\* no notify pending, it waits for exactly that deadline.
+\* no notify pending, it waits for that deadline or an earlier one, and
+\* waits with no deadline only when it holds none.
 SleepIsSafe ==
-    (thread = "sleeping" /\ ~notified /\ ~closed) => planned = deadline
+    (thread = "sleeping" /\ ~notified /\ ~closed)
+        => (deadline = 0 \/ (planned # 0 /\ planned <= deadline))
 
 \* A deadline that has come is acted on: the clock is woken for it (the
 \* driver forgets it), or the clock moved or took it away.

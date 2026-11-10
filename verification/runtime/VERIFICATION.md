@@ -122,7 +122,7 @@ Ablations, each run alone and each violating the property it names:
 | `LabClock_without_freshid` | the new id `Clock::reset` takes | `WakesInOrderAndInTime` | 2,175 |
 | `LabClock_without_max` | `advance` keeping `max(now, deadline)` | `Monotonic` | 4,026 |
 | `Timers_without_closenotify` | the `Condvar` notify when the driver is dropped | `ThreadEnds` | not run |
-| `Timers_without_notify` | the `Condvar` notify in `Driver::set` | `SleepIsSafe` | not run |
+| `Timers_without_notify` | the `Condvar` notify in `Driver::set` for an earlier deadline | `SleepIsSafe` | not run |
 
 Three of the ablations are the bugs earlier rounds fixed in `16abcc1bb` and
 `6a0cc67c3` (the idle point, the moved timer's id, the clock moving back); the

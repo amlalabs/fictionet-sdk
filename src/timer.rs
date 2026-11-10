@@ -85,6 +85,9 @@ mod native {
     pub(crate) struct Shared {
         pub(super) state: Mutex<State>,
         changed: Condvar,
+        /// How many times the thread has looked at its deadline.
+        #[cfg(test)]
+        pub(super) looks: std::sync::atomic::AtomicUsize,
         wake: Waker,
     }
 
@@ -105,12 +108,23 @@ mod native {
                     closed: false,
                 }),
                 changed: Condvar::new(),
+                #[cfg(test)]
+                looks: std::sync::atomic::AtomicUsize::new(0),
                 wake,
             })
         }
 
+        /// Only a deadline earlier than the one held, or one where none was,
+        /// notifies the thread: one that moved later or went is found when
+        /// the thread wakes for the old one, and every notify can cost the
+        /// thread a wake.
         pub(super) fn set(this: &Arc<Shared>, deadline: Option<Instant>) {
             let mut state = this.state.lock();
+            let earlier = match (state.deadline, deadline) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some(held), Some(new)) => new < held,
+            };
             state.deadline = deadline;
             if deadline.is_some() && !state.started {
                 state.started = true;
@@ -121,7 +135,9 @@ mod native {
                     .expect("failed to start a fictionet timer thread");
             }
             drop(state);
-            this.changed.notify_one();
+            if earlier {
+                this.changed.notify_one();
+            }
         }
 
         pub(super) fn close(&self) {
@@ -133,6 +149,8 @@ mod native {
         fn run(&self) {
             let mut state = self.state.lock();
             loop {
+                #[cfg(test)]
+                self.looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if state.closed {
                     return;
                 }
@@ -232,6 +250,33 @@ mod tests {
             "the other driver woke early"
         );
         assert!(drivers[1].deadline().is_some());
+    }
+
+    /// A deadline moved later leaves the sleeping thread asleep; one moved
+    /// earlier wakes it.
+    #[test]
+    fn only_an_earlier_deadline_wakes_the_thread() {
+        let driver = Driver::new(Waker::noop().clone());
+        let start = Instant::now();
+        driver.set(Some(start + Duration::from_secs(3600)));
+        let looks = || driver.shared.looks.load(Ordering::SeqCst);
+        wait_for("the thread never started", || looks() >= 1);
+        // Holding the lock until the thread waits on it.
+        drop(driver.shared.state.lock());
+        let asleep = looks();
+        for i in 1..=1000 {
+            driver.set(Some(start + Duration::from_secs(3600 + i)));
+        }
+        driver.set(None);
+        assert!(
+            looks() <= asleep + 1,
+            "{} looks for 1,001 later or no deadlines",
+            looks() - asleep
+        );
+        driver.set(Some(start + Duration::from_secs(60)));
+        wait_for("an earlier deadline did not wake the thread", || {
+            looks() > asleep
+        });
     }
 
     /// Dropping the driver, as its clock is dropped, ends its thread.
