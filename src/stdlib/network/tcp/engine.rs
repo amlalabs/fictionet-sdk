@@ -544,8 +544,11 @@ pub struct TcpLayer {
     saturated: bool,
     /// The end went to the layer below.
     ended: bool,
+    /// How many sockets and listeners `storage` pays routing for; 0 until
+    /// the first budget paid the fixed storage.
     storage_places: usize,
-    /// Owned by the first environment and dropped after the storage it covers.
+    /// The fixed storage and routing, charged to the first budget the
+    /// engine sees. Last, so it is given back after what it pays for.
     storage: Option<Charge>,
 }
 
