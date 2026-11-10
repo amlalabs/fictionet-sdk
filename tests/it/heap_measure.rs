@@ -1,9 +1,10 @@
 //! A value's [`Heap`] measure is what the allocator holds for it, and a
-//! value parsed with [`parse_paid`] is charged exactly that.
+//! value parsed with [`parse_paid`] is charged exactly that. An SSH key
+//! exchange allocates no more than the scratch its transport states.
 
 use std::collections::VecDeque;
 
-use crate::common::alloc::left_allocated;
+use crate::common::alloc::{left_allocated, measuring};
 use fictionet::heap_of;
 use fictionet::stdlib::codec::{Heap, HeapBound, most_list_places, parse_paid};
 use fictionet::stdlib::layer::Budget;
@@ -97,5 +98,115 @@ fn a_paid_parse_is_charged_what_the_allocator_holds() {
         assert_eq!(i128::try_from(paid.charged()).unwrap(), live);
         assert_eq!(budget.used(), paid.charged());
         assert!(paid.charged() <= Names::most_heap(input.len()));
+    }
+}
+
+/// Answering an ECDH_INIT allocates at most the transport's stated
+/// scratch for it, besides what the transport keeps (the session
+/// identifier and the next incoming keys, which its state's charge
+/// covers): for each key exchange method, and for each kind of cipher.
+/// An Ed25519 host key signs without allocating, so everything counted
+/// is the transport's own; an RSA signer's working memory is the `rsa`
+/// crate's and would be counted here too.
+#[test]
+fn an_ssh_key_exchange_allocates_at_most_its_scratch() {
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::protocols::ssh::transport::{HostKey, Transport, TransportEvent};
+    use fictionet::stdlib::protocols::ssh::{Identification, Message};
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    use std::sync::Arc;
+
+    let shares: [(&str, Vec<u8>); 4] = [
+        (
+            "curve25519-sha256",
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([9; 32]))
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "curve25519-sha256@libssh.org",
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([5; 32]))
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "ecdh-sha2-nistp256",
+            p256::SecretKey::from_slice(&[3; 32])
+                .unwrap()
+                .public_key()
+                .to_sec1_point(false)
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "ecdh-sha2-nistp384",
+            p384::SecretKey::from_slice(&[3; 48])
+                .unwrap()
+                .public_key()
+                .to_sec1_point(false)
+                .as_bytes()
+                .to_vec(),
+        ),
+    ];
+    for (kex, share) in shares {
+        for cipher in ["chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com"] {
+            let host = Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap());
+            let mut transport =
+                Transport::new(host, Identification::new("2.0", "server", None).unwrap());
+            transport.seed([1; 32]).unwrap();
+            let mut out = Vec::with_capacity(1 << 16);
+            transport.start(&mut out).unwrap();
+            let peer = Identification::new("2.0", "client", None).unwrap();
+            transport
+                .handle(TransportEvent::Version(peer), &mut out)
+                .unwrap();
+            let ours = Message::KexInit(transport.proposal().clone())
+                .to_bytes()
+                .unwrap();
+            let mut proposal = transport.proposal().clone();
+            proposal.kex_algorithms = vec![kex.to_owned()];
+            proposal.encryption_client_to_server = vec![cipher.to_owned()];
+            proposal.encryption_server_to_client = vec![cipher.to_owned()];
+            let theirs = Message::KexInit(proposal).to_bytes().unwrap();
+            let event = TransportEvent::Packet {
+                sequence: 0,
+                payload: theirs.clone(),
+            };
+            transport.handle(event, &mut out).unwrap();
+
+            let mut ecdh = vec![30];
+            ecdh.extend_from_slice(&(share.len() as u32).to_be_bytes());
+            ecdh.extend_from_slice(&share);
+            let scratch = transport.scratch(&ecdh);
+            let held = fictionet::stdlib::codec::Decode::held(&transport);
+            out.clear();
+            let room = out.capacity();
+            let event = TransportEvent::Packet {
+                sequence: 1,
+                payload: ecdh,
+            };
+            let (answered, stats) = measuring(|| transport.handle(event, &mut out));
+            assert!(answered.unwrap().is_none());
+            assert_eq!(out.capacity(), room, "the reply fit the room given");
+            // What the transport keeps: its state now, less its state
+            // before, whose two proposals it frees only on returning.
+            let kept =
+                fictionet::stdlib::codec::Decode::held(&transport) + ours.len() + theirs.len()
+                    - held;
+            assert!(
+                stats.peak_live_bytes <= scratch + kept,
+                "{kex} with {cipher}: {} bytes live at the peak, more than the scratch {scratch} \
+                 and the {kept} bytes kept",
+                stats.peak_live_bytes
+            );
+            // The scratch follows from what the exchange works with, not
+            // from an allowance: it is within twice what it allocates.
+            assert!(
+                scratch <= 2 * stats.peak_live_bytes,
+                "{kex} with {cipher}: the scratch {scratch} is more than twice the {} bytes \
+                 the exchange allocates",
+                stats.peak_live_bytes
+            );
+        }
     }
 }

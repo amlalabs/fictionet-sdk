@@ -5,7 +5,7 @@
 //! depends on the active method; use [`Message::parse_with_method`] to decode it.
 
 use super::{Error, MAX_NAME, MAX_PAYLOAD, Reader};
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Heap, HeapBound, Wire, most_list_places};
 
 /// SHA256 fingerprint of an SSH encoded public key, before display encoding.
 pub fn public_key_fingerprint(key: &[u8]) -> [u8; 32] {
@@ -83,6 +83,39 @@ impl Method {
             Self::KeyboardInteractive { .. } => "keyboard-interactive",
             Self::Other { name, .. } => name,
         }
+    }
+}
+
+fictionet::heap_of! { Request { user, service, method } }
+
+impl Heap for Method {
+    fn heap(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Password {
+                password,
+                new_password,
+            } => password.heap() + new_password.heap(),
+            Self::PublicKey {
+                algorithm,
+                key,
+                signature,
+            } => algorithm.heap() + key.heap() + signature.heap(),
+            Self::KeyboardInteractive {
+                language,
+                submethods,
+            } => language.heap() + submethods.heap(),
+            Self::Other { name, data } => name.heap() + data.heap(),
+        }
+    }
+}
+
+/// Each field, the method's name among them while it is read, is a copy
+/// of distinct bytes of the payload, made whole: together at most the
+/// payload's length.
+impl HeapBound for Request {
+    fn most_heap(len: usize) -> usize {
+        len
     }
 }
 
@@ -408,6 +441,58 @@ impl Message {
     }
 }
 
+fictionet::heap_of! { Prompt { text, echo } }
+
+impl Heap for Message {
+    fn heap(&self) -> usize {
+        match self {
+            Self::Request(request) => request.heap(),
+            Self::Failure {
+                methods,
+                partial_success: _,
+            } => methods.heap(),
+            Self::Success => 0,
+            Self::Banner { message, language }
+            | Self::PasswordChange {
+                prompt: message,
+                language,
+            } => message.heap() + language.heap(),
+            Self::PublicKeyOk { algorithm, key } => algorithm.heap() + key.heap(),
+            Self::InfoRequest {
+                name,
+                instruction,
+                language,
+                prompts,
+            } => name.heap() + instruction.heap() + language.heap() + prompts.heap(),
+            Self::InfoResponse(responses) => responses.heap(),
+        }
+    }
+}
+
+/// A message parsed as [`Message::parse`] parses it. Its strings copy
+/// distinct bytes of the payload, made whole: at most the payload's
+/// length. A FAILURE's name-list also has places for its names, each
+/// taking at least two bytes, in a vector grown by pushes; a challenge
+/// or its answers have places for their prompts or answers, at most one
+/// per five or four bytes left, allocated for exactly their count.
+impl HeapBound for Message {
+    fn most_heap(len: usize) -> usize {
+        len + most_list_places::<String>(len + 1, 2)
+            .max(len / 5 * size_of::<Prompt>())
+            .max(len / 4 * size_of::<Vec<u8>>())
+    }
+    fn most_heap_of(payload: &[u8]) -> usize {
+        let len = payload.len();
+        match payload.first() {
+            Some(51) => len + most_list_places::<String>(len + 1, 2),
+            Some(52) => 0,
+            Some(60) => len + len / 5 * size_of::<Prompt>(),
+            Some(61) => len + len / 4 * size_of::<Vec<u8>>(),
+            _ => len,
+        }
+    }
+}
+
 impl Wire for Message {
     type ParseError = Error;
     type WriteError = Error;
@@ -563,9 +648,104 @@ impl Payload {
 mod tests {
     use super::*;
     use fictionet::stdlib::{
-        codec::Lcg,
+        codec::{Lcg, assert_heap_bound},
         test_support::{mutate, rounds},
     };
+
+    /// Random requests with every method, at every size the generator
+    /// reaches.
+    fn requests(g: &mut Lcg) -> Vec<Vec<u8>> {
+        let mut requests = Vec::new();
+        for _ in 0..200 {
+            let max = 1 + g.index(4000);
+            for method in [
+                Method::None,
+                Method::Password {
+                    password: g.bytes(max),
+                    new_password: g.coin().then(|| g.bytes(max)),
+                },
+                Method::PublicKey {
+                    algorithm: "ssh-ed25519".into(),
+                    key: g.bytes(max),
+                    signature: g.coin().then(|| g.bytes(max)),
+                },
+                Method::KeyboardInteractive {
+                    language: g.text(20),
+                    submethods: g.text(max),
+                },
+                Method::Other {
+                    name: "extension@example.com".into(),
+                    data: g.bytes(max),
+                },
+            ] {
+                let request = Request {
+                    user: g.text(max),
+                    service: "ssh-connection".into(),
+                    method,
+                };
+                requests.push(request.to_bytes().unwrap());
+            }
+        }
+        requests
+    }
+
+    /// Each parsed request and message holds at most its type's bound:
+    /// random ones, and lists of the shortest items, which cost the most
+    /// per byte: names of one letter, empty prompts and empty answers, as
+    /// many as a payload holds and fewer.
+    #[test]
+    fn parsed_authentication_messages_hold_at_most_their_bound() {
+        let mut g = Lcg::new(0x68656170);
+        let requests = requests(&mut g);
+        assert_heap_bound(&requests, Request::parse);
+        let mut messages = requests;
+        for count in [0, 1, 2, 3, 4, 5, 100, 1000, 6550, 8190] {
+            let failure = Message::Failure {
+                methods: vec!["a".into(); 2 * count],
+                partial_success: false,
+            };
+            let challenge = Message::InfoRequest {
+                name: String::new(),
+                instruction: String::new(),
+                language: String::new(),
+                prompts: vec![
+                    Prompt {
+                        text: String::new(),
+                        echo: false,
+                    };
+                    count.min(6550)
+                ],
+            };
+            let answers = Message::InfoResponse(vec![Vec::new(); count]);
+            for message in [failure, challenge, answers] {
+                messages.push(message.to_bytes().unwrap());
+            }
+        }
+        for _ in 0..200 {
+            for message in [
+                Message::Success,
+                Message::Banner {
+                    message: g.text(2000),
+                    language: g.text(20),
+                },
+                Message::InfoRequest {
+                    name: g.text(50),
+                    instruction: g.text(200),
+                    language: g.text(20),
+                    prompts: (0..g.index(40))
+                        .map(|_| Prompt {
+                            text: g.text(200),
+                            echo: g.coin(),
+                        })
+                        .collect(),
+                },
+                Message::InfoResponse((0..g.index(40)).map(|_| g.bytes(200)).collect()),
+            ] {
+                messages.push(message.to_bytes().unwrap());
+            }
+        }
+        assert_heap_bound(&messages, Message::parse);
+    }
 
     #[test]
     fn randomized_authentication_roundtrips() {

@@ -19,6 +19,8 @@ pub struct Opening {
     pub kind: wire::OpenKind,
 }
 
+crate::heap_of! { Opening { user, channel, kind } }
+
 /// SSH channel semantics, including extended data and requests.
 pub struct ChannelPort;
 impl Port for ChannelPort {

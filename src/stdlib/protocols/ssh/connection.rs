@@ -5,7 +5,7 @@
 
 use super::auth::{Payload, name, reader, rest};
 use super::{Error, MAX_PAYLOAD, Reader};
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{Heap, HeapBound, Wire, most_list_places};
 
 /// Extended channel data type for standard error.
 pub const STDERR: u32 = 1;
@@ -231,6 +231,100 @@ pub enum Message {
     ChannelSuccess(u32),
     /// Failed channel request for this recipient.
     ChannelFailure(u32),
+}
+
+fictionet::heap_of! {
+    TcpIp { host, port, originator, originator_port }
+    TerminalMode { opcode, value }
+    Dimensions { columns, rows, pixel_width, pixel_height }
+}
+
+impl Heap for OpenKind {
+    fn heap(&self) -> usize {
+        match self {
+            Self::Session => 0,
+            Self::DirectTcpIp(ends) | Self::ForwardedTcpIp(ends) => ends.heap(),
+            Self::Other { name, data } => name.heap() + data.heap(),
+        }
+    }
+}
+
+impl Heap for GlobalRequest {
+    fn heap(&self) -> usize {
+        match self {
+            Self::TcpIpForward { address, port: _ }
+            | Self::CancelTcpIpForward { address, port: _ } => address.heap(),
+            Self::Other { name, data } => name.heap() + data.heap(),
+        }
+    }
+}
+
+impl Heap for SessionRequest {
+    fn heap(&self) -> usize {
+        match self {
+            Self::Pty {
+                terminal,
+                dimensions,
+                modes,
+            } => terminal.heap() + dimensions.heap() + modes.heap(),
+            Self::Shell | Self::WindowChange(_) | Self::ExitStatus(_) => 0,
+            Self::Exec(command) => command.heap(),
+            Self::Env { name, value } => name.heap() + value.heap(),
+            Self::Subsystem(name) | Self::Signal(name) => name.heap(),
+            Self::ExitSignal {
+                signal,
+                core_dumped: _,
+                message,
+                language,
+            } => signal.heap() + message.heap() + language.heap(),
+            Self::Other { name, data } => name.heap() + data.heap(),
+        }
+    }
+}
+
+impl Heap for Message {
+    fn heap(&self) -> usize {
+        match self {
+            Self::GlobalRequest {
+                want_reply: _,
+                request,
+            } => request.heap(),
+            Self::RequestSuccess(data) => data.heap(),
+            Self::ChannelOpen { kind, .. } => kind.heap(),
+            Self::ChannelOpenConfirmation { data, .. } => data.heap(),
+            Self::ChannelOpenFailure {
+                description,
+                language,
+                ..
+            } => description.heap() + language.heap(),
+            Self::Data { data, .. } | Self::ExtendedData { data, .. } => data.heap(),
+            Self::ChannelRequest { request, .. } => request.heap(),
+            Self::RequestFailure
+            | Self::WindowAdjust { .. }
+            | Self::Eof(_)
+            | Self::Close(_)
+            | Self::ChannelSuccess(_)
+            | Self::ChannelFailure(_) => 0,
+        }
+    }
+}
+
+/// Every string of a message, the request or channel type's name among
+/// them while it is read, copies distinct bytes of the payload, made
+/// whole: together at most the payload's length. A terminal request also
+/// has places for its modes, each taking five bytes, in a vector grown by
+/// pushes. Channel data holds only its bytes.
+impl HeapBound for Message {
+    fn most_heap(len: usize) -> usize {
+        len + most_list_places::<TerminalMode>(len, 5)
+    }
+    fn most_heap_of(payload: &[u8]) -> usize {
+        match payload.first() {
+            Some(98) => Self::most_heap(payload.len()),
+            Some(82 | 93 | 96 | 97 | 99 | 100) => 0,
+            _ => payload.len(),
+        }
+    }
 }
 
 impl Dimensions {
@@ -632,7 +726,7 @@ impl Wire for Message {
 mod tests {
     use super::*;
     use fictionet::stdlib::{
-        codec::Lcg,
+        codec::{Lcg, assert_heap_bound},
         test_support::{assert_write, mutate, rounds},
     };
 
@@ -649,122 +743,7 @@ mod tests {
     fn randomized_connection_roundtrips() {
         let mut g = Lcg::new(0x636f6e6e);
         for _ in 0..rounds(1000) {
-            let recipient = g.next() as u32;
-            let requests = [
-                SessionRequest::Pty {
-                    terminal: g.text(50),
-                    dimensions: dimensions(&mut g),
-                    modes: (0..g.index(30))
-                        .map(|_| TerminalMode {
-                            opcode: (1 + g.index(159)) as u8,
-                            value: g.next() as u32,
-                        })
-                        .collect(),
-                },
-                SessionRequest::Shell,
-                SessionRequest::Exec(g.bytes(300)),
-                SessionRequest::Env {
-                    name: g.bytes(50),
-                    value: g.bytes(200),
-                },
-                SessionRequest::Subsystem(g.text(50)),
-                SessionRequest::WindowChange(dimensions(&mut g)),
-                SessionRequest::Signal("TERM".into()),
-                SessionRequest::ExitStatus(g.next() as u32),
-                SessionRequest::ExitSignal {
-                    signal: "HUP".into(),
-                    core_dumped: g.coin(),
-                    message: g.text(100),
-                    language: g.text(20),
-                },
-                SessionRequest::Other {
-                    name: "extension@example.com".into(),
-                    data: g.bytes(200),
-                },
-            ];
-            let tcp = TcpIp {
-                host: g.text(100),
-                port: g.next() as u32,
-                originator: g.text(100),
-                originator_port: g.next() as u32,
-            };
-            let mut messages = vec![
-                Message::RequestSuccess(g.bytes(200)),
-                Message::RequestFailure,
-                Message::ChannelOpenConfirmation {
-                    recipient,
-                    sender: g.next() as u32,
-                    window: g.next() as u32,
-                    max_packet: g.next() as u32,
-                    data: g.bytes(200),
-                },
-                Message::ChannelOpenFailure {
-                    recipient,
-                    reason: g.next() as u32,
-                    description: g.text(100),
-                    language: g.text(20),
-                },
-                Message::WindowAdjust {
-                    recipient,
-                    bytes: g.next() as u32,
-                },
-                Message::Data {
-                    recipient,
-                    data: g.bytes(400),
-                },
-                Message::ExtendedData {
-                    recipient,
-                    kind: g.next() as u32,
-                    data: g.bytes(400),
-                },
-                Message::Eof(recipient),
-                Message::Close(recipient),
-                Message::ChannelSuccess(recipient),
-                Message::ChannelFailure(recipient),
-            ];
-            for kind in [
-                OpenKind::Session,
-                OpenKind::DirectTcpIp(tcp.clone()),
-                OpenKind::ForwardedTcpIp(tcp),
-                OpenKind::Other {
-                    name: "extension@example.com".into(),
-                    data: g.bytes(200),
-                },
-            ] {
-                messages.push(Message::ChannelOpen {
-                    sender: g.next() as u32,
-                    window: g.next() as u32,
-                    max_packet: g.next() as u32,
-                    kind,
-                });
-            }
-            for request in requests {
-                messages.push(Message::ChannelRequest {
-                    recipient,
-                    want_reply: g.coin(),
-                    request,
-                });
-            }
-            for request in [
-                GlobalRequest::TcpIpForward {
-                    address: g.text(100),
-                    port: g.next() as u32,
-                },
-                GlobalRequest::CancelTcpIpForward {
-                    address: g.text(100),
-                    port: g.next() as u32,
-                },
-                GlobalRequest::Other {
-                    name: "extension@example.com".into(),
-                    data: g.bytes(200),
-                },
-            ] {
-                messages.push(Message::GlobalRequest {
-                    want_reply: g.coin(),
-                    request,
-                });
-            }
-            for message in messages {
+            for message in messages(&mut g) {
                 assert_write(&message).unwrap();
                 let mut bytes = message.to_bytes().unwrap();
                 mutate(&mut g, &mut bytes);
@@ -773,5 +752,165 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Each parsed message holds at most its type's bound: random ones of
+    /// every kind, and terminal requests with as many modes as a payload
+    /// holds and fewer, the shortest items there are.
+    #[test]
+    fn parsed_connection_messages_hold_at_most_their_bound() {
+        let mut g = Lcg::new(0x68656170);
+        let mut payloads = Vec::new();
+        for _ in 0..200 {
+            payloads.extend(messages(&mut g).iter().map(|m| m.to_bytes().unwrap()));
+        }
+        let most_modes = (MAX_PAYLOAD - 64) / 5;
+        for count in [0, 1, 2, 3, 4, 5, 100, 1000, most_modes] {
+            let request = Message::ChannelRequest {
+                recipient: 0,
+                want_reply: false,
+                request: SessionRequest::Pty {
+                    terminal: String::new(),
+                    dimensions: Dimensions::default(),
+                    modes: vec![
+                        TerminalMode {
+                            opcode: 1,
+                            value: 0,
+                        };
+                        count
+                    ],
+                },
+            };
+            payloads.push(request.to_bytes().unwrap());
+        }
+        payloads.push(
+            Message::Data {
+                recipient: 0,
+                data: vec![7; MAX_PAYLOAD - 9],
+            }
+            .to_bytes()
+            .unwrap(),
+        );
+        assert_heap_bound(&payloads, Message::parse);
+    }
+
+    /// One of each message, with random fields.
+    fn messages(g: &mut Lcg) -> Vec<Message> {
+        let recipient = g.next() as u32;
+        let requests = [
+            SessionRequest::Pty {
+                terminal: g.text(50),
+                dimensions: dimensions(g),
+                modes: (0..g.index(30))
+                    .map(|_| TerminalMode {
+                        opcode: (1 + g.index(159)) as u8,
+                        value: g.next() as u32,
+                    })
+                    .collect(),
+            },
+            SessionRequest::Shell,
+            SessionRequest::Exec(g.bytes(300)),
+            SessionRequest::Env {
+                name: g.bytes(50),
+                value: g.bytes(200),
+            },
+            SessionRequest::Subsystem(g.text(50)),
+            SessionRequest::WindowChange(dimensions(g)),
+            SessionRequest::Signal("TERM".into()),
+            SessionRequest::ExitStatus(g.next() as u32),
+            SessionRequest::ExitSignal {
+                signal: "HUP".into(),
+                core_dumped: g.coin(),
+                message: g.text(100),
+                language: g.text(20),
+            },
+            SessionRequest::Other {
+                name: "extension@example.com".into(),
+                data: g.bytes(200),
+            },
+        ];
+        let tcp = TcpIp {
+            host: g.text(100),
+            port: g.next() as u32,
+            originator: g.text(100),
+            originator_port: g.next() as u32,
+        };
+        let mut messages = vec![
+            Message::RequestSuccess(g.bytes(200)),
+            Message::RequestFailure,
+            Message::ChannelOpenConfirmation {
+                recipient,
+                sender: g.next() as u32,
+                window: g.next() as u32,
+                max_packet: g.next() as u32,
+                data: g.bytes(200),
+            },
+            Message::ChannelOpenFailure {
+                recipient,
+                reason: g.next() as u32,
+                description: g.text(100),
+                language: g.text(20),
+            },
+            Message::WindowAdjust {
+                recipient,
+                bytes: g.next() as u32,
+            },
+            Message::Data {
+                recipient,
+                data: g.bytes(400),
+            },
+            Message::ExtendedData {
+                recipient,
+                kind: g.next() as u32,
+                data: g.bytes(400),
+            },
+            Message::Eof(recipient),
+            Message::Close(recipient),
+            Message::ChannelSuccess(recipient),
+            Message::ChannelFailure(recipient),
+        ];
+        for kind in [
+            OpenKind::Session,
+            OpenKind::DirectTcpIp(tcp.clone()),
+            OpenKind::ForwardedTcpIp(tcp),
+            OpenKind::Other {
+                name: "extension@example.com".into(),
+                data: g.bytes(200),
+            },
+        ] {
+            messages.push(Message::ChannelOpen {
+                sender: g.next() as u32,
+                window: g.next() as u32,
+                max_packet: g.next() as u32,
+                kind,
+            });
+        }
+        for request in requests {
+            messages.push(Message::ChannelRequest {
+                recipient,
+                want_reply: g.coin(),
+                request,
+            });
+        }
+        for request in [
+            GlobalRequest::TcpIpForward {
+                address: g.text(100),
+                port: g.next() as u32,
+            },
+            GlobalRequest::CancelTcpIpForward {
+                address: g.text(100),
+                port: g.next() as u32,
+            },
+            GlobalRequest::Other {
+                name: "extension@example.com".into(),
+                data: g.bytes(200),
+            },
+        ] {
+            messages.push(Message::GlobalRequest {
+                want_reply: g.coin(),
+                request,
+            });
+        }
+        messages
     }
 }
