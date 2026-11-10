@@ -12,7 +12,8 @@
   * `policy.json`: `Dnssec.AlgorithmPolicy.treat`, over `Policy.iana` and other policies;
   * `chain.json`: `Chain.check`;
   * `cache.json`: `Cache.insert`, `Cache.advance`, and `Cache.serve`;
-  * `resolver.json`: `Resolver.runAll` over a hierarchy of zones with scripted losses, and with some servers dead.
+  * `resolver.json`: `Resolver.runAll` over a hierarchy of zones with scripted losses, and with some servers dead;
+  * `framing.json`: `Wire.unframeAll` over messages framed for a stream.
 
   Usage: `lake exe gen <dir> <seed>`. The output depends only on the seed.
 
@@ -287,11 +288,28 @@ def rRR (owner : Option Name) (t : Option Nat) : G RR := do
   let cls ← pick #[1, 1, 1, 3]
   return ⟨owner, t, cls, ← rNat 100000, ← rRData t⟩
 
+/-- A name of three or four labels of 60 to 64 octets: near the 255-octet limit of a name, or past it, and
+now and then with a label past the 63-octet limit of a label (RFC 1035 §2.3.4). -/
+def rLongName : G Name := do
+  let k ← pick #[60, 61, 62, 62, 63, 64]
+  let n ← pick #[3, 4, 4]
+  return List.replicate n (List.replicate k 97)
+
 def rMessage : G Message := do
   let q ← do
     let n ← pick #[0, 1, 1, 1, 2]
     rList n (do return (⟨← rName 3 true, ← pick #[1, 28, 15, 16, 2, 255], ← pick #[1, 1, 3]⟩ : Question))
+  -- now and then a long question name, and an owner one label longer, which the encoder writes as a label
+  -- and a pointer to the question's name, so the owner reaches 255 octets, or passes it, only through the
+  -- pointer
+  let q ← if (← chance 5) then do
+      let long ← rLongName
+      pure (q.map fun x => { x with name := long })
+    else pure q
   let an ← do let n ← rNat 4; rList n (rRR none none)
+  let an ← match q with
+    | x :: _ => if (← chance 3) then do pure ((← rRR (some ((← rLabel false) :: x.name)) none) :: an) else pure an
+    | [] => pure an
   let ns ← do let n ← rNat 3; rList n (rRR none none)
   let ar ← do let n ← rNat 3; rList n (rRR none none)
   return ⟨⟨← rNat 65536, ← rNat 65536⟩, q, an, ns, ar⟩
@@ -299,7 +317,7 @@ def rMessage : G Message := do
 def setAt (bs : List Nat) (i v : Nat) : List Nat := bs.set i v
 
 def corrupt (bs : List Nat) : G (List Nat) := do
-  match ← rNat 10 with
+  match ← rNat 12 with
   | 0 => return bs.take (← rNat bs.length)
   | 1 => do
     if bs.length ≤ 12 then return bs
@@ -309,6 +327,13 @@ def corrupt (bs : List Nat) : G (List Nat) := do
     if bs.length ≤ 13 then return bs
     let i ← rRange 12 (bs.length - 2)
     let t ← rRange i (bs.length + 4)
+    return setAt (setAt bs i (192 + t / 256 % 64)) (i + 1) (t % 256)
+  -- a pointer back to any earlier octet: a prior name, the middle of a label, or an earlier octet of the
+  -- name that holds it (RFC 1035 §4.1.4)
+  | 4 | 5 => do
+    if bs.length ≤ 14 then return bs
+    let i ← rRange 13 (bs.length - 2)
+    let t ← rRange 12 (i - 1)
     return setAt (setAt bs i (192 + t / 256 % 64)) (i + 1) (t % 256)
   | 3 => return bs ++ (← rBytes (← rRange 1 4))
   | _ => return bs
@@ -353,7 +378,8 @@ def fitCase : G String := do
   let r : Fit.Resp := ⟨⟨← rNat 65536, 33152⟩, [⟨← rName 3 false, 1, 1⟩], an, au, ad, req, opt⟩
   let lim ← match ← rNat 3 with
     | 0 => pure Fit.Limit.udp512
-    | 1 => do pure (Fit.Limit.udpEdns (← pick #[512, 700, 1232, 1400, 4096]))
+    -- payload sizes below 512 count as 512 (RFC 6891 §6.2.5)
+    | 1 => do pure (Fit.Limit.udpEdns (← pick #[512, 700, 1232, 1400, 4096, 100, 511]))
     | _ => pure Fit.Limit.stream
   let p := Fit.plan r lim
   let out := Fit.fit r lim
@@ -371,8 +397,9 @@ def fitCase : G String := do
 /-! ## respond.json -/
 
 def flagsJson (h : Header) : String :=
-  jobj [("qr", jbool h.qr), ("opcode", jnat h.opcode), ("aa", jbool h.aa), ("tc", jbool h.tc), ("rd", jbool h.rd),
-    ("ra", jbool h.ra), ("z", jbool h.z), ("ad", jbool h.ad), ("cd", jbool h.cd), ("rcode", jnat h.rcode)]
+  jobj [("id", jnat h.id), ("qr", jbool h.qr), ("opcode", jnat h.opcode), ("aa", jbool h.aa), ("tc", jbool h.tc),
+    ("rd", jbool h.rd), ("ra", jbool h.ra), ("z", jbool h.z), ("ad", jbool h.ad), ("cd", jbool h.cd),
+    ("rcode", jnat h.rcode)]
 
 def rOpt : G RR := do
   let version ← pick #[0, 0, 0, 1]
@@ -383,7 +410,9 @@ def rOpt : G RR := do
     | 1 => do pure ([0, 10, 0, 8] ++ (← rBytes 8))
     | 2 => if (← chance 3) then pure [0, 3, 0] else pure []
     | _ => pure []
-  return ⟨[], 41, ← pick #[512, 1232, 4096], version * 65536 + (if dnssec then 32768 else 0) + other, .octets opts⟩
+  -- payload sizes below 512 count as 512 (RFC 6891 §6.2.5)
+  return ⟨[], 41, ← pick #[512, 1232, 4096, 1232, 0, 100, 511], version * 65536 + (if dnssec then 32768 else 0) +
+    other, .octets opts⟩
 
 def respondCase : G String := do
   let udp ← chance 3 |>.map not
@@ -391,7 +420,8 @@ def respondCase : G String := do
     | 0 => rBytes (← rNat 12)
     | _ => do
       let qr ← chance 12
-      let opcode ← if (← chance 8) then pick #[1, 2, 4, 5] else pure 0
+      -- IQUERY, STATUS, NOTIFY, UPDATE, DSO, and opcodes no RFC assigns
+      let opcode ← if (← chance 8) then pick #[1, 2, 3, 4, 5, 6, 7, 11, 15] else pure 0
       let rd ← chance 2
       let cd ← chance 4
       let ad ← chance 4
@@ -409,13 +439,14 @@ def respondCase : G String := do
       let fields := if (← chance 6) then fields.dropLast else fields
       let tsig : RR := ⟨[toBytes "key"], 250, 255, 0,
         .octets (Dnssec.Symbolic.wire [toBytes "hmac-sha256"] ++ fields)⟩
-      -- last, as it belongs, or before the OPT records, or twice
-      let additional ← match ← rNat 8 with
-        | 0 | 1 => pure (opts ++ [tsig])
-        | 2 => pure (tsig :: opts)
-        | 3 => pure (opts ++ [tsig, tsig])
-        | _ => pure opts
-      let m : Message := ⟨⟨← rNat 65536, flags⟩, qs, [], [], additional⟩
+      -- last, as it belongs, or before the OPT records, or twice, or alone in the answer section
+      let (answer, additional) ← match ← rNat 9 with
+        | 0 | 1 => pure ([], opts ++ [tsig])
+        | 2 => pure ([], tsig :: opts)
+        | 3 => pure ([], opts ++ [tsig, tsig])
+        | 4 => pure ([tsig], opts)
+        | _ => pure ([], opts)
+      let m : Message := ⟨⟨← rNat 65536, flags⟩, qs, answer, [], additional⟩
       let b := encode true m
       if (← chance 10) then corrupt b else pure b
   let expected := match parse bytes udp with
@@ -435,6 +466,25 @@ def respondCase : G String := do
           | none => "null")]
   return jobj [("input", jobj [("bytes", jstr (hex bytes)), ("transport", jstr (if udp then "udp" else "tcp"))]),
     ("expected", expected)]
+
+/-! ## framing.json -/
+
+/-- Messages after their two-octet lengths as a stream carries them (RFC 1035 §4.2.2), then sometimes part of
+one more; or now and then octets of no such shape. `cuts` are where the stream is split into the chunks it
+arrives in. -/
+def framingCase : G String := do
+  let stream ← if (← chance 5) then do rList (← rNat 40) (pick #[0, 0, 0, 1, 2, 3, 5, 7, 200]) else do
+    let ms ← rList (← rNat 4) (do rBytes (← pick #[0, 1, 3, 12, 30, 300]))
+    let tail ← match ← rNat 3 with
+      | 0 => pure []
+      | 1 => do let m ← rBytes (← rRange 1 20); pure ((frame m).take (← rRange 1 (m.length + 1)))
+      | _ => do pure [← rNat 256]
+    pure ((ms.map frame).flatten ++ tail)
+  let cuts ← rList (← rNat 5) (rNat (stream.length + 1))
+  let (ms, rest) := unframeAll stream
+  let cuts := Dnssec.sortBy (· < ·) cuts
+  return jobj [("input", jobj [("bytes", jstr (hex stream)), ("cuts", jarr (cuts.map jnat))]),
+    ("expected", jobj [("messages", jarr (ms.map (jstr ∘ hex))), ("rest", jnat rest.length)])]
 
 end Msgs
 
@@ -576,9 +626,15 @@ def rBroken : G Spec := do
   | 6 => return add [⟨lb "dsx" :: apex, 43, 300, [.ds 12345 13 2 (← rBytes 8)]⟩]
   -- RFC 9471 §3.1: a nameserver below its own cut with no glue.
   | 7 => return { sp with delegations := sp.delegations ++ [⟨cut, 86400, [lb "ns" :: cut], [], none⟩] }
-  -- RFC 2181 §10.3: an MX target that is an alias.
-  | 8 => return add [⟨lb "alias" :: apex, 5, 300, [.cname other]⟩,
-      ⟨lb "mx2" :: apex, 15, 300, [.mx 10 (lb "alias" :: apex)]⟩]
+  -- RFC 2181 §10.3: an MX target that is an alias, the owner of a CNAME or a name below a DNAME
+  -- (RFC 6672 §2.2).
+  | 8 =>
+    if ← chance 2 then
+      return add [⟨lb "alias" :: apex, 5, 300, [.cname other]⟩,
+        ⟨lb "mx2" :: apex, 15, 300, [.mx 10 (lb "alias" :: apex)]⟩]
+    else
+      return add [⟨lb "moved" :: apex, 39, 300, [.dname other]⟩,
+        ⟨lb "mx2" :: apex, 15, 300, [.mx 10 ([lb "mail", lb "moved"] ++ apex)]⟩]
   -- RFC 2181 §5.2: two TTLs in one RRset.
   | 9 => return add [addr (lb "ttl" :: apex) 300, ⟨lb "ttl" :: apex, 1, 600, [.a [192, 0, 2, 10]]⟩]
   -- RFC 2181 §8: a TTL of 2^31.
@@ -1270,7 +1326,8 @@ def kinds : List (String × Nat × G String) :=
     ("respond", 400, respondCase), ("zone", 400, zoneCase), ("partial", 300, partialCase),
     ("signed", 300, signedCase), ("policy", 200, policyCase), ("chain", 200, chainCase),
     ("cache", 200, cacheCase), ("resolver", 200, resolverCase),
-    ("keytag", 300, keytagCase), ("minimise", 300, minimiseCase)]
+    ("keytag", 300, keytagCase), ("minimise", 300, minimiseCase),
+    ("framing", 300, framingCase)]
 
 def main (args : List String) : IO UInt32 := do
   match args with
