@@ -45,7 +45,12 @@ fn virtual_hosts_route_borrowed_names_and_deliver_typed_sites_without_allocating
     vhost.https = true;
     hosts.insert("example.test", vhost);
     let entropy = SeededEntropy::new(Seed::from_u64(7));
-    let mut exchange = Exchange::new(fictionet::time::Instant::ZERO, &entropy, &conn);
+    let mut exchange = Exchange::new(
+        fictionet::time::Instant::ZERO,
+        &entropy,
+        &conn,
+        fictionet::stdlib::web::httpd::Responses::new(&fictionet::Budget::unlimited()),
+    );
     let heads: Vec<_> = [
         "example.test",
         "EXAMPLE.Test:8080",
@@ -193,22 +198,20 @@ fn pooled_full_bodies_reuse_storage() {
 #[test]
 fn warm_now_fields_and_full_body_encode_without_allocating() {
     use fictionet::stdlib::layer::{Admit, Driver, StreamCommand, StreamEvent};
-    use fictionet::stdlib::protocols::http1;
     use fictionet::stdlib::web::{
-        Fields, Request, Response,
+        Request, Response,
         httpd::{Exchange, Handler, Http1, Reply},
     };
     use fictionet::{Chunk, Seed, SeededEntropy};
     use std::sync::Arc;
 
     struct Page {
-        fields: Pool,
-        budget: Budget,
         body: Chunk,
     }
     impl Handler for Page {
-        fn call(&self, _: Request, _: &mut Exchange<'_>) -> Reply {
-            let mut fields = Fields::in_block(self.fields.take(&self.budget, 0).unwrap()).unwrap();
+        fn call(&self, request: Request, ex: &mut Exchange<'_>) -> Reply {
+            assert_eq!(request.body.bytes().unwrap().as_ref(), b"body");
+            let mut fields = ex.responses().fields().unwrap();
             for _ in 0..10 {
                 fields.push("X-Field", b"value").unwrap();
             }
@@ -218,31 +221,29 @@ fn warm_now_fields_and_full_body_encode_without_allocating() {
         }
     }
     let budget = Budget::new(1 << 20);
-    let fields = Pool::new(&budget, 2048, 2);
     let bodies = Pool::new(&budget, 2048, 1);
     let mut body = bodies.take(&budget, 0).unwrap();
     body.extend_within(b"held response body").unwrap();
     let expected = body.clone();
     let mut driver = Driver::new(
-        Http1::new(Page {
-            fields,
-            budget: budget.clone(),
-            body,
-        }),
+        Http1::new(Page { body }),
         Arc::new(SeededEntropy::new(Seed::from_u64(91))),
-        budget,
+        budget.clone(),
         fictionet::time::Instant::ZERO,
     );
     driver.run().unwrap();
-    let request = Chunk::unpaid(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec());
+    let input = Pool::new(&budget, 2048, 2);
+    let wire = b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\n\r\nbody";
     let mut allocations = 0;
     let count = 2000;
     for i in 0..(200 + count) {
-        assert!(matches!(
-            driver.deliver(StreamEvent::Data(request.clone())).unwrap(),
-            Admit::Taken
-        ));
-        let (output, stats) = measuring(|| {
+        let (_, stats) = measuring(|| {
+            let mut request = input.take(&budget, 0).unwrap();
+            request.extend_within(wire).unwrap();
+            assert!(matches!(
+                driver.deliver(StreamEvent::Data(request)).unwrap(),
+                Admit::Taken
+            ));
             driver.run().unwrap();
             let Some(StreamCommand::Write(chunk)) = driver.take_command() else {
                 panic!("response chunk");
@@ -251,36 +252,33 @@ fn warm_now_fields_and_full_body_encode_without_allocating() {
                 driver.take_command().is_none(),
                 "small response uses one chunk"
             );
-            chunk
+            assert!(matches!(
+                driver
+                    .deliver(StreamEvent::Written(chunk.len() as u64))
+                    .unwrap(),
+                Admit::Taken
+            ));
+            driver.run().unwrap();
+            assert!(chunk.headroom() >= 64);
+            assert!(chunk.ends_with(&expected));
+            assert_eq!(
+                chunk
+                    .windows(b"X-Field: value".len())
+                    .filter(|field| field.eq_ignore_ascii_case(b"X-Field: value"))
+                    .count(),
+                10
+            );
+            drop(chunk);
         });
         if i >= 200 {
             allocations += stats.allocations;
         }
-        assert!(output.headroom() >= 64);
-        let decoded = http1::Response::parse_for(&output, "GET").unwrap();
-        assert_eq!(decoded.body.as_slice(), expected.as_ref());
-        assert_eq!(
-            decoded
-                .head
-                .headers
-                .iter()
-                .filter(|field| field.name.eq_ignore_ascii_case("x-field"))
-                .count(),
-            10
-        );
-        let written = output.len();
-        drop(output);
-        assert!(matches!(
-            driver
-                .deliver(StreamEvent::Written(written as u64))
-                .unwrap(),
-            Admit::Taken
-        ));
-        driver.run().unwrap();
     }
     eprintln!("{count} warm responses: {allocations} allocations");
-    const PER_RESPONSE_CEILING: usize = 0;
-    assert!(allocations <= count * PER_RESPONSE_CEILING);
+    const CEILING: usize = 0;
+    // A direct layer driver has no cable or measurement checkpoint allocations.
+    const FIXED: usize = 0;
+    assert!(allocations <= count * CEILING + FIXED);
 }
 
 #[test]
@@ -358,4 +356,62 @@ fn large_full_responses_send_slices_of_the_held_body() {
     }
     driver.run().unwrap();
     assert!(driver.take_command().is_none());
+}
+
+#[test]
+fn request_bodies_preserve_storage_and_fragmentation_preserves_contents() {
+    use fictionet::stdlib::layer::{Admit, Driver, StreamEvent};
+    use fictionet::stdlib::web::{
+        Request, Response,
+        httpd::{Exchange, Handler, Http1, Reply},
+    };
+    use fictionet::{Chunk, Seed, SeededEntropy};
+    use std::sync::{Arc, Mutex};
+
+    struct Keep(Arc<Mutex<Option<Chunk>>>);
+    impl Handler for Keep {
+        fn call(&self, request: Request, _: &mut Exchange<'_>) -> Reply {
+            *self.0.lock().unwrap() = request.body.bytes();
+            Reply::Now(Response::new(Body::empty()))
+        }
+    }
+    let wire = b"POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 11\r\n\r\nhello world";
+    for split in 1..=wire.len() {
+        let budget = Budget::new(1 << 20);
+        let held = Arc::new(Mutex::new(None));
+        let mut driver = Driver::new(
+            Http1::new(Keep(held.clone())),
+            Arc::new(SeededEntropy::new(Seed::from_u64(92))),
+            budget.clone(),
+            fictionet::time::Instant::ZERO,
+        );
+        let first = Chunk::unpaid(wire[..split].to_vec());
+        let address = first.as_ptr();
+        assert!(matches!(
+            driver.deliver(StreamEvent::Data(first)).unwrap(),
+            Admit::Taken
+        ));
+        driver.run().unwrap();
+        if split < wire.len() {
+            assert!(held.lock().unwrap().is_none());
+            let second = Chunk::unpaid(wire[split..].to_vec());
+            assert!(matches!(
+                driver.deliver(StreamEvent::Data(second)).unwrap(),
+                Admit::Taken
+            ));
+            driver.run().unwrap();
+        }
+        let body = held.lock().unwrap().take().unwrap();
+        assert_eq!(body.as_ref(), &wire[wire.len() - 11..]);
+        if split == wire.len() {
+            assert_eq!(
+                body.as_ptr() as usize,
+                address as usize + wire.len() - body.len()
+            );
+        }
+        drop(driver);
+        assert_eq!(budget.used(), body.charged());
+        drop(body);
+        assert_eq!(budget.used(), 0);
+    }
 }

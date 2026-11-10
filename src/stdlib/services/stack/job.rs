@@ -392,6 +392,58 @@ mod tests {
     use fictionet::{Seed, SeededEntropy};
     use std::sync::atomic::AtomicUsize;
 
+    #[test]
+    fn immediate_http_answers_keep_jobs_empty_throughout() {
+        use fictionet::stdlib::layer::{StreamCommand, StreamEvent};
+        use fictionet::stdlib::web::{
+            Request,
+            httpd::{self, Exchange, Handler, Http1, Reply},
+        };
+        struct Page;
+        impl Handler for Page {
+            fn call(&self, _: Request, ex: &mut Exchange<'_>) -> Reply {
+                Reply::Now(httpd::text(ex.responses(), http::StatusCode::OK, "answer"))
+            }
+        }
+        let budget = Budget::new(1 << 20);
+        let mut jobs = Jobs::new(&budget);
+        let mut driver = Driver::new(
+            Http1::new(Page),
+            Arc::new(SeededEntropy::new(Seed::from_u64(1))),
+            budget,
+            Instant::ZERO,
+        );
+        for _ in 0..8 {
+            driver.run().unwrap();
+            assert!(!jobs.take(&mut driver));
+            assert_eq!(jobs.len(), 0);
+            assert!(matches!(
+                driver
+                    .deliver(StreamEvent::Data(fictionet::Chunk::unpaid(
+                        b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()
+                    )))
+                    .unwrap(),
+                Admit::Taken
+            ));
+            driver.run().unwrap();
+            assert!(!jobs.take(&mut driver));
+            assert_eq!(jobs.len(), 0);
+            let Some(StreamCommand::Write(chunk)) = driver.take_command() else {
+                panic!("ready answer");
+            };
+            assert!(matches!(
+                driver
+                    .deliver(StreamEvent::Written(chunk.len() as u64))
+                    .unwrap(),
+                Admit::Taken
+            ));
+            drop(chunk);
+            driver.run().unwrap();
+            assert!(!jobs.take(&mut driver));
+            assert_eq!(jobs.len(), 0);
+        }
+    }
+
     type Start = Arc<fictionet::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
 
     struct PendingJob {
