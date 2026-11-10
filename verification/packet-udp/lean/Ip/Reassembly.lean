@@ -63,6 +63,10 @@ structure Frag where
   data : List Nat
   header : Option (List Nat)
   timeout : Nat
+  /-- For an IPv6 first fragment: where the "next header" byte that named
+  the Fragment header is, and the Fragment header's 8 bytes, so that the
+  fragment can be quoted as it came. -/
+  frag6 : Option (Nat × List Nat)
 
 /-- Where a fragment's data ends. -/
 def Frag.stop (f : Frag) : Nat := f.offset + f.data.length
@@ -102,14 +106,18 @@ structure Partial where
   got : Nat
   size : Nat
   expires : Nat
+  /-- The first fragment's `frag6`, kept with its headers. -/
+  frag6 : Option (Nat × List Nat)
 
-/-- `Reassembly`: the unfinished packets and the bytes they count. -/
+/-- `Reassembly`: the unfinished packets, the first fragments of the packets
+that timed out (oldest first, until taken), and the bytes they all count. -/
 structure State where
   parts : List (Key × Partial)
   size : Nat
+  out : List (List Nat)
 
 /-- The empty table (`Reassembly::default`). -/
-def State.empty : State := ⟨[], 0⟩
+def State.empty : State := ⟨[], 0, []⟩
 
 /-! ## The association list -/
 
@@ -196,7 +204,7 @@ def finish (header : List Nat) (datas : List (List Nat)) (total : Nat) : Option 
 /-! ## The steps -/
 
 /-- A new unfinished packet, with its deadline (`or_insert_with`). -/
-def fresh (expires : Nat) : Partial := ⟨false, none, [], none, 0, PARTIAL_COST, expires⟩
+def fresh (expires : Nat) : Partial := ⟨false, none, [], none, 0, PARTIAL_COST, expires, none⟩
 
 /-- What `kill` leaves of a packet: dead, its fragments freed. -/
 def Partial.killed (p : Partial) : Partial :=
@@ -206,19 +214,47 @@ def Partial.killed (p : Partial) : Partial :=
 def kill (s : State) (k : Key) : State :=
   match get? s.parts k with
   | none => s
-  | some p => ⟨put s.parts k p.killed, s.size - (p.size - PARTIAL_COST)⟩
+  | some p => ⟨put s.parts k p.killed, s.size - (p.size - PARTIAL_COST), s.out⟩
 
 /-- `Reassembly::take` (ip.rs 807-813), and `remove`. -/
 def take (s : State) (k : Key) : State :=
   match get? s.parts k with
   | none => s
-  | some p => ⟨del s.parts k, s.size - p.size⟩
+  | some p => ⟨del s.parts k, s.size - p.size, s.out⟩
 
-/-- `Reassembly::expire` (ip.rs 863-871): drops every packet whose deadline
-is at or before `now`. -/
+/-- A first fragment as it came, from what reassembly keeps of it: its
+headers and data, and for IPv6 the Fragment header (`frag6`, 8 bytes, as
+the code keeps them in a `[u8; 8]`) back in front of the data, with the
+"next header" byte that named it naming it (44) again. -/
+def rebuild (h : List Nat) (frag6 : Option (Nat × List Nat)) (data : List Nat) : List Nat :=
+  match frag6 with
+  | none => h ++ data
+  | some (n, fh) => h.set n 44 ++ fh.take 8 ++ data
+
+/-- The first fragment of a packet, as it came, if it arrived: its headers
+and the piece at offset 0. -/
+def firstPacket (p : Partial) : Option (List Nat) :=
+  match p.header, p.pieces.find? (fun q => q.off == 0) with
+  | some h, some q => some (rebuild h p.frag6 q.data)
+  | _, _ => none
+
+/-- The bytes the waiting first fragments count. -/
+def osize (out : List (List Nat)) : Nat := (out.map List.length).sum
+
+/-- `Reassembly::expire`: drops every packet whose deadline is at or
+before `now`, and keeps the first fragment of each one that had it, for
+the ICMP Time Exceeded (code 1) answer (RFC 1122 section 3.3.2, RFC 8200
+section 4.5). The kept fragments count against the cap until taken. -/
 def expire (s : State) (now : Nat) : State :=
+  let due := s.parts.filter (fun e => decide (e.2.expires ≤ now))
+  let firsts := due.filterMap (fun e => firstPacket e.2)
   ⟨s.parts.filter (fun e => decide (now < e.2.expires)),
-   s.size - sizes (s.parts.filter (fun e => decide (e.2.expires ≤ now)))⟩
+   s.size - sizes due + osize firsts, s.out ++ firsts⟩
+
+/-- `Reassembly::take_expired`, until it gives nothing: the first fragments
+kept for answers, oldest first, and the table without them. -/
+def takeOut (s : State) : State × List (List Nat) :=
+  (⟨s.parts, s.size - osize s.out, []⟩, s.out)
 
 /-- The cap loop in `reassemble` (ip.rs 677-682), with fuel for each entry. -/
 def capLoop : Nat → State → State
@@ -273,7 +309,10 @@ def Partial.add (p : Partial) (f : Frag) : Partial :=
   let hdr := match f.header, p.header with
     | some h, none => h.length
     | _, _ => 0
-  { p with header := header, pieces := insertPiece f.piece p.pieces, got := p.got + f.data.length,
+  let frag6 := match f.header, p.header with
+    | some _, none => f.frag6
+    | _, _ => p.frag6
+  { p with header := header, frag6 := frag6, pieces := insertPiece f.piece p.pieces, got := p.got + f.data.length,
            size := p.size + (f.data.length + PIECE_COST + hdr) }
 
 /-- The packet a fragment joins, made if there is none (`entry(key)
@@ -282,7 +321,7 @@ arrival plus the timeout. -/
 def lookup (s : State) (f : Frag) (now : Nat) : State × Partial :=
   match get? s.parts f.key with
   | some p => (s, p)
-  | none => (⟨put s.parts f.key (fresh (now + f.timeout)), s.size + PARTIAL_COST⟩,
+  | none => (⟨put s.parts f.key (fresh (now + f.timeout)), s.size + PARTIAL_COST, s.out⟩,
              fresh (now + f.timeout))
 
 /-- The rest of `push_fragment` (ip.rs 725-804), for a fragment of the
@@ -295,10 +334,10 @@ def admit (s : State) (p : Partial) (f : Frag) : State × Out :=
   else
     let ok := lengthOk p f && overlapOk p f
     let p := p.setLen f
-    if !ok then (kill ⟨put s.parts f.key p, s.size⟩ f.key, .discarded)
+    if !ok then (kill ⟨put s.parts f.key p, s.size, s.out⟩ f.key, .discarded)
     else
       let q := p.add f
-      let s' : State := ⟨put s.parts f.key q, s.size + (q.size - p.size)⟩
+      let s' : State := ⟨put s.parts f.key q, s.size + (q.size - p.size), s.out⟩
       match q.header with
       | some h =>
         if q.total = some q.got then
@@ -353,7 +392,7 @@ def arrived4 (b : List Nat) : Option Frag :=
       let offset := flags % 8192 * 8
       some ⟨.v4 (slice b 12 16) (slice b 16 20) (be16 b 4) (b.getD 9 0), offset,
         flags / 8192 % 2 == 1, slice b ihl total,
-        if offset = 0 then some (b.take ihl) else none, V4_TIMEOUT⟩
+        if offset = 0 then some (b.take ihl) else none, V4_TIMEOUT, none⟩
 
 /-- An IPv6 header chain as `chain6` walks one it accepts: the upper-layer
 protocol, where it starts, and the first fragment header with the place of
@@ -411,7 +450,8 @@ def arrived6 (b : List Nat) : Option Frag :=
         let offset := om / 8 * 8
         some ⟨.v6 (slice b 8 24) (slice b 24 40) (be32 b (pos + 4)), offset, om % 2 == 1,
           slice b (pos + 8) stop,
-          if offset = 0 then some ((b.take pos).set nextAt (b.getD pos 0)) else none, V6_TIMEOUT⟩
+          if offset = 0 then some ((b.take pos).set nextAt (b.getD pos 0)) else none, V6_TIMEOUT,
+          if offset = 0 then some (nextAt, slice b pos (pos + 8)) else none⟩
 
 /-- `arrived`: a fragment, or `none` for a packet that is not one. -/
 def arrived (b : List Nat) : Option Frag :=
@@ -450,10 +490,21 @@ def push (s : State) (b : List Nat) (now : Nat) : State × Out :=
     else r
   | _ => r
 
+/-- One step of a vector: a packet arriving (`push`), or, with no bytes, the
+timer running `expire`; then every kept first fragment is taken. -/
+def step (s : State) (b : List Nat) (now : Nat) : State × Option Out × List (List Nat) :=
+  let r : State × Option Out :=
+    if b.isEmpty then (expire s now, none)
+    else
+      let x := push s b now
+      (x.1, some x.2)
+  let t := takeOut r.1
+  (t.1, r.2, t.2)
+
 /-- Every step's result, from the empty table. -/
-def run (steps : List (Nat × List Nat)) : List Out :=
-  (steps.foldl (fun (acc : State × Array Out) (st : Nat × List Nat) =>
-    let r := push acc.1 st.2 st.1
+def run (steps : List (Nat × List Nat)) : List (Option Out × List (List Nat)) :=
+  (steps.foldl (fun (acc : State × Array (Option Out × List (List Nat))) (st : Nat × List Nat) =>
+    let r := step acc.1 st.2 st.1
     (r.1, acc.2.push r.2)) (State.empty, #[])).2.toList
 
 
@@ -750,7 +801,7 @@ structure PartialOk (p : Partial) : Prop where
 /-- The table's invariant without the cap. -/
 structure Inv0 (s : State) : Prop where
   nodup : (s.parts.map (·.1)).Nodup
-  size : s.size = sizes s.parts
+  size : s.size = sizes s.parts + osize s.out
   ok : ∀ e ∈ s.parts, PartialOk e.2
 
 theorem ok_of_get {s : State} {k : Key} {p : Partial} (hs : Inv0 s) (h : get? s.parts k = some p) :
@@ -763,11 +814,12 @@ theorem mem_of_mem_filter' {α} {l : List α} {c : α → Bool} {x : α} (h : x 
 def Inv (s : State) : Prop := Inv0 s ∧ s.size ≤ MAX_WAITING
 
 /-- Everything `Reassembly::check` asserts (ip.rs 839-861): the cap; the
-sizes add up; the pieces of each packet ascend and do not overlap; `have`
-is their bytes; none passes the length. The code's `by_expiry` index is read
-off the entries here, so its agreement with the map holds by construction. -/
+sizes add up, the kept first fragments included; the pieces of each packet
+ascend and do not overlap; `have` is their bytes; none passes the length.
+The code's `by_expiry` index is read off the entries here, so its agreement
+with the map holds by construction. -/
 def Check (s : State) : Prop :=
-  s.size ≤ MAX_WAITING ∧ s.size = sizes s.parts ∧
+  s.size ≤ MAX_WAITING ∧ s.size = sizes s.parts + osize s.out ∧
   ∀ e ∈ s.parts, Sorted e.2.pieces ∧ e.2.got = lens e.2.pieces ∧
     ∀ t, e.2.total = some t → ∀ q ∈ e.2.pieces, q.stop ≤ t
 
@@ -775,7 +827,7 @@ theorem check_of_inv {s : State} (h : Inv s) : Check s :=
   ⟨h.2, h.1.size, fun e he => ⟨(h.1.ok e he).sorted, (h.1.ok e he).got, (h.1.ok e he).bound⟩⟩
 
 theorem inv_empty : Inv State.empty :=
-  ⟨⟨by simp [State.empty], by simp [State.empty, sizes], by simp [State.empty]⟩,
+  ⟨⟨by simp [State.empty], by simp [State.empty, sizes, osize], by simp [State.empty]⟩,
    by simp [State.empty, MAX_WAITING]⟩
 
 theorem partialOk_size {p : Partial} (h : PartialOk p) : PARTIAL_COST ≤ p.size := by
@@ -788,7 +840,7 @@ theorem fresh_ok (t : Nat) : PartialOk (fresh t) := by
   constructor <;> simp [fresh, Sorted, lens, pieceCost, hdrCost]
 
 theorem inv0_put {s : State} {k : Key} {p : Partial} {sz : Nat} (hs : Inv0 s) (hp : PartialOk p)
-    (hsz : sz + oldSize s.parts k = s.size + p.size) : Inv0 ⟨put s.parts k p, sz⟩ := by
+    (hsz : sz + oldSize s.parts k = s.size + p.size) : Inv0 ⟨put s.parts k p, sz, s.out⟩ := by
   refine ⟨nodup_put k p hs.nodup, ?_, ?_⟩
   · have := sizes_put s.parts k p; have := hs.size; simp only; omega
   · intro e he
@@ -797,7 +849,7 @@ theorem inv0_put {s : State} {k : Key} {p : Partial} {sz : Nat} (hs : Inv0 s) (h
     · exact hs.ok e h
 
 theorem inv0_del {s : State} {k : Key} {sz : Nat} (hs : Inv0 s)
-    (hsz : sz + oldSize s.parts k = s.size) : Inv0 ⟨del s.parts k, sz⟩ := by
+    (hsz : sz + oldSize s.parts k = s.size) : Inv0 ⟨del s.parts k, sz, s.out⟩ := by
   refine ⟨nodup_del k hs.nodup, ?_, fun e he => hs.ok e (mem_del he)⟩
   have := sizes_del s.parts k; have := hs.size; simp only; omega
 
@@ -823,6 +875,58 @@ theorem take_inv0 {s : State} (k : Key) (hs : Inv0 s) : Inv0 (take s k) ∧ (tak
     have h2 : p.size ≤ s.size := by have := @oldSize_le s.parts k; rw [hs.size]; omega
     exact ⟨inv0_del hs (by omega), by simp only; omega⟩
 
+theorem pieceCost_mem {ps : List Piece} {q : Piece} (hq : q ∈ ps) :
+    q.data.length + PIECE_COST ≤ pieceCost ps := by
+  induction ps with
+  | nil => simp at hq
+  | cons x rest ih =>
+    simp only [pieceCost, List.map_cons, List.sum_cons] at ih ⊢
+    rcases List.mem_cons.mp hq with rfl | hq
+    · omega
+    · have := ih hq; omega
+
+/-- A kept first fragment is no bigger than what its packet counted. -/
+theorem firstPacket_le {p : Partial} {b : List Nat} (hp : PartialOk p)
+    (h : firstPacket p = some b) : b.length ≤ p.size := by
+  unfold firstPacket at h
+  split at h
+  · next hd q hh hq =>
+    have hqm := List.mem_of_find?_eq_some hq
+    have h1 := pieceCost_mem hqm
+    have h2 : hdrCost p.header = hd.length := by simp [hdrCost, hh]
+    have h3 := hp.size
+    have h8 : 8 ≤ PIECE_COST := by decide
+    have hpc : 8 ≤ PARTIAL_COST := by decide
+    injection h with h; subst h
+    unfold rebuild
+    split
+    · simp; omega
+    · simp only [List.length_append, List.length_set, List.length_take]; omega
+  · cases h
+
+theorem osize_append (a b : List (List Nat)) : osize (a ++ b) = osize a + osize b := by
+  simp [osize]
+
+theorem osize_firsts : ∀ {ps : List (Key × Partial)}, (∀ e ∈ ps, PartialOk e.2) →
+    osize (ps.filterMap fun e => firstPacket e.2) ≤ sizes ps
+  | [], _ => by simp [osize, sizes]
+  | e :: rest, h => by
+    have ih := osize_firsts (ps := rest) (fun x hx => h x (List.mem_cons_of_mem _ hx))
+    obtain ⟨k, p⟩ := e
+    have hp : PartialOk p := h (k, p) List.mem_cons_self
+    simp only [List.filterMap_cons, sizes]
+    cases hf : firstPacket p with
+    | none =>
+      show osize (rest.filterMap fun e => firstPacket e.2) ≤ p.size + sizes rest
+      omega
+    | some b =>
+      have := firstPacket_le hp hf
+      show osize (b :: rest.filterMap fun e => firstPacket e.2) ≤ p.size + sizes rest
+      simp only [osize, List.map_cons, List.sum_cons] at ih ⊢
+      omega
+
+/-- Expiry keeps the invariant, never counts more, and only adds to the
+kept first fragments. -/
 theorem expire_inv0 {s : State} (now : Nat) (hs : Inv0 s) :
     Inv0 (expire s now) ∧ (expire s now).size ≤ s.size := by
   have hf := sizes_filter s.parts (fun e => decide (now < e.2.expires))
@@ -834,26 +938,49 @@ theorem expire_inv0 {s : State} (now : Nat) (hs : Inv0 s) :
     simp only [Bool.not_eq_true', decide_eq_false_iff_not, decide_eq_true_eq]
     exact Nat.not_lt
   rw [e1] at hf
+  have hle := osize_firsts (ps := s.parts.filter fun e => decide (e.2.expires ≤ now))
+    (fun e he => hs.ok e (mem_of_mem_filter' he))
+  have hsz := hs.size
   refine ⟨⟨hs.nodup.sublist ((List.filter_sublist).map _), ?_, ?_⟩, ?_⟩
-  · simp only [expire]; have := hs.size; omega
+  · simp only [expire, osize_append]; omega
   · intro e he; exact hs.ok e (mem_of_mem_filter' he)
   · simp only [expire]; omega
 
+theorem take_out (s : State) (k : Key) : (take s k).out = s.out := by
+  unfold take; split <;> rfl
+
+theorem kill_out (s : State) (k : Key) : (kill s k).out = s.out := by
+  unfold kill; split <;> rfl
+
+theorem capLoop_out : ∀ (n : Nat) (s : State), (capLoop n s).out = s.out
+  | 0, _ => rfl
+  | n + 1, s => by
+    unfold capLoop
+    split
+    · split
+      · rfl
+      · rw [capLoop_out n, take_out]
+    · rfl
+
 theorem capLoop_inv0 : ∀ (n : Nat) {s : State}, Inv0 s →
     Inv0 (capLoop n s) ∧ (capLoop n s).size ≤ s.size ∧
-    (s.parts.length ≤ n → (capLoop n s).size ≤ MAX_WAITING)
+    (s.parts.length ≤ n → osize s.out ≤ MAX_WAITING → (capLoop n s).size ≤ MAX_WAITING)
   | 0, s, hs => by
-    refine ⟨hs, Nat.le_refl _, fun hn => ?_⟩
+    refine ⟨hs, Nat.le_refl _, fun hn ho => ?_⟩
     have : s.parts = [] := List.eq_nil_of_length_eq_zero (by omega)
-    simp [capLoop, hs.size, this, sizes, MAX_WAITING]
+    have h1 := hs.size
+    rw [this] at h1
+    show s.size ≤ MAX_WAITING
+    simp only [sizes] at h1; omega
   | n + 1, s, hs => by
     unfold capLoop
     split
     · split
       · next hn =>
-        have := soonestE_none (by simpa [soonest] using hn)
-        refine ⟨hs, Nat.le_refl _, fun _ => ?_⟩
-        simp [hs.size, this, sizes, MAX_WAITING]
+        have h0 := soonestE_none (by simpa [soonest] using hn)
+        refine ⟨hs, Nat.le_refl _, fun _ ho => ?_⟩
+        have := hs.size
+        rw [h0] at this; simp [sizes] at this; omega
       · next k hk =>
         obtain ⟨⟨k', t⟩, hkt, rfl⟩ : ∃ x, soonestE s.parts = some x ∧ x.1 = k := by
           simp [soonest] at hk; obtain ⟨t, ht⟩ := hk; exact ⟨_, ht, rfl⟩
@@ -861,14 +988,15 @@ theorem capLoop_inv0 : ∀ (n : Nat) {s : State}, Inv0 s →
         obtain ⟨p', hp'⟩ := get?_of_mem hp
         have ht := take_inv0 k' hs
         have ih := capLoop_inv0 n ht.1
-        refine ⟨ih.1, Nat.le_trans ih.2.1 ht.2, fun hn => ih.2.2 ?_⟩
+        refine ⟨ih.1, Nat.le_trans ih.2.1 ht.2, fun hn ho => ih.2.2 ?_ (by rw [take_out]; exact ho)⟩
         have := length_del hp'
         simp only [take, hp']; omega
-    · exact ⟨hs, Nat.le_refl _, fun _ => by omega⟩
+    · exact ⟨hs, Nat.le_refl _, fun _ _ => by omega⟩
 
-theorem cap_inv {s : State} (hs : Inv0 s) : Inv (cap s) ∧ (cap s).size ≤ s.size :=
+theorem cap_inv {s : State} (hs : Inv0 s) (ho : osize s.out ≤ MAX_WAITING) :
+    Inv (cap s) ∧ (cap s).size ≤ s.size :=
   let h := capLoop_inv0 s.parts.length hs
-  ⟨⟨h.1, h.2.2 (Nat.le_refl _)⟩, h.2.1⟩
+  ⟨⟨h.1, h.2.2 (Nat.le_refl _) ho⟩, h.2.1⟩
 
 theorem capLoop_id : ∀ (n : Nat) {s : State}, s.size ≤ MAX_WAITING → capLoop n s = s
   | 0, _, _ => rfl
@@ -1207,6 +1335,7 @@ theorem admit_inv0 {s : State} {p : Partial} {f : Frag} (hs : Inv0 s)
     (hlim : f.stop ≤ MAX_LEN) : Inv0 (admit s p f).1 := by
   unfold admit
   try dsimp only
+  try dsimp only
   split
   · exact hs
   split
@@ -1224,7 +1353,7 @@ theorem admit_inv0 {s : State} {p : Partial} {f : Frag} (hs : Inv0 s)
       have := oldSize_some hg
       have := partialOk_size hp
       have h2 : p.size ≤ s.size := by
-        have := @oldSize_le s.parts f.key; rw [oldSize_some hg] at this; rw [hs.size]; exact this
+        have := @oldSize_le s.parts f.key; rw [oldSize_some hg] at this; rw [hs.size]; omega
       simp [Partial.killed]; omega
     · next hok =>
       replace hok : lengthOk p f = true ∧ overlapOk p f = true := by simpa using hok
@@ -1233,7 +1362,7 @@ theorem admit_inv0 {s : State} {p : Partial} {f : Frag} (hs : Inv0 s)
         have h1 := add_size (p.setLen f) f; have h2 := hdrCost_add_le (p.setLen f) f
         simp only [setLen_header, setLen_size] at h1 h2 ⊢; omega
       have hput : Inv0 ⟨put s.parts f.key ((p.setLen f).add f),
-          s.size + (((p.setLen f).add f).size - (p.setLen f).size)⟩ := by
+          s.size + (((p.setLen f).add f).size - (p.setLen f).size), s.out⟩ := by
         apply inv0_put hs hq
         have := oldSize_some hg
         simp at hle ⊢; omega
@@ -1261,14 +1390,32 @@ theorem pushFragment_inv0 {s : State} (f : Frag) (now : Nat) (hs : Inv0 s) :
     obtain ⟨h1, h2, h3⟩ := lookup_inv0 (f := f) (now := now) hs
     exact admit_inv0 h1 h2 h3 hb (Nat.not_lt.mp hlim)
 
+theorem lookup_out (s : State) (f : Frag) (now : Nat) : (lookup s f now).1.out = s.out := by
+  unfold lookup; split <;> rfl
+
+theorem admit_out (s : State) (p : Partial) (f : Frag) : (admit s p f).1.out = s.out := by
+  unfold admit
+  try dsimp only
+  repeat' split
+  all_goals first | rfl | simp only [kill_out, take_out]
+
+/-- A step adds no first fragment to the kept ones but by expiry. -/
+theorem pushFragment_out (s : State) (f : Frag) (now : Nat) : (pushFragment s f now).1.out = s.out := by
+  unfold pushFragment
+  repeat' split
+  all_goals first | rfl | simp only [kill_out] | (rw [admit_out, lookup_out])
+
 /-- **The cap and the accounting** (ip.rs 675-682, 839-861). From any table
 that keeps the invariant, a step leaves one that keeps it: at most
 `MAX_WAITING` bytes are counted, the count is the sum of the packets'
 sizes, and every packet's size is `PARTIAL_COST`, plus its first
 fragment's headers, plus each piece's data and `PIECE_COST`. -/
 theorem reassemble_inv {s : State} (f : Frag) (now : Nat) (hs : Inv s) :
-    Inv (reassemble s f now).1 :=
-  (cap_inv (pushFragment_inv0 f now (expire_inv0 now hs.1).1)).1
+    Inv (reassemble s f now).1 := by
+  have he := expire_inv0 now hs.1
+  have ho : osize (pushFragment (expire s now) f now).1.out ≤ MAX_WAITING := by
+    rw [pushFragment_out]; have := he.1.size; have := he.2; have := hs.2; omega
+  exact (cap_inv (pushFragment_inv0 f now he.1) ho).1
 
 /-- So everything `Reassembly::check` asserts holds after every step. -/
 theorem reassemble_check {s : State} (f : Frag) (now : Nat) (hs : Inv s) :
@@ -1413,33 +1560,49 @@ theorem tiles_byte : ∀ {ps : List Piece} {a t : Nat} {q : Piece} {i : Nat}, Ti
 
 /-! ## Proofs: soundness -/
 
+/-- Every piece of `p` came from a fragment in `hist` with key `k`. -/
+def PiecesFrom (hist : List Frag) (k : Key) (p : Partial) : Prop :=
+  ∀ q ∈ p.pieces, ∃ g ∈ hist, g.key = k ∧ g.piece = q
+
+/-- `p`'s first-fragment headers came from a fragment in `hist` with key
+`k`, with its Fragment header (`frag6`), whose piece is waiting in `p`. -/
+def HeadFrom (hist : List Frag) (k : Key) (p : Partial) : Prop :=
+  ∀ x, p.header = some x →
+    ∃ g ∈ hist, g.key = k ∧ g.header = some x ∧ g.frag6 = p.frag6 ∧ g.piece ∈ p.pieces
+
 /-- Every piece and first-fragment header in the table came from a
 fragment in `hist` with the packet's key. -/
 def Hist (hist : List Frag) (s : State) : Prop :=
-  ∀ e ∈ s.parts, (∀ q ∈ e.2.pieces, ∃ g ∈ hist, g.key = e.1 ∧ g.piece = q) ∧
-    (∀ h, e.2.header = some h → ∃ g ∈ hist, g.key = e.1 ∧ g.header = some h)
+  ∀ e ∈ s.parts, PiecesFrom hist e.1 e.2 ∧ HeadFrom hist e.1 e.2
+
+theorem from_mono {hist : List Frag} {f : Frag} {k : Key} {p : Partial}
+    (h : PiecesFrom hist k p ∧ HeadFrom hist k p) : PiecesFrom (f :: hist) k p ∧ HeadFrom (f :: hist) k p :=
+  ⟨fun q hq => let ⟨g, hg, h'⟩ := h.1 q hq; ⟨g, List.mem_cons_of_mem _ hg, h'⟩,
+   fun x hx => let ⟨g, hg, h'⟩ := h.2 x hx; ⟨g, List.mem_cons_of_mem _ hg, h'⟩⟩
 
 theorem hist_mono {hist : List Frag} {f : Frag} {s : State} (h : Hist hist s) : Hist (f :: hist) s :=
-  fun e he => ⟨fun q hq => let ⟨g, hg, h'⟩ := (h e he).1 q hq; ⟨g, List.mem_cons_of_mem _ hg, h'⟩,
-    fun x hx => let ⟨g, hg, h'⟩ := (h e he).2 x hx; ⟨g, List.mem_cons_of_mem _ hg, h'⟩⟩
+  fun e he => from_mono (h e he)
 
-theorem hist_put {hist : List Frag} {s : State} {k : Key} {p : Partial} {sz : Nat} (h : Hist hist s)
-    (hp : (∀ q ∈ p.pieces, ∃ g ∈ hist, g.key = k ∧ g.piece = q) ∧
-      (∀ x, p.header = some x → ∃ g ∈ hist, g.key = k ∧ g.header = some x)) :
-    Hist hist ⟨put s.parts k p, sz⟩ := by
+theorem hist_put {hist : List Frag} {s : State} {k : Key} {p : Partial} {sz : Nat}
+    {o : List (List Nat)} (h : Hist hist s) (hp : PiecesFrom hist k p ∧ HeadFrom hist k p) :
+    Hist hist ⟨put s.parts k p, sz, o⟩ := by
   intro e he
   rcases mem_put he with rfl | he
   · exact hp
   · exact h e he
 
 theorem hist_sub {hist : List Frag} {s : State} {ps : List (Key × Partial)} {sz : Nat}
-    (h : Hist hist s) (hsub : ∀ e ∈ ps, e ∈ s.parts) : Hist hist ⟨ps, sz⟩ :=
+    {o : List (List Nat)} (h : Hist hist s) (hsub : ∀ e ∈ ps, e ∈ s.parts) : Hist hist ⟨ps, sz, o⟩ :=
   fun e he => h e (hsub e he)
+
+theorem killed_from (hist : List Frag) (k : Key) (p : Partial) :
+    PiecesFrom hist k p.killed ∧ HeadFrom hist k p.killed :=
+  ⟨by simp [PiecesFrom, Partial.killed], by simp [HeadFrom, Partial.killed]⟩
 
 theorem hist_kill {hist : List Frag} {s : State} (k : Key) (h : Hist hist s) : Hist hist (kill s k) := by
   unfold kill; split
   · exact h
-  · exact hist_put h ⟨by simp [Partial.killed], by simp [Partial.killed]⟩
+  · exact hist_put h (killed_from _ _ _)
 
 theorem hist_take {hist : List Frag} {s : State} (k : Key) (h : Hist hist s) : Hist hist (take s k) := by
   unfold take; split
@@ -1456,22 +1619,30 @@ theorem hist_capLoop {hist : List Frag} : ∀ (n : Nat) {s : State}, Hist hist s
       · exact hist_capLoop n (hist_take _ h)
     · exact h
 
+theorem fresh_from (hist : List Frag) (k : Key) (t : Nat) :
+    PiecesFrom hist k (fresh t) ∧ HeadFrom hist k (fresh t) :=
+  ⟨by simp [PiecesFrom, fresh], by simp [HeadFrom, fresh]⟩
+
 theorem hist_lookup {hist : List Frag} {s : State} {f : Frag} {now : Nat} (h : Hist hist s) :
     Hist hist (lookup s f now).1 ∧
-    (∀ q ∈ (lookup s f now).2.pieces, ∃ g ∈ hist, g.key = f.key ∧ g.piece = q) ∧
-    (∀ x, (lookup s f now).2.header = some x → ∃ g ∈ hist, g.key = f.key ∧ g.header = some x) := by
+    PiecesFrom hist f.key (lookup s f now).2 ∧ HeadFrom hist f.key (lookup s f now).2 := by
   unfold lookup
   split
-  · next p hp => exact ⟨h, (h _ (get?_mem hp)).1, (h _ (get?_mem hp)).2⟩
-  · exact ⟨hist_put h ⟨by simp [fresh], by simp [fresh]⟩, by simp [fresh], by simp [fresh]⟩
+  · next p hp => exact ⟨h, h _ (get?_mem hp)⟩
+  · exact ⟨hist_put h (fresh_from _ _ _), fresh_from _ _ _⟩
+
+@[simp] theorem setLen_frag6 (p : Partial) (f : Frag) : (p.setLen f).frag6 = p.frag6 := by
+  unfold Partial.setLen; split <;> rfl
+
+/-- The headers and `frag6` a packet keeps: the first fragment's, together. -/
+theorem add_frag6 (p : Partial) (f : Frag) :
+    (p.add f).frag6 = (if p.header = none ∧ f.header.isSome then f.frag6 else p.frag6) := by
+  cases hf : f.header <;> cases hp : p.header <;> simp [Partial.add, hf, hp]
 
 theorem hist_add {hist : List Frag} {p : Partial} {f : Frag}
-    (hp : (∀ q ∈ p.pieces, ∃ g ∈ hist, g.key = f.key ∧ g.piece = q) ∧
-      (∀ x, p.header = some x → ∃ g ∈ hist, g.key = f.key ∧ g.header = some x)) :
-    (∀ q ∈ ((p.setLen f).add f).pieces,
-        ∃ g ∈ f :: hist, g.key = f.key ∧ g.piece = q) ∧
-      (∀ x, ((p.setLen f).add f).header = some x →
-        ∃ g ∈ f :: hist, g.key = f.key ∧ g.header = some x) := by
+    (hp : PiecesFrom hist f.key p ∧ HeadFrom hist f.key p) :
+    PiecesFrom (f :: hist) f.key ((p.setLen f).add f) ∧
+      HeadFrom (f :: hist) f.key ((p.setLen f).add f) := by
   constructor
   · intro q hq
     rw [add_pieces, setLen_pieces] at hq
@@ -1479,15 +1650,21 @@ theorem hist_add {hist : List Frag} {p : Partial} {f : Frag}
     · exact ⟨f, List.mem_cons_self, rfl, rfl⟩
     · obtain ⟨g, hg, h'⟩ := hp.1 q hq; exact ⟨g, List.mem_cons_of_mem _ hg, h'⟩
   · intro x hx
+    have hmem : ∀ {q}, q ∈ p.pieces → q ∈ ((p.setLen f).add f).pieces := fun hq => by
+      rw [add_pieces, setLen_pieces]; exact mem_insertPiece.mpr (Or.inr hq)
     rw [add_header, setLen_header] at hx
-    split at hx
-    · exact ⟨f, List.mem_cons_self, rfl, hx⟩
-    · obtain ⟨g, hg, h'⟩ := hp.2 x hx; exact ⟨g, List.mem_cons_of_mem _ hg, h'⟩
-
+    rw [add_frag6, setLen_frag6, setLen_header]
+    by_cases hn : p.header = none
+    · rw [if_pos hn] at hx
+      refine ⟨f, List.mem_cons_self, rfl, hx, by rw [if_pos ⟨hn, by simp [hx]⟩], ?_⟩
+      rw [add_pieces, setLen_pieces]; exact mem_insertPiece.mpr (Or.inl rfl)
+    · rw [if_neg hn] at hx
+      obtain ⟨g, hg, h1, h2, h3, h4⟩ := hp.2 x hx
+      exact ⟨g, List.mem_cons_of_mem _ hg, h1, h2, by rw [if_neg (fun hc => hn hc.1)]; exact h3,
+        hmem h4⟩
 
 theorem hist_admit {hist : List Frag} {s : State} {p : Partial} {f : Frag} (h : Hist hist s)
-    (hp : (∀ q ∈ p.pieces, ∃ g ∈ hist, g.key = f.key ∧ g.piece = q) ∧
-      (∀ x, p.header = some x → ∃ g ∈ hist, g.key = f.key ∧ g.header = some x)) :
+    (hp : PiecesFrom hist f.key p ∧ HeadFrom hist f.key p) :
     Hist (f :: hist) (admit s p f).1 := by
   have h' := hist_mono (f := f) h
   unfold admit
@@ -1500,9 +1677,9 @@ theorem hist_admit {hist : List Frag} {s : State} {p : Partial} {f : Frag} (h : 
     · exact hist_kill _ h'
   split
   · unfold kill; simp only [get?_put_self, put_put]
-    exact hist_put h' ⟨by simp [Partial.killed], by simp [Partial.killed]⟩
+    exact hist_put h' (killed_from _ _ _)
   · have hput := hist_put (sz := s.size + (((p.setLen f).add f).size -
-        (p.setLen f).size)) h' (hist_add hp)
+        (p.setLen f).size)) (o := s.out) h' (hist_add hp)
     split
     · split
       · split
@@ -1641,7 +1818,8 @@ theorem reassemble_sound {hist : List Frag} {s : State} {f : Frag} {now : Nat} {
           · next b hfin =>
             simp at hw; subst hw
             have ht := (complete_iff_noHoles hok' htot).1.mp rfl
-            refine builtFrom_of (hha.2 h hqh) hha.1 ht ?_ hfin
+            obtain ⟨g, hg, hg1, hg2, -⟩ := hha.2 h hqh
+            refine builtFrom_of ⟨g, hg, hg1, hg2⟩ hha.1 ht ?_ hfin
             intro r hr; rw [hok'.last r hr, htot, Option.some.injEq]; exact eq_comm
           · simp at hw
         · simp at hw
@@ -1745,6 +1923,7 @@ theorem admit_get {s : State} {p : Partial} {f : Frag} (hs : Inv0 s)
   revert h
   unfold admit
   try dsimp only
+  try dsimp only
   split
   · next hd => intro h; rw [hg] at h; cases h; exact ⟨rfl, fun _ => hd⟩
   split
@@ -1811,6 +1990,7 @@ theorem overlap_kills {s : State} {f : Frag} {now : Nat} {p : Partial} {q : Piec
   apply discarded_dead hs hg1 hna hnb hlim
   have hf : f.data ≠ [] := fun h => hnb (Or.inr h)
   unfold admit
+  try dsimp only
   try dsimp only
   rw [if_neg (by simp [hd])]
   split
@@ -1879,6 +2059,7 @@ theorem length_disagreement_kills {s : State} {f : Frag} {now : Nat} {p : Partia
   have hg1 := get?_expire_keep hg hexp
   apply discarded_dead hs hg1 hna hnb hlim
   unfold admit
+  try dsimp only
   try dsimp only
   rw [if_neg (by simp [hd])]
   split
@@ -2012,7 +2193,7 @@ theorem late_completes_nothing {s : State} {f : Frag} {now : Nat} {p : Partial} 
   split at hw
   · simp at hw
   have hl : lookup (expire s now) f now = (⟨put (expire s now).parts f.key (fresh (now + f.timeout)),
-      (expire s now).size + PARTIAL_COST⟩, fresh (now + f.timeout)) := by simp [lookup, hn]
+      (expire s now).size + PARTIAL_COST, (expire s now).out⟩, fresh (now + f.timeout)) := by simp [lookup, hn]
   rw [hl] at hw
   exact hna (admit_fresh_whole hw)
 
@@ -2020,8 +2201,8 @@ theorem late_completes_nothing {s : State} {f : Frag} {now : Nat} {p : Partial} 
 
 /-- The fragment that carries piece `q` of a packet with key `k`, first
 fragment headers `h` and timeout `tmo`: the headers go with offset 0. -/
-def fragOf (k : Key) (h : List Nat) (tmo : Nat) (q : Piece) : Frag :=
-  ⟨k, q.off, q.more, q.data, if q.off = 0 then some h else none, tmo⟩
+def fragOf (k : Key) (h : List Nat) (tmo : Nat) (f6 : Option (Nat × List Nat)) (q : Piece) : Frag :=
+  ⟨k, q.off, q.more, q.data, if q.off = 0 then some h else none, tmo, if q.off = 0 then f6 else none⟩
 
 /-- `P` cuts a packet's `t` data bytes into fragments as RFC 791 section
 3.2 and RFC 8200 section 4.5 allow: nonempty, contiguous pieces from 0 to
@@ -2056,8 +2237,8 @@ theorem tiles_nonempty : ∀ {ps : List Piece} {a t : Nat}, Tiles a t ps → ∀
 
 theorem piece_eta (q : Piece) : (⟨q.off, q.data, q.more⟩ : Piece) = q := by cases q; rfl
 
-theorem fragOf_piece (k : Key) (h : List Nat) (tmo : Nat) (q : Piece) :
-    (fragOf k h tmo q).piece = q := piece_eta q
+theorem fragOf_piece (k : Key) (h : List Nat) (tmo : Nat) (f6 : Option (Nat × List Nat)) (q : Piece) :
+    (fragOf k h tmo f6 q).piece = q := piece_eta q
 
 theorem lens_filter (ps : List Piece) (c : Piece → Bool) :
     lens (ps.filter c) + lens (ps.filter (fun r => !c r)) = lens ps := by
@@ -2153,7 +2334,7 @@ theorem track_lookup {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} 
     obtain ⟨hn, hsz⟩ := hnil rfl
     have hn1 := get?_filter_none (fun e => decide (now < e.2.expires)) hn
     have : lookup (expire s now) f now = (⟨put (expire s now).parts f.key (fresh (now + f.timeout)),
-        (expire s now).size + PARTIAL_COST⟩, fresh (now + f.timeout)) := by
+        (expire s now).size + PARTIAL_COST, (expire s now).out⟩, fresh (now + f.timeout)) := by
       simp [lookup, hfk]; rw [show (expire s now).parts = s.parts.filter _ from rfl, hn1]
     rw [this]
     refine ⟨⟨rfl, by simp [fresh], by simp [fresh], by simp [fresh], by simp [fresh, hft, hfirst rfl]⟩, ?_⟩
@@ -2168,18 +2349,18 @@ theorem track_lookup {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} 
 the deadline. A piece already here is ignored; a new one joins; the last
 missing one completes the packet. -/
 theorem track_step {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} {s0 : Nat}
-    {s : State} {S : List Piece} {q : Piece} {now : Nat}
+    {s : State} {S : List Piece} {q : Piece} {now : Nat} {f6 : Option (Nat × List Nat)}
     (hcut : Cut P t) (hlen : lenField h t ≤ MAX_LEN)
     (hbud : s0 + PARTIAL_COST + pieceCost P + h.length ≤ MAX_WAITING)
     (hmany : ∀ r ∈ P, ¬ (r.off = 0 ∧ r.more = false))
     (htr : Track P h t (t0 + tmo) k s0 s S) (hq : q ∈ P) (hnow : now < t0 + tmo)
     (hfirst : S = [] → now = t0) :
-    (q ∈ S → (reassemble s (fragOf k h tmo q) now).2 = .waiting ∧
-        Track P h t (t0 + tmo) k s0 (reassemble s (fragOf k h tmo q) now).1 S) ∧
+    (q ∈ S → (reassemble s (fragOf k h tmo f6 q) now).2 = .waiting ∧
+        Track P h t (t0 + tmo) k s0 (reassemble s (fragOf k h tmo f6 q) now).1 S) ∧
     (q ∉ S → (∀ x ∈ P, x ∈ q :: S) → ∃ w, finish h (P.map (·.data)) t = some w ∧
-        (reassemble s (fragOf k h tmo q) now).2 = .whole w) ∧
-    (q ∉ S → ¬ (∀ x ∈ P, x ∈ q :: S) → (reassemble s (fragOf k h tmo q) now).2 = .waiting ∧
-        Track P h t (t0 + tmo) k s0 (reassemble s (fragOf k h tmo q) now).1 (q :: S)) := by
+        (reassemble s (fragOf k h tmo f6 q) now).2 = .whole w) ∧
+    (q ∉ S → ¬ (∀ x ∈ P, x ∈ q :: S) → (reassemble s (fragOf k h tmo f6 q) now).2 = .waiting ∧
+        Track P h t (t0 + tmo) k s0 (reassemble s (fragOf k h tmo f6 q) now).1 (q :: S)) := by
   have hSP := htr.2.1
   have hsort := tiles_sorted hcut.tiles
   have hne := tiles_nonempty hcut.tiles
@@ -2200,8 +2381,8 @@ theorem track_step {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} {s
     have h1 := (hcut.flags r hr).mp hm; have h2 := (hcut.flags q hq).mp hqm
     have := hapart r hr hrq; have := stop_pos (hne r hr); have := stop_pos hqn
     simp [Apart] at *; omega
-  let f := fragOf k h tmo q
-  have hfp : f.piece = q := fragOf_piece k h tmo q
+  let f := fragOf k h tmo f6 q
+  have hfp : f.piece = q := fragOf_piece k h tmo f6 q
   have hna : ¬ f.atomic := fun ha => hmany q hq ha
   have hnb : ¬ f.bad := by
     simp only [Frag.bad, f, fragOf, not_or, not_and]
@@ -2401,7 +2582,7 @@ theorem track_step {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} {s
       omega
     have hwait : admit s2 p f = (⟨put s2.parts f.key ((p.setLen f).add f),
         s2.size + (((p.setLen f).add f).size -
-          (p.setLen f).size)⟩, .waiting) := by
+          (p.setLen f).size), s2.out⟩, .waiting) := by
       simp only [admit, hd, hnc, hlok, hook, Bool.and_self, Bool.not_true, Bool.false_eq_true,
         ite_false]
       split
@@ -2432,7 +2613,7 @@ theorem track_step {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} {s
 
 /-- Every piece of `ds` is in `P`, arrives before the deadline, and the last
 one is the only arrival of its piece. -/
-theorem run_track {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} {s0 : Nat}
+theorem run_track {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} {s0 : Nat} {f6 : Option (Nat × List Nat)}
     (hcut : Cut P t) (hlen : lenField h t ≤ MAX_LEN)
     (hbud : s0 + PARTIAL_COST + pieceCost P + h.length ≤ MAX_WAITING)
     (hmany : ∀ r ∈ P, ¬ (r.off = 0 ∧ r.more = false)) :
@@ -2442,10 +2623,10 @@ theorem run_track {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} {s0
       (S = [] → (pre ++ [(q, tq)]).head?.map (·.2) = some t0) →
       q ∉ S → (∀ d ∈ pre, d.1 ≠ q) → (∀ x ∈ P, x ∈ S ∨ ∃ d ∈ pre ++ [(q, tq)], d.1 = x) →
       ∃ w, finish h (P.map (·.data)) t = some w ∧
-        (runF s ((pre ++ [(q, tq)]).map fun d => (fragOf k h tmo d.1, d.2))).2 =
+        (runF s ((pre ++ [(q, tq)]).map fun d => (fragOf k h tmo f6 d.1, d.2))).2 =
           List.replicate pre.length .waiting ++ [.whole w]
   | [], q, tq, s, S, htr, hds, hfirst, hqS, _, hcov => by
-    have hst := track_step (q := q) (now := tq) hcut hlen hbud hmany htr
+    have hst := track_step (q := q) (now := tq) (f6 := f6) hcut hlen hbud hmany htr
       (hds (q, tq) (by simp)).1 (hds (q, tq) (by simp)).2 (fun h0 => by simpa using hfirst h0)
     obtain ⟨w, hw, hout⟩ := hst.2.1 hqS (fun x hx => by
       rcases hcov x hx with h' | ⟨d, hd, rfl⟩
@@ -2454,15 +2635,15 @@ theorem run_track {P : List Piece} {h : List Nat} {t tmo t0 : Nat} {k : Key} {s0
     exact ⟨w, hw, by simp [runF, hout]⟩
   | (r, tr) :: pre, q, tq, s, S, htr, hds, hfirst, hqS, hpre, hcov => by
     have hrq : r ≠ q := hpre (r, tr) List.mem_cons_self
-    have hst := track_step (q := r) (now := tr) hcut hlen hbud hmany htr
+    have hst := track_step (q := r) (now := tr) (f6 := f6) hcut hlen hbud hmany htr
       (hds (r, tr) (by simp)).1 (hds (r, tr) (by simp)).2 (fun h0 => by simpa using hfirst h0)
     have hnot : ¬ ∀ x ∈ P, x ∈ r :: S := fun hall => by
       rcases List.mem_cons.mp (hall q (hds (q, tq) (by simp)).1) with h' | h'
       · exact hrq h'.symm
       · exact hqS h'
     -- after r, the table tracks S' and the rest is the same kind of run
-    obtain ⟨S', hout, htr'⟩ : ∃ S', (reassemble s (fragOf k h tmo r) tr).2 = .waiting ∧
-        Track P h t (t0 + tmo) k s0 (reassemble s (fragOf k h tmo r) tr).1 S' ∧
+    obtain ⟨S', hout, htr'⟩ : ∃ S', (reassemble s (fragOf k h tmo f6 r) tr).2 = .waiting ∧
+        Track P h t (t0 + tmo) k s0 (reassemble s (fragOf k h tmo f6 r) tr).1 S' ∧
         (∀ x, x ∈ S' ↔ x = r ∨ x ∈ S) := by
       by_cases hrS : r ∈ S
       · exact ⟨S, (hst.1 hrS).1, (hst.1 hrS).2, fun x => ⟨Or.inr, fun h' => h'.elim (· ▸ hrS) id⟩⟩
@@ -2494,7 +2675,7 @@ Then every step waits until the last missing fragment arrives, and that
 step hands out exactly one whole packet: `finish` of the first fragment's
 headers and the data in order, which `finish_ipv4` and `finish_ipv6`
 describe byte by byte. -/
-theorem complete {s : State} {k : Key} {h : List Nat} {tmo t t0 : Nat} {P : List Piece}
+theorem complete {s : State} {k : Key} {h : List Nat} {tmo t t0 : Nat} {P : List Piece} {f6 : Option (Nat × List Nat)}
     (pre : List (Piece × Nat)) (q : Piece) (tq : Nat)
     (hs : Inv s) (hk : get? s.parts k = none) (hcut : Cut P t) (hlen : lenField h t ≤ MAX_LEN)
     (hbud : s.size + PARTIAL_COST + pieceCost P + h.length ≤ MAX_WAITING)
@@ -2504,7 +2685,7 @@ theorem complete {s : State} {k : Key} {h : List Nat} {tmo t t0 : Nat} {P : List
     (ht0 : (pre ++ [(q, tq)]).head?.map (·.2) = some t0)
     (htime : ∀ d ∈ pre ++ [(q, tq)], d.2 < t0 + tmo) :
     ∃ w, finish h (P.map (·.data)) t = some w ∧
-      (runF s ((pre ++ [(q, tq)]).map fun d => (fragOf k h tmo d.1, d.2))).2 =
+      (runF s ((pre ++ [(q, tq)]).map fun d => (fragOf k h tmo f6 d.1, d.2))).2 =
         List.replicate pre.length .waiting ++ [.whole w] := by
   by_cases hmany : ∀ r ∈ P, ¬ (r.off = 0 ∧ r.more = false)
   · exact run_track hcut hlen hbud hmany pre q tq s [] ⟨hs, by simp, fun _ => ⟨hk, by omega⟩,
@@ -2548,8 +2729,8 @@ theorem complete {s : State} {k : Key} {h : List Nat} {tmo t t0 : Nat} {P : List
       | some w => exact ⟨w, rfl⟩
     have hlen' : q.data.length = t := by simp [Piece.stop] at hrt; omega
     refine ⟨w, by simpa using hw, ?_⟩
-    have ha : (fragOf k h tmo q).atomic := ⟨hr0, hrm⟩
-    have hh : (fragOf k h tmo q).header = some h := by simp [fragOf, hr0]
+    have ha : (fragOf k h tmo f6 q).atomic := ⟨hr0, hrm⟩
+    have hh : (fragOf k h tmo f6 q).header = some h := by simp [fragOf, hr0]
     simp only [List.nil_append, List.map_cons, List.map_nil, runF, List.length_nil,
       List.replicate_zero]
     rw [atomic_alone hs ha hh]
@@ -2778,12 +2959,14 @@ theorem arrived6_header {b : List Nat} {f : Frag} {hd : List Nat} (ha : arrived6
     (hh : f.header = some hd) :
     ∃ pos nextAt c, chain b = some c ∧ c.frag = some (pos, nextAt) ∧
       hd = (b.take pos).set nextAt (b.getD pos 0) ∧ f.offset = 0 ∧
-      f.data = slice b (pos + 8) (40 + be16 b 4) := by
+      f.data = slice b (pos + 8) (40 + be16 b 4) ∧
+      f.frag6 = some (nextAt, slice b pos (pos + 8)) ∧ 40 + be16 b 4 ≤ b.length := by
   unfold arrived6 at ha
   try dsimp only at ha
   split at ha
   · simp at ha
-  · split at ha
+  · next hlen =>
+    split at ha
     · simp at ha
     · next c hc =>
       split at ha
@@ -2791,16 +2974,16 @@ theorem arrived6_header {b : List Nat} {f : Frag} {hd : List Nat} (ha : arrived6
       · next pos nextAt hf =>
         injection ha with ha; subst ha
         simp at hh
-        exact ⟨pos, nextAt, c, hc, hf, hh.2.symm, hh.1, rfl⟩
+        refine ⟨pos, nextAt, c, hc, hf, hh.2.symm, hh.1, rfl, by simp [hh.1], by omega⟩
 
 /-- The walk records a Fragment header only where a "next header" byte
-names 44, and that byte comes before it. -/
+names 44, before it, and only one whose 8 bytes fit in the packet. -/
 theorem walk_frag : ∀ (fuel : Nat) {b : List Nat} {stop next nextAt pos : Nat}
     {frag : Option (Nat × Nat)} {c : Chain},
     (next = b.getD nextAt 0) → nextAt < pos →
-    (∀ a n, frag = some (a, n) → b.getD n 0 = 44 ∧ n < a) →
+    (∀ a n, frag = some (a, n) → b.getD n 0 = 44 ∧ n < a ∧ a + 8 ≤ stop) →
     walk b stop fuel next nextAt pos frag = some c →
-    ∀ a n, c.frag = some (a, n) → b.getD n 0 = 44 ∧ n < a
+    ∀ a n, c.frag = some (a, n) → b.getD n 0 = 44 ∧ n < a ∧ a + 8 ≤ stop
   | 0, _, _, _, _, _, _, _, _, _, _, h => by simp [walk] at h
   | fuel + 1, b, stop, next, nextAt, pos, frag, c, hn, hlt, hfr, h => by
     unfold walk at h
@@ -2814,14 +2997,16 @@ theorem walk_frag : ∀ (fuel : Nat) {b : List Nat} {stop next nextAt pos : Nat}
     · rw [if_pos h3] at h; cases h
     rw [if_neg h3] at h
     have hfr' : ∀ a n, (if next = 44 then some (pos, nextAt) else frag) = some (a, n) →
-        b.getD n 0 = 44 ∧ n < a := by
+        b.getD n 0 = 44 ∧ n < a ∧ a + 8 ≤ stop := by
       intro a n he
       by_cases h44 : next = 44
       · rw [if_pos h44] at he
         injection he with he
-        injection he with h1 h2
-        subst h1 h2
-        exact ⟨by rw [← hn]; exact h44, hlt⟩
+        injection he with e1 e2
+        rw [← e1, ← e2]
+        have h8 : extLen b next pos = 8 := by simp [extLen, h44]
+        rw [h8] at h2
+        exact ⟨by rw [← hn]; exact h44, hlt, by omega⟩
       · rw [if_neg h44] at he
         exact hfr a n he
     have hpos : 0 < extLen b next pos := by
@@ -2837,9 +3022,67 @@ theorem walk_frag : ∀ (fuel : Nat) {b : List Nat} {stop next nextAt pos : Nat}
 theorem arrived6_names_fragment {b : List Nat} {f : Frag} {hd : List Nat} (ha : arrived6 b = some f)
     (hh : f.header = some hd) :
     ∃ pos nextAt, nextAt < pos ∧ b.getD nextAt 0 = 44 ∧ hd = (b.take pos).set nextAt (b.getD pos 0) := by
-  obtain ⟨pos, nextAt, c, hc, hf, hhd, -, -⟩ := arrived6_header ha hh
+  obtain ⟨pos, nextAt, c, hc, hf, hhd, -⟩ := arrived6_header ha hh
   have := walk_frag _ rfl (by omega) (by simp) hc pos nextAt hf
-  exact ⟨pos, nextAt, this.2, this.1, hhd⟩
+  exact ⟨pos, nextAt, this.2.1, this.1, hhd⟩
+
+/-- `l` with the byte it already has at `n` set again is `l`. -/
+theorem set_self : ∀ (l : List Nat) (n v : Nat), n < l.length → l.getD n 0 = v → l.set n v = l
+  | [], _, _, h, _ => by simp at h
+  | x :: xs, 0, v, _, h => by simp at h; simp [h]
+  | x :: xs, n + 1, v, h, hv => by
+    simp only [List.set_cons_succ, List.cons.injEq, true_and]
+    exact set_self xs n v (by simp at h; omega) (by simpa using hv)
+
+theorem take_slice (b : List Nat) {i j : Nat} (h : i ≤ j) :
+    b.take i ++ slice b i j = b.take j := by
+  unfold slice
+  rw [← List.take_add]; congr 1; omega
+
+/-- **The quoted IPv4 packet is fragment zero as it came** (RFC 792, RFC
+1122 section 3.3.2): what reassembly keeps of a first fragment, rebuilt,
+is the packet up to its total length. -/
+theorem arrived4_rebuild {b : List Nat} {f : Frag} {hd : List Nat} (ha : arrived4 b = some f)
+    (hh : f.header = some hd) : rebuild hd f.frag6 f.data = b.take (be16 b 2) := by
+  unfold arrived4 at ha
+  try dsimp only at ha
+  split at ha
+  · simp at ha
+  · next hl =>
+    split at ha
+    · simp at ha
+    · split at ha
+      · simp at ha
+      · injection ha with ha; subst ha
+        try dsimp only at hh
+        split at hh
+        · injection hh with hh; subst hh
+          simp only [rebuild]
+          exact take_slice b (by omega)
+        · cases hh
+
+/-- **The quoted IPv6 packet is fragment zero as it came** (RFC 4443
+section 3.3, RFC 8200 section 4.5): the headers, with the "next header"
+byte naming the Fragment header again, the Fragment header and the data
+are the packet up to its payload length. -/
+theorem arrived6_rebuild {b : List Nat} {f : Frag} {hd : List Nat} (ha : arrived6 b = some f)
+    (hh : f.header = some hd) : rebuild hd f.frag6 f.data = b.take (40 + be16 b 4) := by
+  obtain ⟨pos, nextAt, c, hc, hf, hhd, -, hdata, hf6, hlen⟩ := arrived6_header ha hh
+  have hw := walk_frag _ rfl (by omega) (by simp) hc pos nextAt hf
+  obtain ⟨h44, hlt, hstop⟩ := hw
+  rw [hhd, hdata, hf6]
+  simp only [rebuild]
+  have hpl : pos ≤ b.length := by omega
+  have hset : ((b.take pos).set nextAt (b.getD pos 0)).set nextAt 44 = b.take pos := by
+    rw [List.set_set]
+    apply set_self
+    · simp; omega
+    · rw [List.getD_eq_getElem?_getD, List.getElem?_take]
+      simp only [hlt, ite_true]
+      rw [← List.getD_eq_getElem?_getD]; exact h44
+  have h8 : (slice b pos (pos + 8)).take 8 = slice b pos (pos + 8) := by
+    simp only [slice, Nat.add_sub_cancel_left, List.take_take, Nat.min_self]
+  rw [hset, h8, take_slice b (by omega), take_slice b (by omega)]
 
 /-- `arrived` sets the timeouts: 30 s for IPv4, 60 s for IPv6. -/
 theorem arrived_timeout {b : List Nat} {f : Frag} (ha : arrived b = some f) :
@@ -2878,6 +3121,86 @@ theorem arrived_header {b : List Nat} {f : Frag} {hd : List Nat} (ha : arrived b
   · split at ha
     · obtain ⟨_, _, _, _, _, _, h0, _⟩ := arrived6_header ha hh; exact h0
     · simp at ha
+
+
+/-! ## Proofs: the Time Exceeded answer -/
+
+/-- **What expiry keeps for the answers** (RFC 1122 section 3.3.2, RFC 8200
+section 4.5). After what was kept before: the first fragment of every
+packet whose deadline has come, if it arrived, in the table's order. The
+cap drops packets without keeping anything. -/
+theorem expire_out (s : State) (now : Nat) :
+    (expire s now).out = s.out ++
+      (s.parts.filter (fun e => decide (e.2.expires ≤ now))).filterMap (fun e => firstPacket e.2) :=
+  rfl
+
+theorem cap_out (s : State) : (cap s).out = s.out := capLoop_out _ s
+
+/-- A step keeps for answers exactly what its expiry keeps: the fragment
+it takes adds nothing (`push_fragment` never times anything out). -/
+theorem reassemble_out (s : State) (f : Frag) (now : Nat) :
+    (reassemble s f now).1.out = (expire s now).out := by
+  simp only [reassemble, cap_out, pushFragment_out]
+
+/-- **Without fragment zero there is no answer** (RFC 1122 section
+3.3.2: "if fragment zero has been received"). -/
+theorem firstPacket_none {p : Partial} (h : ∀ q ∈ p.pieces, q.off ≠ 0) : firstPacket p = none := by
+  unfold firstPacket
+  have : p.pieces.find? (fun q => q.off == 0) = none := by
+    rw [List.find?_eq_none]; intro q hq; simpa using h q hq
+  rw [this]; cases p.header <;> rfl
+
+/-- A packet dropped for a bad fragment (dead) is not answered: it was
+discarded already (RFC 5722). -/
+theorem firstPacket_dead {p : Partial} (hp : PartialOk p) (hd : p.dead = true) :
+    firstPacket p = none := by
+  have := (hp.dead hd).2
+  unfold firstPacket; rw [this]
+
+/-- **The kept fragment is fragment zero** (RFC 792, RFC 1122 section
+3.3.2, RFC 4443 section 3.3). In a table whose headers came from `hist`
+(`Hist`), where only fragments at offset 0 carry headers (as `arrived`
+reads them, `arrived_header`), every first fragment a packet keeps is the
+rebuild of one fragment taken for its key at offset 0: its headers, its
+Fragment header and its data. `arrived4_rebuild` and `arrived6_rebuild`
+show that rebuild is the packet as it came. -/
+theorem firstPacket_from {hist : List Frag} {k : Key} {p : Partial} {b : List Nat}
+    (hp : PartialOk p) (hh : HeadFrom hist k p)
+    (hwf : ∀ g ∈ hist, ∀ x, g.header = some x → g.offset = 0)
+    (hb : firstPacket p = some b) :
+    ∃ g ∈ hist, g.key = k ∧ g.offset = 0 ∧ ∃ x, g.header = some x ∧ b = rebuild x g.frag6 g.data := by
+  unfold firstPacket at hb
+  split at hb
+  · next x q hx hq =>
+    injection hb with hb; subst hb
+    obtain ⟨g, hg, hk, hgx, hf6, hgp⟩ := hh x hx
+    have hg0 := hwf g hg x hgx
+    have hqm := List.mem_of_find?_eq_some hq
+    have hq0 : q.off = 0 := by simpa using List.find?_some hq
+    have hqg : q = g.piece := by
+      refine Classical.byContradiction fun hne => ?_
+      have := sorted_apart hp.sorted hp.nonempty hqm hgp hne
+      have h1 := stop_pos (hp.nonempty q hqm)
+      have h2 := stop_pos (hp.nonempty _ hgp)
+      simp only [Apart, Frag.piece, hg0] at this h2
+      omega
+    refine ⟨g, hg, hk, hg0, x, hgx, ?_⟩
+    rw [hqg, hf6]; rfl
+  · cases hb
+
+/-- Every kept first fragment came from the table's packets: `Hist` and
+`Inv0` give `firstPacket_from` for each one expiry keeps. -/
+theorem expire_from {hist : List Frag} {s : State} {now : Nat} {b : List Nat}
+    (hs : Inv0 s) (hh : Hist hist s)
+    (hwf : ∀ g ∈ hist, ∀ x, g.header = some x → g.offset = 0)
+    (hb : b ∈ (expire s now).out) (hnew : b ∉ s.out) :
+    ∃ k, ∃ g ∈ hist, g.key = k ∧ g.offset = 0 ∧ ∃ x, g.header = some x ∧ b = rebuild x g.frag6 g.data := by
+  rw [expire_out] at hb
+  rcases List.mem_append.mp hb with hb | hb
+  · exact absurd hb hnew
+  · obtain ⟨e, he, hfe⟩ := List.mem_filterMap.mp hb
+    have he' := mem_of_mem_filter' he
+    exact ⟨e.1, firstPacket_from (hs.ok e he') (hh e he').2 hwf hfe⟩
 
 /-! ## Vectors
 
@@ -3095,7 +3418,9 @@ def scenario (kind : Nat) (v6 : Bool) : Rng (String × List (Nat × List Nat)) :
     let k ← below (order.length + 1)
     let steps ← timed t0 (order.map (build fam))
     let gap := fam.timeout + (← pick [0, 0, 1, 500]) - (← pick [0, 1, 0])
-    let steps := steps.take k ++ (steps.drop k).map fun (t, p) => (t + gap, p)
+    let tk := (steps.getD (k - 1) (t0, [])).1
+    let timer := if ← coin then [(tk + gap, ([] : List Nat))] else []
+    let steps := steps.take k ++ timer ++ (steps.drop k).map fun (t, p) => (t + gap, p)
     return (s!"{name}: late fragments", steps)
   | 6 =>
     -- Two packets at once: another identification, or the other family.
@@ -3136,7 +3461,7 @@ def scenario (kind : Nat) (v6 : Bool) : Rng (String × List (Nat × List Nat)) :
     let broken := p.set pos (p.getD pos 0 ^^^ 1)
     let j ← below (ps.length + 1)
     return (s!"{name}: broken copy", ← timed t0 (ps.take j ++ [broken] ++ ps.drop j))
-  | _ =>
+  | 11 =>
     -- An overlap kills the packet; once its time is up the same key makes
     -- a packet again.
     let i ← if v6 ∧ o = 0 then (8 + ·) <$> below (d.length - 8) else below d.length
@@ -3145,6 +3470,16 @@ def scenario (kind : Nat) (v6 : Bool) : Rng (String × List (Nat × List Nat)) :
     let tl := (first.getLast?.map (·.1)).getD t0
     let again ← timed (tl + fam.timeout + (← below 2000)) ((← shuffle frs).map (build fam))
     return (s!"{name}: dead until expiry, then again", first ++ again)
+  | _ =>
+    -- Some fragments, then the timer at, just before or past the deadline
+    -- of the first: a packet whose fragment zero came is reported once.
+    let order ← withCopies (← shuffle frs) (← below 2)
+    let k ← below (order.length + 1)
+    let steps ← timed t0 ((order.take k).map (build fam))
+    let first := (steps.head?.map (·.1)).getD t0
+    let tm := first + fam.timeout + (← pick [0, 0, 1, 700]) - (← pick [0, 0, 1])
+    let more ← timed (tm + 1) ((order.drop k).map (build fam))
+    return (s!"{name}: the timer runs", steps ++ [(tm, [])] ++ [(tm, [])] ++ more)
 
 /-- A packet whose reassembled length field is 65,535, or one more. -/
 def atLimit (v6 over : Bool) : Rng (String × List (Nat × List Nat)) := do
@@ -3190,16 +3525,20 @@ def expectJson : Out → Lean.Json
 def caseJson (name : String) (steps : List (Nat × List Nat)) : Lean.Json :=
   let outs := run steps
   Lean.Json.mkObj [("name", Lean.Json.str name),
-    ("steps", Lean.Json.arr ((steps.zip outs).map fun ((t, p), o) =>
+    ("steps", Lean.Json.arr ((steps.zip outs).map fun ((t, p), (o, firsts)) =>
       Lean.Json.mkObj [("at_ms", Lean.Json.num (Lean.JsonNumber.fromNat t)),
-        ("packet", Lean.Json.str (hex p)), ("expect", expectJson o)]).toArray)]
+        ("packet", Lean.Json.str (hex p)),
+        ("expect", match o with
+          | some o => expectJson o
+          | none => Lean.Json.null),
+        ("expired", Lean.Json.arr (firsts.map fun b => Lean.Json.str (hex b)).toArray)]).toArray)]
 
-/-- Twelve scenarios, both families, `rounds` cases of each, then the four
+/-- Thirteen scenarios, both families, `rounds` cases of each, then the four
 cases at the length limit. -/
 def cases (rounds : Nat) : Rng (List Lean.Json) := do
   let mut out : Array Lean.Json := #[]
   for r in [0:rounds] do
-    for kind in [0:12] do
+    for kind in [0:13] do
       for v6 in [false, true] do
         let (name, steps) ← scenario kind v6
         out := out.push (caseJson s!"{name} #{r}" steps)
