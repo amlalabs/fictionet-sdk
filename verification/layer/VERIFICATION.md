@@ -994,3 +994,210 @@ empty. With both, `a_chunk_cursor_keeps_the_rest_in_place` still ran out
 of memory in the mutex's contended loop and in the drop of the list. The
 harnesses need the budget's wake path in a shape CBMC can bound, which is
 a change to `budget.rs`, not to the proofs.
+
+## The budget leftovers checked (November 10, 2026, `comp/fv-layer`)
+
+This pass checked the budget mechanism as merged at main `3db7a847e`
+against the rules its two designs state: rule 9 of
+`src/stdlib/layer/mod.rs` (a refused charge waits for memory and the idle
+limit does not count meanwhile; only a need past the whole limit ends a
+run), the wake (a refusal followed by a release that leaves room for it
+wakes every runner that registered, once), the views (a refusal through
+one view is invisible to another), `Starved`, and the causes on
+`MuxOp::Close`. Two models are new, `BudgetWake.tla` and
+`ChildMemory.tla`; the runner's model, `StreamRunner.tla` in
+`verification/layer-runtime`, was rewritten for the memory rules. Two bugs
+were found and fixed, each with a test that fails on the code before its
+fix.
+
+### Bug: a need noted after its release made runners spin
+
+`Budget::take_with` counts a refusal, notes the refused need in `wanted`,
+then tries once more; `release` frees bytes, then clears `wanted` if the
+room covers it and wakes the runners. A release that frees its bytes
+between a charge's first try and its note sees no need and wakes no one;
+the charge then takes the room on its last try. The need stays noted, now
+with room for it. From then on every runner refused meanwhile, whatever
+it needs, found `room() >= wanted` in `wake_when_freed` and was woken at
+once, each time it asked: it polled, was refused, asked again and was
+woken again, a busy loop that lasts until something else is released.
+
+TLC found it as a violation of `NoSpin` in
+`BudgetWake_without_owedwake.cfg` (the code as it was): runner `a` holds
+all 3 bytes, `b`'s charge of 1 finds no room, `a` releases its 3 before
+`b` notes its need, `b` takes 1 on its last try and holds it, and `a`
+(need 3, room 2) is then woken at once every time it asks. Threads only:
+one thread cannot interleave a release inside a charge.
+
+Fix: when `wake_when_freed` finds room for the least refused need and no
+release woke anyone since the mark, it pays the wake that release owed:
+it clears `wanted` (compare and swap), counts a wake and wakes the list
+with the asker, as `release` does. The asker then tries once, is refused,
+notes its own need and waits for room for it. The test
+`a_need_noted_after_its_release_wakes_once_and_not_in_a_loop`
+(`budget.rs`) sets up the state the trace reaches and asks four times: it
+was woken four times before the fix, once after, and the release that
+leaves room for its need wakes it again.
+
+### Bug: the runner's idle clock ran while a child waited for memory
+
+A child of `Children` charges through a view of its own, so a refusal of
+the child's is not in the runner's view, and `Live` set
+`Outstanding::memory` from its own view only. A stack such as
+`Chain<Http2, Children<Respond, ..>>` whose child waited for memory, with
+nothing else under way, looked idle: the idle limit ended its input while
+the child waited (StreamRunner's `IdleNeedsQuiet`, violated in
+`StreamRunner_without_childwaittold.cfg`).
+
+Fix: `Layer::waits_for_memory`, false by default and answered by the
+layers made of parts (`Chain`, `Switch`, `Side`, `Optional`, the boxed
+stacks, the TLS wrappers, the host's observed stack and `Session`).
+`Children` keeps `Kid::memory` and a count: a child's wait begins when its
+view refuses a charge (in a visit, an event's charge, a timer or a
+result), and ends at its next visit, which the wake brings, or when it
+closes. `Live` stops the idle clock when its own view was refused or the
+stack waits; `Session` the same for its part. Tests:
+`a_child_waiting_for_memory_keeps_the_run_from_idling`
+(`services/stack/tests.rs`: a real `Children` under `stream`, a child
+waiting a second for memory under an idle limit of 10 ms; before the fix
+the child heard its input end 10 ms in) and the new assertions in
+`a_child_refused_by_its_own_budget_is_visited_when_that_budget_frees`.
+
+### The wake under threads: `BudgetWake.tla`
+
+[`tla/BudgetWake.tla`](tla/BudgetWake.tla) is `budget.rs` one atomic
+operation at a time: a charge's first try, its count, its note, its last
+try; `wake_when_freed` with the waiters locked; a release's `fetch_sub`,
+its clearing of `wanted`, its locked count and taking of the list, and its
+wakes. Four runners on views of one budget of 3, needing 3, 1, 2 and 4 (the
+last past the limit), each charging, holding and releasing twice. Under
+`Spec` every runner holds only for a while; under `SpinSpec` a runner may
+hold for ever, as a long-lived connection does.
+
+- `AllServed`: every runner whose need fits is served all its rounds, the
+  one past the limit ends starved.
+- `WakeWhenRoom`: no runner whose need fits is left asleep for good while
+  the room covers its need. `AllServed` cannot see a wake that comes only
+  with a later, unrelated release; this can.
+- `NoSpin`: no runner is woken over and over while nothing is released.
+- `StarvedNeverWaits`: a starved runner never joins the list and never
+  lowers `wanted`; `WithinLimit`.
+
+The last try and the room check each close the same window (a release
+between a charge's first try and its note), so turning either off alone
+passes; turning both off violates `WakeWhenRoom`.
+
+TLC 2.19, two workers, a 2 GiB heap under a 3 GiB scope, on November
+10, 2026, with the code as fixed. A configuration that must fail stops at
+its first violation, so its counts depend on the order two workers find
+states in; each counterexample was read.
+
+| Config | Generated | Distinct | Depth | Result |
+| --- | ---: | ---: | ---: | --- |
+| `BudgetWake_base.cfg` | 11,529,992 | 3,335,756 | 60 | all pass |
+| `BudgetWake_spin_base.cfg` | 11,529,992 | 3,335,756 | 60 | `NoSpin`, `WakeWhenRoom` pass |
+| `BudgetWake_without_owedwake.cfg` | 6,057,176 | 1,919,772 | | `NoSpin` violated: `b` holds 1 taken on its last try after `a`'s release went by unseen, and `a` (need 3, room 2) is woken at once each time it asks |
+| `BudgetWake_without_wokenmark.cfg` | 9,721,001 | 2,927,337 | | `WakeWhenRoom` violated: `b` (need 1) sleeps for good with room 1 while a need of 2 is noted, having ignored a release that woke the runners since its mark |
+| `BudgetWake_without_recheck.cfg` | 316,904 | 111,477 | | `WakeWhenRoom` violated: a release between `b`'s first try and its note goes unseen, and `b` (need 1) sleeps with room 1 |
+| `BudgetWake_lasttry_alone.cfg` | 11,263,661 | 3,264,220 | 60 | all pass |
+| `BudgetWake_roomcheck_alone.cfg` | 5,130,716 | 1,477,232 | 67 | all pass |
+
+### Children and memory: `ChildMemory.tla`
+
+[`tla/ChildMemory.tla`](tla/ChildMemory.tla) is three children of
+`Children` on views of one budget of 3, needing 1, 2 and 4, each paying a
+window of 1 at `Opened`, a child limit of 2, and other connections that
+take 2 and give it back. It checks:
+
+- `CauseMatches`: every `Close` carries the cause Children decided, and a
+  `Refused` report carries the cause of its `Close`.
+- `MemoryClosesNothing`: a child is closed once, and as failed only for a
+  layer error or a need past the whole limit.
+- `StarvedClosesAlone`: a child's need past the limit closes that child;
+  the run goes on and the stack's view records nothing.
+- `WaitTold`, `TellEnds`: while a child waits, the router tells its runner
+  so, and the tell ends at the child's next visit.
+- `ChildWakes`: a waiting child is visited again, whatever its siblings
+  and other connections charge and give back.
+
+The first base run failed `ChildWakes` for a reason in the model: closing
+a starved child kept its window charged, so a sibling waited for room that
+never came. In the code a closed child's window charge goes with its
+`Kid`; the model now gives it back (`Release`), and the base passes.
+
+| Config | Generated | Distinct | Depth | Result |
+| --- | ---: | ---: | ---: | --- |
+| `ChildMemory_base.cfg` | 13,379 | 5,473 | 16 | all pass |
+| `ChildMemory_without_waitonrefusal.cfg` | 83 | 57 | 4 | `MemoryClosesNothing` violated: child 2 (need 2, room 1) is closed as failed |
+| `ChildMemory_without_ownview.cfg` | 70 | 49 | 4 | `StarvedClosesAlone` violated: child 3's need of 4 ends the run |
+| `ChildMemory_without_samecause.cfg` | 147 | 90 | 5 | `CauseMatches` violated: `Close(2, ResourceShortage)` reported `Refused(2, Prohibited)` |
+| `ChildMemory_without_wakeonrelease.cfg` | 5,911 | 2,709 | | `ChildWakes` violated: child 1 waits while the others take and give back 2 for ever |
+| `ChildMemory_without_tellevent.cfg` | 77 | 53 | 4 | `WaitTold` violated: child 2 waits after an event's charge and the count says none |
+
+The muxes map each cause to their wire as the design says, read in the
+code, not modeled: SSH refuses an unconfirmed channel with reason 1 for
+`Prohibited` (and `Done`), 4 for `ResourceShortage` and 2 for `Failed`,
+and closes a confirmed one (`ssh.rs`, `refuse` and the `MuxOp::Close`
+arm); HTTP/2 resets with `REFUSED_STREAM` for `Prohibited` and
+`ResourceShortage`, `INTERNAL_ERROR` for `Failed`, and for `Done` by the
+response's state (`http2.rs`); TCP resets a connection the receiver never
+took and closes one it took (`tcp/engine.rs`); UDP and the observer have
+no wire reason and ignore it.
+
+`Children.tla`'s `BudgetRefuses` still closes a child, at `Opened` and at
+`MuxSend`. After the leftovers that is the behavior for a place or window
+refused at `Opened` (`ResourceShortage`) and for a charge past the child's
+whole limit (`Failed`); a refusal within the limit now waits, which
+`ChildMemory.tla` covers. The `Children` and `Route` configurations
+were not rerun in this pass: the shared machine's queue was given to
+the new models. The trace check, `cargo xtask layer-verify trace`, ran
+on the fixed code: 32 logs replayed, all passed.
+
+### Kani
+
+The crate did not compile under `cfg(kani)`: the TLS layer proof
+(`verification/tls/kani/LayerProof.rs`) still named the write
+accounting's old fields, and `charge_within_takes_what_fits_or_nothing`
+compared two `Refusals`, which have no equality. Both were fixed
+(`3fc05814f`; the TLS harnesses read the renamed fields through two
+helpers and keep every assertion). Then, one harness at a time under an
+8 GiB scope with swap off (Kani 0.68, CBMC 6.11):
+
+| Harness | Unwind | Checks | Result |
+| --- | ---: | ---: | --- |
+| `the_idle_clock_stops_while_memory_waits` (`layer-runtime/kani/lifetime.rs`) | 4 | 247 (3 unreachable) | all pass, 5.3 s |
+| `charge_within_takes_what_fits_or_nothing` | 3 | 1,505 (12 unreachable) | all pass, 142 s; the unwinding assertions hold, so 3 covers every loop |
+| `charge_within_takes_what_fits_or_nothing` | 4 | | out of memory at 8 GiB, with CaDiCaL and with MiniSat (3,382,796 program steps) |
+| `a_view_records_only_its_own_refusals` | 3 | 1,709 | an unwinding assertion fails: 3 is too few; not run at 4 |
+| `starved_is_a_need_over_the_limit_and_never_wakes` | 3 | | out of memory at 8 GiB |
+| `a_repay_pays_before_it_lets_go_and_a_refusal_changes_nothing` (new) | 6 | | out of memory at 8 GiB |
+
+Why they are large: every `try_update` on the budget's atomics
+(`take`'s count, `wanted`, `release`) is a loop of
+`compare_exchange_weak`, which may fail spuriously (that this is why is our
+reading), so CBMC bounds none of them from the code and unrolls each to
+the harness's bound.
+A harness that charges and releases a few times nests several such loops;
+the TLS harness `a_completion_credits_the_pending_write_once_at_its_fence`,
+which has no unwind bound, unrolled the one in `release` 1,724 times
+before it was stopped. The budget harnesses that predate the views ran in
+seconds on the code of their time.
+
+Not run: `a_release_after_a_refusal_wakes_once`,
+`transfer_within_one_budget_never_raises_used`,
+`charges_split_and_drop_within_the_limit`,
+`charges_sum_to_the_budget_and_never_pass_its_limit`, the charged
+container harnesses (`a_charge_becomes_bounded_vector_places`,
+`charged_bytes_capacity_is_its_charge`, `a_refused_growth_changes_nothing`)
+and the framed retries (`encoding_is_not_called_without_its_reservation`,
+`a_refused_write_keeps_its_value_and_writes_once_after_release`,
+`a_refused_packet_keeps_its_value_and_writes_once_after_release`): each
+goes through the same loops, and the machine's shared queue left no room
+to try them after the first ones ran out of memory. The stale Kani files
+are being fixed on `comp/kani-fix`. The way through is to bound the
+loops: a stub of `try_update` with a strong compare-exchange for these
+single-threaded harnesses, or the budget's own update loop on
+`compare_exchange`, which costs nothing on x86. What the harnesses state
+is covered meanwhile by the model test
+`random_calls_keep_cover_sum_order_return_move_and_wake` (`charged.rs`),
+the unit tests in `budget.rs`, and `BudgetWake.tla` for the wake.

@@ -6,11 +6,13 @@ use super::StreamLimits;
 /// [`Session`](super::Session) and the stream adapter share. Each adapter
 /// moves the bytes and reports what happened; this decides.
 ///
-/// The idle limit counts while the stream waits for the peer: input is
-/// open and none is held, no output is held, no work runs, and the stream
-/// does not wait for memory. It starts again each time the stream begins
-/// to wait. The write limit counts while output is held, from the last
-/// byte that went out, whether or not the stream also waits for memory.
+/// A stream is idle only while no byte moves in either direction and
+/// nothing is outstanding: input is open and none is held, no output is
+/// held, no work runs, and the stream does not wait for memory. The idle
+/// limit counts from the first settle that finds it so, and any byte read
+/// or written starts it again. The write limit counts while output is
+/// held, from the last byte that went out, whether or not the stream also
+/// waits for memory.
 pub(super) struct Lifetime {
     limits: StreamLimits,
     /// When the idle limit started counting, while the stream waits.
@@ -67,10 +69,12 @@ impl Lifetime {
         self.idle_from = None;
     }
 
-    /// Bytes went out: the write limit counts again from the next
-    /// [`settle`](Self::settle).
+    /// Bytes went out: the idle limit and the write limit count again from
+    /// the next [`settle`](Self::settle). A stream that sends is not
+    /// idle, even when its peer says nothing.
     pub(super) fn wrote(&mut self) {
         self.stalled_since = None;
+        self.idle_from = None;
     }
 
     /// The adapter stopped for its own work: that time is not spent
@@ -207,8 +211,9 @@ mod tests {
     /// Random steps at random times, against a model of when the stream
     /// was last busy. After every step: the idle deadline is never earlier
     /// than an idle limit after the first settle that found the stream
-    /// quiet since its last busy one, busy being any of output, input,
-    /// work or memory; a settle that finds it waiting for memory leaves no
+    /// quiet since its last busy moment, busy being a byte read or written
+    /// or a settle that found output, input, work or memory outstanding; a
+    /// settle that finds it waiting for memory leaves no
     /// idle deadline; and a twin that sees the same steps without memory
     /// has the same write deadline at every step, so memory never moves it.
     #[test]
@@ -237,6 +242,10 @@ mod tests {
                     other => other,
                 };
                 apply(&mut twin, now, twin_step);
+                // A byte read or written: the stream is not idle.
+                if let Step::TookInput | Step::Wrote = step {
+                    quiet_from = None;
+                }
                 if let Step::Settle(o) = step {
                     if o.output || o.input || o.work || o.memory {
                         quiet_from = None;

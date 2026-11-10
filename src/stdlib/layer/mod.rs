@@ -387,6 +387,16 @@ pub trait Layer: Sized {
         false
     }
 
+    /// Whether a part of this layer waits for memory on a budget its runner
+    /// does not read: a child of [`Children`] whose charge its own view
+    /// refused, until a visit after the release that makes room for it.
+    /// The runner reads its own view's refusals itself; this tells it of
+    /// the others, so that its idle limit does not count while they wait
+    /// (rule 9). A layer made of parts answers for them.
+    fn waits_for_memory(&self) -> bool {
+        false
+    }
+
     /// The port this layer runs over.
     type Lower: Port;
     /// The port this layer offers.

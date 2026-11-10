@@ -42,6 +42,13 @@ where
         }
     }
 
+    fn waits_for_memory(&self) -> bool {
+        match self {
+            Side::Lower(a) => a.waits_for_memory(),
+            Side::Upper(b) => b.waits_for_memory(),
+        }
+    }
+
     fn on_event(
         &mut self,
         env: &mut Env<'_, Self::Report>,
@@ -223,6 +230,10 @@ where
 
     fn is_terminal(&self) -> bool {
         self.layer.as_ref().is_some_and(Layer::is_terminal)
+    }
+
+    fn waits_for_memory(&self) -> bool {
+        self.layer.as_ref().is_some_and(Layer::waits_for_memory)
     }
 
     fn on_event(

@@ -417,7 +417,7 @@ write clock alone:
 
 | Harness | Proves | Unwind | Checks | Result |
 | --- | --- | ---: | ---: | --- |
-| `the_idle_clock_stops_while_memory_waits` | over three settles at symbolic `u8` times, with symbolic `u8` limits and flags: the idle deadline is never earlier than an idle limit after the first settle that found the stream quiet since its last busy one (busy: output, input, work or memory); a settle that finds the stream waiting for memory leaves no idle deadline; a twin that never waits for memory keeps the same write clock | 4 | not run yet | not run yet |
+| `the_idle_clock_stops_while_memory_waits` | over three settles at symbolic `u8` times, with symbolic `u8` limits and flags: the idle deadline is never earlier than an idle limit after the first settle that found the stream quiet since its last busy one (busy: output, input, work or memory); a settle that finds the stream waiting for memory leaves no idle deadline; a twin that never waits for memory keeps the same write clock | 4 | 247 (3 unreachable) | all pass, 5.3 s (November 10, 2026) |
 
 The random model test `the_idle_deadline_never_falls_inside_a_wait_for_memory`
 (`lifetime.rs`) checks the same over 256 seeds of 64 steps, with the
@@ -699,3 +699,150 @@ under an 8 GB memory cap without swap:
 No check failed. Each charges a budget, and CBMC runs out of memory on
 the budget's release and wake path, as recorded in
 `verification/layer/VERIFICATION.md` under "Kani on main `3db7a847e`".
+
+## The runner and memory (November 10, 2026, `comp/fv-layer`)
+
+`StreamRunner.tla` described the runner before the budget redesign: a
+read whose charge the budget refused ended the run with
+`StreamEnd::Budget` after offering the stack a reset. The runner now
+waits for memory instead, and a run ends for memory only when a charge
+needs more than the budget's whole limit (`Starved`), without a reset. The
+model was rewritten to `live.rs` and `lifetime.rs` at main `3db7a847e`:
+
+- The budget is shared: `full` says it has no room now, `Fill` (at most
+  `Fills` times) and `Free` (fair) are the other connections' charges and
+  releases. A round's own refusals are those of the runner's view: the
+  read buffer paid for before a read, the copy that pays for bytes read
+  (refused, the buffer goes on with the bytes, which `InputKept` still
+  counts), and a charge of the stack's, which then takes no input in that
+  round. A refused round that settles registers the runner's wake, or
+  wakes it at once if the room is already there, and stops the idle clock.
+- The stack may ask for more than the whole limit: the run ends with
+  `Budget` at the end of that round, the stack hearing no reset.
+- A child of the stack may wait for memory on its own view; the release
+  that makes room wakes the runner through the child's waiter, and
+  `Layer::waits_for_memory` tells the runner the child waits.
+- The idle clock follows `Lifetime::settle`: it counts from the first
+  settle that finds nothing outstanding, and any byte read or written
+  restarts it (see "One idle rule" below).
+
+`IdleNeedsQuiet` now counts memory, the stack's or a child's, as not
+waiting for the peer. `ResetHeardOnBreak` says a starved run hears no
+reset; `EndsAreEarned` says a `Budget` end comes only from a need past the
+limit. New switches, each with a control: `MemoryStopsIdle`,
+`ChildWaitTold`, `WakeOnRelease`, `StarvedEnds`.
+
+`StreamRunner_base.cfg` keeps the old configuration's sizes with the
+budget never full, and `StreamRunner_memory.cfg` turns memory on (one
+fill, a stack that may starve, a child that may wait) with the stack's
+timer, resets and a stalled peer off, so the run finishes in reasonable
+time on a shared machine. The old controls run on the base; the four new
+ones on the memory configuration.
+
+`StreamRunner_without_childwaittold.cfg` is the runner as it was: its
+counterexample is a bug, fixed in this pass (see
+`verification/layer/VERIFICATION.md`, "the runner's idle clock ran while
+a child waited for memory"). Shortest trace: the run waits two ticks for
+its peer, the budget fills, a round has the child begin to wait for
+memory, and the settle that follows ends the input as idle while the
+child waits.
+
+TLC 2.19, two workers, a 2 GiB heap under a 3 GiB scope, November 10,
+2026, on the code as fixed; each counterexample was read.
+
+| Config | Generated | Distinct | Depth | Result |
+| --- | ---: | ---: | ---: | --- |
+| `StreamRunner_memory.cfg` | 16,735,332 | 163,658 | 50 | every invariant and `Terminates` pass |
+| `StreamRunner_without_childwaittold.cfg` | 11,389,660 | 83,629 | | `IdleNeedsQuiet` violated, the trace above |
+| `StreamRunner_without_memorystopsidle.cfg` | 1,279,234 | 15,482 | | `IdleNeedsQuiet` violated: a round refused for memory settles and the idle limit ends the input while the stack waits |
+| `StreamRunner_without_wakeonrelease.cfg` | 1,165,027 | 13,866 | | `Terminates` violated: the runner waits for memory with no deadline, memory frees, and nothing wakes it |
+| `StreamRunner_without_starvedends.cfg` | 689,976 | 8,806 | | `Terminates` violated: a starved stack is refused in every round and the runner sleeps with no deadline and no wake |
+
+The nine older controls that stop at a violation were rerun on the
+rewritten model (with memory never short), each violating the property
+it names: `_without_finishinput` (`FinishNeedsInput`, 977 distinct),
+`_idleresetonread` (`IdleNeedsQuiet`, 18,728), `_keeppartialrest`
+(`InputKept`, 146), `_readonlywhentaken` (`ReadOnlyWhenTaken`, 746),
+`_reportonce` (`WrittenOnce`, 346), `_resetonbreak`
+(`ResetHeardOnBreak`, 20), `_restartidleonwait` (`IdleNeedsQuiet`,
+13,302), `_stallresetonprogress` (`StallNeedsNoProgress`, 24,850) and
+`_writebeforeend` (`EndAfterWrites`, 76). `StreamRunner_base.cfg`,
+`_halfclose` and `_without_writetimeout`, which explore the whole state
+space, were not finished on the shared machine in this pass: the base
+had reached 30,702 distinct states when it was stopped. They are the
+first to run next.
+
+The model as it stood before this pass was also rerun unchanged:
+`StreamRunner_base.cfg` passed with 27,865,057 generated and 185,569
+distinct states (depth 45), as recorded before; `_halfclose` passed and
+`_without_finishinput` violated `FinishNeedsInput`. The rest of its
+controls were not rerun, the model being replaced.
+
+`DatagramRunner.tla`, unchanged, rerun:
+
+| Config | Generated | Distinct | Result |
+| --- | ---: | ---: | --- |
+| `DatagramRunner_base.cfg` | 56,180 | 9,828 | all pass |
+| `DatagramRunner_without_deadlineinwait.cfg` | 46,426 | 8,650 | `TimerFires` violated |
+| `DatagramRunner_without_droponbudgetmiss.cfg` | 31 | 14 | `ReturnHasReason` violated |
+| `DatagramRunner_without_endclosesoutput.cfg` | 159 | 42 | `NothingAfterEnd` violated |
+| `DatagramRunner_without_oneconversation.cfg` | 1,593 | 322 | `InOrderOnce` violated |
+
+`DatagramRunner.tla` was not changed. Its one budget path, a received
+datagram the budget cannot pay for being dropped and reported, is still
+the code's (`run_datagrams`, `DatagramReport::Dropped`). It does not have
+the stack's own refusals, the wait for memory or `DatagramEnd::Budget`;
+those are the same `driver.refusals()`, `starved_since` and
+`wake_when_freed` calls as the stream runner's, checked there and by
+`a_datagram_stack_refused_memory_runs_again_when_it_frees` and
+`a_datagram_stack_needing_more_than_the_limit_ends_starved_at_once`. Its
+header's line numbers are those of `e2858ccc4`.
+
+## One idle rule (November 10, 2026, `comp/fv-layer`)
+
+A connection is idle only when no byte moved in either direction and
+nothing is outstanding: no output held, no input held, no work, no wait
+for memory. Any byte read or written restarts the idle clock. Before
+this, `Lifetime::wrote` restarted only the write limit, so a stack that
+kept sending to a peer that said nothing had its input ended as idle
+while it sent. `Lifetime::wrote` now restarts both clocks; `Live` and
+`Session` already call it for every byte that goes out, so both follow
+the rule. `StreamLimits::idle` and `Lifetime` say so.
+
+- Test: `a_connection_that_only_sends_is_never_idle`
+  (`services/stack/tests.rs`). A stack writes one byte every 200 ms, five
+  times, to a client that only reads, under an idle limit of 300 ms. Under
+  the old rule its input ended at 300 ms, while it was still sending (last
+  byte at 1 s); under the new one the run finishes when the client closes,
+  after the last byte.
+- `lifetime.rs`'s random model test and the Kani harness
+  `the_idle_clock_stops_while_memory_waits` now count a byte read or
+  written as busy: the idle deadline is never earlier than an idle limit
+  after the first settle that found the stream quiet since its last byte
+  or outstanding work. The harness reads or writes before each of its
+  three settles, symbolically.
+- `StreamRunner.tla`: `IdleResetOnWrite` restarts the idle clock on bytes
+  the transport took, and `IdleNeedsQuiet` counts them as activity. The
+  model's stack only echoed, so a byte never went out without input or
+  held output just before it; `StackMaySpeak` lets it write a byte of its
+  own when its timer fires, and `StreamRunner_speaks.cfg` turns it on.
+  `StreamRunner_without_idleresetonwrite.cfg` is the old rule.
+
+Results, November 10, 2026, one heavy job at a time (Cargo and Kani
+under 8 GiB, TLC under 3 GiB with two workers and a 2 GiB heap):
+
+- `a_connection_that_only_sends_is_never_idle`: fails under the old rule
+  ("input ended at 300ms, while the stack was still sending (last byte at
+  1s)"), passes under the new; all 63 `services::stack` tests pass.
+- `the_idle_clock_stops_while_memory_waits` (Kani): 269 checks (3
+  unreachable), all pass, 4.6 s.
+
+| Config | Generated | Distinct | Depth | Result |
+| --- | ---: | ---: | ---: | --- |
+| `StreamRunner_speaks.cfg` | 5,605,390 | 44,224 | 51 | every invariant and `Terminates` pass |
+| `StreamRunner_without_idleresetonwrite.cfg` | 2,323,600 | 16,446 | 13 | `IdleNeedsQuiet` violated: the stack's own byte goes out at 1, quiet starts then, and the idle limit counted from 0 ends the input at 2 |
+| `StreamRunner_memory.cfg` | 16,735,332 | 163,658 | 50 | all pass (before `StackMaySpeak` was added; with it off the model is the same) |
+| `StreamRunner_without_idleresetonread.cfg` | 1,401,753 | 18,780 | 9 | `IdleNeedsQuiet` violated |
+| `StreamRunner_without_restartidleonwait.cfg` | 949,474 | 13,287 | 8 | `IdleNeedsQuiet` violated |
+| `StreamRunner_without_childwaittold.cfg` | 1,242,266 | 14,784 | 8 | `IdleNeedsQuiet` violated |
+| `StreamRunner_without_memorystopsidle.cfg` | 1,280,202 | 15,499 | 7 | `IdleNeedsQuiet` violated |

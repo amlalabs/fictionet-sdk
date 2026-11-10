@@ -262,7 +262,7 @@ fn charges_sum_to_the_budget_and_never_pass_its_limit() {
 /// left if that covers its start, else nothing, changing nothing but the
 /// count of refusals. Over every `u8` limit, charge held and range.
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(3)]
 fn charge_within_takes_what_fits_or_nothing() {
     let limit: u8 = kani::any();
     let budget = Budget::new(limit as usize);
@@ -853,6 +853,50 @@ fn work_cancellation_stays_with_its_owner() {
 
 /// A copied edit preserves its sibling, is reserved before allocation, and
 /// returns both reservations when the owners leave.
+/// `Chunk::repay` pays the new budget before the old one lets go, and a
+/// refusal changes nothing. Four bytes of any value paid by one budget,
+/// moved to another with any room left, whole (moved in place) or as a
+/// two-byte piece that shares its backing (copied); and repaid to the
+/// budget that pays for them already. Over every `u8` room.
+#[kani::proof]
+#[kani::unwind(6)]
+fn a_repay_pays_before_it_lets_go_and_a_refusal_changes_nothing() {
+    let bytes: [u8; 4] = kani::any();
+    let room: u8 = kani::any();
+    kani::assume(room <= 8);
+    let from = Budget::new(4);
+    let to = Budget::new(8);
+    let held = to.charge(usize::from(8 - room)).unwrap();
+    let whole: bool = kani::any();
+    let mut chunk = ChargedBytes::copy_of(&from, &bytes).unwrap().into_chunk();
+    let mut rest = (!whole).then(|| chunk.split_to(2));
+    let want = if whole { 4 } else { 2 };
+    let (before, used_from, used_to) = (chunk.to_vec(), from.used(), to.used());
+
+    // Repaying the budget that pays already never raises it.
+    assert!(chunk.repay(&from));
+    assert!(from.used() <= used_from);
+    assert_eq!((&*chunk, to.used()), (&before[..], used_to));
+    let used_from = from.used();
+
+    let paid = chunk.repay(&to);
+    assert_eq!(paid, want <= usize::from(room));
+    assert_eq!(&*chunk, &before[..]);
+    if paid {
+        assert_eq!(to.used(), used_to + chunk.charged());
+        assert!(chunk.charged() >= chunk.len());
+        // Moved whole, the old budget lets go; copied, the piece left
+        // behind keeps what it shares.
+        assert_eq!(from.used(), if whole { 0 } else { used_from });
+    } else {
+        assert_eq!((from.used(), to.used()), (used_from, used_to));
+    }
+    drop(rest.take());
+    drop(chunk);
+    drop(held);
+    assert_eq!((from.used(), to.used()), (0, 0));
+}
+
 #[kani::proof]
 #[kani::unwind(6)]
 fn a_shared_chunk_edit_preserves_ownership_and_budget() {
