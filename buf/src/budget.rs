@@ -229,6 +229,29 @@ impl Budget {
         }
     }
 
+    /// A [`view`](Self::view) of this budget made in `spare`'s record,
+    /// cleared, when nothing else holds that record: no clone of `spare`,
+    /// and no charge or container made through it. Then nothing is
+    /// allocated, and no refusal of `spare`'s can reach the new view. When
+    /// something still holds it, that holder keeps it, and the view is
+    /// made new. `spare` may be a view of another budget: only its record
+    /// is used again. For an owner that makes views and lets them go, as a
+    /// router does for its children.
+    pub fn view_in(&self, mut spare: Budget) -> Budget {
+        let Some(record) = Arc::get_mut(&mut spare.view) else {
+            return self.view();
+        };
+        *record = View::default();
+        Budget {
+            inner: self.inner.clone(),
+            view: spare.view,
+        }
+    }
+
+    /// What a view's record holds on the heap, its two counts included:
+    /// the fixed state of an owner that keeps one ([`view_in`](Self::view_in)).
+    pub const VIEW_BYTES: usize = 2 * size_of::<usize>() + size_of::<View>();
+
     /// A budget that never refuses, for code that is not limited.
     pub fn unlimited() -> Budget {
         Budget::new(usize::MAX)

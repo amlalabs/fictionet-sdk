@@ -798,3 +798,43 @@ fn backings_dropped_on_many_threads_come_back_consistent() {
     assert_eq!(budget.used(), pool.charged());
     assert!(pool.free() <= MOST);
 }
+
+/// A view made in a spare's record is a view of the budget it was made
+/// from, whatever budget the spare viewed, and sees only its own
+/// refusals: never one made through a charge that still held the spare,
+/// nor one the spare saw before.
+#[test]
+fn a_view_made_in_a_spare_sees_only_its_own_refusals() {
+    let first = Budget::new(64);
+    let second = Budget::new(64);
+    // A spare nothing else holds, which saw a refusal of its own.
+    let spare = first.view();
+    let mark = spare.refusals();
+    assert!(spare.charge(65).is_none());
+    assert!(spare.starved_since(mark).is_some());
+    let view = second.view_in(spare);
+    let mark = view.refusals();
+    let charge = view.charge(16).expect("room in the second budget");
+    assert_eq!((first.used(), second.used()), (0, 16));
+    assert!(!view.refused_since(mark));
+    // A spare a charge still holds stays that charge's: the view made
+    // in its place does not see what the charge is refused.
+    let view = first.view_in(charge.budget().clone());
+    let mark = view.refusals();
+    let mut charge = charge;
+    let theirs = charge.budget().refusals();
+    assert!(!charge.grow_to(65), "past the second budget's limit");
+    assert!(
+        charge.budget().refused_since(theirs),
+        "the charge's view sees it"
+    );
+    assert!(
+        !view.refused_since(mark),
+        "the charge's refusal is not the new view's"
+    );
+    assert!(view.starved_since(mark).is_none());
+    let held = view.charge(8).expect("room in the first budget");
+    assert_eq!((first.used(), second.used()), (8, 16));
+    drop((held, charge));
+    assert_eq!((first.used(), second.used()), (0, 0));
+}
