@@ -464,7 +464,6 @@ name = "fictionet"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "fictionet-buf",
  "fictionet-rustls",
  "getrandom 0.4.3",
  "hickory-proto",
@@ -477,17 +476,13 @@ dependencies = [
  "ring",
  "rsa",
  "rustls-pki-types",
- "slab",
  "smoltcp",
  "tokio",
+ "tower-service",
  "wasm-bindgen",
  "web-time",
  "x25519-dalek",
 ]
-
-[[package]]
-name = "fictionet-buf"
-version = "0.1.0"
 
 [[package]]
 name = "fictionet-cli"
@@ -517,6 +512,7 @@ dependencies = [
  "fictionet-codegen-golden",
  "fictionet-rustls",
  "http",
+ "http-body-util",
  "libfuzzer-sys",
  "tokio",
  "tower-service",
@@ -685,6 +681,19 @@ checksum = "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c"
 dependencies = [
  "bytes",
  "http",
+]
+
+[[package]]
+name = "http-body-util"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "pin-project-lite",
 ]
 
 [[package]]
