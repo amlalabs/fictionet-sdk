@@ -614,25 +614,43 @@ impl DynamicTable {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    /// Allocated dynamic-table storage, including entry slots and string capacity.
+    /// Allocated dynamic-table storage: the entry slots, each value, and
+    /// each name in its shared allocation, with that allocation's header
+    /// and padding. A name entries share is counted for each of them.
     pub fn held(&self) -> usize {
         self.entries.capacity() * size_of::<Slot>()
             + self
                 .entries
                 .iter()
-                .map(|(name, value)| name.len() + value.len())
+                .map(|(name, value)| shared_len(name.len()) + value.len())
                 .sum::<usize>()
+    }
+    /// The most the table allocates at any moment from now while each
+    /// insert comes after an [`evict`](Self::evict) to `capacity`:
+    /// [`most_held`](Self::most_held)`(capacity)`, or more when the slots
+    /// grew for a larger capacity before. Slots are never given back, so
+    /// those stay beside entries of at most `capacity`. Slots at least as
+    /// many as the entries that fit `capacity` never double again; fewer
+    /// are a count `most_held` already covers.
+    pub fn most_held_at(&self, capacity: usize) -> usize {
+        Self::most_held(capacity).max(
+            self.entries
+                .capacity()
+                .saturating_mul(size_of::<Slot>())
+                .saturating_add(capacity),
+        )
     }
     /// The most the table allocates at any moment while each insert comes
     /// after an [`evict`](Self::evict) that made room for its entry within
-    /// `capacity`, as [`Table`] and [`Encoder`] do. The entries fit
-    /// `capacity`: at most `capacity / ENTRY_OVERHEAD` of them, whose
-    /// octets come to at most `capacity`. The slots start at four and
-    /// double only when an insert finds them all full, so they reach at
-    /// most twice the entries. While they double, the old slots and the new
-    /// are both allocated. Room was made first, so the old ones were fewer
-    /// than the entries that fit: the most such count of four doubled,
-    /// three times over, for that moment.
+    /// `capacity`, as [`Table`] and [`Encoder`] do, if its capacity was
+    /// never larger ([`most_held_at`](Self::most_held_at) if it was). The
+    /// entries fit `capacity`: at most `capacity / ENTRY_OVERHEAD` of them,
+    /// whose octets, with each name's header, come to at most `capacity`.
+    /// The slots start at four and double only when an insert finds them
+    /// all full, so they reach at most twice the entries. While they
+    /// double, the old slots and the new are both allocated. Room was made
+    /// first, so the old ones were fewer than the entries that fit: the
+    /// most such count of four doubled, three times over, for that moment.
     pub fn most_held(capacity: usize) -> usize {
         let entries = capacity / ENTRY_OVERHEAD;
         let mut old: usize = 0;
@@ -739,8 +757,10 @@ impl Table {
     /// The most [`held`](Self::held) reaches while neither the settings
     /// limit nor the table's capacity rises above what it is now: the
     /// peer can raise the capacity to the settings limit at any block.
+    /// Slots grown before the capacity fell stay, and are counted
+    /// ([`DynamicTable::most_held_at`]).
     pub fn most_held(&self) -> usize {
-        DynamicTable::most_held(self.settings.max(self.max))
+        self.table.most_held_at(self.settings.max(self.max))
     }
     /// The number of retained table entries.
     pub fn table_len(&self) -> usize {
@@ -924,6 +944,16 @@ fn keep(
     Ok(())
 }
 
+/// What a shared name of `len` octets allocates: its two counts, then its
+/// octets, padded to the counts' alignment.
+fn shared_len(len: usize) -> usize {
+    (2 * size_of::<usize>() + len).next_multiple_of(align_of::<usize>())
+}
+
+// A name's header and padding fit within the overhead each entry is
+// counted with, so the entries' storage stays within their size.
+const _: () = assert!(2 * size_of::<usize>() + align_of::<usize>() - 1 <= ENTRY_OVERHEAD);
+
 /// A name for a table entry, decoded into an allocation of its own that
 /// entries can share.
 fn shared(text: Text<'_>) -> Result<Arc<[u8]>, Error> {
@@ -974,9 +1004,11 @@ impl Encoder {
     }
     /// The most [`held`](Self::held) reaches while the table's capacity
     /// stays at most what it is now: it rises only by
-    /// [`set_capacity`](Self::set_capacity).
+    /// [`set_capacity`](Self::set_capacity). Slots grown before the
+    /// capacity fell stay, and are counted
+    /// ([`DynamicTable::most_held_at`]).
     pub fn most_held(&self) -> usize {
-        DynamicTable::most_held(self.table.max)
+        self.table.table.most_held_at(self.table.max)
     }
     /// Applies the peer's settings limit, capped at [`MAX_TABLE`].
     /// A reduction shrinks the table and queues the required size update.

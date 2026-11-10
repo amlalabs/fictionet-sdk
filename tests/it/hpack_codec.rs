@@ -12,7 +12,7 @@ use fictionet::stdlib::{
 };
 use fictionet::{Budget, Chunk, stdlib::protocols::fields::Fields};
 
-use crate::common::alloc::measuring;
+use crate::common::alloc::{left_allocated, measuring};
 
 #[test]
 fn wire_contracts_and_collection_at_eof() {
@@ -204,4 +204,65 @@ fn an_encoder_entry_larger_than_the_table_is_not_copied_for_it() {
         "the table holds {} bytes, past its bound of {charge}",
         encoder.held()
     );
+}
+
+/// Forty entries of a few octets: they fit a table of 4096, and their
+/// slots double from four to 64.
+fn forty_fields() -> Vec<Field> {
+    (0..40).map(|i| Field::new(format!("x-{i}"), "v")).collect()
+}
+
+/// What a table leaves allocated, counted, is within what `held()` says,
+/// and that within `most_held()`.
+fn within_its_bounds(what: &str, live: i128, held: usize, most: usize) {
+    assert!(
+        live <= held as i128,
+        "{what}: {live} bytes allocated, past held() of {held}"
+    );
+    assert!(
+        held <= most,
+        "{what}: held() of {held}, past most_held() of {most}"
+    );
+}
+
+/// A decoder's table whose capacity falls keeps the slots it grew at the
+/// larger capacity, and `most_held()` counts them: forty entries grow 64
+/// slots at 4096, then SETTINGS lower the limit to 64 and the size update
+/// it requires leaves one entry in them.
+#[test]
+fn a_decoder_table_lowered_stays_within_most_held() {
+    let mut encoder = Encoder::new(4096);
+    let mut first = Vec::new();
+    encoder.encode_block(&forty_fields(), &mut first).unwrap();
+    // A size update to 64: 31 in the five-bit prefix, then 33.
+    let lowered = [0x3f, 0x21];
+    let decode = |table: &mut Table, block: &[u8]| {
+        let mut fields = Fields::new();
+        table
+            .decode_block(block, &mut fields, &Budget::unlimited(), hpack::MAX_DECODED)
+            .unwrap();
+    };
+    let (table, live) = left_allocated(|| {
+        let mut table = Table::new(4096);
+        decode(&mut table, &first);
+        table.set_settings_limit(64);
+        decode(&mut table, &lowered);
+        table
+    });
+    assert_eq!(table.table_capacity(), 64, "the size update lowered it");
+    within_its_bounds("decoder", live, table.held(), table.most_held());
+}
+
+/// The same for an encoder whose capacity falls.
+#[test]
+fn an_encoder_table_lowered_stays_within_most_held() {
+    let fields = forty_fields();
+    let mut out = Vec::with_capacity(Encoder::new(4096).block_bound(&fields).unwrap());
+    let (encoder, live) = left_allocated(|| {
+        let mut encoder = Encoder::new(4096);
+        encoder.encode_block(&fields, &mut out).unwrap();
+        encoder.set_capacity(64).unwrap();
+        encoder
+    });
+    within_its_bounds("encoder", live, encoder.held(), encoder.most_held());
 }

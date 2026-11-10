@@ -104,22 +104,18 @@ fn read(out: &Fields) -> Decoded {
     }
 }
 
-/// [`decode`] as a costed step. The table's charge is held as the server
-/// holds it: `most_held()` when the session opens, raised when that rises,
-/// never given back (`Costs::held_charge`). `most_held()` alone is not a
-/// bound once the limit has fallen: the entry slots the table grew stay.
-/// The head block, made before the step, is the budget's; growing it
-/// would be the step's own charge.
+/// [`decode`] as a costed step. The table's charge is `most_held()` as it
+/// is before the step, a bound even once the limit has fallen, since it
+/// counts the entry slots the table grew before. The server holds less
+/// tightly: it charges `most_held()` when the connection opens and never
+/// gives it back. The head block, made before the step, is the budget's;
+/// growing it would be the step's own charge.
 fn decode_costed(table: &mut Table, block: &[u8], costs: &mut Costs) -> Result<Decoded, Error> {
     // The budget is the connection's, made before its blocks.
     let budget = Budget::unlimited();
     let bound = table.most_block(block.len(), MAX_DECODED).bytes();
     let mut out = Fields::in_block(Chunk::block(&budget, 0, bound.max(1)).unwrap());
-    let (charge, linear, before) = (
-        costs.held_charge(table.most_held()),
-        decoding(table),
-        out.charged(),
-    );
+    let (charge, linear, before) = (table.most_held(), decoding(table), out.charged());
     let result = costs.step(block.len(), charge, linear, || {
         let value = table.decode_block(block, &mut out, &budget, MAX_DECODED);
         Charged {
@@ -321,14 +317,14 @@ fn encoder() {
             if let Some(limit) = step.get("settings") {
                 // The SETTINGS acknowledgment goes out before the next block,
                 // so the decoder applies the limit before reading it.
-                let charge = costs.held_charge(encoder.most_held());
+                let charge = encoder.most_held();
                 costs.step(0, charge, NOTHING, || Charged {
                     value: encoder.set_settings_limit(size(limit)),
                     charged: 0,
                 });
                 table.set_settings_limit(size(limit));
             } else if let Some(capacity) = step.get("capacity") {
-                let charge = costs.held_charge(encoder.most_held());
+                let charge = encoder.most_held();
                 let got = costs.step(0, charge, NOTHING, || Charged {
                     value: encoder.set_capacity(size(capacity)),
                     charged: 0,
@@ -342,7 +338,7 @@ fn encoder() {
                 // that writes into a charged block does.
                 let mut out = Vec::with_capacity(encoder.block_bound(&given).unwrap_or(0));
                 let input = given.iter().map(|f| f.name.len() + f.value.len() + 1).sum();
-                let (charge, linear) = (costs.held_charge(encoder.most_held()), encoding(&encoder));
+                let (charge, linear) = (encoder.most_held(), encoding(&encoder));
                 let got = costs.step(input, charge, linear, || Charged {
                     value: encoder.encode_block(&given, &mut out),
                     charged: 0,
