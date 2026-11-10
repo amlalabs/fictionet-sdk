@@ -390,11 +390,13 @@ def rejectName : Http.Reject → String
   | .unsupportedTransferCoding => "UnsupportedTransferCoding"
 
 /-- List elements written into one or two field lines named `name`, with
-empty elements here and there. -/
-def listFields (name : String) (elems : List String) : G (List Bytes) := do
+empty elements here and there when `empties` (for `Transfer-Encoding`:
+`Request.lean` reads an empty `Content-Length` element as an invalid one,
+so none is written there). -/
+def listFields (name : String) (elems : List String) (empties : Bool) : G (List Bytes) := do
   let mut parts : List String := []
   for e in elems do
-    if ← chance 5 then parts := parts ++ [""]
+    if empties && (← chance 5) then parts := parts ++ [""]
     parts := parts ++ [e]
   if parts.isEmpty then parts := [← pick #["", ",", " "]]
   let cut ← rNat (parts.length + 1)
@@ -426,10 +428,10 @@ def framingCase : G Json := do
   let mut fields : List Bytes := [str "Host: a.test"]
   if let some cs := te then
     let names ← cs.mapM fun c => if c then pure "chunked" else pick #["gzip", "deflate", "x-custom"]
-    fields := fields ++ (← listFields "Transfer-Encoding" names)
+    fields := fields ++ (← listFields "Transfer-Encoding" names true)
   if let some ls := cl then
     let names := ls.map fun l => match l with | some n => toString n | none => "x1"
-    let cls ← listFields "Content-Length" names
+    let cls ← listFields "Content-Length" names false
     fields := if ← chance 2 then fields ++ cls else cls ++ fields
   let start := str ("POST / " ++ (if v == .h10 then "HTTP/1.0" else "HTTP/1.1"))
   let head := line start ++ fields.flatMap line ++ crlf

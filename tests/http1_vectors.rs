@@ -229,3 +229,45 @@ fn responses() {
         })
     });
 }
+
+/// `framing.json`: heads written from the abstract framing fields of
+/// `Request.lean`, with what its `requestFraming` says of them. The decoder
+/// must refuse with the same reason, or read the one message with the body
+/// the framing gives.
+#[test]
+fn framing() {
+    cases("framing", |i, case| {
+        let input = bytes(&case["input"]);
+        let (events, stop) = replay(
+            RequestEvents::new(),
+            &input,
+            true,
+            None,
+            |h: &RequestHead, _| json!(h.method()),
+            |e| json!(format!("{:?}", e.reason())),
+        );
+        let expect = &case["expect"];
+        let got = if let Some(reason) = stop.get("failed") {
+            json!({ "error": reason })
+        } else {
+            let body: Vec<u8> = events
+                .iter()
+                .filter_map(|e| e.get("body"))
+                .flat_map(bytes)
+                .collect();
+            let heads = events.iter().filter(|e| e.get("head").is_some()).count();
+            let dones = events.iter().filter(|e| e.get("done").is_some()).count();
+            if heads != 1 || dones != 1 || stop.get("ended").is_none() {
+                json!({ "messages": heads, "done": dones, "stop": stop })
+            } else {
+                json!({ "body": body })
+            }
+        };
+        (got != *expect).then(|| {
+            format!(
+                "case {i}: input {:?}\n  rust:  {got}\n  Request.lean: {expect}",
+                String::from_utf8_lossy(&input)
+            )
+        })
+    });
+}
