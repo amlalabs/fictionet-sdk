@@ -199,7 +199,7 @@ pub trait Connection: Send + 'static {
     /// chunk over instead of copying it into `buf`: [`Read::Owned`], never
     /// empty and never longer than `buf`. It is still charged to whatever
     /// paid for it; the caller moves it to its own budget with
-    /// [`Chunk::recharge`] before keeping it. `Read::Copied(0)` means the
+    /// [`Chunk::repay`] before keeping it. `Read::Copied(0)` means the
     /// other side will send nothing more. The default reads into `buf`.
     fn poll_read_owned(
         &mut self,

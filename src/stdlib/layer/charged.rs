@@ -225,10 +225,15 @@ impl std::io::Write for ChargedBytes {
     }
 }
 
+/// The places an empty queue or vector grows to first when the budget has
+/// room. An owner that gives places back after a burst keeps this many to
+/// stay where its first push left it.
+pub const FIRST_PLACES: usize = 4;
+
 /// The places a queue grows to when it is full and the budget has room:
-/// twice as many, at least four, at most `most`.
+/// twice as many, at least [`FIRST_PLACES`], at most `most`.
 fn more_places(places: usize, most: usize) -> usize {
-    places.saturating_mul(2).max(4).min(most)
+    places.saturating_mul(2).max(FIRST_PLACES).min(most)
 }
 
 /// Charges the places a container of `places` places grows by to hold
@@ -510,7 +515,9 @@ impl<T> ChargedVec<T> {
             return Err(item);
         }
         if len == self.items.capacity() {
-            let Some(more) = charge_places(&mut self.charge, len, len + 1, self.most, size_of::<T>()) else {
+            let Some(more) =
+                charge_places(&mut self.charge, len, len + 1, self.most, size_of::<T>())
+            else {
                 return Err(item);
             };
             self.items.reserve_exact(more);
@@ -1317,13 +1324,21 @@ mod tests {
                     };
                     let (len, places) = (deque.len(), deque.places());
                     let wanted = len + additional;
-                    let grown = more_places(places, deque.most).max(wanted);
                     let fits = wanted <= deque.most
-                        && (wanted <= places || grown * size_of::<u64>() - deque.charged() <= room);
+                        && (wanted <= places || (wanted - places) * size_of::<u64>() <= room);
+                    // Growth doubles, or goes to what is asked if that is
+                    // more, when there is room, else takes the places
+                    // there is room for, never fewer than asked.
+                    let grown = more_places(places, deque.most)
+                        .max(wanted)
+                        .min(places + room / size_of::<u64>());
                     let reserved = deque.reserve(additional);
                     assert_eq!(reserved, fits);
                     if reserved {
-                        assert!(deque.places() >= wanted);
+                        assert_eq!(
+                            deque.places(),
+                            if wanted <= places { places } else { grown }
+                        );
                         for item in 0..additional as u64 {
                             assert!(deque.push_back(item).is_ok(), "a reserved place refused");
                         }

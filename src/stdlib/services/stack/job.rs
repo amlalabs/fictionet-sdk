@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use fictionet::stdlib::layer::{
-    Budget, ChargedDeque, ChildId, ChildWork, Driver, Layer, OwnedWork, Side, Worker,
+    Budget, ChargedDeque, ChildId, ChildWork, Driver, FIRST_PLACES, Layer, OwnedWork, Side, Worker,
 };
 use fictionet::time::Instant;
 use fictionet::{Cx, Entropy};
@@ -295,8 +295,9 @@ impl<W: Job> Jobs<W> {
             }
         }
         if self.running.len() < before {
-            // Keep one place for the next check of the stack's work.
-            self.running.shrink_to(1);
+            // Keep the places an idle table made for its first check of
+            // the stack's work, so a burst that ends leaves it as it was.
+            self.running.shrink_to(FIRST_PLACES);
         }
         Ok(finished)
     }
