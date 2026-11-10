@@ -373,6 +373,8 @@ struct Kid<B: Layer> {
     /// What pays for the memory of the bytes in its receive window, shared
     /// by every chunk that waits in it.
     window: Arc<Charge>,
+    /// The window went to the mux with the first credit.
+    lent: bool,
     max_command: u64,
     /// Credit the mux may still use for this child's events.
     granted: u64,
@@ -961,7 +963,16 @@ where
         kid.owed += kid.wake.take_released();
         if kid.owed > 0 {
             if self.places.down.len() < QUEUE {
-                self.places.down.push_back(kid.handle.grant(kid.owed));
+                // The first credit lends the mux the window that pays for
+                // every byte it lets come up, so the mux can make them in
+                // it.
+                let grant = if kid.lent {
+                    kid.handle.grant(kid.owed)
+                } else {
+                    kid.lent = true;
+                    kid.handle.lend_window(kid.owed, &kid.window)
+                };
+                self.places.down.push_back(grant);
                 kid.granted += kid.owed;
                 kid.owed = 0;
                 moved = true;
@@ -1061,6 +1072,7 @@ where
                     waiter,
                     window,
                     max_command,
+                    lent: false,
                     granted: 0,
                     owed: self.window,
                     credit: 0,
@@ -2574,6 +2586,68 @@ mod tests {
         driver.run().unwrap();
         assert_eq!(held(&driver), FLOOR);
         assert_eq!(budget.used(), idle);
+    }
+
+    /// The first credit lends the mux the child's receive window, and
+    /// bytes the mux makes in it are taken in with nothing charged or
+    /// given back. The window stays the router's: once the child closes,
+    /// what the mux kept of it no longer reaches it.
+    #[test]
+    fn the_first_credit_lends_the_window_and_bytes_made_in_it_move_no_charge() {
+        let budget = Budget::new(100_000);
+        let child_budget = budget.clone();
+        let mut driver = Driver::new(
+            Children::<Reader, Top, ()>::new(1, 8, |_, (), _| Some(Reader::default()))
+                .budgets(move |_, _, _| child_budget.clone()),
+            Arc::new(SeededEntropy::new(Seed::from_u64(96))),
+            Budget::unlimited(),
+            Instant::ZERO,
+        );
+        let child = Slots::new(1).insert(()).unwrap();
+        let id = child.id();
+        let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
+        driver.run().unwrap();
+        let mut lent = None;
+        while let Some(command) = driver.take_command() {
+            match command.into_op() {
+                super::super::MuxOp::Window(found, units, window) if found == id => {
+                    lent = Some((units, window));
+                }
+                super::super::MuxOp::Credit(found, _) if found == id => {
+                    panic!("the first credit lends the window");
+                }
+                _ => {}
+            }
+        }
+        let (units, kept) = lent.expect("the first credit went to the mux");
+        assert_eq!(units, 8);
+        let window = kept.upgrade().expect("the child keeps its window");
+        assert_eq!(
+            window.bytes(),
+            <StreamEvent as Credited>::receive_bytes(8).unwrap()
+        );
+
+        let used = budget.used();
+        let bytes = Chunk::in_window(vec![1; 8], window.clone());
+        drop(window);
+        let _ = driver
+            .deliver(MuxEvent::Child(id, StreamEvent::Data(bytes)))
+            .unwrap();
+        driver.run().unwrap();
+        let layer = driver.layer();
+        let inbox = layer.places.kids[layer.key(id).unwrap()].inbox.charged();
+        assert_eq!(
+            budget.used(),
+            used + inbox,
+            "the bytes charged or gave back nothing; the inbox paid for its places"
+        );
+        assert_eq!(layer.child(id).unwrap().held.as_deref(), Some(&[1; 8][..]));
+
+        let _ = driver.deliver(MuxEvent::Closed(id)).unwrap();
+        assert!(
+            kept.upgrade().is_none(),
+            "the window went back with the child"
+        );
     }
 
     #[test]

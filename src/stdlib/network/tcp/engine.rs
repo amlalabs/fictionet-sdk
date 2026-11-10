@@ -18,6 +18,7 @@
 use super::*;
 
 use core::convert::Infallible;
+use std::sync::Weak;
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
@@ -664,6 +665,11 @@ pub(super) struct Conn {
     live: bool,
     /// Bytes the layer above lets come up.
     recv_credit: u64,
+    /// The receive window the layer above lent for its child's bytes
+    /// ([`MuxOp::Window`]): while it keeps it, they come up made in it,
+    /// already paid for on the child's budget, instead of charged to the
+    /// endpoint's.
+    window: Option<Weak<Charge>>,
     /// Send-buffer room granted to the layer above and not yet used.
     send_granted: u64,
     /// [`StreamEvent::Ended`] went up.
@@ -700,10 +706,29 @@ impl Conn {
             request: None,
             live: false,
             recv_credit: 0,
+            window: None,
             send_granted: 0,
             ended_sent: false,
             reset_sent: false,
             released: false,
+        }
+    }
+}
+
+/// Copies what `socket` received into `into`, up to its capacity, straight
+/// out of the socket's ring, which may hand the bytes over in two pieces,
+/// into memory nothing zeroed first.
+fn recv_into(socket: &mut stcp::Socket<'static>, into: &mut Vec<u8>) {
+    while into.len() < into.capacity() && socket.can_recv() {
+        let took = socket
+            .recv(|data| {
+                let take = data.len().min(into.capacity() - into.len());
+                into.extend_from_slice(&data[..take]);
+                (take, take)
+            })
+            .unwrap_or(0);
+        if took == 0 {
+            break;
         }
     }
 }
@@ -2269,34 +2294,35 @@ impl TcpLayer {
         let mut moved = false;
         while c.recv_credit > 0 && s.can_recv() && self.up.len() < UP_ROOM {
             let n = (c.recv_credit as usize).min(s.recv_queue()).min(DATA_MAX);
-            let Some(mut bytes) = ChargedBytes::with_capacity_within(budget, 1..=n) else {
-                break;
-            };
-            // Copied straight out of the socket's ring, which may hand the
-            // bytes over in two pieces, into memory nothing zeroed first.
-            while bytes.room() > 0 && s.can_recv() {
-                let took = s
-                    .recv(|data| {
-                        let take = data.len().min(bytes.room());
-                        match bytes.extend_within(&data[..take]) {
-                            Ok(()) => (take, take),
-                            Err(_) => (0, 0),
-                        }
-                    })
-                    .unwrap_or(0);
-                if took == 0 {
-                    break;
+            // In the window the layer above lent, which paid for every
+            // byte its credit lets come up. Otherwise charged to the
+            // endpoint's budget, taking as much as it has room for.
+            let chunk = match c.window.as_ref().and_then(Weak::upgrade) {
+                Some(window) => {
+                    let mut bytes = Vec::with_capacity(n);
+                    recv_into(s, &mut bytes);
+                    Chunk::in_window(bytes, window)
                 }
-            }
-            let got = bytes.len();
+                None => {
+                    let Some(mut bytes) = ChargedBytes::with_capacity_within(budget, 1..=n) else {
+                        break;
+                    };
+                    bytes
+                        .fill(|into| {
+                            recv_into(s, into);
+                            Ok::<_, Infallible>(())
+                        })
+                        .expect("a receive stops at the capacity");
+                    Chunk::from_bytes(bytes)
+                }
+            };
+            let got = chunk.len();
             if got == 0 {
                 break;
             }
             c.recv_credit -= got as u64;
-            self.up.push_back(MuxEvent::Child(
-                id,
-                StreamEvent::Data(Chunk::from_bytes(bytes)),
-            ));
+            self.up
+                .push_back(MuxEvent::Child(id, StreamEvent::Data(chunk)));
             moved = true;
         }
         if moved {
@@ -2526,6 +2552,21 @@ impl TcpLayer {
             return Some(true);
         }
         (s.send_capacity() - s.send_queue() < chunk.len()).then_some(false)
+    }
+
+    /// Lets `units` more bytes come up for child `id`, in `window` from now
+    /// on if the layer above lent one.
+    fn credit(&mut self, env: &Env<'_, ()>, id: ChildId, units: u64, window: Option<Weak<Charge>>) {
+        let Some(h) = self.open_socket(id) else {
+            return;
+        };
+        let c = self.conns.get_mut(&h).unwrap();
+        c.recv_credit = c.recv_credit.saturating_add(units);
+        if window.is_some() {
+            c.window = window;
+        }
+        self.sockets.mark(h);
+        self.refresh_all(env.budget());
     }
 
     /// The socket of child `id`, while the layer above holds the child.
@@ -2839,14 +2880,8 @@ impl Layer for TcpLayer {
                 let h = self.open_socket(id).expect("admitted");
                 self.abort(h);
             }
-            MuxOp::Credit(id, units) => {
-                if let Some(h) = self.open_socket(id) {
-                    let c = self.conns.get_mut(&h).unwrap();
-                    c.recv_credit = c.recv_credit.saturating_add(units);
-                    self.sockets.mark(h);
-                    self.refresh_all(env.budget());
-                }
-            }
+            MuxOp::Credit(id, units) => self.credit(env, id, units, None),
+            MuxOp::Window(id, units, window) => self.credit(env, id, units, Some(window)),
             MuxOp::Close(id) => {
                 if let Some(h) = self.open_socket(id) {
                     self.orphan(h, false);

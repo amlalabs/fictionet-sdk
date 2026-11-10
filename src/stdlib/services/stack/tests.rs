@@ -1103,7 +1103,7 @@ impl Layer for StreamChild {
                 assert!(self.slots.contains(child));
                 self.outgoing = Some(command);
             }
-            MuxOp::Credit(child, n) => {
+            MuxOp::Credit(child, n) | MuxOp::Window(child, n, _) => {
                 assert_eq!(child, self.child);
                 self.receive_credit += n;
             }
