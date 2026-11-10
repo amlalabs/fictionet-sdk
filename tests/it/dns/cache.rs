@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::protocols::dns::dnssec::{
     Algorithm, KeyFlags, Validation, Window, ZoneKey, sign,
 };
@@ -16,15 +17,25 @@ use fictionet::{Seed, SeededEntropy};
 
 use super::resolver::{a, at, date, name, rrset};
 
-fn cache() -> Cache {
-    Cache::new(Limits {
+fn limits(max_entries: usize) -> Limits {
+    Limits {
         max_ttl: Duration::from_secs(86400),
         max_negative_ttl: Duration::from_secs(3600),
         failure_ttl: Duration::from_secs(5),
         stale: Duration::ZERO,
-        max_entries: usize::MAX,
-        max_bytes: usize::MAX,
-    })
+        max_entries,
+    }
+}
+
+/// A cache of at most `max_entries` things, on a budget that never
+/// refuses.
+fn counted(max_entries: usize) -> Cache {
+    Cache::new(limits(max_entries), &Budget::unlimited()).unwrap()
+}
+
+/// A cache that holds far more than any test here stores.
+fn cache() -> Cache {
+    counted(4096)
 }
 
 fn key(owner: &str, rtype: RecordType) -> Key {
@@ -588,15 +599,18 @@ fn a_failure_persists_from_when_its_resolution_began() {
     assert_eq!(cache.get(&www, at(60)).map(Entry::expires), Some(at(70)));
 }
 
-fn limited(max_entries: usize, max_bytes: usize) -> Cache {
-    Cache::new(Limits {
-        max_ttl: Duration::from_secs(86400),
-        max_negative_ttl: Duration::from_secs(3600),
-        failure_ttl: Duration::from_secs(5),
-        stale: Duration::ZERO,
-        max_entries,
-        max_bytes,
-    })
+/// A cache on a budget with room for its index and `room` bytes more.
+fn limited(room: usize) -> Cache {
+    let budget = Budget::new(Cache::storage(64).unwrap() + room);
+    Cache::new(limits(64), &budget).unwrap()
+}
+
+/// What a cache charges its budget for storing `offer`.
+fn charge(offer: Offer) -> usize {
+    let mut cache = cache();
+    let empty = cache.budget().used();
+    cache.insert(at(0), offer);
+    cache.budget().used() - empty
 }
 
 /// A TXT RRset at `owner` whose one string is 200 octets.
@@ -611,7 +625,7 @@ fn text(owner: &str, ttl: u32) -> RecordSet {
 /// Past its entry limit the cache keeps the entries that live longest.
 #[test]
 fn the_cache_holds_no_more_entries_than_its_limit() {
-    let mut cache = limited(3, usize::MAX);
+    let mut cache = counted(3);
     for ttl in [40, 10, 50, 20, 30] {
         let owner = format!("ttl{ttl}.example.");
         cache.insert(at(0), positive(rrset(&owner, ttl, vec![a("192.0.2.1")])));
@@ -626,14 +640,16 @@ fn the_cache_holds_no_more_entries_than_its_limit() {
     }
 }
 
-/// Past its byte limit the cache keeps what lives longest and fits.
+/// Past its budget the cache keeps what lives longest and fits.
 #[test]
-fn the_cache_holds_no_more_octets_than_its_limit() {
-    // Each RRset holds a 200-octet string and a few dozen octets more,
-    // so two fit in 500 octets and three do not.
-    let mut cache = limited(usize::MAX, 500);
+fn the_cache_holds_no_more_memory_than_its_budget() {
+    // Every owner has as many octets, so each entry is charged the same:
+    // two fit and three do not.
+    let one = charge(positive(text("ttl40.example.", 40)));
+    let mut cache = limited(2 * one + one / 2);
     for ttl in [40, 10, 50, 20] {
         cache.insert(at(0), positive(text(&format!("ttl{ttl}.example."), ttl)));
+        assert!(cache.budget().used() <= cache.budget().limit());
     }
     let kept: Vec<String> = cache
         .entries(at(0))
@@ -645,25 +661,24 @@ fn the_cache_holds_no_more_octets_than_its_limit() {
     }
 }
 
-/// The records that support an entry count against the byte limit, as
-/// the entry's own do.
+/// The records that support an entry are charged with it, as the entry's
+/// own are.
 #[test]
-fn an_entry_whose_proof_is_past_the_byte_limit_is_not_kept() {
-    let mut cache = limited(usize::MAX, 500);
+fn an_entry_whose_proof_is_past_the_budget_is_not_kept() {
     let small = rrset("www.example.", 60, vec![a("192.0.2.80")]);
-    let proof = (0..3)
-        .map(|index| text(&format!("p{index}.example."), 60))
-        .collect();
-    cache.insert(
-        at(0),
-        Offer::Positive {
-            set: small.clone(),
-            rank: Rank::AuthAnswer,
-            validation: Validation::NotPerformed,
-            proof,
-            truncated: false,
-        },
-    );
+    let proved = || Offer::Positive {
+        set: small.clone(),
+        rank: Rank::AuthAnswer,
+        validation: Validation::NotPerformed,
+        proof: (0..3)
+            .map(|index| text(&format!("p{index}.example."), 60))
+            .collect(),
+        truncated: false,
+    };
+    let alone = charge(positive(small.clone()));
+    assert!(charge(proved()) > alone);
+    let mut cache = limited(alone);
+    cache.insert(at(0), proved());
     assert!(
         cache
             .get(&key("www.example.", RecordType::A), at(0))

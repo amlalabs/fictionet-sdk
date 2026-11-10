@@ -53,6 +53,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fictionet::Entropy;
+use fictionet::stdlib::layer::Budget;
 use fictionet::stdlib::protocols::dns::dnssec::{Ring, Validation, Verified, Verify};
 use fictionet::stdlib::protocols::dns::op::ResponseCode;
 use fictionet::stdlib::protocols::dns::rr::{DNSClass, LowerName, Name, RecordType};
@@ -254,6 +255,16 @@ fn worse(a: Validation, b: Validation) -> Validation {
 impl<V: Verify> Resolver<V> {
     /// A resolver behaving as `config`, checking signatures with `verify`
     /// against dates from `clock`, in generation 0.
+    ///
+    /// Its cache's memory is charged to a budget of its own, of
+    /// [`max_cache_bytes`](Config::max_cache_bytes). The resolver owns it,
+    /// as it owns the cache, and not the sandbox of a client whose
+    /// question brought the data in.
+    ///
+    /// # Panics
+    ///
+    /// If `max_cache_bytes` has no room for the cache's index of
+    /// `max_cache_entries` things ([`Cache::storage`]).
     pub fn new(config: Config, verify: V, clock: WallClock) -> Resolver<V> {
         let server = ServerConfig {
             identity: config.identity.clone(),
@@ -272,8 +283,9 @@ impl<V: Verify> Resolver<V> {
                 .serve_stale
                 .map_or(std::time::Duration::ZERO, |stale| stale.max_stale),
             max_entries: config.max_cache_entries,
-            max_bytes: config.max_cache_bytes,
         };
+        let cache = Cache::new(limits, &Budget::new(config.max_cache_bytes))
+            .expect("max_cache_bytes holds the cache's index of max_cache_entries things");
         let mut local_order: Vec<usize> = (0..config.local.len()).collect();
         local_order.sort_by_key(|&index| {
             std::cmp::Reverse((label_count(config.local[index].data.apex()), index))
@@ -291,7 +303,7 @@ impl<V: Verify> Resolver<V> {
             verify,
             clock,
             tokens: Tokens::new(),
-            cache: Cache::new(limits),
+            cache,
             servers,
             graph: Graph::default(),
             askers: BTreeMap::new(),

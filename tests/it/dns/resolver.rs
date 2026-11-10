@@ -27,7 +27,7 @@ use fictionet::stdlib::services::dns::authority::{
 };
 use fictionet::stdlib::services::dns::memory::{Exchanges, MemoryNet, drive};
 use fictionet::stdlib::services::dns::resolver::{
-    Config, Entry, FailureKind, Key, LocalZone, Resolver, Work,
+    Cache, Config, Entry, FailureKind, Key, LocalZone, Resolver, Work,
 };
 use fictionet::stdlib::services::dns::zone::{
     Denial, Fact, Lazy, Transparent, Zone, ZoneBuilder, ZoneData, dname,
@@ -627,6 +627,44 @@ fn the_first_question_primes_the_root_from_a_hint() {
         resolver.cache().get(&ns, at(1)),
         Some(Entry::Positive { .. })
     ));
+}
+
+/// The resolver charges its cache to a budget of its own, of
+/// `max_cache_bytes`: what it learns raises the count, and a new session,
+/// which empties the cache, gives it back.
+#[test]
+fn the_resolver_charges_its_cache_to_a_budget_of_its_own() {
+    let (mut net, _) = internet(false);
+    let config = config(None);
+    let mut engine = resolver(config.clone());
+    let budget = engine.cache().budget().clone();
+    assert_eq!(budget.limit(), config.max_cache_bytes);
+    let empty = Cache::storage(config.max_cache_entries).unwrap();
+    assert_eq!(budget.used(), empty);
+    assert!(!budget.same(resolver(config).cache().budget()));
+    ask(
+        &mut engine,
+        &mut net,
+        0,
+        query(client(1), "www.example.com.", RecordType::A, |_| {}),
+    );
+    assert!(budget.used() > empty);
+    assert!(budget.used() <= budget.limit());
+    engine.advance(Session {
+        generation: Generation(1),
+        clock: clock(),
+    });
+    assert_eq!(budget.used(), empty);
+}
+
+#[test]
+#[should_panic(expected = "max_cache_bytes")]
+fn a_resolver_needs_room_for_the_index_of_its_cache() {
+    let config = config(None);
+    resolver(Config {
+        max_cache_bytes: Cache::storage(config.max_cache_entries).unwrap() - 1,
+        ..config
+    });
 }
 
 #[test]
