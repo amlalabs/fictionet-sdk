@@ -32,6 +32,9 @@ impl std::error::Error for ClientError {}
 pub struct Client<C> {
     conn: C,
     pub tls: ClientConnection,
+    /// Bytes read from the connection that rustls has not taken yet: it
+    /// takes no more while it holds plaintext for the reader.
+    unread: Vec<u8>,
 }
 
 impl<C: Connection> Client<C> {
@@ -43,7 +46,11 @@ impl<C: Connection> Client<C> {
     ) -> Result<Self, ClientError> {
         let name = ServerName::try_from(name.to_owned()).unwrap();
         let tls = ClientConnection::new(config, name).unwrap();
-        let mut c = Client { conn, tls };
+        let mut c = Client {
+            conn,
+            tls,
+            unread: Vec::new(),
+        };
         while c.tls.is_handshaking() {
             c.flush(fcx).await?;
             if !c.tls.is_handshaking() {
@@ -64,21 +71,30 @@ impl<C: Connection> Client<C> {
         Ok(())
     }
 
-    /// Reads one chunk from the connection and processes it.
+    /// Reads one chunk from the connection, unless bytes read before are
+    /// still waiting, and gives rustls what it takes of them, processing
+    /// each record. rustls takes no more while it holds plaintext for the
+    /// reader: the rest waits for the next call.
     pub async fn read_more(&mut self, fcx: &Cx) -> Result<(), ClientError> {
-        let mut buf = vec![0; 16 * 1024];
-        let n = self.conn.read(fcx, &mut buf).await?;
-        if n == 0 && self.tls.is_handshaking() {
-            return Err(ClientError::Truncated);
+        if self.unread.is_empty() {
+            let mut buf = vec![0; 16 * 1024];
+            let n = self.conn.read(fcx, &mut buf).await?;
+            if n == 0 && self.tls.is_handshaking() {
+                return Err(ClientError::Truncated);
+            }
+            buf.truncate(n);
+            self.unread = buf;
         }
-        let mut data = &buf[..n];
         loop {
+            let mut data = &self.unread[..];
             self.tls.read_tls(&mut data).unwrap();
+            let taken = self.unread.len() - data.len();
+            self.unread.drain(..taken);
             let r = self.tls.process_new_packets();
             // Send any alert or reply before reporting.
             let _ = self.flush(fcx).await;
             r.map_err(ClientError::Tls)?;
-            if data.is_empty() {
+            if self.unread.is_empty() || !self.tls.wants_read() {
                 return Ok(());
             }
         }

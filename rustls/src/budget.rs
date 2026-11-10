@@ -1,11 +1,14 @@
 //! Paying for the bytes a connection's buffers hold.
 //!
 //! A connection made with a [`BufferBudget`] charges it before any of its
-//! buffers grows: the records it has read and not yet processed, the
-//! plaintext it has decrypted and not yet handed over, the plaintext written
-//! before the handshake finished, and the records queued to send. Each buffer
-//! holds one [`BufferCharge`] that always covers its allocation, and gives
-//! back what it frees.
+//! buffers grows: the record arriving (or a handshake message being joined),
+//! the plaintext it has decrypted and not yet handed over, the plaintext
+//! written before the handshake finished, and the records queued to send.
+//! Each buffer holds one [`BufferCharge`] that always covers its allocation,
+//! and gives back what it frees. A record's plaintext stays in the buffer the
+//! record arrived in, which joins the plaintext queue with its charge: the
+//! queue's charge takes it in, and the budget's total does not move.
+//! Buffers are freed once empty, so an idle connection is charged nothing.
 //!
 //! A growth the budget refuses changes nothing, and the call that wanted it
 //! says so in a way that can be retried once memory frees:
@@ -131,6 +134,17 @@ impl BufferCharge {
             bytes,
         })
     }
+
+    /// Takes `other` into this charge, as when the bytes it pays for join
+    /// this buffer. The budget's total does not change. Gives `other` back,
+    /// still charged, if it is on another budget.
+    fn absorb(&mut self, mut other: Self) -> Result<(), Self> {
+        if !Arc::ptr_eq(&self.budget, &other.budget) {
+            return Err(other);
+        }
+        self.bytes += core::mem::take(&mut other.bytes);
+        Ok(())
+    }
 }
 
 impl Drop for BufferCharge {
@@ -230,6 +244,18 @@ impl Paid {
     pub(crate) fn split(&mut self, bytes: usize) -> Option<BufferCharge> {
         self.0.as_mut()?.split(bytes)
     }
+
+    /// Takes in the charge that pays for bytes joining this buffer.
+    /// `false` if it is not a charge on this buffer's budget: it is
+    /// dropped, giving its bytes back, and the bytes must go with it.
+    #[must_use = "bytes whose charge was refused must be dropped with it"]
+    pub(crate) fn absorb(&mut self, other: Option<BufferCharge>) -> bool {
+        match (&mut self.0, other) {
+            (None, None) => true,
+            (Some(charge), Some(other)) => charge.absorb(other).is_ok(),
+            (_, _) => false,
+        }
+    }
 }
 
 impl fmt::Debug for Paid {
@@ -277,6 +303,8 @@ pub(crate) mod testing {
     pub(crate) struct Limit {
         used: AtomicUsize,
         limit: AtomicUsize,
+        /// The most `used` has been.
+        most: AtomicUsize,
     }
 
     impl Limit {
@@ -284,11 +312,23 @@ pub(crate) mod testing {
             Arc::new(Self {
                 used: AtomicUsize::new(0),
                 limit: AtomicUsize::new(limit),
+                most: AtomicUsize::new(0),
             })
         }
 
         pub(crate) fn used(&self) -> usize {
             self.used.load(Ordering::SeqCst)
+        }
+
+        /// The most charged at once since [`Self::reset_most`], reservations
+        /// held within a call included.
+        pub(crate) fn most(&self) -> usize {
+            self.most.load(Ordering::SeqCst)
+        }
+
+        /// Starts counting [`Self::most`] from what is charged now.
+        pub(crate) fn reset_most(&self) {
+            self.most.store(self.used(), Ordering::SeqCst);
         }
 
         pub(crate) fn set_limit(&self, limit: usize) {
@@ -299,11 +339,18 @@ pub(crate) mod testing {
     impl BufferBudget for Limit {
         fn take(&self, bytes: usize) -> bool {
             let limit = self.limit.load(Ordering::SeqCst);
-            self.used
+            let taken = self
+                .used
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                     (used + bytes <= limit).then_some(used + bytes)
-                })
-                .is_ok()
+                });
+            match taken {
+                Ok(before) => {
+                    self.most.fetch_max(before + bytes, Ordering::SeqCst);
+                    true
+                }
+                Err(_) => false,
+            }
         }
 
         fn give_back(&self, bytes: usize) {

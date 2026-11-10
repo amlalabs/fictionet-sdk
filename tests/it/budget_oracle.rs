@@ -51,6 +51,11 @@ use crate::common::alloc::{left_allocated, unmeasured};
 /// comment.
 const SLACK: i128 = 8 << 10;
 
+/// The slack for TLS, in bytes. The layer runs no handler, and the record
+/// it copies in is charged by rustls, so all that is left is the shared
+/// header around the at most one chunk the layer holds each way.
+const TLS_SLACK: i128 = 1 << 10;
+
 #[test]
 fn complete_headers_need_no_assembly_copy() {
     use crate::common::alloc::allocations;
@@ -93,6 +98,8 @@ struct Oracle {
     held: i128,
     /// What the stack held beyond its charge once it settled.
     fixed: i128,
+    /// What the budget does not count for this stack by design.
+    slack: i128,
     /// The most the stack held past its charge and `fixed`.
     worst: i128,
     most_used: usize,
@@ -106,10 +113,18 @@ impl Oracle {
             budget: budget.clone(),
             held: 0,
             fixed: 0,
+            slack: SLACK,
             worst: i128::MIN,
             most_used: 0,
             checks: 0,
         }
+    }
+
+    /// Allows only `bytes` of slack for a stack that needs less than
+    /// [`SLACK`].
+    fn slack(mut self, bytes: i128) -> Oracle {
+        self.slack = bytes;
+        self
     }
 
     /// Runs one step of the stack, counting what it leaves allocated.
@@ -134,12 +149,13 @@ impl Oracle {
         self.most_used = self.most_used.max(self.budget.used());
         self.checks += 1;
         assert!(
-            over <= SLACK,
+            over <= self.slack,
             "{}: the heap holds {} bytes, {over} past the budget's {used}, the fixed {} \
-             and the slack {SLACK}",
+             and the slack {}",
             self.stack,
             self.held - outside as i128,
             self.fixed,
+            self.slack,
         );
     }
 
@@ -153,17 +169,18 @@ impl Oracle {
         );
         eprintln!(
             "{}: {} checks, fixed {} bytes, worst {} bytes past budget plus fixed \
-             (slack {SLACK}), most used {} of {}, left after drop {}",
+             (slack {}), most used {} of {}, left after drop {}",
             self.stack,
             self.checks,
             self.fixed,
             self.worst,
+            self.slack,
             self.most_used,
             self.budget.limit(),
             self.held,
         );
         assert!(
-            self.held <= SLACK,
+            self.held <= self.slack,
             "{}: {} bytes stayed allocated after the stack was dropped",
             self.stack,
             self.held
@@ -406,7 +423,7 @@ fn tls_bulk_holds_no_heap_its_budget_does_not_cover() {
         let budget = Budget::new(256 << 10);
         // rustls's own buffers are charged to the same budget: nothing
         // the connection holds is allowed for.
-        let mut oracle = Oracle::new("TLS", &budget);
+        let mut oracle = Oracle::new("TLS", &budget).slack(TLS_SLACK);
         let mut h = oracle.step(|| {
             Harness::with_budget(
                 Seed::from_u64(12),
@@ -435,6 +452,8 @@ fn tls_bulk_holds_no_heap_its_budget_does_not_cover() {
         receive(&mut client, &out);
         oracle.settled();
         oracle.check(h.unread());
+        // What the settled connection is charged: its hello, and no buffer.
+        let idle = budget.used();
 
         // The client sends a mebibyte; the server echoes each piece back.
         let message = vec![b'p'; 16 << 10];
@@ -465,6 +484,11 @@ fn tls_bulk_holds_no_heap_its_budget_does_not_cover() {
                 written(&mut h)
             });
             oracle.check(h.unread());
+            if h.unread() == 0 {
+                // Every record read has gone up and every reply down: the
+                // connection is charged no more than once it settled.
+                assert_eq!(budget.used(), idle, "an idle connection kept buffers");
+            }
             receive(&mut client, &out);
             let mut plain = [0; 16 << 10];
             loop {

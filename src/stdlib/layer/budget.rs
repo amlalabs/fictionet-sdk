@@ -457,6 +457,17 @@ impl Charge {
         })
     }
 
+    /// Takes `other` into this charge, as when what it pays for joins what
+    /// this one pays for. The budget's total does not change. Gives `other`
+    /// back, unchanged, if it is on another budget.
+    pub fn absorb(&mut self, mut other: Charge) -> Result<(), Charge> {
+        if !self.budget.same(&other.budget) {
+            return Err(other);
+        }
+        self.now += std::mem::take(&mut other.now);
+        Ok(())
+    }
+
     /// Moves this charge to `to`. Within one budget nothing changes.
     /// Otherwise `to` is charged first and this charge's budget given back
     /// after, so a refusal changes nothing.
@@ -596,6 +607,25 @@ mod tests {
         assert_eq!(charge.bytes(), 1, "shrinking never grows");
         drop((other, charge));
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn absorbing_moves_a_charge_within_its_budget_and_refuses_another() {
+        let budget = Budget::new(16);
+        let mut charge = budget.charge(4).unwrap();
+        let split = charge.split(3).unwrap();
+        let used = budget.used();
+        charge.absorb(split).unwrap();
+        assert_eq!(charge.bytes(), 4);
+        assert_eq!(budget.used(), used, "the total does not move");
+
+        let other = Budget::new(16);
+        let foreign = other.charge(5).unwrap();
+        let foreign = charge.absorb(foreign).unwrap_err();
+        assert_eq!((charge.bytes(), foreign.bytes()), (4, 5));
+        assert_eq!((budget.used(), other.used()), (4, 5));
+        drop((charge, foreign));
+        assert_eq!((budget.used(), other.used()), (0, 0));
     }
 
     #[test]

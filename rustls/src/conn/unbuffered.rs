@@ -8,7 +8,9 @@ use std::error::Error as StdError;
 
 use super::UnbufferedConnectionCommon;
 use crate::client::ClientConnectionData;
+use crate::enums::ContentType;
 use crate::msgs::deframer::buffers::DeframerSliceBuffer;
+use crate::msgs::deframer::buffers::Locator;
 use crate::server::ServerConnectionData;
 use crate::Error;
 
@@ -70,6 +72,7 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 );
             }
 
+            let locator = Locator::new(buffer.filled_mut());
             let deframer_output = if self.core.common_state.has_received_close_notify {
                 None
             } else {
@@ -89,6 +92,9 @@ impl<Data> UnbufferedConnectionCommon<Data> {
             };
 
             if let Some(msg) = deframer_output {
+                // Application data is decrypted in place: where its plaintext is.
+                let plaintext =
+                    (msg.typ == ContentType::ApplicationData).then(|| locator.locate(msg.payload));
                 let mut state =
                     match mem::replace(&mut self.core.state, Err(Error::HandshakeNotComplete)) {
                         Ok(state) => state,
@@ -102,7 +108,25 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                         }
                     };
 
-                match self.core.process_msg(msg, state, None) {
+                let processed = self.core.process_msg(msg, state, None).and_then(|new| {
+                    // The caller owns the buffer the record arrived in, so the
+                    // plaintext kept is a copy.
+                    let kept = mem::take(&mut self.core.common_state.plaintext_kept);
+                    let (true, Some(plaintext)) = (kept, plaintext) else {
+                        return Ok(new);
+                    };
+                    let bytes = &buffer.filled_mut()[plaintext];
+                    match self
+                        .core
+                        .common_state
+                        .received_plaintext
+                        .append_with(bytes.len(), || bytes.to_vec())
+                    {
+                        true => Ok(new),
+                        false => Err(Error::BudgetExhausted),
+                    }
+                });
+                match processed {
                     Ok(new) => state = new,
 
                     Err(e) => {

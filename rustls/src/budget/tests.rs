@@ -13,8 +13,10 @@ use crate::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerC
 use crate::client::ClientConnection;
 use crate::crypto::ring::default_provider;
 use crate::enums::{AlertDescription, SignatureScheme};
+use crate::msgs::message::MAX_WIRE_SIZE;
 use crate::server::{Acceptor, IntoConnectionError, ServerConnection};
 use crate::sync::Arc;
+use crate::vecbuf::{FIRST_PLACES, PLACE};
 use crate::version::{TLS12, TLS13};
 use crate::{
     ClientConfig, CommonState, DigitallySignedStruct, Error, ServerConfig, Side,
@@ -106,15 +108,20 @@ fn from_client(client: &mut ClientConnection) -> Vec<u8> {
 
 /// Gives the server `wire` in pieces of `piece` bytes, processing after
 /// each, and checks after each that its buffers are charged what they hold.
-fn to_server(server: &mut ServerConnection, wire: &[u8], piece: usize) {
+/// Returns the most they held after any step.
+fn to_server(server: &mut ServerConnection, wire: &[u8], piece: usize) -> usize {
+    let mut most = 0;
     for mut rest in wire.chunks(piece) {
         while !rest.is_empty() {
             assert!(server.read_tls(&mut rest).unwrap() > 0);
             assert!(server.buffers_accounted());
+            most = most.max(server.buffers_held());
             server.process_new_packets().unwrap();
             assert!(server.buffers_accounted());
+            most = most.max(server.buffers_held());
         }
     }
+    most
 }
 
 /// Gives the client what the server has to send.
@@ -131,12 +138,16 @@ fn to_client(server: &mut ServerConnection, client: &mut ClientConnection) {
     }
 }
 
-fn handshake(server: &mut ServerConnection, client: &mut ClientConnection) {
+/// Runs the handshake, returning the most the server's buffers held after
+/// any step of it.
+fn handshake(server: &mut ServerConnection, client: &mut ClientConnection) -> usize {
+    let mut most = 0;
     while client.is_handshaking() || server.is_handshaking() || server.wants_write() {
         let wire = from_client(client);
-        to_server(server, &wire, 1000);
+        most = most.max(to_server(server, &wire, 1000));
         to_client(server, client);
     }
+    most
 }
 
 /// Everything the client has decrypted.
@@ -154,9 +165,8 @@ fn every_buffer_is_charged_what_it_holds_and_gives_it_back() {
         let limit = Limit::new(1 << 20);
         let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
         let mut client = client(version);
-        handshake(&mut server, &mut client);
         assert!(
-            limit.used() > 0,
+            handshake(&mut server, &mut client) > 0,
             "{version:?}: the handshake charged nothing"
         );
 
@@ -190,12 +200,12 @@ fn every_buffer_is_charged_what_it_holds_and_gives_it_back() {
                     }
                     continue;
                 }
-                // The plaintext leaves with its charge: the budget's total
-                // does not move until it is dropped, and then gives back
-                // exactly its allocation.
+                // The plaintext leaves with its charge: the budget gets back
+                // only the queue's places, and then exactly the plaintext's
+                // allocation once it is dropped.
                 let charge = charge.unwrap();
                 assert_eq!(charge.bytes(), plaintext.capacity());
-                assert_eq!(limit.used(), before);
+                assert!(limit.used() <= before);
                 assert_eq!(limit.used(), server.buffers_held() + plaintext.capacity());
                 let written = server.writer().write(&plaintext).unwrap();
                 assert_eq!(written, plaintext.len());
@@ -243,8 +253,12 @@ fn a_read_without_room_reads_nothing_until_there_is_room() {
     assert!(!server.is_handshaking());
 }
 
+/// A record's plaintext is decrypted where the record was read and stays
+/// in that buffer: keeping it takes nothing past the record's own buffer
+/// but a place in the plaintext queue. Without room for that place and the
+/// answers a record can make, the record waits intact.
 #[test]
-fn a_record_without_room_for_its_plaintext_waits_in_the_buffer() {
+fn a_records_plaintext_stays_in_the_buffer_it_arrived_in() {
     for version in [&TLS12, &TLS13] {
         let limit = Limit::new(1 << 20);
         let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
@@ -255,15 +269,14 @@ fn a_record_without_room_for_its_plaintext_waits_in_the_buffer() {
         client.writer().write_all(&message).unwrap();
         let wire = from_client(&mut client);
         let mut rest = &wire[..];
-        while !rest.is_empty() {
-            server.read_tls(&mut rest).unwrap();
-        }
-        // Room for the answers a record can make, not for its plaintext.
-        limit.set_limit(limit.used() + 500);
-        let used = limit.used();
+        assert_eq!(server.read_tls(&mut rest).unwrap(), wire.len());
+        let read = limit.used();
+        assert_eq!(read, wire.len(), "{version:?}: the buffer is the record");
+
+        limit.set_limit(read);
         server.process_new_packets().unwrap();
         assert!(server.wants_budget(), "{version:?}");
-        assert!(limit.used() <= used + 500);
+        assert_eq!(limit.used(), read);
         assert!(server.buffers_accounted());
         assert_eq!(
             server.reader().into_first_chunk().unwrap_err().kind(),
@@ -274,13 +287,125 @@ fn a_record_without_room_for_its_plaintext_waits_in_the_buffer() {
         server.process_new_packets().unwrap();
         assert!(!server.wants_budget(), "{version:?}");
         assert!(server.buffers_accounted());
-        let mut plaintext = Vec::new();
-        server.reader().read_to_end(&mut plaintext).unwrap_err();
+        assert!(
+            limit.used() <= read + FIRST_PLACES * PLACE,
+            "{version:?}: keeping the plaintext took {} bytes past its record",
+            limit.used() - read
+        );
+        let (plaintext, charge) = server.reader().take_first_chunk().unwrap().into_parts();
         assert!(
             plaintext == message,
             "{version:?}: the record waited intact"
         );
+        // It leaves in the record's buffer, with the record's charge.
+        assert_eq!(plaintext.capacity(), read, "{version:?}");
+        assert_eq!(charge.unwrap().bytes(), read, "{version:?}");
+        assert_eq!(server.buffers_held(), 0, "{version:?}");
     }
+}
+
+/// Once the handshake's flights are out, and again once an echo has gone
+/// both ways, the connection holds no buffer at all: the receive buffer,
+/// the queues and their places are freed, not just emptied.
+#[test]
+fn an_idle_connection_holds_no_buffer() {
+    for version in [&TLS12, &TLS13] {
+        let limit = Limit::new(1 << 20);
+        let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
+        let mut client = client(version);
+        let most = handshake(&mut server, &mut client);
+        std::eprintln!(
+            "{version:?}: the handshake's buffers held at most {most} bytes between \
+             calls, {} within one",
+            limit.most()
+        );
+        assert_eq!(
+            (server.buffers_held(), limit.used()),
+            (0, 0),
+            "{version:?}: after the handshake"
+        );
+
+        let message = vec![3; 5000];
+        client.writer().write_all(&message).unwrap();
+        let wire = from_client(&mut client);
+        to_server(&mut server, &wire, wire.len());
+        let mut echoed = Vec::new();
+        server.reader().read_to_end(&mut echoed).unwrap_err();
+        assert!(echoed == message, "{version:?}");
+        server.writer().write_all(&echoed).unwrap();
+        to_client(&mut server, &mut client);
+        assert!(received(&mut client) == message, "{version:?}");
+        assert_eq!(
+            (server.buffers_held(), limit.used()),
+            (0, 0),
+            "{version:?}: after an echo"
+        );
+    }
+}
+
+/// A full-size record from the peer, the most plaintext one record can
+/// carry, arrives into one buffer of exactly its size and leaves in it,
+/// however it is split on the way: the connection never holds more than
+/// that record and its place in the plaintext queue.
+#[test]
+fn a_full_record_takes_one_buffer_of_its_size() {
+    for version in [&TLS12, &TLS13] {
+        let limit = Limit::new(1 << 20);
+        let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
+        let mut client = client(version);
+        handshake(&mut server, &mut client);
+
+        let message = vec![9; 1 << 14];
+        client.writer().write_all(&message).unwrap();
+        let wire = from_client(&mut client);
+        assert!(wire.len() > message.len() && wire.len() <= MAX_WIRE_SIZE);
+        limit.reset_most();
+        let most = to_server(&mut server, &wire, 1000);
+        std::eprintln!(
+            "{version:?}: a {}-byte record held at most {most} bytes of buffers between \
+             calls, {} within one",
+            wire.len(),
+            limit.most()
+        );
+        assert!(
+            most <= wire.len() + FIRST_PLACES * PLACE,
+            "{version:?}: {most} bytes held for a {}-byte record",
+            wire.len()
+        );
+        let (plaintext, _charge) = server.reader().take_first_chunk().unwrap().into_parts();
+        assert!(plaintext == message, "{version:?}");
+        assert_eq!(plaintext.capacity(), wire.len(), "{version:?}");
+        assert_eq!(server.buffers_held(), 0, "{version:?}");
+    }
+}
+
+/// A read takes no more than the record arriving: once a whole record is
+/// buffered, the next read takes nothing until it has been processed.
+#[test]
+fn a_read_stops_at_the_end_of_the_record_arriving() {
+    let limit = Limit::new(1 << 20);
+    let mut server = ServerConnection::with_budget(server_config(), limit.clone()).unwrap();
+    let mut client = client(&TLS13);
+    handshake(&mut server, &mut client);
+
+    client.writer().write_all(&[1; 100]).unwrap();
+    let first = from_client(&mut client);
+    client.writer().write_all(&[2; 200]).unwrap();
+    let second = from_client(&mut client);
+    let wire = [first.clone(), second.clone()].concat();
+    let mut rest = &wire[..];
+    assert_eq!(server.read_tls(&mut rest).unwrap(), first.len());
+    assert_eq!(limit.used(), first.len());
+    let error = server.read_tls(&mut rest).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(rest.len(), second.len());
+
+    server.process_new_packets().unwrap();
+    assert_eq!(server.read_tls(&mut rest).unwrap(), second.len());
+    server.process_new_packets().unwrap();
+    let mut plaintext = Vec::new();
+    server.reader().read_to_end(&mut plaintext).unwrap_err();
+    assert!(plaintext == [[1; 100].as_slice(), &[2; 200]].concat());
 }
 
 #[test]

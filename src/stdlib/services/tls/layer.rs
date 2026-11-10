@@ -112,15 +112,18 @@ impl Job for Pick {
 /// report the original TLS failure even if sending the alert also fails.
 ///
 /// The connection's budget pays for every buffer it holds, rustls's own
-/// included: the records read and not yet processed (up to a full record,
-/// or a handshake message being joined), the plaintext decrypted and not
-/// yet taken, and the records queued to send, all charged by the vendored
+/// included: the record arriving (a buffer of exactly its size, or a
+/// handshake message being joined), the plaintext decrypted and not yet
+/// taken, and the records queued to send, all charged by the vendored
 /// rustls before they grow ([`rustls::budget`]), and the hello snapshot.
-/// Records and plaintext leave rustls in the buffers that hold them, with
-/// their charge. A buffer the budget has no room for waits: the layer takes
-/// no more input, keeps the record or the write it could not pay for, and
-/// goes on when memory frees. rustls's protocol state, such as keys, the
-/// transcript and certificates, is not a buffer and is not charged.
+/// A record is decrypted where it was read, and its plaintext goes up in
+/// that same buffer. Records go down in the buffer they were encrypted
+/// into. Both leave with their charge. Buffers are freed once empty, so an
+/// idle connection holds none. A buffer the budget has no room for waits:
+/// the layer takes no more input, keeps the record or the write it could
+/// not pay for, and goes on when memory frees. rustls's protocol state,
+/// such as keys, the transcript and certificates, is not a buffer and is
+/// not charged.
 pub struct TlsLayer {
     acceptor: Option<Acceptor>,
     accepted: Option<Accepted>,

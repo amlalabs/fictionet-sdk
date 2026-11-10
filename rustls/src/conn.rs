@@ -791,6 +791,11 @@ impl<Data> ConnectionCommon<Data> {
     /// You should call [`process_new_packets()`] each time a call to this function succeeds in order
     /// to empty the incoming TLS data buffer.
     ///
+    /// It reads no further than the end of the record arriving, into a buffer of exactly that
+    /// record's size, which is freed once the record is processed. Once a whole record is
+    /// buffered it reads nothing more, failing with `ErrorKind::Other`, until
+    /// [`process_new_packets()`] has taken it.
+    ///
     /// This function returns `Ok(0)` when the underlying `rd` does so. This typically happens when
     /// a socket is cleanly closed, or a file is at EOF. Errors may result from the IO done through
     /// `rd`; additionally, errors of `ErrorKind::Other` are emitted to signal backpressure:
@@ -817,9 +822,10 @@ impl<Data> ConnectionCommon<Data> {
             return Ok(0);
         }
 
+        let hs = &self.core.hs_deframer;
         let res = self
             .deframer_buffer
-            .read(rd, self.core.hs_deframer.is_active());
+            .read(rd, hs.progress().processed(), hs.is_active());
         if let Ok(0) = res {
             self.has_seen_eof = true;
         }
@@ -995,6 +1001,7 @@ impl<Data> ConnectionCore<Data> {
                 break;
             }
 
+            let locator = Locator::new(deframer_buffer.filled());
             let res = self.deframe(
                 Some(&*state),
                 deframer_buffer.filled_mut(),
@@ -1015,9 +1022,15 @@ impl<Data> ConnectionCore<Data> {
                 break;
             };
 
+            // Application data is decrypted in place: where its plaintext is.
+            let plaintext =
+                (msg.typ == ContentType::ApplicationData).then(|| locator.locate(msg.payload));
             let processed = self
                 .process_msg(msg, state, Some(sendable_plaintext))
-                .and_then(|new| self.common_state.output_paid().map(|()| new));
+                .and_then(|new| {
+                    self.keep_plaintext(deframer_buffer, plaintext, &mut buffer_progress)?;
+                    self.common_state.output_paid().map(|()| new)
+                });
             match processed {
                 Ok(new) => state = new,
                 Err(e) => {
@@ -1043,6 +1056,34 @@ impl<Data> ConnectionCore<Data> {
         self.common_state.release_step();
         self.state = Ok(state);
         Ok(self.common_state.current_io_state())
+    }
+
+    /// Keeps the plaintext of the record just processed, at `plaintext` in
+    /// `deframer_buffer`, if the state took it: it leaves in the buffer the
+    /// record arrived in, with the charge that pays for it, and the next
+    /// record starts a buffer of its own.
+    fn keep_plaintext(
+        &mut self,
+        deframer_buffer: &mut DeframerVecBuffer,
+        plaintext: Option<Range<usize>>,
+        buffer_progress: &mut BufferProgress,
+    ) -> Result<(), Error> {
+        let kept = mem::take(&mut self.common_state.plaintext_kept);
+        let (true, Some(plaintext)) = (kept, plaintext) else {
+            return Ok(());
+        };
+        // Reads stop at the end of the record arriving, so the record is
+        // everything buffered.
+        if buffer_progress.take_discard() != deframer_buffer.filled().len() {
+            return Err(Error::General(
+                "bytes buffered past an application data record".into(),
+            ));
+        }
+        let bytes = deframer_buffer.take_plaintext(plaintext);
+        match self.common_state.received_plaintext.push_charged(bytes) {
+            true => Ok(()),
+            false => Err(Error::BudgetExhausted),
+        }
     }
 
     /// Pull a message out of the deframer and send any messages that need to be sent as a result.
@@ -1096,7 +1137,15 @@ impl<Data> ConnectionCore<Data> {
             let (message, processed) = loop {
                 let message = match iter.next().transpose() {
                     Ok(Some(message)) => message,
-                    Ok(None) => return Ok(None),
+                    Ok(None) => {
+                        // Records that failed trial decryption are done
+                        // with: the record after them is read only once
+                        // they leave the buffer.
+                        let skipped = iter.bytes_consumed();
+                        buffer_progress.add_processed(skipped);
+                        buffer_progress.add_discard(skipped);
+                        return Ok(None);
+                    }
                     Err(err) => return Err(self.handle_deframe_error(err, state)),
                 };
 
@@ -1124,11 +1173,13 @@ impl<Data> ConnectionCore<Data> {
                     break (message.into_plain_message(), iter.bytes_consumed());
                 }
 
-                // Room for its plaintext, which may be application data that
-                // is kept, before the record is decrypted, which cannot be
-                // undone. The record stays where it is if there is none.
+                // Room for a place in the plaintext queue, in case this is
+                // application data that is kept, before the record is
+                // decrypted, which cannot be undone. The plaintext itself
+                // stays in the buffer the record arrived in, already paid
+                // for. The record stays where it is if there is no room.
                 if self.common_state.record_layer.is_decrypting()
-                    && !self.common_state.reserve_plaintext(message.payload.len())
+                    && !self.common_state.reserve_plaintext()
                 {
                     return Ok(None);
                 }
