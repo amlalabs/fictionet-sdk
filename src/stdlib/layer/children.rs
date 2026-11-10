@@ -114,14 +114,17 @@ type ChildBudget<O> = dyn FnMut(ChildId, &O, &Budget) -> Budget + Send;
 /// event goes back to the mux, until the budget frees and the child is
 /// visited again.
 ///
-/// The mux never waits for a child, except for memory. Credit bounds a child's bytes, but not
-/// how many events it holds: many small pieces, completions and ends cost
-/// nothing. Each child holds at most 64 events and one urgent event. When an
-/// event finds its child's place full, the child is visited at once to
-/// take what waits. A child that still takes nothing is overloaded: it alone
-/// is refused and closed, its work cancelled, and the event is dropped with
-/// it. So any child, however it behaves, holds up neither its siblings nor
-/// the connection's own traffic below and above.
+/// The mux never waits for a child's reading. Credit bounds a child's
+/// bytes, but not how many events it holds: many small pieces, completions
+/// and ends cost nothing. Each child holds at most 64 events and one urgent
+/// event. When an event finds its child's place full, the child is visited
+/// at once to take what waits. A child that still takes nothing is
+/// overloaded: it alone is refused and closed, its work cancelled, and the
+/// event is dropped with it. So any child, however it reads, holds up
+/// neither its siblings nor the connection's own traffic below and above.
+/// Memory is the one wait: an event its budget cannot pay for now goes
+/// back to the mux, and what the mux has behind it waits too, until that
+/// budget frees.
 pub struct Children<B, K, O = ()>
 where
     B: Layer<Upper = Top>,
