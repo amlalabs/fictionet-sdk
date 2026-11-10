@@ -10,7 +10,7 @@ use kernel::KernelConnection;
 use crate::budget::{Account, BufferBudget, Paid};
 use crate::common_state::{CommonState, Context, IoState, State, DEFAULT_BUFFER_LIMIT};
 use crate::enums::{AlertDescription, ContentType, ProtocolVersion};
-use crate::error::{Error, InvalidMessage, PeerMisbehaved};
+use crate::error::{Error, PeerMisbehaved};
 use crate::log::trace;
 use crate::msgs::deframer::buffers::{BufferProgress, DeframerVecBuffer, Delocator, Locator};
 use crate::msgs::deframer::handshake::HandshakeDeframer;
@@ -1279,22 +1279,16 @@ impl<Data> ConnectionCore<Data> {
 
     fn handle_deframe_error(&mut self, error: Error, state: Option<&dyn State<Data>>) -> Error {
         match error {
-            // "If a TLS implementation receives an unexpected record type, it
-            // MUST terminate the connection with an "unexpected_message"
-            // alert." (RFC 8446 section 5; RFC 5246 section 6)
-            error @ Error::InvalidMessage(InvalidMessage::InvalidContentType)
-                if !self.common_state.is_quic() =>
-            {
-                self.common_state
-                    .send_fatal_alert(AlertDescription::UnexpectedMessage, error)
-            }
-            error @ Error::InvalidMessage(_) => {
+            Error::InvalidMessage(invalid) => {
+                let error = Error::InvalidMessage(invalid);
                 if self.common_state.is_quic() {
                     self.common_state.quic.alert = Some(AlertDescription::DecodeError);
                     error
                 } else {
+                    // decode_error, or unexpected_message for a record type
+                    // this does not know.
                     self.common_state
-                        .send_fatal_alert(AlertDescription::DecodeError, error)
+                        .send_fatal_alert(AlertDescription::from(invalid), error)
                 }
             }
             Error::PeerSentOversizedRecord => self

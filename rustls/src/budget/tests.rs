@@ -568,18 +568,23 @@ fn a_tls12_record_may_be_2_14_plus_2048_long_and_no_longer() {
 
 #[test]
 fn an_unknown_record_type_is_an_unexpected_message() {
-    let mut server = ServerConnection::with_budget(server_config(), Limit::new(1 << 20)).unwrap();
-    process_all(&mut server, &record(99, 1)).unwrap_err();
-    let mut alert = Vec::new();
-    while server.wants_write() {
-        server.write_tls(&mut alert).unwrap();
+    // An unassigned type, and heartbeat, which rustls does not implement.
+    for typ in [99, 24] {
+        let mut server =
+            ServerConnection::with_budget(server_config(), Limit::new(1 << 20)).unwrap();
+        process_all(&mut server, &record(typ, 1)).unwrap_err();
+        let mut alert = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut alert).unwrap();
+        }
+        // One unprotected alert record: type, version, length, then the
+        // alert's level and description.
+        assert_eq!(alert.len(), HEADER_SIZE + 2, "type {typ}");
+        assert_eq!(alert[0], u8::from(crate::ContentType::Alert));
+        assert_eq!(
+            AlertDescription::from(alert[HEADER_SIZE + 1]),
+            AlertDescription::UnexpectedMessage,
+            "type {typ}"
+        );
     }
-    // One unprotected alert record: type, version, length, then the
-    // alert's level and description.
-    assert_eq!(alert.len(), HEADER_SIZE + 2);
-    assert_eq!(alert[0], u8::from(crate::ContentType::Alert));
-    assert_eq!(
-        AlertDescription::from(alert[HEADER_SIZE + 1]),
-        AlertDescription::UnexpectedMessage
-    );
 }
