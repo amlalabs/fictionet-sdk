@@ -229,8 +229,11 @@ impl Budget {
         self.inner.limit.saturating_sub(self.used())
     }
 
-    /// Takes as much of `want` as fits, or nothing.
-    fn take(&self, want: RangeInclusive<usize>) -> Option<usize> {
+    /// Takes as much of `want` as fits, or nothing. Outside this module
+    /// only a holder that keeps its own count calls it, as rustls's charges
+    /// do ([`services::tls`](fictionet::stdlib::services::tls)), and gives
+    /// the bytes back with [`release`](Self::release).
+    pub(crate) fn take(&self, want: RangeInclusive<usize>) -> Option<usize> {
         if *want.end() == 0 {
             return (*want.start() == 0).then_some(0);
         }
@@ -290,7 +293,7 @@ impl Budget {
 
     /// Gives back `bytes`, waking the runners if that leaves room for the
     /// least that a charge refused since they were last woken needed.
-    fn release(&self, bytes: usize) {
+    pub(crate) fn release(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
@@ -335,6 +338,17 @@ impl Charge {
         Charge {
             budget: budget.clone(),
             now: 0,
+        }
+    }
+
+    /// A charge of `bytes` that `budget` already counts, taken over from
+    /// a holder that ended its own charge without giving them back, as
+    /// rustls's charges do when bytes leave a connection. The budget's
+    /// total does not change.
+    pub(crate) fn adopt(budget: &Budget, bytes: usize) -> Charge {
+        Charge {
+            budget: budget.clone(),
+            now: bytes,
         }
     }
 

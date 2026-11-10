@@ -39,50 +39,123 @@
 //! [`Accepted`]: crate::server::Accepted
 //! [`Error::BudgetExhausted`]: crate::Error::BudgetExhausted
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
 
 use crate::sync::Arc;
 
-/// Where a connection's buffers are paid from.
-pub trait BufferBudget: Send + Sync {
-    /// A charge of nothing on this budget, for one buffer to grow.
-    fn open(&self) -> Box<dyn BufferCharge>;
+/// Where a connection's buffers are paid from: a count of bytes that
+/// refuses to go past its limit.
+///
+/// The connection holds what it takes in [`BufferCharge`]s, which give it
+/// back when dropped. The budget is an [`Any`], so its owner can recognize
+/// it in a charge that leaves the connection ([`BufferCharge::budget`]) and
+/// hold the bytes in a charge of its own type ([`BufferCharge::into_bytes`]).
+pub trait BufferBudget: Any + Send + Sync {
+    /// Takes `bytes`, if they fit. Refuses, changing nothing, if not.
+    fn take(&self, bytes: usize) -> bool;
+
+    /// Gives back `bytes` taken before.
+    fn give_back(&self, bytes: usize);
 }
 
 /// Bytes charged to a [`BufferBudget`], given back when dropped.
-pub trait BufferCharge: Send + Sync {
+///
+/// Making, growing, splitting and dropping one allocates nothing: it is the
+/// budget and a count.
+#[must_use = "a charge that is dropped gives its bytes back"]
+pub struct BufferCharge {
+    budget: Arc<dyn BufferBudget>,
+    bytes: usize,
+}
+
+impl BufferCharge {
+    /// A charge of nothing on `budget`.
+    pub(crate) fn nothing(budget: &Arc<dyn BufferBudget>) -> Self {
+        Self {
+            budget: budget.clone(),
+            bytes: 0,
+        }
+    }
+
     /// The bytes charged now.
-    fn bytes(&self) -> usize;
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The budget it counts against.
+    pub fn budget(&self) -> &Arc<dyn BufferBudget> {
+        &self.budget
+    }
+
+    /// Ends this charge without giving its bytes back, and returns them, for
+    /// the budget's owner to hold in a charge of its own. The budget's total
+    /// does not change.
+    pub fn into_bytes(mut self) -> usize {
+        core::mem::take(&mut self.bytes)
+    }
 
     /// Charges `to` bytes in all, if that is more than now. Refuses,
     /// changing nothing, if the budget has no room for the difference.
-    fn grow_to(&mut self, to: usize) -> bool;
+    fn grow_to(&mut self, to: usize) -> bool {
+        if to <= self.bytes {
+            return true;
+        }
+        if !self.budget.take(to - self.bytes) {
+            return false;
+        }
+        self.bytes = to;
+        true
+    }
 
     /// Charges only `to` bytes, if that is less than now, giving back the
     /// rest.
-    fn shrink_to(&mut self, to: usize);
+    fn shrink_to(&mut self, to: usize) {
+        if to < self.bytes {
+            self.budget.give_back(self.bytes - to);
+            self.bytes = to;
+        }
+    }
 
     /// Moves `bytes` of this charge into a new one on the same budget, as
     /// when the bytes it pays for leave the buffer. The budget's total does
     /// not change. `None`, changing nothing, if this charge holds less.
-    fn split(&mut self, bytes: usize) -> Option<Box<dyn BufferCharge>>;
+    fn split(&mut self, bytes: usize) -> Option<Self> {
+        if bytes > self.bytes {
+            return None;
+        }
+        self.bytes -= bytes;
+        Some(Self {
+            budget: self.budget.clone(),
+            bytes,
+        })
+    }
+}
 
-    /// The charge as its own type, for the budget's owner to take back.
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
+impl Drop for BufferCharge {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.budget.give_back(self.bytes);
+        }
+    }
+}
+
+impl fmt::Debug for BufferCharge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("BufferCharge").field(&self.bytes).finish()
+    }
 }
 
 /// Bytes taken out of a connection's buffer with the charge that pays for
 /// their allocation, so they leave without a copy.
 pub struct PaidBytes {
     bytes: Vec<u8>,
-    charge: Option<Box<dyn BufferCharge>>,
+    charge: Option<BufferCharge>,
 }
 
 impl PaidBytes {
-    pub(crate) fn new(bytes: Vec<u8>, charge: Option<Box<dyn BufferCharge>>) -> Self {
+    pub(crate) fn new(bytes: Vec<u8>, charge: Option<BufferCharge>) -> Self {
         Self { bytes, charge }
     }
 
@@ -93,7 +166,7 @@ impl PaidBytes {
 
     /// The bytes, and their charge: `None` for a connection without a
     /// budget, otherwise exactly their capacity.
-    pub fn into_parts(self) -> (Vec<u8>, Option<Box<dyn BufferCharge>>) {
+    pub fn into_parts(self) -> (Vec<u8>, Option<BufferCharge>) {
         (self.bytes, self.charge)
     }
 }
@@ -102,7 +175,7 @@ impl fmt::Debug for PaidBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PaidBytes")
             .field("len", &self.bytes.len())
-            .field("charged", &self.charge.as_ref().map(|c| c.bytes()))
+            .field("charged", &self.charge.as_ref().map(BufferCharge::bytes))
             .finish()
     }
 }
@@ -113,12 +186,12 @@ pub(crate) type Account = Option<Arc<dyn BufferBudget>>;
 /// What one buffer's allocation is charged. Nothing is charged for a
 /// connection without a budget, and every growth fits.
 #[derive(Default)]
-pub(crate) struct Paid(Option<Box<dyn BufferCharge>>);
+pub(crate) struct Paid(Option<BufferCharge>);
 
 impl Paid {
     /// A charge of nothing on `account`.
     pub(crate) fn open(account: &Account) -> Self {
-        Self(account.as_ref().map(|budget| budget.open()))
+        Self(account.as_ref().map(BufferCharge::nothing))
     }
 
     /// Whether this charges a budget at all.
@@ -154,7 +227,7 @@ impl Paid {
     }
 
     /// Moves `bytes` of this charge out with the bytes it pays for.
-    pub(crate) fn split(&mut self, bytes: usize) -> Option<Box<dyn BufferCharge>> {
+    pub(crate) fn split(&mut self, bytes: usize) -> Option<BufferCharge> {
         self.0.as_mut()?.split(bytes)
     }
 }
@@ -195,19 +268,13 @@ mod tests;
 pub(crate) mod testing {
     //! A budget for the crate's own tests.
 
-    use alloc::boxed::Box;
-    use core::any::Any;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{BufferBudget, BufferCharge};
+    use super::BufferBudget;
     use crate::sync::Arc;
 
     /// At most `limit` bytes, shared by every charge on it.
     pub(crate) struct Limit {
-        counts: Arc<Counts>,
-    }
-
-    struct Counts {
         used: AtomicUsize,
         limit: AtomicUsize,
     }
@@ -215,86 +282,32 @@ pub(crate) mod testing {
     impl Limit {
         pub(crate) fn new(limit: usize) -> Arc<Self> {
             Arc::new(Self {
-                counts: Arc::new(Counts {
-                    used: AtomicUsize::new(0),
-                    limit: AtomicUsize::new(limit),
-                }),
+                used: AtomicUsize::new(0),
+                limit: AtomicUsize::new(limit),
             })
         }
 
         pub(crate) fn used(&self) -> usize {
-            self.counts.used.load(Ordering::SeqCst)
+            self.used.load(Ordering::SeqCst)
         }
 
         pub(crate) fn set_limit(&self, limit: usize) {
-            self.counts.limit.store(limit, Ordering::SeqCst);
+            self.limit.store(limit, Ordering::SeqCst);
         }
-    }
-
-    struct Held {
-        limit: Arc<Counts>,
-        bytes: usize,
     }
 
     impl BufferBudget for Limit {
-        fn open(&self) -> Box<dyn BufferCharge> {
-            Box::new(Held {
-                limit: self.counts.clone(),
-                bytes: 0,
-            })
-        }
-    }
-
-    impl BufferCharge for Held {
-        fn bytes(&self) -> usize {
-            self.bytes
-        }
-
-        fn grow_to(&mut self, to: usize) -> bool {
-            if to <= self.bytes {
-                return true;
-            }
-            let more = to - self.bytes;
-            let limit = self.limit.limit.load(Ordering::SeqCst);
-            let fits = self
-                .limit
-                .used
+        fn take(&self, bytes: usize) -> bool {
+            let limit = self.limit.load(Ordering::SeqCst);
+            self.used
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                    (used + more <= limit).then_some(used + more)
+                    (used + bytes <= limit).then_some(used + bytes)
                 })
-                .is_ok();
-            if fits {
-                self.bytes = to;
-            }
-            fits
+                .is_ok()
         }
 
-        fn shrink_to(&mut self, to: usize) {
-            if to < self.bytes {
-                self.limit.used.fetch_sub(self.bytes - to, Ordering::SeqCst);
-                self.bytes = to;
-            }
-        }
-
-        fn split(&mut self, bytes: usize) -> Option<Box<dyn BufferCharge>> {
-            if bytes > self.bytes {
-                return None;
-            }
-            self.bytes -= bytes;
-            Some(Box::new(Self {
-                limit: self.limit.clone(),
-                bytes,
-            }))
-        }
-
-        fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
-            self
-        }
-    }
-
-    impl Drop for Held {
-        fn drop(&mut self) {
-            self.limit.used.fetch_sub(self.bytes, Ordering::SeqCst);
+        fn give_back(&self, bytes: usize) {
+            self.used.fetch_sub(bytes, Ordering::SeqCst);
         }
     }
 }

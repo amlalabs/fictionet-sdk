@@ -59,7 +59,9 @@ The divergences from upstream are:
 - A connection's buffers can be paid from a budget the caller passes in
   (`budget::BufferBudget`, through `Acceptor::with_budget` or
   `ServerConnection::with_budget`); there is no global or thread-local
-  state. The records read and not yet processed, the plaintext decrypted
+  state. The budget only takes and gives back bytes; each buffer holds a
+  `budget::BufferCharge`, the budget and a count, so charging, splitting
+  a charge off with bytes that leave, and dropping it allocate nothing. The records read and not yet processed, the plaintext decrypted
   and not yet taken, the plaintext written during the handshake, and the
   records queued to send are each charged before they grow, and their
   capacities are exact, so what is charged is what they hold. A growth the

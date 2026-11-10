@@ -348,7 +348,7 @@ impl TlsLayer {
         // size, at most a record.
         if let Some(record) = tls.take_sendable_tls_chunk(RECORD) {
             let (bytes, charge) = record.into_parts();
-            let charge = charge_of(charge).ok_or_else(|| {
+            let charge = charge.and_then(charge_of).ok_or_else(|| {
                 HandshakeError::Failed("ciphertext left rustls without its charge".to_owned())
             })?;
             return Chunk::adopt(bytes, charge)
@@ -700,7 +700,7 @@ impl Layer for TlsLayer {
                         .take_first_chunk()
                         .map_err(|error| HandshakeError::Failed(error.to_string()))?
                         .into_parts();
-                    let charge = charge_of(charge).ok_or_else(|| {
+                    let charge = charge.and_then(charge_of).ok_or_else(|| {
                         HandshakeError::Failed(
                             "plaintext left rustls without its charge".to_owned(),
                         )

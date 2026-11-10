@@ -2,8 +2,9 @@
 //!
 //! The vendored rustls charges a [`BufferBudget`] before any of a
 //! connection's buffers grows (see [`rustls::budget`]). A [`Budget`] is one:
-//! each buffer holds a [`Charge`] on it, so a refusal wakes the runner when
-//! memory frees, as every other charge does.
+//! rustls takes and gives back bytes through the same count every
+//! [`Charge`] uses, so a refusal wakes the runner when memory frees, as
+//! every other refusal does.
 
 use std::any::Any;
 
@@ -12,39 +13,21 @@ use rustls::budget::{BufferBudget, BufferCharge};
 use fictionet::stdlib::layer::{Budget, Charge};
 
 impl BufferBudget for Budget {
-    fn open(&self) -> Box<dyn BufferCharge> {
-        Box::new(Charge::nothing(self))
+    fn take(&self, bytes: usize) -> bool {
+        Budget::take(self, bytes..=bytes).is_some()
+    }
+
+    fn give_back(&self, bytes: usize) {
+        self.release(bytes);
     }
 }
 
-impl BufferCharge for Charge {
-    fn bytes(&self) -> usize {
-        Charge::bytes(self)
-    }
-
-    fn grow_to(&mut self, to: usize) -> bool {
-        Charge::grow_to(self, to)
-    }
-
-    fn shrink_to(&mut self, to: usize) {
-        Charge::shrink_to(self, to);
-    }
-
-    fn split(&mut self, bytes: usize) -> Option<Box<dyn BufferCharge>> {
-        Charge::split(self, bytes).map(|charge| Box::new(charge) as Box<dyn BufferCharge>)
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
-        self
-    }
-}
-
-/// The [`Charge`] rustls handed over with bytes it took out of a connection
-/// paid from a [`Budget`]. `None` from a connection without one.
-pub(crate) fn charge_of(charge: Option<Box<dyn BufferCharge>>) -> Option<Charge> {
-    charge?
-        .into_any()
-        .downcast::<Charge>()
-        .ok()
-        .map(|charge| *charge)
+/// The [`Charge`] that holds the bytes rustls handed over with bytes it took
+/// out of a connection paid from a [`Budget`]. `None`, giving the bytes
+/// back, for a charge on another kind of budget.
+pub(crate) fn charge_of(charge: BufferCharge) -> Option<Charge> {
+    let budget = (&**charge.budget() as &dyn Any)
+        .downcast_ref::<Budget>()?
+        .clone();
+    Some(Charge::adopt(&budget, charge.into_bytes()))
 }
