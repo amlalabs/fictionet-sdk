@@ -672,7 +672,7 @@ async fn ssh_channels_hold_no_heap_their_budget_does_not_cover() {
     use fictionet::stdlib::services::ssh;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     const CHANNELS: usize = 4;
-    const PER_CHANNEL: usize = 32 << 10;
+    const PER_CHANNEL: usize = 64 << 10;
     tokio::time::timeout(Duration::from_secs(60), async {
         let (client_side, mut server) = tokio::io::duplex(1 << 20);
         let budget = Budget::new(4 << 20);

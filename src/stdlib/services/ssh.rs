@@ -785,6 +785,17 @@ impl Channel {
         self.window -= bytes as u32;
         Ok(())
     }
+
+    /// The window adjustment to send now, if one is due: everything the
+    /// channel can take beyond what the peer was told, once that is at
+    /// least what the peer has left. The peer then hears of new room about
+    /// once per half window it uses, as OpenSSH tells it, and never runs
+    /// dry while room is owed: at zero left, any room owed is due.
+    fn adjustment(&self) -> Option<u32> {
+        let owed = self.receive - u64::from(self.advertised);
+        let owed = owed.min(u64::from(u32::MAX - self.advertised)) as u32;
+        (owed > 0 && owed >= self.advertised).then_some(owed)
+    }
 }
 
 struct Flight {
@@ -1479,7 +1490,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                     && !channel.closed
                     && (!channel.confirmed && channel.receive > 0
                         || channel.confirmed
-                            && (channel.receive > channel.advertised as u64
+                            && (channel.adjustment().is_some()
                                 || channel.granted == 0 && channel.window > 0 && !channel.sent_eof))
             };
             let id = self
@@ -1507,10 +1518,7 @@ impl<H: Handler, T: PacketTransport> Ssh<H, T> {
                             data: Vec::new(),
                         },
                     )?;
-                } else if channel.receive > channel.advertised as u64 {
-                    let bytes = (channel.receive - channel.advertised as u64)
-                        .min(u32::MAX as u64 - channel.advertised as u64)
-                        as u32;
+                } else if let Some(bytes) = channel.adjustment() {
                     channel.advertised += bytes;
                     self.send(
                         env,
@@ -2352,6 +2360,143 @@ mod tests {
                 ]
             );
             assert_eq!(budget.used(), 0);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A client that counts the window adjustments it receives.
+    struct Adjustments(Arc<std::sync::atomic::AtomicUsize>);
+    impl russh::client::Handler for Adjustments {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn window_adjusted(
+            &mut self,
+            _: russh::ChannelId,
+            _: u32,
+            _: &mut russh::client::Session,
+        ) -> Result<(), Self::Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Opens `channels` echo channels; with all of them open, each in turn
+    /// sends a full receive window before it reads anything back. Returns
+    /// the window adjustments the client received.
+    async fn full_windows(seed: u64, channels: usize) -> usize {
+        let config = Arc::new(Config::new(
+            Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap()),
+            ssh::Identification::new("2.0", "test", None).unwrap(),
+        ));
+        let programs = Arc::new(Mutex::new(Vec::new()));
+        let layer = Ssh::new(
+            config,
+            Arc::new(Echo(programs)),
+            Arc::new(ConnInfo::default()),
+        )
+        .sessions();
+        let budget = Budget::new(32 << 20);
+        let mut harness = crate::stdlib::layer::Harness::with_budget(
+            crate::Seed::from_u64(seed),
+            layer,
+            budget.clone(),
+        );
+        let (client, mut server) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(async move {
+            harness.settle().unwrap();
+            server.write_all(&harness.take_output()).await.unwrap();
+            let mut input = [0; 8192];
+            loop {
+                let n = server.read(&mut input).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                harness.push(&input[..n]).unwrap();
+                server.write_all(&harness.take_output()).await.unwrap();
+                if harness.ended() {
+                    break;
+                }
+            }
+        });
+        let adjustments = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client,
+            Adjustments(adjustments.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            client
+                .authenticate_password("guest", "secret")
+                .await
+                .unwrap()
+                .success()
+        );
+        let mut open = Vec::new();
+        for _ in 0..channels {
+            let channel = client.channel_open_session().await.unwrap();
+            channel.exec(true, b"echo".to_vec()).await.unwrap();
+            open.push(channel);
+        }
+        let block = [b'w'; 1024];
+        for channel in &mut open {
+            for _ in 0..WINDOW as usize / block.len() {
+                channel.data(&block[..]).await.unwrap();
+            }
+            channel.eof().await.unwrap();
+            let mut received = 0;
+            let mut exit = None;
+            while let Some(message) = channel.wait().await {
+                match message {
+                    russh::ChannelMsg::Data { data } => received += data.len(),
+                    russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(received, WINDOW as usize);
+            assert_eq!(exit, Some(7));
+        }
+        client
+            .disconnect(russh::Disconnect::ByApplication, "done", "")
+            .await
+            .unwrap();
+        drop(client);
+        task.await.unwrap();
+        assert_eq!(budget.used(), 0);
+        adjustments.load(Ordering::Relaxed)
+    }
+
+    /// A client that sends a channel's whole window before reading, with
+    /// other channels open, gets its echo, exit status and close. The peer
+    /// hears of new room about once per half window it used, not once per
+    /// packet the server consumed: a client that buffers a bounded number
+    /// of messages per channel (russh, 100) stalled behind one adjustment
+    /// per kilobyte.
+    #[tokio::test]
+    async fn full_windows_on_open_channels_finish_with_an_adjustment_per_half_window() {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for seed in 0..16 {
+                for channels in [4, 1] {
+                    let adjustments = full_windows(seed, channels).await;
+                    // One per half window each channel's peer used, and a
+                    // last one that tops the window up once it is done.
+                    let most = channels * (WINDOW as usize / (WINDOW as usize / 2) + 1);
+                    assert!(
+                        adjustments <= most,
+                        "{channels} channels got {adjustments} window adjustments, more than {most}"
+                    );
+                }
+            }
         })
         .await
         .unwrap();
