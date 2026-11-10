@@ -84,6 +84,13 @@ passing runs:
 | `LabClock_base` | `Clock` in lab mode (`src/clock.rs`), `Timer` (`src/cx/timer.rs`), `Cx::idle`, `RunShared::idle` and the end of a turn (`src/run.rs`) | 1,322,969 | 526,048 | 39 | `Monotonic`, `WakesInOrderAndInTime`, `EntriesOwned`, `SleepersHaveEntries`, `SleepersWake` |
 | `Timers_base` | `Timers::add`, `reset`, `remove`, `State::take_due`, `Timers::thread` (`src/timer.rs`) | 131,483 | 21,878 | 19 | `NoEarlyFire`, `SleepIsSafe`, `DueTimersFire` |
 
+On branch `comp/buf-locks` a `Timer` polled for a later deadline keeps its
+entry at the earlier instant while that instant has yet to come: it wakes
+there once, and the next poll moves the entry. `LabClock.tla` was changed to
+match (`Register` takes the poller's clock reading, `Keep`, and each timer's
+`wanted` deadline) and has not been run since; the `LabClock_base` counts
+above are from before the change.
+
 The properties say, in the runtime's terms: a task that is woken is polled
 again, even when the wake lands during its own poll; queued work between polls
 of the run always comes with a wake of whatever polls the run; a cancel gets

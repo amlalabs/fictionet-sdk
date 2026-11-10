@@ -1,4 +1,4 @@
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use super::{CancelWait, Cancelled, Cx};
 use crate::time::Instant;
@@ -8,16 +8,32 @@ use crate::time::Instant;
 /// Moving the deadline reuses the same timer entry, where dropping one
 /// [`Cx::sleep_until`] future and making another would add and remove an
 /// entry, and allocate the boxed future, each time.
+///
+/// A poll with the deadline and waker the entry already has, or with a
+/// later deadline, leaves the clock alone and takes none of its locks. A
+/// later deadline keeps the entry at the earlier one: the timer wakes there
+/// once, the task polls again, and the entry moves to the later deadline
+/// then. Only an earlier deadline, a new waker, or a first deadline
+/// changes the entry at once.
+///
 /// Create an inactive timer with [`Timer::new`]. Each call to
 /// [`Timer::poll_until`] sets its deadline. [`Timer::clear`] removes the
 /// deadline; dropping the timer also unregisters its cancellation waiter.
 /// Use a timer with one region.
 pub struct Timer {
     fcx: Cx,
-    /// The logical deadline of the timer entry, if there is one.
-    deadline: Option<Instant>,
-    entry: Option<u64>,
+    /// The timer's entry in the run's clock, if there is one.
+    entry: Option<Entry>,
     wait: CancelWait,
+}
+
+/// A timer's entry in the run's clock: its registration, the instant it
+/// wakes at, and a clone of the waker it wakes, for comparing without the
+/// clock's lock.
+struct Entry {
+    id: u64,
+    at: Instant,
+    waker: Waker,
 }
 
 impl Timer {
@@ -25,7 +41,6 @@ impl Timer {
     pub fn new(fcx: &Cx) -> Self {
         Self {
             fcx: fcx.clone(),
-            deadline: None,
             entry: None,
             wait: CancelWait::default(),
         }
@@ -33,9 +48,11 @@ impl Timer {
 
     /// Polls for `deadline` to pass: `Ready(Ok(()))` once it has. Until
     /// then, `cx`'s waker is woken when it passes or when the owning region is
-    /// cancelled. Cancellation returns `Ready(Err(Cancelled))`, even if
-    /// the deadline has passed. `Duration::MAX` is an unarmed wait. Real
-    /// deadlines beyond the host clock's range also wait only for cancellation.
+    /// cancelled. It may also be woken once at an earlier deadline this
+    /// timer was polled for. Cancellation returns `Ready(Err(Cancelled))`,
+    /// even if the deadline has passed. `Duration::MAX` is an unarmed wait.
+    /// Real deadlines beyond the host clock's range also wait only for
+    /// cancellation.
     pub fn poll_until(
         &mut self,
         cx: &mut Context<'_>,
@@ -44,35 +61,42 @@ impl Timer {
         if self.fcx.is_cancelled() {
             return Poll::Ready(Err(Cancelled));
         }
+        let clock = &self.fcx.run.environment.clock;
         // A deadline past what the clock can hold never comes.
-        match self
-            .fcx
-            .run
-            .environment
-            .clock
-            .finite(deadline)
-            .then_some(deadline)
-        {
-            Some(at) => {
-                if self.fcx.now() >= at {
-                    self.clear();
-                    return Poll::Ready(Ok(()));
-                }
-                match self.entry {
-                    Some(id) if self.deadline == Some(at) => {
-                        self.fcx.run.environment.clock.update(id, cx.waker())
-                    }
-                    Some(id) => {
-                        self.entry = Some(self.fcx.run.environment.clock.reset(id, at, cx.waker()))
-                    }
-                    None => {
-                        self.entry =
-                            Some(self.fcx.run.environment.clock.add(at, cx.waker().clone()))
-                    }
-                }
-                self.deadline = Some(at);
+        if clock.finite(deadline) {
+            let now = self.fcx.now();
+            if now >= deadline {
+                self.clear();
+                return Poll::Ready(Ok(()));
             }
-            None => self.clear(),
+            let waker = cx.waker();
+            match &mut self.entry {
+                // The entry wakes the task first, at its own instant, and the
+                // task polls again then.
+                Some(entry) if entry.at == deadline || (entry.at < deadline && now < entry.at) => {
+                    if !entry.waker.will_wake(waker) {
+                        clock.update(entry.id, waker);
+                        entry.waker = waker.clone();
+                    }
+                }
+                // Earlier, or past the instant the entry woke at.
+                Some(entry) => {
+                    entry.id = clock.reset(entry.id, deadline, waker);
+                    entry.at = deadline;
+                    if !entry.waker.will_wake(waker) {
+                        entry.waker = waker.clone();
+                    }
+                }
+                None => {
+                    self.entry = Some(Entry {
+                        id: clock.add(deadline, waker.clone()),
+                        at: deadline,
+                        waker: waker.clone(),
+                    });
+                }
+            }
+        } else {
+            self.clear();
         }
         if self.fcx.register_cancel(cx.waker(), &mut self.wait) {
             return Poll::Ready(Err(Cancelled));
@@ -83,10 +107,9 @@ impl Timer {
     /// Removes the deadline and its timer entry, if any.
     /// The cancellation registration stays until the timer is dropped.
     pub fn clear(&mut self) {
-        if let Some(id) = self.entry.take() {
-            self.fcx.run.environment.clock.remove(id);
+        if let Some(entry) = self.entry.take() {
+            self.fcx.run.environment.clock.remove(entry.id);
         }
-        self.deadline = None;
     }
 }
 
@@ -101,6 +124,127 @@ mod tests {
     use super::*;
     use crate::block_on;
     use crate::time::{Duration, ms};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+    impl std::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A splitmix64 step.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// Reading a lab's time, and polling a timer for the deadline and
+    /// waker its entry has, or for a later deadline, take no clock lock:
+    /// they go through with the clock's lock held elsewhere.
+    #[test]
+    fn time_and_an_unchanged_or_later_deadline_take_no_clock_lock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut world = Box::pin(crate::lab(
+            fictionet::Seed::from_u64(0),
+            move |fcx| async move {
+                tx.send(fcx.clone()).unwrap();
+                fcx.sleep(Duration::from_secs(3600)).await?;
+                Ok(())
+            },
+        ));
+        assert!(
+            world
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let fcx = rx.recv().unwrap();
+        let waker = Waker::from(Arc::new(Wakes::default()));
+        let mut timer = Timer::new(&fcx);
+        let base = fcx.now() + ms(10);
+        assert!(
+            timer
+                .poll_until(&mut Context::from_waker(&waker), base)
+                .is_pending()
+        );
+        let clock = fcx.run.environment.clock.clone();
+        let held = clock.hold();
+        let (done, finished) = std::sync::mpsc::channel();
+        let polls = std::thread::spawn(move || {
+            let mut cx = Context::from_waker(&waker);
+            for i in 0..1000 {
+                assert!(fcx.now() < base);
+                assert!(timer.poll_until(&mut cx, base).is_pending());
+                assert!(timer.poll_until(&mut cx, base + ms(i)).is_pending());
+            }
+            done.send(()).unwrap();
+            // Dropping the timer takes the lock: hand it back instead.
+            (timer, fcx)
+        });
+        let finished = finished.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        drop(polls.join().unwrap());
+        drop(world);
+        assert_eq!(finished, Ok(()), "a read or a poll took the clock's lock");
+    }
+
+    /// A timer whose deadline moves at random, earlier or later, on the
+    /// polls its wakes cause: in a lab it fires exactly at the deadline it
+    /// was last polled for, and wakes at most once between a move and that
+    /// deadline.
+    #[test]
+    fn a_moving_timer_fires_exactly_at_its_last_deadline() {
+        for seed in 1..=8u64 {
+            block_on(crate::lab(
+                fictionet::Seed::from_u64(seed),
+                move |fcx| async move {
+                    let mut timer = Timer::new(&fcx);
+                    let mut state = seed;
+                    let mut deadline = fcx.now() + ms(1 + next(&mut state) % 100);
+                    let mut pending_since_move = 0;
+                    let mut fired = 0;
+                    std::future::poll_fn(|cx| {
+                        loop {
+                            let now = fcx.now();
+                            if now < deadline && next(&mut state).is_multiple_of(3) {
+                                deadline = now + ms(1 + next(&mut state) % 100);
+                                pending_since_move = 0;
+                            }
+                            match timer.poll_until(cx, deadline) {
+                                Poll::Ready(Ok(())) => {
+                                    assert_eq!(fcx.now(), deadline, "seed {seed}");
+                                    fired += 1;
+                                    if fired == 200 {
+                                        return Poll::Ready(Ok::<(), Cancelled>(()));
+                                    }
+                                    deadline = fcx.now() + ms(1 + next(&mut state) % 100);
+                                    pending_since_move = 0;
+                                }
+                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                Poll::Pending => {
+                                    pending_since_move += 1;
+                                    assert!(
+                                        pending_since_move <= 2,
+                                        "seed {seed}: woken twice before its deadline"
+                                    );
+                                    return Poll::Pending;
+                                }
+                            }
+                        }
+                    })
+                    .await?;
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        }
+    }
 
     #[test]
     fn a_timer_fires_at_its_latest_deadline() {
@@ -140,8 +284,9 @@ mod tests {
     }
 
     /// A lab wakes timers due at the same instant in the order they were
-    /// set. A timer that moves its deadline is set again, so it wakes after
-    /// a timer that set the same deadline before it moved.
+    /// set. A timer moved to a later deadline wakes once at its earlier one
+    /// and is set again when its task polls it then, so it wakes after a
+    /// timer that set the same deadline before.
     #[test]
     fn a_moved_timer_wakes_after_timers_set_before_the_move() {
         use fictionet::sync::Mutex;
@@ -170,8 +315,12 @@ mod tests {
             assert!(pending(&mut a, &first, ms(10)));
             assert!(pending(&mut b, &second, ms(20)));
             assert!(pending(&mut a, &first, ms(20)));
+            fcx.sleep_until(Instant::from_since_start(ms(15))).await?;
+            assert_eq!(*woken.lock(), ["first"], "the entry at 10 ms woke `a`");
+            // `a`'s task polls it again, as a woken task does.
+            assert!(pending(&mut a, &first, ms(20)));
             fcx.sleep_until(Instant::from_since_start(ms(30))).await?;
-            assert_eq!(*woken.lock(), ["second", "first"]);
+            assert_eq!(*woken.lock(), ["first", "second", "first"]);
             Ok(())
         }))
         .unwrap();
