@@ -25,9 +25,9 @@ fn downloads() -> Result<PathBuf> {
     Ok(folder.into())
 }
 
-/// The guest's Claude Code credential kind decides who the demo is for. A
-/// subscription token is the owner's own; an API key serves other people,
-/// who get only the pages their searches allow.
+/// The pages, with the editor and live search the host's keys allow. A
+/// hosted demo, which runs its workstation as a Nitro Sandbox on an EC2
+/// parent, serves other people, who get only the pages their searches allow.
 fn app_pages(seed: Seed, downloads: &std::path::Path, login: Option<ClaudeLogin>) -> Result<Pages> {
     use web_world::pages::model::Model;
     let model = if std::env::var("OPENROUTER_API_KEY").is_ok_and(|key| !key.is_empty()) {
@@ -49,9 +49,9 @@ fn app_pages(seed: Seed, downloads: &std::path::Path, login: Option<ClaudeLogin>
         pages = pages.with_editor(model);
     }
     if std::env::var("EXA_API_KEY").is_ok_and(|key| !key.is_empty()) {
-        let web = match login {
-            Some(ClaudeLogin::ApiKey) => LiveWeb::SearchedOnly,
-            Some(ClaudeLogin::Subscription) | None => LiveWeb::Any,
+        let web = match kit::vm::Vmm::of_host() {
+            kit::vm::Vmm::Nitro => LiveWeb::SearchedOnly,
+            kit::vm::Vmm::CloudHypervisor => LiveWeb::Any,
         };
         pages = pages.with_live_search(downloads, web)?;
     }
