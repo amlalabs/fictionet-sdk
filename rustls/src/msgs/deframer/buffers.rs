@@ -4,6 +4,7 @@ use core::ops::Range;
 #[cfg(feature = "std")]
 use std::io;
 
+use crate::budget::Paid;
 #[cfg(feature = "std")]
 use crate::msgs::message::MAX_WIRE_SIZE;
 
@@ -154,9 +155,52 @@ pub(crate) struct DeframerVecBuffer {
 
     /// What size prefix of `buf` is used.
     used: usize,
+
+    /// Pays for `buf`'s capacity, charged before it grows.
+    paid: Paid,
 }
 
 impl DeframerVecBuffer {
+    /// An empty buffer that pays for itself with `paid`.
+    pub(crate) fn paid_with(paid: Paid) -> Self {
+        Self {
+            paid,
+            ..Self::default()
+        }
+    }
+
+    /// Makes `buf` `len` bytes long, paying for the capacity first. Refuses,
+    /// changing nothing, if the budget has no room. A smaller length gives
+    /// the capacity past it back.
+    #[must_use = "a refused growth must not be followed by a write past the length"]
+    fn resize(&mut self, len: usize) -> bool {
+        let capacity = self.buf.capacity();
+        if len > capacity {
+            if !self.paid.grow_by(len - capacity) {
+                return false;
+            }
+            self.buf.reserve_exact(len - self.buf.len());
+        }
+        self.buf.resize(len, 0);
+        if len < capacity {
+            self.buf.shrink_to(len);
+            self.paid.shrink_by(capacity - self.buf.capacity());
+        }
+        true
+    }
+
+    /// What the buffer's allocation takes.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// Whether what is paid for is the capacity, as the invariant says.
+    #[cfg(test)]
+    pub(crate) fn accounted(&self) -> bool {
+        !self.paid.is_budgeted() || self.paid.bytes() == self.buf.capacity()
+    }
+
     /// Discard `taken` bytes from the start of our buffer.
     pub(crate) fn discard(&mut self, taken: usize) {
         #[allow(clippy::comparison_chain)]
@@ -193,9 +237,24 @@ impl DeframerVecBuffer {
 #[cfg(feature = "std")]
 impl DeframerVecBuffer {
     /// Read some bytes from `rd`, and add them to the buffer.
+    ///
+    /// Fails with [`io::ErrorKind::OutOfMemory`], having read nothing, if the
+    /// buffer must grow for the read and the budget has no room.
     pub(crate) fn read(&mut self, rd: &mut dyn io::Read, in_handshake: bool) -> io::Result<usize> {
-        if let Err(err) = self.prepare_read(in_handshake) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+        match self.prepare_read(in_handshake) {
+            Ok(()) => {}
+            Err(NoRoom::Full) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "message buffer full",
+                ));
+            }
+            Err(NoRoom::Unpaid) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "no budget for the received records",
+                ));
+            }
         }
 
         // Try to do the largest reads possible. Note that if
@@ -208,7 +267,7 @@ impl DeframerVecBuffer {
     }
 
     /// Resize the internal `buf` if necessary for reading more bytes.
-    fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), &'static str> {
+    fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), NoRoom> {
         /// TLS allows for handshake messages of up to 16MB.  We
         /// restrict that to 64KB to limit potential for denial-of-
         /// service.
@@ -229,7 +288,7 @@ impl DeframerVecBuffer {
         };
 
         if self.used >= allow_max {
-            return Err("message buffer full");
+            return Err(NoRoom::Full);
         }
 
         // If we can and need to increase the buffer size to allow a 4k read, do so. After
@@ -237,12 +296,13 @@ impl DeframerVecBuffer {
         // make sure to reduce the buffer size again (large messages should be rare).
         // Also, reduce the buffer size if there are neither full nor partial messages in it,
         // which usually means that the other side suspended sending data.
+        // The capacity is exactly what is asked for, so that it is exactly
+        // what is paid for.
         let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
-        if need_capacity > self.buf.len() {
-            self.buf.resize(need_capacity, 0);
-        } else if self.used == 0 || self.buf.len() > allow_max {
-            self.buf.resize(need_capacity, 0);
-            self.buf.shrink_to(need_capacity);
+        if (need_capacity > self.buf.len() || self.used == 0 || self.buf.len() > allow_max)
+            && !self.resize(need_capacity)
+        {
+            return Err(NoRoom::Unpaid);
         }
 
         Ok(())
@@ -250,18 +310,28 @@ impl DeframerVecBuffer {
 
     /// Append `bytes` to the end of this buffer.
     ///
-    /// Return a `Range` saying where it went.
-    pub(crate) fn extend(&mut self, bytes: &[u8]) -> Range<usize> {
+    /// Return a `Range` saying where it went, or `None`, changing nothing, if
+    /// the buffer must grow and the budget has no room.
+    pub(crate) fn extend(&mut self, bytes: &[u8]) -> Option<Range<usize>> {
         let len = bytes.len();
         let start = self.used;
         let end = start + len;
-        if self.buf.len() < end {
-            self.buf.resize(end, 0);
+        if self.buf.len() < end && !self.resize(end) {
+            return None;
         }
         self.buf[start..end].copy_from_slice(bytes);
         self.used += len;
-        Range { start, end }
+        Some(Range { start, end })
     }
+}
+
+/// Why a read found no room.
+#[cfg(feature = "std")]
+enum NoRoom {
+    /// The buffer holds the most it may.
+    Full,
+    /// The buffer must grow, and the budget has no room.
+    Unpaid,
 }
 
 /// A borrowed version of [`DeframerVecBuffer`] that tracks discard operations

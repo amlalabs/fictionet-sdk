@@ -331,7 +331,7 @@ impl std::fmt::Debug for Charge {
 
 impl Charge {
     /// A charge of nothing, which always fits.
-    pub(super) fn nothing(budget: &Budget) -> Charge {
+    pub(crate) fn nothing(budget: &Budget) -> Charge {
         Charge {
             budget: budget.clone(),
             now: 0,

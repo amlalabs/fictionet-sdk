@@ -22,10 +22,6 @@
 //! design: the shared header around each chunk's bytes, one handler call's
 //! request and response values in flight, and the part of the harness's
 //! front input piece the stack has already copied.
-//!
-//! A stack built on a third-party type whose heap its budget leaves out by
-//! design adds that type's declared bound to the right side
-//! ([`Oracle::third_party`]): the check then holds the type to its bound.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,10 +93,7 @@ struct Oracle {
     held: i128,
     /// What the stack held beyond its charge once it settled.
     fixed: i128,
-    /// The declared bound of a third-party type's heap the budget leaves
-    /// out by design.
-    third_party: i128,
-    /// The most the stack held past its charge, `fixed` and `third_party`.
+    /// The most the stack held past its charge and `fixed`.
     worst: i128,
     most_used: usize,
     checks: usize,
@@ -113,18 +106,10 @@ impl Oracle {
             budget: budget.clone(),
             held: 0,
             fixed: 0,
-            third_party: 0,
             worst: i128::MIN,
             most_used: 0,
             checks: 0,
         }
-    }
-
-    /// The stack also holds up to `bytes` inside a third-party type its
-    /// budget leaves out by design.
-    fn third_party(mut self, bytes: usize) -> Oracle {
-        self.third_party = bytes as i128;
-        self
     }
 
     /// Runs one step of the stack, counting what it leaves allocated.
@@ -144,18 +129,17 @@ impl Oracle {
     /// peer's that the harness still holds.
     fn check(&mut self, outside: usize) {
         let used = self.used();
-        let over = self.held - outside as i128 - used - self.fixed - self.third_party;
+        let over = self.held - outside as i128 - used - self.fixed;
         self.worst = self.worst.max(over);
         self.most_used = self.most_used.max(self.budget.used());
         self.checks += 1;
         assert!(
             over <= SLACK,
-            "{}: the heap holds {} bytes, {over} past the budget's {used}, the fixed {}, \
-             the third-party bound {} and the slack {SLACK}",
+            "{}: the heap holds {} bytes, {over} past the budget's {used}, the fixed {} \
+             and the slack {SLACK}",
             self.stack,
             self.held - outside as i128,
             self.fixed,
-            self.third_party,
         );
     }
 
@@ -168,12 +152,11 @@ impl Oracle {
             self.stack
         );
         eprintln!(
-            "{}: {} checks, fixed {} bytes, third-party bound {}, worst {} bytes past \
-             budget plus fixed plus bound (slack {SLACK}), most used {} of {}, left after drop {}",
+            "{}: {} checks, fixed {} bytes, worst {} bytes past budget plus fixed \
+             (slack {SLACK}), most used {} of {}, left after drop {}",
             self.stack,
             self.checks,
             self.fixed,
-            self.third_party,
             self.worst,
             self.most_used,
             self.budget.limit(),
@@ -421,14 +404,9 @@ fn tls_bulk_holds_no_heap_its_budget_does_not_cover() {
             }
         };
         let budget = Budget::new(256 << 10);
-        // The TLS layer's budget leaves rustls's own buffers out by
-        // design. Once the handshake is done rustls declares two: the
-        // record it is reading, at most a full record on the wire (16384
-        // bytes of payload, 2048 of expansion, a 5-byte header), and the
-        // plaintext it has decrypted and not yet handed over, at most
-        // 16384 bytes.
-        let rustls_buffers = (16384 + 2048 + 5) + 16384;
-        let mut oracle = Oracle::new("TLS", &budget).third_party(rustls_buffers);
+        // rustls's own buffers are charged to the same budget: nothing
+        // the connection holds is allowed for.
+        let mut oracle = Oracle::new("TLS", &budget);
         let mut h = oracle.step(|| {
             Harness::with_budget(
                 Seed::from_u64(12),

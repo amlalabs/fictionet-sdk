@@ -113,7 +113,10 @@ impl<C: Connection> Client<C> {
 
     /// Sends close_notify and a FIN. Reading still works.
     pub async fn close(&mut self, fcx: &Cx) -> Result<(), ClientError> {
-        self.tls.send_close_notify();
+        assert!(
+            self.tls.send_close_notify(),
+            "a client without a budget always queues its close_notify"
+        );
         self.flush(fcx).await?;
         self.conn.shutdown(fcx).await?;
         Ok(())

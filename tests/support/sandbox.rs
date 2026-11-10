@@ -278,7 +278,10 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
     }
 
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        self.tls.send_close_notify();
+        assert!(
+            self.tls.send_close_notify(),
+            "a client without a budget always queues its close_notify"
+        );
         match self.poll_flush(fcx, cx) {
             Poll::Ready(Ok(())) => self.conn.poll_shutdown(fcx, cx),
             other => other,

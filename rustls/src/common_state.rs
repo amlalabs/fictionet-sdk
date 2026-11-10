@@ -4,6 +4,9 @@ use alloc::vec::Vec;
 
 use pki_types::CertificateDer;
 
+use crate::budget::{
+    Account, Paid, PaidBytes, CONTROL_PAYLOAD, CONTROL_RECORDS, HANDSHAKE_RECORDS, HANDSHAKE_ROOM,
+};
 use crate::conn::kernel::KernelState;
 use crate::crypto::SupportedKxGroup;
 use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
@@ -17,8 +20,7 @@ use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::fragmenter::MessageFragmenter;
 use crate::msgs::handshake::{CertificateChain, HandshakeMessagePayload, ProtocolName};
 use crate::msgs::message::{
-    Message, MessagePayload, OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage,
-    PlainMessage,
+    Message, MessagePayload, OutboundChunks, OutboundPlainMessage, PlainMessage, HEADER_SIZE,
 };
 use crate::record_layer::PreEncryptAction;
 use crate::suites::{PartiallyExtractedSecrets, SupportedCipherSuite};
@@ -52,7 +54,22 @@ pub struct CommonState {
     message_fragmenter: MessageFragmenter,
     pub(crate) received_plaintext: ChunkVecBuffer,
     pub(crate) sendable_tls: ChunkVecBuffer,
-    queued_key_update_message: Option<Vec<u8>>,
+    /// A key update notification encrypted and paid for in `sendable_tls`,
+    /// with what was paid, waiting to go before the next record.
+    queued_key_update_message: Option<(Vec<u8>, usize)>,
+
+    /// The budget the connection's buffers are paid from, if any.
+    pub(crate) account: Account,
+    /// The last `process_new_packets` stopped before a record or message
+    /// it could not pay for.
+    wants_budget: bool,
+    /// Output for a received message outgrew the room charged for it and
+    /// the budget refused the rest. Nothing more is queued, and the
+    /// connection fails.
+    output_unpaid: bool,
+    /// The room, in bytes and records, charged before each handshake
+    /// message for the output it makes.
+    pub(crate) handshake_room: (usize, usize),
 
     /// Protocol whose key schedule should be used. Unused for TLS < 1.3.
     pub(crate) protocol: Protocol,
@@ -88,6 +105,10 @@ impl CommonState {
             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
             queued_key_update_message: None,
+            account: None,
+            wants_budget: false,
+            output_unpaid: false,
+            handshake_room: (HANDSHAKE_ROOM, HANDSHAKE_RECORDS),
             protocol: Protocol::Tcp,
             quic: quic::Quic::default(),
             enable_secret_extraction: false,
@@ -114,12 +135,131 @@ impl CommonState {
     }
 
     /// Takes the sole queued ciphertext chunk without copying if it is whole
-    /// and its allocation fits `max_capacity`. Otherwise leaves output queued
-    /// for [`Connection::write_tls`], preserving coalescing and partial writes.
+    /// and its allocation fits `max_capacity`, with the charge that pays for
+    /// it. Otherwise leaves output queued for [`Connection::write_tls`],
+    /// preserving coalescing and partial writes.
     ///
     /// [`Connection::write_tls`]: crate::Connection::write_tls
-    pub fn take_sendable_tls_chunk(&mut self, max_capacity: usize) -> Option<Vec<u8>> {
+    pub fn take_sendable_tls_chunk(&mut self, max_capacity: usize) -> Option<PaidBytes> {
         self.sendable_tls.take_sole_whole_chunk(max_capacity)
+    }
+
+    /// Whether the last [`Connection::process_new_packets`] stopped before a
+    /// record or message because the connection's
+    /// [`BufferBudget`](crate::budget::BufferBudget) had no room for what it
+    /// would hold or send. It is still buffered: calling
+    /// [`Connection::process_new_packets`] again once the budget has room
+    /// carries on from it.
+    ///
+    /// [`Connection::process_new_packets`]: crate::Connection::process_new_packets
+    pub fn wants_budget(&self) -> bool {
+        self.wants_budget
+    }
+
+    /// Pays for this connection's buffers from `account`. The buffers are
+    /// still empty: this is part of making the connection.
+    pub(crate) fn pay_from(&mut self, account: Account) {
+        debug_assert!(self.received_plaintext.is_empty() && self.sendable_tls.is_empty());
+        self.received_plaintext =
+            ChunkVecBuffer::paid_with(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT), Paid::open(&account));
+        self.sendable_tls =
+            ChunkVecBuffer::paid_with(Some(DEFAULT_BUFFER_LIMIT), Paid::open(&account));
+        self.account = account;
+    }
+
+    /// The room, in bytes and records, for the output of `records` control
+    /// records: key updates and alerts.
+    fn control_room(&self, records: usize) -> (usize, usize) {
+        let record = HEADER_SIZE + self.record_layer.encrypted_len(CONTROL_PAYLOAD);
+        (records * record, records)
+    }
+
+    /// Charges room for the most output the next received message can make,
+    /// before any of it is taken. `false`, charging nothing, if the budget
+    /// has no room; [`Self::wants_budget`] then says so.
+    pub(crate) fn reserve_step(&mut self) -> bool {
+        let (bytes, records) = match self.is_handshaking() {
+            true => self.handshake_room,
+            false => self.control_room(CONTROL_RECORDS),
+        };
+        let reserved = self.sendable_tls.reserve(bytes, records);
+        self.wants_budget |= !reserved;
+        reserved
+    }
+
+    /// Charges room for the plaintext of a record whose payload is `len`
+    /// bytes, before it is decrypted: its plaintext is no longer. `false`,
+    /// charging nothing, if the budget has no room; [`Self::wants_budget`]
+    /// then says so.
+    pub(crate) fn reserve_plaintext(&mut self, len: usize) -> bool {
+        let reserved = self.received_plaintext.reserve(len, 1);
+        self.wants_budget |= !reserved;
+        reserved
+    }
+
+    /// Charges room for a server's handshake flight once its certificate
+    /// chain is known: a record for everything else, and the chain and its
+    /// OCSP response. Later handshake messages are given the same room. The
+    /// room is kept charged until the end of the step. `false`, charging
+    /// nothing, if the budget has no room.
+    pub(crate) fn reserve_flight(
+        &mut self,
+        chain: &[CertificateDer<'_>],
+        ocsp: Option<&[u8]>,
+    ) -> bool {
+        /// A certificate entry's 24-bit length and 16-bit extensions length.
+        const ENTRY: usize = 3 + 2;
+        /// The status_request extension around an OCSP response.
+        const STATUS: usize = 4 + 1 + 3;
+        let chain = chain
+            .iter()
+            .map(|cert| cert.as_ref().len() + ENTRY)
+            .sum::<usize>()
+            + ocsp.map_or(0, |ocsp| ocsp.len() + STATUS);
+        // Each record holds at most 2^14 bytes of the chain.
+        let room = (
+            HANDSHAKE_ROOM + chain,
+            HANDSHAKE_RECORDS + chain / (1 << 14),
+        );
+        self.handshake_room = room;
+        self.sendable_tls.reserve(room.0, room.1)
+    }
+
+    /// Starts processing received records.
+    pub(crate) fn start_step(&mut self) {
+        self.wants_budget = false;
+    }
+
+    /// Gives back the room charged for processing received records and not
+    /// used.
+    pub(crate) fn release_step(&mut self) {
+        self.sendable_tls.release_reserve();
+        self.received_plaintext.release_reserve();
+    }
+
+    /// Fails if output went unpaid, which nothing undoes.
+    pub(crate) fn output_paid(&self) -> Result<(), Error> {
+        match self.output_unpaid {
+            true => Err(Error::BudgetExhausted),
+            false => Ok(()),
+        }
+    }
+
+    /// Runs `send` with room for `records` control records charged first,
+    /// giving back what it did not use after. `false`, running nothing, if
+    /// the budget has no room.
+    pub(crate) fn with_control_room(
+        &mut self,
+        records: usize,
+        send: impl FnOnce(&mut Self),
+    ) -> bool {
+        let (bytes, records) = self.control_room(records);
+        if !self.sendable_tls.reserve(bytes, records) {
+            return false;
+        }
+        send(self);
+        self.sendable_tls.release_reserve();
+        true
     }
 
     /// Returns true if the connection is currently performing the TLS handshake.
@@ -301,7 +441,7 @@ impl CommonState {
                         error!(
                             "traffic keys exhausted, closing connection to prevent security failure"
                         );
-                        self.send_close_notify();
+                        self.queue_close_notify();
                         return Err(EncryptError::EncryptExhausted);
                     }
                 },
@@ -344,7 +484,10 @@ impl CommonState {
     pub(crate) fn send_msg_encrypt(&mut self, m: PlainMessage) {
         let iter = self.message_fragmenter.fragment_message(&m);
         for m in iter {
-            self.send_single_fragment(m);
+            if !self.send_single_fragment(m) {
+                self.output_unpaid = true;
+                return;
+            }
         }
     }
 
@@ -398,27 +541,34 @@ impl CommonState {
                 return sent;
             }
 
-            sent += m.payload.len();
-            self.send_single_fragment(m);
+            let len = m.payload.len();
+            if !self.send_single_fragment(m) {
+                // The budget has no room for this record: the caller takes
+                // what went before it.
+                return sent;
+            }
+            sent += len;
         }
 
         len
     }
 
-    fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
-        if m.typ == ContentType::Alert {
-            // Alerts are always sendable -- never quashed by a PreEncryptAction.
-            let em = self.record_layer.encrypt_outgoing(m);
-            self.queue_tls_message(em);
-            return;
+    /// Pays for the record `m` makes, from the room reserved for output
+    /// first, then encrypts and queues it. `false`, encrypting nothing, if
+    /// the budget has no room for it.
+    #[must_use = "an unpaid record was not sent"]
+    fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) -> bool {
+        // Alerts are always sendable -- never quashed by a PreEncryptAction.
+        if m.typ != ContentType::Alert && !self.check_pre_encrypt_action(0) {
+            return true;
         }
 
-        if !self.check_pre_encrypt_action(0) {
-            return;
+        let len = m.encoded_len(&self.record_layer);
+        if !self.sendable_tls.pay(len, 1) {
+            return false;
         }
-
-        let em = self.record_layer.encrypt_outgoing(m);
-        self.queue_tls_message(em);
+        let em = self.record_layer.encrypt_outgoing(m).encode();
+        self.queue_paid(em, len)
     }
 
     /// Take the remedial action needed before encrypting the record `add` records after the next.
@@ -440,7 +590,7 @@ impl CommonState {
                     error!(
                         "traffic keys exhausted, closing connection to prevent security failure"
                     );
-                    self.send_close_notify();
+                    self.queue_close_notify();
                     false
                 }
             },
@@ -491,25 +641,38 @@ impl CommonState {
 
     /// Send any buffered plaintext.  Plaintext is buffered if
     /// written during handshake.
-    fn flush_plaintext(&mut self, sendable_plaintext: &mut ChunkVecBuffer) {
+    ///
+    /// Stops at the first record the budget has no room for, keeping the
+    /// rest buffered for the next call. Returns whether none is left.
+    pub(crate) fn flush_plaintext(&mut self, sendable_plaintext: &mut ChunkVecBuffer) -> bool {
         if !self.may_send_application_data {
-            return;
+            return sendable_plaintext.is_empty();
         }
 
-        while let Some(buf) = sendable_plaintext.pop() {
-            self.send_plain_non_buffering(buf.as_slice().into(), Limit::No, false);
+        while let Some(buf) = sendable_plaintext.chunk() {
+            let len = buf.len();
+            let sent = self.send_plain_non_buffering(buf.into(), Limit::No, false);
+            sendable_plaintext.consume_first_chunk(sent);
+            if sent < len {
+                return false;
+            }
         }
+        true
     }
 
-    // Put m into sendable_tls for writing.
-    fn queue_tls_message(&mut self, m: OutboundOpaqueMessage) {
+    /// Queues `record`, paid for in `sendable_tls` as `paid` bytes, after a
+    /// key update waiting to go first. `false` if it went unpaid after all.
+    #[must_use = "an unpaid record was not sent"]
+    fn queue_paid(&mut self, record: Vec<u8>, paid: usize) -> bool {
         self.perhaps_write_key_update();
-        self.sendable_tls.append(m.encode());
+        self.sendable_tls.push_paid(record, paid)
     }
 
     pub(crate) fn perhaps_write_key_update(&mut self) {
-        if let Some(message) = self.queued_key_update_message.take() {
-            self.sendable_tls.append(message);
+        if let Some((message, paid)) = self.queued_key_update_message.take() {
+            if !self.sendable_tls.push_paid(message, paid) {
+                self.output_unpaid = true;
+            }
         }
     }
 
@@ -534,20 +697,40 @@ impl CommonState {
                 return;
             }
         }
+        // Output went unpaid: the connection is failing, and nothing more
+        // goes after the gap.
+        if self.output_unpaid {
+            return;
+        }
         if !must_encrypt {
             let msg = &m.into();
             let iter = self.message_fragmenter.fragment_message(msg);
             for m in iter {
-                self.queue_tls_message(m.to_unencrypted_opaque());
+                let len = HEADER_SIZE + m.payload.len();
+                if !self.sendable_tls.pay(len, 1)
+                    || !self.queue_paid(m.to_unencrypted_opaque().encode(), len)
+                {
+                    self.output_unpaid = true;
+                    return;
+                }
             }
         } else {
             self.send_msg_encrypt(m.into());
         }
     }
 
-    pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) {
+    /// Queues decrypted application data, paid for by the room charged
+    /// before its record was decrypted.
+    pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) -> Result<(), Error> {
         self.temper_counters.received_app_data();
-        self.received_plaintext.append(bytes.into_vec());
+        let bytes = bytes.bytes();
+        match self
+            .received_plaintext
+            .append_with(bytes.len(), || bytes.to_vec())
+        {
+            true => Ok(()),
+            false => Err(Error::BudgetExhausted),
+        }
     }
 
     #[cfg(feature = "tls12")]
@@ -639,8 +822,19 @@ impl CommonState {
     ///
     /// Does nothing if any `close_notify` or fatal alert was already sent.
     ///
+    /// Returns `false`, queuing nothing, if the connection's
+    /// [`BufferBudget`](crate::budget::BufferBudget) has no room for the
+    /// alert; call it again once it has. Without a budget it always queues.
+    ///
     /// [`Connection::write_tls`]: crate::Connection::write_tls
-    pub fn send_close_notify(&mut self) {
+    #[must_use = "a close_notify the budget had no room for was not queued"]
+    pub fn send_close_notify(&mut self) -> bool {
+        self.sent_fatal_alert || self.with_control_room(1, Self::queue_close_notify)
+    }
+
+    /// Queues a `close_notify`, paid for from the room charged for the
+    /// output being made.
+    pub(crate) fn queue_close_notify(&mut self) {
         if self.sent_fatal_alert {
             return;
         }
@@ -654,7 +848,7 @@ impl CommonState {
         &mut self,
         outgoing_tls: &mut [u8],
     ) -> Result<usize, EncryptError> {
-        self.send_close_notify();
+        self.queue_close_notify();
         self.check_required_size(outgoing_tls, [].into_iter())?;
         Ok(self.write_fragments(outgoing_tls, [].into_iter()))
     }
@@ -767,13 +961,20 @@ impl CommonState {
         }
     }
 
+    /// Encrypts a key update notification to go before the next record,
+    /// paid for first from the room charged for the output being made.
     pub(crate) fn enqueue_key_update_notification(&mut self) {
         let message = PlainMessage::from(Message::build_key_update_notify());
-        self.queued_key_update_message = Some(
-            self.record_layer
-                .encrypt_outgoing(message.borrow_outbound())
-                .encode(),
-        );
+        let paid = message.borrow_outbound().encoded_len(&self.record_layer);
+        if self.output_unpaid || !self.sendable_tls.pay(paid, 1) {
+            self.output_unpaid = true;
+            return;
+        }
+        let encrypted = self
+            .record_layer
+            .encrypt_outgoing(message.borrow_outbound())
+            .encode();
+        self.queued_key_update_message = Some((encrypted, paid));
     }
 
     pub(crate) fn received_tls13_change_cipher_spec(&mut self) -> Result<(), Error> {
@@ -823,9 +1024,15 @@ impl CommonState {
         if !self.may_send_application_data {
             // If we haven't completed handshaking, buffer
             // plaintext to send once we do.
+            // With a budget, none is taken if it has no room.
             let len = match limit {
                 Limit::Yes => sendable_plaintext.append_limited_copy(payload),
-                Limit::No => sendable_plaintext.append(payload.to_vec()),
+                Limit::No => {
+                    match sendable_plaintext.append_with(payload.len(), || payload.to_vec()) {
+                        true => payload.len(),
+                        false => 0,
+                    }
+                }
             };
             return len;
         }
@@ -1129,10 +1336,14 @@ mod ciphertext_ownership_tests {
         bytes.extend_from_slice(&[1; 16]);
         let pointer = bytes.as_ptr();
         let capacity = bytes.capacity();
-        state.sendable_tls.append(bytes);
+        assert!(state.sendable_tls.pay(capacity, 1));
+        assert!(state.sendable_tls.push_paid(bytes, capacity));
         assert!(state.take_sendable_tls_chunk(16).is_none());
         assert_eq!(state.sendable_tls_len(), 16);
-        let owned = state.take_sendable_tls_chunk(capacity).unwrap();
+        let (owned, _) = state
+            .take_sendable_tls_chunk(capacity)
+            .unwrap()
+            .into_parts();
         assert_eq!(owned.as_ptr(), pointer);
         assert_eq!(owned.capacity(), capacity);
         assert_eq!(owned.len(), 16);
@@ -1142,8 +1353,8 @@ mod ciphertext_ownership_tests {
     #[test]
     fn ineligible_ciphertext_stays_queued_for_bounded_coalescing() {
         let mut state = CommonState::new(Side::Server);
-        state.sendable_tls.append(alloc::vec![1; 8]);
-        state.sendable_tls.append(alloc::vec![2; 8]);
+        assert!(state.sendable_tls.append_copy(&[1; 8]));
+        assert!(state.sendable_tls.append_copy(&[2; 8]));
         assert!(state.take_sendable_tls_chunk(64).is_none());
         let mut output = [0; 12];
         assert_eq!(
@@ -1159,7 +1370,7 @@ mod ciphertext_ownership_tests {
         assert_eq!(state.sendable_tls.write_to(&mut remainder).unwrap(), 4);
         assert!(!state.wants_write());
 
-        state.sendable_tls.append(alloc::vec![3; 65]);
+        assert!(state.sendable_tls.append_copy(&[3; 65]));
         assert!(state.take_sendable_tls_chunk(64).is_none());
         assert_eq!(state.sendable_tls_len(), 65);
         assert_eq!(state.sendable_tls.write_to(&mut Vec::new()).unwrap(), 65);

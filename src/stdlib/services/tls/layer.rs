@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rustls::ServerConfig;
-use rustls::server::{Accepted, AcceptedAlert, Acceptor, ServerConnection};
+use rustls::server::{Accepted, AcceptedAlert, Acceptor, IntoConnectionError, ServerConnection};
 
 use super::HandshakeError;
+use super::budget::charge_of;
 use fictionet::Cx;
 use fictionet::stdlib::layer::{
-    Admit, ByteStream, Charge, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
+    Admit, ByteStream, Charge, ChargedBytes, Chunk, Env, Layer, StreamCommand, StreamEvent, Timers,
 };
 use fictionet::stdlib::services::stack::Job;
 use fictionet::time::Instant;
@@ -20,7 +21,8 @@ use fictionet::time::Instant;
 const CHUNK: usize = 16 * 1024;
 /// The most one record takes on the wire: a 5-byte header and at most
 /// 2^14 + 2048 bytes of ciphertext in TLS 1.2 (RFC 5246 section 6.2.3).
-/// TLS 1.3 allows less, 2^14 + 256 (RFC 8446 section 5.2).
+/// TLS 1.3 allows less, 2^14 + 256 (RFC 8446 section 5.2). One write
+/// carries at most this much.
 const RECORD: usize = 5 + (1 << 14) + 2048;
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
 
@@ -109,20 +111,28 @@ impl Job for Pick {
 /// A failure remains available while its alert drains, allowing the carrier to
 /// report the original TLS failure even if sending the alert also fails.
 ///
-/// The budget covers this adapter's hello snapshot, the room it keeps for
-/// its next output record, and transferred byte buffers. Rustls owns its protocol and cryptographic allocations separately;
-/// its buffer limits and read readiness bound streaming input and output, but
-/// are not a byte-exact heap limit for handshake state or user configurations.
+/// The connection's budget pays for every buffer it holds, rustls's own
+/// included: the records read and not yet processed (up to a full record,
+/// or a handshake message being joined), the plaintext decrypted and not
+/// yet taken, and the records queued to send, all charged by the vendored
+/// rustls before they grow ([`rustls::budget`]), and the hello snapshot.
+/// Records and plaintext leave rustls in the buffers that hold them, with
+/// their charge. A buffer the budget has no room for waits: the layer takes
+/// no more input, keeps the record or the write it could not pay for, and
+/// goes on when memory frees. rustls's protocol state, such as keys, the
+/// transcript and certificates, is not a buffer and is not charged.
 pub struct TlsLayer {
     acceptor: Option<Acceptor>,
     accepted: Option<Accepted>,
+    /// The config picked for `accepted`, kept while the budget has no room
+    /// for the server's flight.
+    unpaid_config: Option<Arc<ServerConfig>>,
     tls: Option<ServerConnection>,
     hello: Option<Arc<Hello>>,
     select: Select,
     work: bool,
     deadline: Timers<()>,
     initialized: bool,
-    output_reserve: Option<Charge>,
     alert: Option<AcceptedAlert>,
     reject: bool,
     first_byte: Option<u8>,
@@ -181,13 +191,13 @@ impl TlsLayer {
         Self {
             acceptor: None,
             accepted: None,
+            unpaid_config: None,
             tls: None,
             hello: None,
             select,
             work: false,
             deadline: Timers::new(),
             initialized: false,
-            output_reserve: None,
             alert: None,
             reject: false,
             first_byte: None,
@@ -275,25 +285,83 @@ impl TlsLayer {
         self.below = None;
         self.acceptor = None;
         self.accepted = None;
+        self.unpaid_config = None;
         self.tls = None;
         self.hello = None;
         self.alert = None;
         self.reject = false;
         self.failure = None;
-        self.output_reserve = None;
         self.ciphertext_completed = self.ciphertext_emitted;
         self.plaintext_completion = None;
         self.completed_plaintext_bytes = 0;
     }
 
-    /// Makes room for the next output, the largest record, before anything
-    /// that can produce it. `false`, with nothing allocated, if the budget
-    /// has no room.
-    fn reserve_output(&mut self, env: &Env<'_, ()>) -> bool {
-        if self.output_reserve.is_none() {
-            self.output_reserve = env.budget().charge(RECORD);
+    /// Answers the client's hello with `config`. `false` if the budget had
+    /// no room for the server's flight: the hello and the config are kept
+    /// to try again when memory frees.
+    fn connect(&mut self, config: Arc<ServerConfig>) -> bool {
+        let Some(accepted) = self.accepted.take() else {
+            return true;
+        };
+        match accepted.into_connection(config.clone()) {
+            Ok(mut tls) => {
+                tls.set_buffer_limit(Some(CHUNK * 2));
+                self.tls = Some(tls);
+            }
+            Err(IntoConnectionError::Unpaid(accepted)) => {
+                self.accepted = Some(*accepted);
+                self.unpaid_config = Some(config);
+                return false;
+            }
+            Err(IntoConnectionError::Failed(error, alert)) => {
+                self.alert = Some(alert);
+                self.fail(Self::protocol_error(error));
+            }
         }
-        self.output_reserve.is_some()
+        true
+    }
+
+    /// Ciphertext for the carrier below, in an allocation paid for before it
+    /// was made. `None` if the budget has no room for it yet.
+    fn output(&mut self, env: &Env<'_, ()>) -> Result<Option<Chunk>, HandshakeError> {
+        let failed = |error: io::Error| HandshakeError::Failed(error.to_string());
+        if self.reject {
+            let Some(mut bytes) =
+                ChargedBytes::with_capacity(env.budget(), UNRECOGNIZED_NAME.len())
+            else {
+                return Ok(None);
+            };
+            bytes.write_all(&UNRECOGNIZED_NAME).map_err(failed)?;
+            return Ok(Some(bytes.into_chunk()));
+        }
+        if let Some(alert) = self.alert.as_mut() {
+            let Some(mut bytes) = ChargedBytes::with_capacity(env.budget(), alert.len()) else {
+                return Ok(None);
+            };
+            alert.write(&mut bytes).map_err(failed)?;
+            return Ok(Some(bytes.into_chunk()));
+        }
+        let tls = self.tls.as_mut().unwrap();
+        // A single whole record goes down in the buffer rustls encrypted it
+        // into, with the charge that paid for it. Anything else, several
+        // records or the rest of one, is written into an allocation of its
+        // size, at most a record.
+        if let Some(record) = tls.take_sendable_tls_chunk(RECORD) {
+            let (bytes, charge) = record.into_parts();
+            let charge = charge_of(charge).ok_or_else(|| {
+                HandshakeError::Failed("ciphertext left rustls without its charge".to_owned())
+            })?;
+            return Chunk::adopt(bytes, charge)
+                .map(Some)
+                .map_err(|_| HandshakeError::Failed("ciphertext outgrew its charge".to_owned()));
+        }
+        let Some(mut bytes) =
+            ChargedBytes::with_capacity(env.budget(), tls.sendable_tls_len().min(RECORD))
+        else {
+            return Ok(None);
+        };
+        tls.write_tls(&mut bytes).map_err(failed)?;
+        Ok(Some(bytes.into_chunk()))
     }
 
     fn complete_plaintext_write(&mut self) {
@@ -343,22 +411,37 @@ impl Layer for TlsLayer {
             }
             event if self.input_ended || self.failed || self.reset => Ok(Admit::Closed(event)),
             StreamEvent::Ended => {
+                // The end comes after every record already read: after the
+                // plaintext waiting above, and after a record waiting for
+                // room.
                 if let Some(tls) = self.tls.as_mut()
-                    && tls
-                        .reader()
-                        .into_first_chunk()
-                        .is_ok_and(|bytes| !bytes.is_empty())
+                    && (tls.wants_budget()
+                        || tls
+                            .reader()
+                            .into_first_chunk()
+                            .is_ok_and(|bytes| !bytes.is_empty()))
                 {
                     return Ok(Admit::Blocked(StreamEvent::Ended));
                 }
-                self.input_ended = true;
                 if self.is_handshaking() {
+                    self.input_ended = true;
                     self.fail(HandshakeError::Closed);
                 } else if let Some(tls) = self.tls.as_mut() {
                     match tls.read_tls(&mut &[][..]) {
-                        Ok(_) => self.process(),
-                        Err(error) => self.fail(HandshakeError::Failed(error.to_string())),
+                        Ok(_) => {
+                            self.input_ended = true;
+                            self.process();
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                            return Ok(Admit::Blocked(StreamEvent::Ended));
+                        }
+                        Err(error) => {
+                            self.input_ended = true;
+                            self.fail(HandshakeError::Failed(error.to_string()));
+                        }
                     }
+                } else {
+                    self.input_ended = true;
                 }
                 Ok(Admit::Taken)
             }
@@ -369,20 +452,14 @@ impl Layer for TlsLayer {
                 if self.accepted.is_some()
                     || self.above.is_some()
                     || self.below.is_some()
-                    || self
-                        .tls
-                        .as_ref()
-                        .is_some_and(|tls| tls.wants_write() || !tls.wants_read())
+                    || self.tls.as_ref().is_some_and(|tls| {
+                        tls.wants_write() || !tls.wants_read() || tls.wants_budget()
+                    })
                 {
                     return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
                 }
-                // Reserve the next output allocation before processing bytes
-                // that can produce a handshake response or a fatal alert.
-                if !self.reserve_output(env) {
-                    return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
-                }
                 if !self.initialized {
-                    self.acceptor = Some(Acceptor::default());
+                    self.acceptor = Some(Acceptor::with_budget(Arc::new(env.budget().clone())));
                     self.initialized = true;
                 }
                 let limit = chunk.len().min(CHUNK);
@@ -400,6 +477,11 @@ impl Layer for TlsLayer {
                         return Ok(Admit::Closed(StreamEvent::Data(chunk)));
                     }
                     Ok(n) => n,
+                    // No room to read into: the bytes wait, and the runner
+                    // comes back when memory frees.
+                    Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+                        return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
+                    }
                     Err(error) => {
                         self.fail(HandshakeError::Failed(error.to_string()));
                         return Ok(Admit::Closed(StreamEvent::Data(chunk)));
@@ -435,7 +517,7 @@ impl Layer for TlsLayer {
 
     fn on_command(
         &mut self,
-        env: &mut Env<'_, ()>,
+        _env: &mut Env<'_, ()>,
         command: StreamCommand,
     ) -> Result<Admit<StreamCommand>, HandshakeError> {
         if matches!(command, StreamCommand::Reset) && !self.reset {
@@ -448,11 +530,10 @@ impl Layer for TlsLayer {
         match command {
             StreamCommand::Reset => Ok(Admit::Closed(StreamCommand::Reset)),
             StreamCommand::End => {
-                if self.is_handshaking() || !self.reserve_output(env) {
+                if self.is_handshaking() || !self.tls.as_mut().unwrap().send_close_notify() {
                     return Ok(Admit::Blocked(StreamCommand::End));
                 }
                 self.closing = true;
-                self.tls.as_mut().unwrap().send_close_notify();
                 Ok(Admit::Taken)
             }
             StreamCommand::Write(mut chunk) => {
@@ -468,9 +549,7 @@ impl Layer for TlsLayer {
                 if chunk.is_empty() {
                     return Ok(Admit::Taken);
                 }
-                if !self.reserve_output(env) {
-                    return Ok(Admit::Blocked(StreamCommand::Write(chunk)));
-                }
+                // Takes none if the budget has no room for its record.
                 let n = self
                     .tls
                     .as_mut()
@@ -504,25 +583,21 @@ impl Layer for TlsLayer {
             // A pick that finished after the handshake gave up.
             return Ok(());
         }
-        let accepted = self.accepted.take().ok_or_else(|| {
-            HandshakeError::Failed("TLS configuration without a client hello".into())
-        })?;
+        if self.accepted.is_none() {
+            return Err(HandshakeError::Failed(
+                "TLS configuration without a client hello".into(),
+            ));
+        }
         self.work = false;
         let Some(config) = config else {
+            self.accepted = None;
             self.reject = true;
             self.fail(HandshakeError::Rejected);
             return Ok(());
         };
-        match accepted.into_connection(config) {
-            Ok(mut tls) => {
-                tls.set_buffer_limit(Some(CHUNK * 2));
-                self.tls = Some(tls);
-            }
-            Err((error, alert)) => {
-                self.alert = Some(alert);
-                self.fail(Self::protocol_error(error));
-            }
-        }
+        // Without room for the flight, `advance` tries again when memory
+        // frees.
+        self.connect(config);
         Ok(())
     }
 
@@ -564,47 +639,29 @@ impl Layer for TlsLayer {
             self.work = true;
             return Ok(true);
         }
+        // Memory freed since the budget had no room for the server's
+        // flight, or for a record waiting in rustls.
+        let mut moved = false;
+        if let Some(config) = self.unpaid_config.take() {
+            if !self.connect(config) {
+                return Ok(false);
+            }
+            moved = true;
+        }
+        if let Some(tls) = self.tls.as_mut()
+            && tls.wants_budget()
+        {
+            self.process();
+            moved |= !self.tls.as_ref().is_some_and(|tls| tls.wants_budget());
+        }
         // At most one charged chunk each way is retained by this layer.
         if self.below.is_none()
             && (self.reject
                 || self.alert.is_some()
                 || self.tls.as_ref().is_some_and(|tls| tls.wants_write()))
         {
-            if !self.reserve_output(env) {
-                return Ok(false);
-            }
-            let room = self.output_reserve.take().unwrap();
-            // The reservation holds the largest record, so a single whole
-            // record goes down in the buffer rustls encrypted it into, paid
-            // for by the reservation's charge. Anything else is written
-            // into a buffer made from the reservation:
-            // several records coalesced, the rest of a split record, the
-            // rejection, or the alert. Either way what goes down is charged
-            // what its allocation holds, and the rest goes back.
-            let owned = if self.reject || self.alert.is_some() {
-                None
-            } else {
-                self.tls
-                    .as_mut()
-                    .unwrap()
-                    .take_sendable_tls_chunk(room.bytes())
-            };
-            let bytes = if let Some(record) = owned {
-                Chunk::adopt(record, room).map_err(|_| {
-                    HandshakeError::Failed("ciphertext outgrew its reservation".to_owned())
-                })?
-            } else {
-                let mut output = room.into_bytes();
-                let result = if self.reject {
-                    output.write_all(&UNRECOGNIZED_NAME)
-                } else if let Some(alert) = self.alert.as_mut() {
-                    alert.write(&mut output).map(drop)
-                } else {
-                    self.tls.as_mut().unwrap().write_tls(&mut output).map(drop)
-                };
-                result.map_err(|error| HandshakeError::Failed(error.to_string()))?;
-                output.trim();
-                output.into_chunk()
+            let Some(bytes) = self.output(env)? else {
+                return Ok(moved);
             };
             self.reject = false;
             if bytes.is_empty() {
@@ -634,25 +691,22 @@ impl Layer for TlsLayer {
                     self.above = Some(StreamEvent::Ended);
                     return Ok(true);
                 }
-                Ok(plaintext) => {
+                Ok(_) => {
                     // A record's plaintext is at most a chunk (RFC 8446
                     // section 5.1), and goes up in the buffer rustls
-                    // decrypted it into.
-                    let n = plaintext.len();
-                    let Some(room) = env.budget().charge(n) else {
-                        return Ok(false);
-                    };
-                    let bytes = tls
+                    // decrypted it into, with the charge that paid for it.
+                    let (bytes, charge) = tls
                         .reader()
                         .take_first_chunk()
-                        .map_err(|error| HandshakeError::Failed(error.to_string()))?;
-                    // Room for more than the plaintext was not charged, so
-                    // the buffer gives its spare capacity back first.
-                    let chunk = Chunk::adopt(bytes, room).or_else(|(mut bytes, room)| {
-                        bytes.shrink_to_fit();
-                        Chunk::adopt(bytes, room).map_err(|_| {
-                            HandshakeError::Failed("plaintext outgrew its charge".to_owned())
-                        })
+                        .map_err(|error| HandshakeError::Failed(error.to_string()))?
+                        .into_parts();
+                    let charge = charge_of(charge).ok_or_else(|| {
+                        HandshakeError::Failed(
+                            "plaintext left rustls without its charge".to_owned(),
+                        )
+                    })?;
+                    let chunk = Chunk::adopt(bytes, charge).map_err(|_| {
+                        HandshakeError::Failed("plaintext outgrew its charge".to_owned())
                     })?;
                     self.above = Some(StreamEvent::Data(chunk));
                     return Ok(true);
@@ -677,7 +731,7 @@ impl Layer for TlsLayer {
         {
             return Err(error);
         }
-        Ok(false)
+        Ok(moved)
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
@@ -751,7 +805,7 @@ impl super::Negotiation for TlsLayer {
 mod ciphertext_transfer_tests {
     use super::*;
     use fictionet::Seed;
-    use fictionet::stdlib::layer::Harness;
+    use fictionet::stdlib::layer::{Budget, Harness};
 
     #[test]
     fn sole_ciphertext_reaches_the_driver_with_its_original_allocation() {
@@ -774,17 +828,18 @@ mod ciphertext_transfer_tests {
                 .with_no_client_auth()
                 .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new())),
         );
-        let mut tls = ServerConnection::new(config.clone()).unwrap();
-        tls.send_close_notify();
+        let budget = Budget::new(1 << 20);
+        let mut tls =
+            ServerConnection::with_budget(config.clone(), Arc::new(budget.clone())).unwrap();
+        assert!(tls.send_close_notify());
         let mut inspect = Inspect(std::ptr::null());
         assert_eq!(tls.write_tls(&mut inspect).unwrap(), 0);
         assert!(!inspect.0.is_null());
         let queued = tls.sendable_tls_len();
         let mut layer = TlsLayer::new(config);
         layer.tls = Some(tls);
-        let mut harness = Harness::new(Seed::from_u64(42), layer);
+        let mut harness = Harness::with_budget(Seed::from_u64(42), layer, budget.clone());
         harness.driver().run().unwrap();
-        let budget = harness.driver().budget().clone();
         let mut output = None;
         harness.driver().send_below(|command| {
             let StreamCommand::Write(bytes) = command else {
@@ -865,7 +920,9 @@ mod ciphertext_transfer_tests {
                     client_config,
                     "record.example".try_into().unwrap(),
                 )?;
-                let mut tls = ServerConnection::new(config.clone())?;
+                let budget = Budget::new(1 << 20);
+                let mut tls =
+                    ServerConnection::with_budget(config.clone(), Arc::new(budget.clone()))?;
                 while client.is_handshaking() || tls.is_handshaking() || tls.wants_write() {
                     deliver(&mut *client, &mut *tls);
                     deliver(&mut *tls, &mut *client);
@@ -879,7 +936,7 @@ mod ciphertext_transfer_tests {
                 let queued = tls.sendable_tls_len();
                 let mut layer = TlsLayer::new(config);
                 layer.tls = Some(tls);
-                let mut harness = Harness::new(Seed::from_u64(44), layer);
+                let mut harness = Harness::with_budget(Seed::from_u64(44), layer, budget);
                 let mut writes = Vec::new();
                 loop {
                     harness.driver().run().unwrap();

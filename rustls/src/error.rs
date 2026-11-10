@@ -90,6 +90,17 @@ pub enum Error {
     /// is complete.
     HandshakeNotComplete,
 
+    /// The connection's [`BufferBudget`](crate::budget::BufferBudget) had no
+    /// room for a buffer to grow.
+    ///
+    /// From a call that would queue output, such as
+    /// [`ConnectionCommon::refresh_traffic_keys`](crate::ConnectionCommon::refresh_traffic_keys),
+    /// nothing was queued and the call can be made again once the budget has
+    /// room. From [`Connection::process_new_packets`](crate::Connection::process_new_packets)
+    /// it is fatal: the output rustls made for a received message outgrew the
+    /// room charged for it, and was dropped rather than held unpaid.
+    BudgetExhausted,
+
     /// The peer sent an oversized record/fragment.
     PeerSentOversizedRecord,
 
@@ -994,6 +1005,7 @@ impl fmt::Display for Error {
             Self::EncryptError => write!(f, "cannot encrypt message"),
             Self::PeerSentOversizedRecord => write!(f, "peer sent excess record size"),
             Self::HandshakeNotComplete => write!(f, "handshake not complete"),
+            Self::BudgetExhausted => write!(f, "no budget for the connection's buffers"),
             Self::NoApplicationProtocol => write!(f, "peer doesn't support any known protocol"),
             Self::FailedToGetCurrentTime => write!(f, "failed to get current time"),
             Self::FailedToGetRandomBytes => write!(f, "failed to get random bytes"),
@@ -1335,6 +1347,7 @@ mod tests {
             Error::FailedToGetCurrentTime,
             Error::FailedToGetRandomBytes,
             Error::HandshakeNotComplete,
+            Error::BudgetExhausted,
             Error::PeerSentOversizedRecord,
             Error::NoApplicationProtocol,
             Error::BadMaxFragmentSize,

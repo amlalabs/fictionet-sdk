@@ -10,6 +10,7 @@ use std::io;
 use pki_types::{DnsName, UnixTime};
 
 use super::hs;
+use crate::budget::{Account, Paid};
 use crate::builder::ConfigBuilder;
 #[cfg(feature = "std")]
 use crate::common_state::State;
@@ -604,6 +605,7 @@ mod connection {
         Accepted, Accepting, EarlyDataState, ServerConfig, ServerConnectionData,
         ServerExtensionsInput,
     };
+    use crate::budget::BufferBudget;
     use crate::common_state::{CommonState, Context, Side};
     use crate::conn::{ConnectionCommon, ConnectionCore};
     use crate::error::Error;
@@ -655,6 +657,21 @@ mod connection {
                     config,
                     ServerExtensionsInput::default(),
                 )?),
+            })
+        }
+
+        /// Make a new ServerConnection whose buffers are paid from `budget`:
+        /// see the [`budget`](crate::budget) module.
+        pub fn with_budget(
+            config: Arc<ServerConfig>,
+            budget: Arc<dyn BufferBudget>,
+        ) -> Result<Self, Error> {
+            Ok(Self {
+                inner: ConnectionCommon::from(ConnectionCore::for_server(
+                    config,
+                    ServerExtensionsInput::default(),
+                )?)
+                .pay_from(budget),
             })
         }
 
@@ -841,6 +858,22 @@ mod connection {
     }
 
     impl Acceptor {
+        /// An empty Acceptor whose connection's buffers are paid from
+        /// `budget`, from the first byte it reads: see the
+        /// [`budget`](crate::budget) module.
+        pub fn with_budget(budget: Arc<dyn BufferBudget>) -> Self {
+            Self {
+                inner: Some(
+                    ConnectionCommon::from(ConnectionCore::new(
+                        Box::new(Accepting),
+                        ServerConnectionData::default(),
+                        CommonState::new(Side::Server),
+                    ))
+                    .pay_from(budget),
+                ),
+            }
+        }
+
         /// Read TLS content from `rd`.
         ///
         /// Returns an error if this `Acceptor` has already yielded an [`Accepted`]. For more details,
@@ -905,11 +938,23 @@ mod connection {
     ///
     /// When [`Acceptor::accept()`] returns an error, it yields an `AcceptedAlert` such that the
     /// application can communicate failure to the client via [`AcceptedAlert::write()`].
-    pub struct AcceptedAlert(ChunkVecBuffer);
+    ///
+    /// The queue is boxed: an error that carries it stays small.
+    pub struct AcceptedAlert(Box<ChunkVecBuffer>);
 
     impl AcceptedAlert {
         pub(super) fn empty() -> Self {
-            Self(ChunkVecBuffer::new(None))
+            Self(Box::new(ChunkVecBuffer::new(None)))
+        }
+
+        /// How many bytes are left to send.
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// Whether nothing is left to send.
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
         }
 
         /// Send the alert to the client.
@@ -931,7 +976,7 @@ mod connection {
 
     impl From<ConnectionCommon<ServerConnectionData>> for AcceptedAlert {
         fn from(conn: ConnectionCommon<ServerConnectionData>) -> Self {
-            Self(conn.core.common_state.sendable_tls)
+            Self(Box::new(conn.core.common_state.sendable_tls))
         }
     }
 
@@ -1044,18 +1089,22 @@ impl Accepted {
     /// Takes the state returned from [`Acceptor::accept()`] as well as the [`ServerConfig`] and
     /// [`sign::CertifiedKey`] that should be used for the session. Returns an error if
     /// configuration-dependent validation of the received `ClientHello` message fails.
+    ///
+    /// If the connection's [`BufferBudget`](crate::budget::BufferBudget) has no room for the
+    /// server's handshake flight, this gives the `Accepted` back unchanged, to convert again
+    /// once the budget has room.
     #[cfg(feature = "std")]
     pub fn into_connection(
         mut self,
         config: Arc<ServerConfig>,
-    ) -> Result<ServerConnection, (Error, AcceptedAlert)> {
+    ) -> Result<ServerConnection, IntoConnectionError> {
         if let Err(err) = self
             .connection
             .set_max_fragment_size(config.max_fragment_size)
         {
             // We have a connection here, but it won't contain an alert since the error
             // is with the fragment size configured in the `ServerConfig`.
-            return Err((err, AcceptedAlert::empty()));
+            return Err(IntoConnectionError::Failed(err, AcceptedAlert::empty()));
         }
 
         self.connection.enable_secret_extraction = config.enable_secret_extraction;
@@ -1064,9 +1113,26 @@ impl Accepted {
         let mut cx = hs::ServerContext::from(&mut self.connection);
 
         let ch = Self::client_hello_payload(&self.message);
-        let new = match state.with_certified_key(self.sig_schemes, ch, &self.message, &mut cx) {
+        let handled = state.with_certified_key(&self.sig_schemes, ch, &self.message, &mut cx);
+        let new = match handled {
+            Err(hs::FlightUnpaid) => return Err(IntoConnectionError::Unpaid(Box::new(self))),
+            Ok(handled) => handled.and_then(|new| {
+                self.connection
+                    .core
+                    .common_state
+                    .output_paid()
+                    .map(|()| new)
+            }),
+        };
+        self.connection.core.common_state.release_step();
+        let new = match new {
             Ok(new) => new,
-            Err(err) => return Err((err, AcceptedAlert::from(self.connection))),
+            Err(err) => {
+                return Err(IntoConnectionError::Failed(
+                    err,
+                    AcceptedAlert::from(self.connection),
+                ))
+            }
         };
 
         self.connection.replace_state(new);
@@ -1090,6 +1156,19 @@ impl Debug for Accepted {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Accepted").finish()
     }
+}
+
+/// Why [`Accepted::into_connection`] made no connection.
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub enum IntoConnectionError {
+    /// Configuration-dependent validation of the `ClientHello` failed, or the
+    /// handshake did. Send the alert, if any, with [`AcceptedAlert::write`].
+    Failed(Error, AcceptedAlert),
+    /// The connection's [`BufferBudget`](crate::budget::BufferBudget) had no room for the
+    /// server's handshake flight. Nothing was sent or changed: convert the `Accepted` again
+    /// once the budget has room. Boxed, as it holds the whole connection.
+    Unpaid(Box<Accepted>),
 }
 
 #[cfg(feature = "std")]
@@ -1129,9 +1208,11 @@ impl EarlyDataState {
         *self = Self::Rejected;
     }
 
-    pub(super) fn accept(&mut self, max_size: usize) {
+    /// Accepts up to `max_size` bytes of early data, kept in a buffer paid
+    /// from `account`.
+    pub(super) fn accept(&mut self, max_size: usize, account: &Account) {
         *self = Self::Accepted {
-            received: ChunkVecBuffer::new(Some(max_size)),
+            received: ChunkVecBuffer::paid_with(Some(max_size), Paid::open(account)),
             left: max_size,
         };
     }
@@ -1175,19 +1256,25 @@ impl EarlyDataState {
         }
     }
 
-    pub(super) fn take_received_plaintext(&mut self, bytes: Payload<'_>) -> bool {
-        let available = bytes.bytes().len();
+    /// Keeps received early data: `Ok(false)` if it is more than was
+    /// accepted, and [`Error::BudgetExhausted`] if the budget has no room
+    /// for it, which fails the connection.
+    pub(super) fn take_received_plaintext(&mut self, bytes: Payload<'_>) -> Result<bool, Error> {
+        let bytes = bytes.bytes();
+        let available = bytes.len();
         let Self::Accepted { received, left } = self else {
-            return false;
+            return Ok(false);
         };
 
         if received.apply_limit(available) != available || available > *left {
-            return false;
+            return Ok(false);
         }
 
-        received.append(bytes.into_vec());
+        if !received.append_with(available, || bytes.to_vec()) {
+            return Err(Error::BudgetExhausted);
+        }
         *left -= available;
-        true
+        Ok(true)
     }
 }
 
