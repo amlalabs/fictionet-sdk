@@ -70,12 +70,13 @@ impl Timer {
                 return Poll::Ready(Ok(()));
             }
             let waker = cx.waker();
+            let mut fired = false;
             match &mut self.entry {
                 // The entry wakes the task first, at its own instant, and the
                 // task polls again then.
                 Some(entry) if entry.at == deadline || (entry.at < deadline && now < entry.at) => {
                     if !entry.waker.will_wake(waker) {
-                        clock.update(entry.id, waker);
+                        fired = !clock.update(entry.id, waker);
                         entry.waker = waker.clone();
                     }
                 }
@@ -94,6 +95,13 @@ impl Timer {
                         waker: waker.clone(),
                     });
                 }
+            }
+            if fired {
+                // The clock took the entry as due after `now` was read and
+                // woke the waker it held, which may not reach this task:
+                // this one is woken, and the next poll looks again.
+                self.entry = None;
+                waker.wake_by_ref();
             }
         } else {
             self.clear();
@@ -192,6 +200,54 @@ mod tests {
         drop(polls.join().unwrap());
         drop(world);
         assert_eq!(finished, Ok(()), "a read or a poll took the clock's lock");
+    }
+
+    /// A poll with a new waker that comes after the clock took the entry
+    /// as due, but read the time before it did, wakes the new waker: the
+    /// clock woke only the old one, which may no longer reach the task.
+    #[test]
+    fn a_new_waker_after_the_entry_fired_is_woken() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut world = Box::pin(crate::lab(
+            fictionet::Seed::from_u64(0),
+            move |fcx| async move {
+                tx.send(fcx.clone()).unwrap();
+                fcx.sleep(Duration::from_secs(3600)).await?;
+                Ok(())
+            },
+        ));
+        assert!(
+            world
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let fcx = rx.recv().unwrap();
+        let old = Arc::new(Wakes::default());
+        let new = Arc::new(Wakes::default());
+        let mut timer = Timer::new(&fcx);
+        let deadline = fcx.now() + ms(10);
+        let old_waker = Waker::from(old.clone());
+        assert!(
+            timer
+                .poll_until(&mut Context::from_waker(&old_waker), deadline)
+                .is_pending()
+        );
+        // The clock takes the entry as due and wakes the waker it held, as
+        // its driver does when the instant comes on a real clock, between
+        // the next poll's reading of the time and its update.
+        let id = timer.entry.as_ref().unwrap().id;
+        fcx.run.environment.clock.remove(id);
+        old_waker.wake_by_ref();
+        let new_waker = Waker::from(new.clone());
+        assert!(
+            timer
+                .poll_until(&mut Context::from_waker(&new_waker), deadline)
+                .is_pending()
+        );
+        assert_eq!(new.0.load(Ordering::SeqCst), 1, "the new waker never woke");
+        drop(timer);
+        drop(world);
     }
 
     /// A timer whose deadline moves at random, earlier or later, on the

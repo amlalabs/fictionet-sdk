@@ -164,14 +164,23 @@ impl Clock {
         id
     }
 
-    pub(crate) fn update(&self, id: u64, waker: &Waker) {
+    /// Has registration `id` wake `waker` instead. Returns `false`, changing
+    /// nothing, when the registration is gone: the clock took it as due and
+    /// woke the waker it held.
+    pub(crate) fn update(&self, id: u64, waker: &Waker) -> bool {
         let mut s = self.state.lock();
-        let old = s.deadlines.get(&id).copied().and_then(|at| {
-            let old = s.entries.get_mut(&(at, id))?;
-            (!old.will_wake(waker)).then(|| std::mem::replace(old, waker.clone()))
-        });
+        let Some(old) = s
+            .deadlines
+            .get(&id)
+            .copied()
+            .and_then(|at| s.entries.get_mut(&(at, id)))
+        else {
+            return false;
+        };
+        let old = (!old.will_wake(waker)).then(|| std::mem::replace(old, waker.clone()));
         drop(s);
         drop(old);
+        true
     }
 
     pub(crate) fn remove(&self, id: u64) {
