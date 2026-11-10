@@ -579,6 +579,46 @@ fn the_control_reserve_pays_for_control_blocks_when_the_budget_is_full() {
 }
 
 #[test]
+fn a_returned_control_block_wakes_its_sender_without_freeing_budget() {
+    use std::task::{Wake, Waker};
+    struct Sender {
+        pool: Pool,
+        wakes: AtomicUsize,
+    }
+    impl Wake for Sender {
+        fn wake(self: Arc<Self>) {
+            assert!(self.pool.free() > 0, "wake runs after the pool is unlocked");
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let budget = Budget::new(256);
+    let pool = Pool::new(&budget, 32, 2);
+    assert!(pool.reserve_control(&budget, 1));
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    let block = pool.take_control(0).unwrap();
+    let sender = Arc::new(Sender {
+        pool: pool.clone(),
+        wakes: AtomicUsize::new(0),
+    });
+    let task = Waker::from(sender.clone());
+    assert!(!pool.wait_control(&task));
+    drop(block);
+    assert_eq!(budget.used(), budget.limit());
+    assert!(sender.wakes.load(Ordering::SeqCst) > 0);
+    assert!(
+        pool.wait_control(&task),
+        "a return before registration is observed"
+    );
+    let block = pool.take_control(0).unwrap();
+    assert!(!pool.wait_control(&task));
+    let before = sender.wakes.load(Ordering::SeqCst);
+    drop(block);
+    assert!(sender.wakes.load(Ordering::SeqCst) > before);
+    drop((task, sender, held, pool));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn a_reserve_the_budget_cannot_pay_changes_nothing() {
     let budget = Budget::new(40);
     let pool = Pool::new(&budget, 32, 2);
