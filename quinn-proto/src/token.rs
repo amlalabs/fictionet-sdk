@@ -434,7 +434,8 @@ mod test {
         use std::net::Ipv6Addr;
 
         let address_1 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 4433);
-        let orig_dst_cid_1 = RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid();
+        let orig_dst_cid_1 =
+            RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid(&mut rand::rng());
         let issued_1 = UNIX_EPOCH + Duration::from_secs(42); // Fractional seconds would be lost
         let payload_1 = TokenPayload::Retry {
             address: address_1,

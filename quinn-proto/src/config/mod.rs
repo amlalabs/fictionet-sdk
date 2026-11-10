@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use rand::Rng;
 #[cfg(feature = "rustls-ring")]
 use rustls::client::WebPkiServerVerifier;
 #[cfg(feature = "rustls-ring")]
@@ -30,6 +31,8 @@ mod transport;
 pub use transport::QlogConfig;
 pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 
+type WithRng<T> = dyn Fn(&mut dyn Rng) -> T + Send + Sync;
+
 /// Global configuration for the endpoint, affecting all connections
 ///
 /// Default values should be suitable for most internet applications.
@@ -40,8 +43,7 @@ pub struct EndpointConfig {
     /// CID generator factory
     ///
     /// Create a cid generator for local cid in Endpoint struct
-    pub(crate) connection_id_generator_factory:
-        Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>,
+    pub(crate) connection_id_generator_factory: Arc<WithRng<Box<dyn ConnectionIdGenerator>>>,
     pub(crate) supported_versions: Vec<u32>,
     pub(crate) grease_quic_bit: bool,
     /// Minimum interval between outgoing stateless reset packets
@@ -53,8 +55,9 @@ pub struct EndpointConfig {
 impl EndpointConfig {
     /// Create a default config with a particular `reset_key`
     pub fn new(reset_key: Arc<dyn HmacKey>) -> Self {
-        let cid_factory =
-            || -> Box<dyn ConnectionIdGenerator> { Box::<HashedConnectionIdGenerator>::default() };
+        let cid_factory = |rng: &mut dyn Rng| -> Box<dyn ConnectionIdGenerator> {
+            Box::new(HashedConnectionIdGenerator::new(rng))
+        };
         Self {
             reset_key,
             max_udp_payload_size: (1500u32 - 28).into(), // Ethernet MTU minus IP + UDP headers
@@ -73,8 +76,11 @@ impl EndpointConfig {
     /// connections involving that  `Endpoint`. A custom CID generator allows applications to embed
     /// information in local connection IDs, e.g. to support stateless packet-level load balancers.
     ///
-    /// Defaults to [`HashedConnectionIdGenerator`].
-    pub fn cid_generator<F: Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static>(
+    /// Receives the endpoint's entropy source. Defaults to
+    /// [`HashedConnectionIdGenerator`].
+    pub fn cid_generator<
+        F: Fn(&mut dyn Rng) -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static,
+    >(
         &mut self,
         factory: F,
     ) -> &mut Self {
@@ -154,7 +160,8 @@ impl EndpointConfig {
     /// By default, quinn will initialize an endpoint's rng using a platform entropy source.
     /// However, you can seed the rng yourself through this method (e.g. if you need to run quinn
     /// deterministically or if you are using quinn in an environment that doesn't have a source of
-    /// entropy available).
+    /// entropy available). Built-in connection ID generators also use this RNG. Reset keys,
+    /// handshake token keys and the TLS provider need their own explicit entropy configuration.
     pub fn rng_seed(&mut self, seed: Option<[u8; 32]>) -> &mut Self {
         self.rng_seed = seed;
         self
@@ -557,7 +564,7 @@ pub struct ClientConfig {
     pub(crate) token_store: Arc<dyn TokenStore>,
 
     /// Provider that populates the destination connection ID of Initial Packets
-    pub(crate) initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
+    pub(crate) initial_dst_cid_provider: Arc<WithRng<ConnectionId>>,
 
     /// QUIC protocol version to use
     pub(crate) version: u32,
@@ -570,8 +577,8 @@ impl ClientConfig {
             transport: Default::default(),
             crypto,
             token_store: Arc::new(TokenMemoryCache::default()),
-            initial_dst_cid_provider: Arc::new(|| {
-                RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
+            initial_dst_cid_provider: Arc::new(|rng| {
+                RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid(rng)
             }),
             version: 1,
         }
@@ -587,7 +594,7 @@ impl ClientConfig {
     /// at least 8 bytes long and unpredictable, as per section 7.2 of RFC 9000.
     pub fn initial_dst_cid_provider(
         &mut self,
-        initial_dst_cid_provider: Arc<dyn Fn() -> ConnectionId + Send + Sync>,
+        initial_dst_cid_provider: Arc<WithRng<ConnectionId>>,
     ) -> &mut Self {
         self.initial_dst_cid_provider = initial_dst_cid_provider;
         self

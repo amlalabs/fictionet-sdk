@@ -42,6 +42,40 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 #[test]
+fn seeded_initials_keep_their_routing_ids() {
+    let now = Instant::now();
+    let routing = |seed| {
+        let mut endpoint_config = EndpointConfig::default();
+        endpoint_config.rng_seed(Some([seed; 32]));
+        let mut endpoint = Endpoint::new(Arc::new(endpoint_config), None, false, None);
+        let (_, mut conn) = endpoint
+            .connect(
+                now,
+                client_config(),
+                "[::1]:443".parse().unwrap(),
+                "localhost",
+            )
+            .unwrap();
+        let mut packet = Vec::new();
+        conn.poll_transmit(now, 1, &mut packet).unwrap();
+        let (packet, _) = packet::PartialDecode::new(
+            packet.as_slice().into(),
+            &packet::FixedLengthConnectionIdParser::new(8),
+            &DEFAULT_SUPPORTED_VERSIONS,
+            true,
+        )
+        .unwrap();
+        let header = packet.initial_header().unwrap();
+        (header.src_cid, header.dst_cid)
+    };
+    let first = routing(1);
+    assert_eq!(first, routing(1));
+    let different = routing(2);
+    assert_ne!(first.0, different.0);
+    assert_ne!(first.1, different.1);
+}
+
+#[test]
 fn pending_incoming_survives_server_config_change() {
     let _guard = subscribe();
     let replacement = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
@@ -147,8 +181,8 @@ fn version_negotiate_client() {
     let server_addr = "[::2]:7890".parse().unwrap();
     // Configure client to use empty CIDs so we can easily hardcode a server version negotiation
     // packet
-    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
-        || Box::new(RandomConnectionIdGenerator::new(0));
+    let cid_generator_factory: fn(&mut dyn Rng) -> Box<dyn ConnectionIdGenerator> =
+        |_| Box::new(RandomConnectionIdGenerator::new(0));
     let mut client = Endpoint::new(
         Arc::new(EndpointConfig {
             connection_id_generator_factory: Arc::new(cid_generator_factory),
@@ -258,7 +292,7 @@ fn server_stateless_reset() {
     rng.fill_bytes(&mut key_material);
 
     let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
-    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
+    endpoint_config.cid_generator(move |_| Box::new(HashedConnectionIdGenerator::from_key(0)));
     let endpoint_config = Arc::new(endpoint_config);
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
@@ -288,7 +322,7 @@ fn client_stateless_reset() {
     rng.fill_bytes(&mut key_material);
 
     let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
-    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
+    endpoint_config.cid_generator(move |_| Box::new(HashedConnectionIdGenerator::from_key(0)));
     let endpoint_config = Arc::new(endpoint_config);
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
@@ -317,7 +351,7 @@ fn stateless_reset_limit() {
     let _guard = subscribe();
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42);
     let mut endpoint_config = EndpointConfig::default();
-    endpoint_config.cid_generator(move || Box::new(RandomConnectionIdGenerator::new(8)));
+    endpoint_config.cid_generator(move |_| Box::new(RandomConnectionIdGenerator::new(8)));
     let endpoint_config = Arc::new(endpoint_config);
     let mut endpoint = Endpoint::new(
         endpoint_config.clone(),
@@ -1877,8 +1911,8 @@ fn implicit_open() {
 #[test]
 fn zero_length_cid() {
     let _guard = subscribe();
-    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
-        || Box::new(RandomConnectionIdGenerator::new(0));
+    let cid_generator_factory: fn(&mut dyn Rng) -> Box<dyn ConnectionIdGenerator> =
+        |_| Box::new(RandomConnectionIdGenerator::new(0));
     let mut pair = Pair::new(
         Arc::new(EndpointConfig {
             connection_id_generator_factory: Arc::new(cid_generator_factory),
@@ -1935,8 +1969,8 @@ fn cid_rotation() {
     let _guard = subscribe();
     const CID_TIMEOUT: Duration = Duration::from_secs(2);
 
-    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
-        || Box::new(*RandomConnectionIdGenerator::new(8).set_lifetime(CID_TIMEOUT));
+    let cid_generator_factory: fn(&mut dyn Rng) -> Box<dyn ConnectionIdGenerator> =
+        |_| Box::new(*RandomConnectionIdGenerator::new(8).set_lifetime(CID_TIMEOUT));
 
     // Only test cid rotation on server side to have a clear output trace
     let server = Endpoint::new(

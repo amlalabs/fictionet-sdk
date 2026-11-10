@@ -75,15 +75,17 @@ impl Endpoint {
         allow_mtud: bool,
         rng_seed: Option<[u8; 32]>,
     ) -> Self {
+        let mut rng = match rng_seed.or(config.rng_seed) {
+            Some(seed) => StdRng::from_seed(seed),
+            None => StdRng::try_from_rng(&mut SysRng)
+                .expect("failed to seed random number generator from system"),
+        };
+        let local_cid_generator = (config.connection_id_generator_factory.as_ref())(&mut rng);
         Self {
-            rng: match rng_seed.or(config.rng_seed) {
-                Some(seed) => StdRng::from_seed(seed),
-                None => StdRng::try_from_rng(&mut SysRng)
-                    .expect("failed to seed random number generator from system"),
-            },
+            rng,
             index: ConnectionIndex::default(),
             connections: Slab::new(),
-            local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
+            local_cid_generator,
             config,
             server_config,
             allow_mtud,
@@ -352,7 +354,7 @@ impl Endpoint {
             return Err(ConnectError::UnsupportedVersion);
         }
 
-        let remote_id = (config.initial_dst_cid_provider)();
+        let remote_id = (config.initial_dst_cid_provider)(&mut self.rng);
         trace!(initial_dcid = %remote_id);
 
         let ch = ConnectionHandle(self.connections.vacant_key());
@@ -419,7 +421,7 @@ impl Endpoint {
     /// Generate a connection ID for `ch`
     fn new_cid(&mut self, ch: ConnectionHandle) -> ConnectionId {
         loop {
-            let cid = self.local_cid_generator.generate_cid();
+            let cid = self.local_cid_generator.generate_cid(&mut self.rng);
             if cid.is_empty() {
                 // Zero-length CID; nothing to track
                 debug_assert_eq!(self.local_cid_generator.cid_len(), 0);
@@ -764,7 +766,7 @@ impl Endpoint {
         // with established connections. In the unlikely event that a collision occurs
         // between two connections in the initial phase, both will fail fast and may be
         // retried by the application layer.
-        let loc_cid = self.local_cid_generator.generate_cid();
+        let loc_cid = self.local_cid_generator.generate_cid(&mut self.rng);
 
         let payload = TokenPayload::Retry {
             address: incoming.addresses.remote,
@@ -886,7 +888,7 @@ impl Endpoint {
         // We don't need to worry about CID collisions in initial closes because the peer
         // shouldn't respond, and if it does, and the CID collides, we'll just drop the
         // unexpected response.
-        let local_id = self.local_cid_generator.generate_cid();
+        let local_id = self.local_cid_generator.generate_cid(&mut self.rng);
         let number = PacketNumber::U8(0);
         let header = Header::Initial(InitialHeader {
             dst_cid: *remote_id,
@@ -1358,4 +1360,28 @@ struct FourTuple {
     remote: SocketAddr,
     // A single socket can only listen on a single port, so no need to store it explicitly
     local_ip: Option<IpAddr>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_seed_controls_connection_ids() {
+        let endpoint = |seed| {
+            let mut config = EndpointConfig::default();
+            config.rng_seed(Some([seed; 32]));
+            Endpoint::new(Arc::new(config), None, false, None)
+        };
+        let (mut first, mut replay, mut different) = (endpoint(1), endpoint(1), endpoint(2));
+        let mut diverged = false;
+        for number in 0..32 {
+            let id = first.new_cid(ConnectionHandle(number));
+            assert_eq!(id, replay.new_cid(ConnectionHandle(number)));
+            first.local_cid_generator.validate(&id).unwrap();
+            diverged |= id != different.new_cid(ConnectionHandle(number));
+        }
+        assert!(diverged);
+        assert_eq!(first.index.connection_ids.len(), 32);
+    }
 }

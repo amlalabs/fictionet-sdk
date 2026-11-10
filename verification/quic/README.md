@@ -150,3 +150,32 @@ denied passed; rustdoc completed with its existing redundant-link warning
 in `network/udp.rs`. The existing `quic_sparse_reassembly` benchmark ran
 at 16 KiB and 64 KiB. This is a baseline for the old codec's reassembler,
 not a benchmark of the vendored transport or an interoperability result.
+
+## Connection ID entropy
+
+The endpoint now supplies its RNG to connection ID generators and their
+factories, including the client's Initial destination ID provider. The
+built-in random and keyed generators no longer consult host entropy. The
+keyed generator also rejects every length other than its eight-byte wire
+format before slicing the input.
+
+The repeated-seed regression failed before this change: two endpoints
+with the same seed produced different local IDs. It now checks successive
+IDs, validity under the generator's key, and divergence with another seed.
+A second regression checks both routing IDs in emitted Initial packets.
+All 317 vendored library tests and three doctests passed. These tests
+compare executions and inputs; they do not pin particular random output.
+
+`random_ids_use_the_supplied_bytes` passed in Kani without stubs for every
+valid length and arbitrary source bytes. It checks length, content and
+entropy consumption. The keyed-ID harness is retained separately; a
+completed proof verdict has not yet been obtained for it. The diagnostic
+run with stop-on-failure stopped on Kani's internal assertion reachability
+check, so it is neither a production counterexample nor proof evidence.
+
+These claims concern connection ID generation, not cryptographic strength,
+complete packet determinism or endpoint allocation costs. The endpoint's
+reset key, server token keys, TLS provider and calendar time still need
+explicit world sources. Standard hash maps also retain their own hash
+seeding. Engine storage admission, the datagram layer, application stream
+multiplexing, RFC 9221 and the HTTP/3 coordinator remain unimplemented.
