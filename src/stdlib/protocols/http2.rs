@@ -1843,6 +1843,11 @@ impl Session {
             }
             self.first = false;
         }
+        // A client cannot push (RFC 9113 section 8.4): its PUSH_PROMISE is a
+        // connection error on receipt, whatever stream it names.
+        if self.side == Side::Client && matches!(frame, Frame::PushPromise(_)) {
+            return Err(protocol("client sent PUSH_PROMISE"));
+        }
         let h = frame.header(length);
         let block = self.blocks.read_parsed(h, &frame)?;
         if block.block.as_ref().is_some_and(|block| block.more != 0) {
@@ -1862,9 +1867,6 @@ impl Session {
         if let Some(block_fields) = block.block {
             let fields = block_fields.headers;
             if let Some(promised) = block.promised {
-                if self.side == Side::Client {
-                    return Err(protocol("client sent PUSH_PROMISE"));
-                }
                 self.open_stream(promised)?;
                 return Ok(Some(Event::PushPromise {
                     stream: block.stream,
@@ -2372,6 +2374,12 @@ pub mod harness {
         }
     }
 }
+
+/// Bounded proofs over the frame decoder's refusals and header-block
+/// sequencing, run with `cargo kani`.
+#[cfg(kani)]
+#[path = "../../../verification/http2-layer/kani/frames.rs"]
+mod frames;
 
 #[cfg(test)]
 mod tests {
@@ -3100,6 +3108,29 @@ mod tests {
                 accept(&mut c, &raw(6, 0, 0, &[0; 8]))[..],
                 [Event::Ping(_)]
             ));
+        }
+    }
+
+    #[test]
+    fn a_client_push_promise_fails_on_its_own_frame() {
+        // A client cannot push (RFC 9113 section 8.4): the server treats its
+        // PUSH_PROMISE as a connection error on receipt, on a stream the
+        // server reset as on any other, and before any CONTINUATION.
+        for (reset, flags) in [(true, 4), (false, 0)] {
+            let mut c = Session::client_side(Limits::default());
+            accept(&mut c, PREFACE);
+            accept(&mut c, &settings());
+            accept(&mut c, &raw(1, 4, 1, &[0x82]));
+            if reset {
+                c.peer_reset(1);
+            }
+            let promise = raw(5, flags, 1, &[0, 0, 0, 2, 0x82]);
+            assert_eq!(c.push(&promise), promise.len());
+            let event = c.next();
+            assert!(
+                matches!(event, Some(Err(e)) if e.code == ErrorCode::ProtocolError),
+                "{event:?}"
+            );
         }
     }
 
