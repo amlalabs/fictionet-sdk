@@ -62,11 +62,13 @@ impl PathData {
         generation: u64,
         now: Instant,
         config: &TransportConfig,
+        rng: &mut dyn rand::Rng,
     ) -> Self {
-        let congestion = config
-            .congestion_controller_factory
-            .clone()
-            .build(now, config.get_initial_mtu());
+        let congestion =
+            config
+                .congestion_controller_factory
+                .clone()
+                .build(now, config.get_initial_mtu(), rng);
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
@@ -139,12 +141,18 @@ impl PathData {
     /// Resets RTT, congestion control, pacing and MTU states.
     ///
     /// This is useful when it is known the underlying path has changed.
-    pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
+    pub(super) fn reset(
+        &mut self,
+        now: Instant,
+        config: &TransportConfig,
+        rng: &mut dyn rand::Rng,
+    ) {
         self.rtt = RttEstimator::new(config.initial_rtt);
-        self.congestion = config
-            .congestion_controller_factory
-            .clone()
-            .build(now, config.get_initial_mtu());
+        self.congestion =
+            config
+                .congestion_controller_factory
+                .clone()
+                .build(now, config.get_initial_mtu(), rng);
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
         self.pacing = Pacer::new(
             self.rtt.get(),
@@ -477,11 +485,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_paths_and_resets_use_the_connection_entropy() {
+        use rand::{Rng, SeedableRng};
+        use std::sync::{Arc, Mutex};
+
+        struct Factory(Arc<Mutex<Vec<u64>>>);
+        impl congestion::ControllerFactory for Factory {
+            fn build(
+                self: Arc<Self>,
+                now: Instant,
+                mtu: u16,
+                rng: &mut dyn Rng,
+            ) -> Box<dyn congestion::Controller> {
+                self.0.lock().unwrap().push(rng.next_u64());
+                Arc::new(congestion::CubicConfig::default()).build(now, mtu, rng)
+            }
+        }
+
+        let draws = Arc::new(Mutex::new(Vec::new()));
+        let mut config = TransportConfig::default();
+        config.congestion_controller_factory(Arc::new(Factory(draws.clone())));
+        let mut rng = rand::rngs::StdRng::from_seed([1; 32]);
+        let mut expected = rand::rngs::StdRng::from_seed([1; 32]);
+        let now = Instant::now();
+        let remote = "203.0.113.1:4433".parse().unwrap();
+        let mut path = PathData::new(remote, true, None, 0, now, &config, &mut rng);
+        path.reset(now, &config, &mut rng);
+        let _rebound = PathData::from_previous(remote, &path, 1, now);
+        assert_eq!(
+            *draws.lock().unwrap(),
+            [expected.next_u64(), expected.next_u64()]
+        );
+        assert_eq!(rng.next_u64(), expected.next_u64());
+    }
+
+    #[test]
     fn reset_refreshes_pacer_budget() {
         let now = Instant::now();
         let config = TransportConfig::default();
         let remote = "203.0.113.1:4433".parse().unwrap();
-        let mut path = PathData::new(remote, true, None, 0, now, &config);
+        let mut path = PathData::new(remote, true, None, 0, now, &config, &mut rand::rng());
         let mtu = path.current_mtu();
         let window = path.congestion.window();
 
@@ -500,7 +543,7 @@ mod tests {
             .delay(path.rtt.get(), mtu.into(), mtu, window, now)
             .is_some());
 
-        path.reset(now, &config);
+        path.reset(now, &config, &mut rand::rng());
 
         assert_eq!(
             path.pacing.delay(

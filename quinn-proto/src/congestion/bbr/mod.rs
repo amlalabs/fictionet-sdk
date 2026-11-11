@@ -61,8 +61,8 @@ pub struct Bbr {
 }
 
 impl Bbr {
-    /// Construct a state using the given `config` and current time `now`
-    pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
+    /// Construct a state using the given configuration and entropy source.
+    pub fn new(config: Arc<BbrConfig>, current_mtu: u16, rng: &mut dyn rand::Rng) -> Self {
         let initial_window = config.initial_window;
         Self {
             config,
@@ -98,7 +98,7 @@ impl Bbr {
             bw_at_last_round: 0,
             round_wo_bw_gain: 0,
             ack_aggregation: AckAggregationState::default(),
-            random_number_generator: Pcg32::from_rng(&mut rand::rng()),
+            random_number_generator: Pcg32::from_rng(rng),
         }
     }
 
@@ -537,8 +537,13 @@ impl Default for BbrConfig {
 }
 
 impl ControllerFactory for BbrConfig {
-    fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(Bbr::new(self, current_mtu))
+    fn build(
+        self: Arc<Self>,
+        _now: Instant,
+        current_mtu: u16,
+        rng: &mut dyn rand::Rng,
+    ) -> Box<dyn Controller> {
+        Box::new(Bbr::new(self, current_mtu, rng))
     }
 }
 
@@ -649,3 +654,30 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacing_cycles_follow_the_supplied_entropy() {
+        let now = Instant::now();
+        let cycles = |seed| {
+            let mut rng = rand::rngs::StdRng::from_seed([seed; 32]);
+            let controller = Arc::new(BbrConfig::default()).build(now, 1200, &mut rng);
+            let mut controller = controller.into_any().downcast::<Bbr>().unwrap();
+            std::array::from_fn::<_, 64, _>(|_| {
+                controller.enter_probe_bandwidth_mode(now);
+                assert_ne!(controller.current_cycle_offset, 1);
+                assert!(usize::from(controller.current_cycle_offset) < K_PACING_GAIN.len());
+                controller.current_cycle_offset
+            })
+        };
+        assert_eq!(cycles(1), cycles(1));
+        assert_ne!(cycles(1), cycles(2));
+    }
+}
+
+#[cfg(kani)]
+#[path = "../../../../verification/quic/kani/congestion.rs"]
+mod proofs;

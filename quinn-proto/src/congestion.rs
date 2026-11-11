@@ -98,8 +98,14 @@ pub struct ControllerMetrics {
 
 /// Constructs controllers on demand
 pub trait ControllerFactory {
-    /// Construct a fresh `Controller`
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller>;
+    /// Construct a fresh controller using the connection's entropy source.
+    /// Controllers without randomized state need not draw from it.
+    fn build(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+        rng: &mut dyn rand::Rng,
+    ) -> Box<dyn Controller>;
 }
 
 const BASE_DATAGRAM_SIZE: u64 = 1200;

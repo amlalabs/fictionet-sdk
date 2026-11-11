@@ -245,3 +245,27 @@ This is a payload-ownership step. Descriptor capacity, interval nodes,
 packet records, receive reassembly, crypto queues and endpoint routing
 storage still require admission and resource evidence. The entire engine
 must not yet be described as bounded by a Fictionet budget.
+
+## Congestion controller entropy
+
+`ControllerFactory::build` now receives the connection's RNG when a path
+is first created or reset, including migration to a new address. BBR seeds
+its pacing RNG from it. Cubic and NewReno consume no entropy. A NAT rebind
+that retains the previous path's congestion state clones that state
+without reseeding it.
+
+The pacing-cycle regression compares two runs with the same seed and a
+run with a different seed, and checks the legal cycle positions. Restoring
+the host RNG makes the equality assertion fail. A path test checks the
+source draws at construction and reset and that cloning a path draws
+nothing. All 323 engine library tests and three doctests pass; clippy with
+warnings denied and rustdoc pass.
+
+The Kani harness `bbr_uses_supplied_entropy` checks arbitrary seed bytes,
+entropy consumption and equality of the complete initialized RNG state
+with a generator seeded directly from those bytes. It does not verify the
+BBR congestion algorithm or cryptographic properties. Its verdict remains
+unfinished. Run it under the required scope with `cargo kani
+-p fictionet-quinn-proto --lib -Z stubbing --harness bbr_uses_supplied_entropy`.
+The selected harness does not stub production functions; `-Z stubbing`
+permits compiling the separate allocation harnesses in this crate.
