@@ -58,9 +58,9 @@ impl Default for WriterConfig {
         Self {
             state_dir: "honeypot-state".into(),
             sensor_id: "honeypot".into(),
-            backend: "world".into(),
+            backend: "raw-ethernet".into(),
             persona: "linux-caddy-openssh".into(),
-            capture_boundary: "world_ip".into(),
+            capture_boundary: "ethernet_and_derived_ip".into(),
             restricted_evidence: false,
             queue_bytes: 16 * 1024 * 1024,
             max_record_bytes: 1024 * 1024,

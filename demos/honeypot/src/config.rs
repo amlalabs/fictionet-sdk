@@ -1,8 +1,7 @@
-//! What the honeypot serves and where it writes, from the command line.
+//! What the honeypot serves, from the command line.
 //!
 //! ```text
-//! honeypot [--world unix:PATH] [--log PATH] [--pcap PATH]
-//!          [--address IPV4] [--address-v6 IPV6] [--internet PREFIX]...
+//! honeypot [--address IPV4] [--address-v6 IPV6] [--internet PREFIX]...
 //!          [--gateway IPV4] [--gateway-v6 IPV6]
 //!          [--ssh PORT]... [--http PORT]... [--http-profile caddy|nginx]
 //!          [--ssh-auth accept|reject|password:VALUE]
@@ -13,10 +12,8 @@
 //! With no `--address-v6`, it has IPv4 only.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
 use std::time::Duration;
 
-use fictionet::WorldSocket;
 use fictionet::stdlib::network::ethernet::host::Ipv6Gateway;
 use fictionet::stdlib::network::route::Prefix;
 
@@ -41,7 +38,7 @@ pub struct Config {
     /// The addresses the `internet` attachment carries.
     pub internet: Internet,
     /// The IPv4 default gateway of the raw Ethernet adapter
-    /// (`start_raw`, with feature `raw-ethernet`): the router every IPv4 packet goes
+    /// ([`start_raw`](crate::start_raw)): the router every IPv4 packet goes
     /// to.
     pub gateway: Ipv4Addr,
     /// Where the raw Ethernet adapter's IPv6 default gateway comes from: an
@@ -192,16 +189,9 @@ impl Default for Config {
     }
 }
 
-/// The command line: the world, the socket it listens on, and its two
-/// output files.
+/// The command line: the world.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
-    /// Where `fictionet attach` connects.
-    pub world: WorldSocket,
-    /// The observations, one JSON object per line.
-    pub log: PathBuf,
-    /// Every packet, as pcapng.
-    pub pcap: PathBuf,
     /// The world.
     pub config: Config,
 }
@@ -237,12 +227,6 @@ impl std::error::Error for ArgsError {}
 /// A flag of the command line. Each takes a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flag {
-    /// `--world`: [`Args::world`].
-    World,
-    /// `--log`: [`Args::log`].
-    Log,
-    /// `--pcap`: [`Args::pcap`].
-    Pcap,
     /// `--address`: [`Config::address`].
     Address,
     /// `--address-v6`: [`Config::address_v6`].
@@ -276,10 +260,7 @@ pub enum Flag {
 
 impl Flag {
     /// Every flag.
-    pub const ALL: [Flag; 17] = [
-        Flag::World,
-        Flag::Log,
-        Flag::Pcap,
+    pub const ALL: [Flag; 14] = [
         Flag::Address,
         Flag::AddressV6,
         Flag::Internet,
@@ -299,9 +280,6 @@ impl Flag {
     /// The flag as written.
     pub fn name(self) -> &'static str {
         match self {
-            Flag::World => "--world",
-            Flag::Log => "--log",
-            Flag::Pcap => "--pcap",
             Flag::Address => "--address",
             Flag::AddressV6 => "--address-v6",
             Flag::Internet => "--internet",
@@ -329,9 +307,6 @@ impl Args {
     /// Reads the arguments after the program name.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args, ArgsError> {
         let mut parsed = Args {
-            world: WorldSocket::UnixSocket("/run/fictionet/world.sock".into()),
-            log: "honeypot.jsonl".into(),
-            pcap: "honeypot.pcapng".into(),
             config: Config {
                 ports: Vec::new(),
                 ..Config::default()
@@ -351,9 +326,6 @@ impl Args {
             };
             let config = &mut parsed.config;
             match flag {
-                Flag::World => parsed.world = value.parse().map_err(|_| bad())?,
-                Flag::Log => parsed.log = value.into(),
-                Flag::Pcap => parsed.pcap = value.into(),
                 Flag::Address => config.address = value.parse().map_err(|_| bad())?,
                 Flag::AddressV6 => config.address_v6 = Some(value.parse().map_err(|_| bad())?),
                 Flag::Internet => config.internet.set(value.parse().map_err(|_| bad())?),
