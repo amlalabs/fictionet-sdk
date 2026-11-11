@@ -595,6 +595,7 @@ mod tests {
     fn held_retry_does_not_make_sequential_checks_parallel() {
         let request = |host_checks| TrapEvent::Request {
             method: "GET".into(),
+            headers: Vec::new(),
             target: "/hosts/edge/check".into(),
             active: 3,
             host_checks,
@@ -644,6 +645,7 @@ mod tests {
         assert_eq!(infer(&trace, None).unwrap().harness.candidates.len(), 4);
         let request = TrapEvent::Request {
             method: "GET".into(),
+            headers: Vec::new(),
             target: "/status".into(),
             active: 2,
             host_checks: 0,
@@ -673,6 +675,7 @@ mod tests {
     fn serial_rule_needs_four_distinct_checks() {
         let request = |host| TrapEvent::Request {
             method: "GET".into(),
+            headers: Vec::new(),
             target: format!("/hosts/{host}/check"),
             active: 1,
             host_checks: 1,
