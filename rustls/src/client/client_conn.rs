@@ -743,6 +743,7 @@ mod connection {
                     name,
                     ClientExtensionsInput::from_alpn(alpn_protocols),
                     Protocol::Tcp,
+                    None,
                 )?),
             })
         }
@@ -853,15 +854,22 @@ mod connection {
 pub use connection::{ClientConnection, WriteEarlyData};
 
 impl ConnectionCore<ClientConnectionData> {
+    /// A client connection; a QUIC one gives the version of its first flight,
+    /// which selects the session ticket the ClientHello may offer
     pub(crate) fn for_client(
         config: Arc<ClientConfig>,
         name: ServerName<'static>,
         extra_exts: ClientExtensionsInput<'static>,
         proto: Protocol,
+        quic_version: Option<crate::quic::Version>,
     ) -> Result<Self, Error> {
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
         common_state.protocol = proto;
+        if let Some(version) = quic_version {
+            common_state.quic.version = version;
+            common_state.quic.early_version = version;
+        }
         common_state.enable_secret_extraction = config.enable_secret_extraction;
         common_state.fips = config.fips();
         let mut data = ClientConnectionData::new();
@@ -926,6 +934,7 @@ impl UnbufferedClientConnection {
                 name,
                 extensions,
                 Protocol::Tcp,
+                None,
             )?),
         })
     }

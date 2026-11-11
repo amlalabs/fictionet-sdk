@@ -204,9 +204,8 @@ mod connection {
                 ..ClientExtensionsInput::from_alpn(alpn_protocols)
             };
 
-            let mut inner = ConnectionCore::for_client(config, name, exts, Protocol::Quic)?;
-            inner.common_state.quic.version = quic_version;
-            inner.common_state.quic.early_version = quic_version;
+            let inner =
+                ConnectionCore::for_client(config, name, exts, Protocol::Quic, Some(quic_version))?;
             Ok(Self {
                 inner: inner.into(),
             })
