@@ -6,8 +6,9 @@
 //! | --- | --- |
 //! | `ip-verify lean` | `lake build`, then the axioms of every headline theorem in `Ip/Axioms.lean` |
 //! | `ip-verify vectors [seed]` | the Lean reference's test vectors, from `seed`, or from each of seeds 1 to 8 when left out |
-//! | `ip-verify diff [seed]` | the vectors, then `tests/ip_vectors.rs` against them, for each seed |
+//! | `ip-verify diff [seed]` | the vectors, then `tests/ip_vectors.rs` against them, for each seed, with each reassembly step costed |
 //! | `ip-verify all` | `lean` and `diff`, with a summary in `SUMMARY.txt` |
+//! | `ip-verify resources` | the resource properties of TCP and below: the counted Kani harnesses, `Holding.tla`'s configs, and the costed sessions |
 //!
 //! Everything is written under a fresh run directory in `ip-verify/` in
 //! Cargo's target directory (`CARGO_TARGET_DIR`, or `target/`): Lean's
@@ -26,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Result;
+use crate::lean_vectors::{self, scoped};
+use crate::resources;
 
 /// The axioms a headline theorem may rest on: Lean's own, and no `sorryAx`.
 const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"];
@@ -33,6 +36,49 @@ const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"]
 /// The seeds of the vectors when none is given. Each seed draws other
 /// octets, lengths and mutations, so several seeds reach cases one misses.
 const SEEDS: std::ops::RangeInclusive<u64> = 1..=8;
+
+const COMMAND: &str = "ip-verify";
+
+/// The counted Kani harnesses in `fictionet`: the counter's own check,
+/// reassembly within its count, and a UDP socket paying before it keeps.
+const KANI_FICTIONET: [&str; 7] = [
+    "counting::proofs::the_counter_sees_every_allocation",
+    "stdlib::network::ip::resource_proofs::a_fragment_into_an_empty_table_stays_within_its_count",
+    "stdlib::network::ip::resource_proofs::a_second_packet_stays_within_its_count",
+    "stdlib::network::ip::resource_proofs::a_packet_past_the_limit_makes_room_first",
+    "stdlib::network::udp::sockets::resource_proofs::the_first_datagram_is_paid_before_it_is_kept",
+    "stdlib::network::udp::sockets::resource_proofs::a_second_datagram_is_paid_before_it_is_kept",
+    "stdlib::network::udp::sockets::resource_proofs::a_fourth_datagram_is_paid_before_it_is_kept",
+];
+
+/// The counted Kani harnesses in the vendored smoltcp: the TCP stores.
+const KANI_SMOLTCP: [&str; 5] = [
+    "socket::tcp::resource_proofs::a_segment_into_an_empty_store_is_paid_for",
+    "socket::tcp::resource_proofs::a_segment_across_a_waiting_piece_is_paid_for",
+    "socket::tcp::resource_proofs::a_segment_across_two_waiting_pieces_is_paid_for",
+    "socket::tcp::resource_proofs::a_first_short_write_is_paid_for",
+    "socket::tcp::resource_proofs::a_third_short_write_is_paid_for",
+];
+
+/// `Holding.tla`'s configs: the code, and a control for each order it keeps.
+const TLC_HOLDING: [&str; 5] = [
+    "Holding_base.cfg",
+    "Holding_without_roomfirst.cfg",
+    "Holding_without_movefirst.cfg",
+    "Holding_without_chargefirst.cfg",
+    "Holding_without_headers.cfg",
+];
+
+/// The costed sessions: the package, the test target, and the filter.
+const SESSIONS: [(&str, &str, &str); 3] = [
+    ("fictionet", "--test=it", "net_resources"),
+    (
+        "fictionet",
+        "--lib",
+        "listen::tests::a_packet_longer_than_a_block_is_paid_from_the_sandboxs_budget",
+    ),
+    ("smoltcp", "--lib", "store_costs"),
+];
 
 /// Runs `ip-verify` with the arguments after it.
 pub fn run(args: &[String]) -> Result {
@@ -58,7 +104,12 @@ pub fn run(args: &[String]) -> Result {
             report.result()
         }
         ["all"] => all(&paths),
-        _ => Err("expected ip-verify lean, vectors [seed], diff [seed], or all".into()),
+        ["resources"] => {
+            let report = resources(&paths)?;
+            report.print();
+            report.result(COMMAND)
+        }
+        _ => Err("expected ip-verify lean, vectors [seed], diff [seed], all, or resources".into()),
     }
 }
 
@@ -380,4 +431,56 @@ fn all(paths: &Paths) -> Result {
     } else {
         Err(format!("ip-verify all: {} failed", failed.join(", ")).into())
     }
+}
+
+/// The resource properties of TCP and below (verification/packet-udp/README.md,
+/// "Resource properties"): the counted Kani harnesses, `Holding.tla`'s
+/// configs, and the costed sessions, each of which must pass.
+fn resources(paths: &Paths) -> Result<lean_vectors::Report> {
+    let mut report = lean_vectors::Report::new("resources");
+    report.absorb(resources::kani(
+        &paths.root,
+        &paths.out.join("fictionet"),
+        "fictionet",
+        &KANI_FICTIONET,
+    )?);
+    report.absorb(resources::kani(
+        &paths.root,
+        &paths.out.join("smoltcp"),
+        "smoltcp",
+        &KANI_SMOLTCP,
+    )?);
+    report.absorb(resources::tlc(
+        &paths.root,
+        &paths.out,
+        &paths.root.join("verification/packet-udp/tla"),
+        "Holding",
+        &TLC_HOLDING,
+    )?);
+    let mut sessions = lean_vectors::Report::new("sessions");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    for (package, target, filter) in SESSIONS {
+        let log = paths
+            .out
+            .join(format!("{package}-{}.out", target.trim_start_matches("--")));
+        let (text, ran) = logged(
+            scoped(&cargo, "8G")
+                .args(["test", "-p", package, target, filter, "--", "--nocapture"])
+                .current_dir(&paths.root),
+            &log,
+        )?;
+        for line in text.lines().filter_map(|line| line.split_once("cost: ")) {
+            sessions.pass(line.1.to_string());
+        }
+        if ran {
+            sessions.pass(format!("{package} {target} {filter}: passed"));
+        } else {
+            sessions.fail(format!(
+                "{package} {target} {filter}: see {}",
+                log.display()
+            ));
+        }
+    }
+    report.absorb(sessions);
+    Ok(report)
 }

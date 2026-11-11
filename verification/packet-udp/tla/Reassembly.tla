@@ -30,7 +30,7 @@
    picks this or the two orders the RFCs forbid, for the controls. Partial
    overlaps, the lengths and the "more fragments" flag on a copy are not
    modeled: a fragment is whole at its offset. Sizes are in units: a packet
-   costs PartialCost, a fragment PieceCost more; the code's 192 and 64 plus
+   costs PartialCost, a fragment PieceCost more; the code's 1536 and 96 plus
    data bytes (and the first fragment's header) scale the same way. Time is
    whole ticks; a packet expires Timeout ticks after its first fragment,
    and `expire(now)` drops those with expires <= now. A packet handed up

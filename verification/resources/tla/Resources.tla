@@ -2,13 +2,15 @@
 (***************************************************************************)
 (* Storage that is paid for before it grows.                              *)
 (*                                                                         *)
-(* A store is a record [held, peak, reserved]: what a part of the code    *)
-(* holds now, the most it held at any moment of the current step, and     *)
-(* what it has reserved from its budget. A TLA+ step is atomic, so a      *)
-(* transient inside it (an entry added, then the old ones dropped) is     *)
-(* invisible to an invariant on the state alone. A model threads the     *)
-(* store through each part of the step that grows or shrinks storage, in  *)
-(* the order the code does them, and Grow records the peak.               *)
+(* A store is a record [held, peak, reserved, short]: what a part of the  *)
+(* code holds now, the most it held at any moment of the current step,    *)
+(* what it has reserved from its budget, and the most it ever held past   *)
+(* what was reserved at that moment. A TLA+ step is atomic, so a          *)
+(* transient inside it (an entry added, then the old ones dropped; bytes  *)
+(* copied, then charged) is invisible to an invariant on the state alone. *)
+(* A model threads the store through each part of the step that grows or  *)
+(* shrinks storage or changes its charge, in the order the code does      *)
+(* them, and each moment is checked against the reservation it had.       *)
 (*                                                                         *)
 (* A model:                                                                *)
 (*   - starts each step with Begin, so the peak is the step's own;        *)
@@ -28,8 +30,14 @@
 (***************************************************************************)
 EXTENDS Naturals
 
+\* How far held passes reserved, or 0.
+Over(held, reserved) == IF held > reserved THEN held - reserved ELSE 0
+
+\* The larger of a and b.
+Larger(a, b) == IF a > b THEN a ELSE b
+
 \* A store holding nothing, with r reserved.
-Store(r) == [held |-> 0, peak |-> 0, reserved |-> r]
+Store(r) == [held |-> 0, peak |-> 0, reserved |-> r, short |-> 0]
 
 \* A new step: its peak starts at what is held.
 Begin(s) == [s EXCEPT !.peak = s.held]
@@ -37,7 +45,8 @@ Begin(s) == [s EXCEPT !.peak = s.held]
 \* The code allocates n more.
 Grow(s, n) ==
     [s EXCEPT !.held = s.held + n,
-              !.peak = IF s.held + n > s.peak THEN s.held + n ELSE s.peak]
+              !.peak = Larger(s.held + n, s.peak),
+              !.short = Larger(s.short, Over(s.held + n, s.reserved))]
 
 \* The code frees n.
 Shrink(s, n) == [s EXCEPT !.held = s.held - n]
@@ -47,13 +56,15 @@ SetHeld(s, h) == IF h >= s.held THEN Grow(s, h - s.held) ELSE Shrink(s, s.held -
 
 \* The code charges its budget n more, or raises its charge to r.
 Reserve(s, n) == [s EXCEPT !.reserved = s.reserved + n]
-ReserveTo(s, r) == [s EXCEPT !.reserved = IF r > s.reserved THEN r ELSE s.reserved]
+ReserveTo(s, r) == [s EXCEPT !.reserved = Larger(r, s.reserved)]
 
 \* The code gives n of its charge back.
-Release(s, n) == [s EXCEPT !.reserved = s.reserved - n]
+Release(s, n) ==
+    [s EXCEPT !.reserved = s.reserved - n,
+              !.short = Larger(s.short, Over(s.held, s.reserved - n))]
 
-\* No moment of the step held more than was reserved.
-Paid(s) == s.peak <= s.reserved /\ s.held <= s.reserved
+\* No moment held more than was reserved at that moment.
+Paid(s) == s.short = 0 /\ s.held <= s.reserved
 
 \* The reservation stays within the budget's limit.
 WithinLimit(s, limit) == s.reserved <= limit

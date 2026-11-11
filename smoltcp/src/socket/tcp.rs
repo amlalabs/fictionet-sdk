@@ -15,6 +15,11 @@ use crate::wire::{
 };
 
 mod reno;
+/// Bounded proofs that the stores pay for what they hold, with every
+/// allocation counted, run with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../verification/tcp-store/kani/resources.rs"]
+mod resource_proofs;
 mod rx;
 #[cfg(test)]
 mod store_costs;

@@ -533,3 +533,89 @@ mod dns {
         eprintln!("cost: dns queries: {}", all.summary());
     }
 }
+
+/// The resolver's cache: what it keeps is charged to its budget, by its
+/// own estimate, before it is kept.
+mod cache {
+    use std::net::Ipv4Addr;
+
+    use fictionet::stdlib::layer::Budget;
+    use fictionet::stdlib::protocols::dns::dnssec::Validation;
+    use fictionet::stdlib::protocols::dns::rr::rdata::A;
+    use fictionet::stdlib::protocols::dns::rr::{Name, RData, Record, RecordSet, RecordType};
+    use fictionet::stdlib::services::dns::resolver::{Cache, Limits, Offer, Rank};
+    use fictionet::time::{Duration, Instant};
+
+    use crate::cost::{Charged, Costs, Linear};
+
+    /// A step's linear bound, over the session ([`Costs::amortized`]): an
+    /// offer's records are built in the step ([`built`], its input). The
+    /// cache keeps a normalized copy (`normalized` in cache.rs): its records
+    /// cloned into a vector that doubles as it grows, then set into the
+    /// copy, at most three times what was built. What it keeps is charged
+    /// in the step, or grows its maps into room charged when the cache was
+    /// made (`Cache::storage`), the first step's charge.
+    const STEP: Linear = Linear {
+        num: 4,
+        den: 1,
+        fixed: 0,
+    };
+
+    /// RRsets of one to 32 addresses at 3,000 names, each offered as it
+    /// arrives from an authority, every insert a costed step: what the
+    /// cache holds stays within what its budget was charged.
+    /// What building an offer of `per` addresses allocates, at most: its
+    /// records in a vector that doubles as it grows, the RRset's own copy
+    /// of the name and type, and the name's text.
+    fn built(per: u32) -> usize {
+        (2 * per as usize + 2) * size_of::<Record>() + 64
+    }
+
+    #[test]
+    fn rrsets_offered_stay_within_what_the_cache_charged() {
+        let limits = Limits {
+            max_ttl: Duration::from_secs(1000),
+            max_negative_ttl: Duration::from_secs(100),
+            failure_ttl: Duration::from_secs(1),
+            stale: Duration::ZERO,
+            max_entries: 4096,
+        };
+        for per in [1u32, 4, 32] {
+            let budget = Budget::new(64 << 20);
+            let mut costs = Costs::amortized(format!("cache, {per} a set"));
+            let storage = Cache::storage(limits.max_entries).unwrap();
+            let mut cache = costs.step(storage, 0, STEP, || Charged {
+                value: Cache::new(limits, &budget).expect("room"),
+                charged: budget.used(),
+                // The maps double as they grow into that room: over all their
+                // growth they ask for it twice, once charged and once moved.
+                moved: storage,
+            });
+            for i in 0..3000u32 {
+                let before = budget.used();
+                costs.step(built(per), before, STEP, || {
+                    let name = Name::from_ascii(format!("n{i}.a-long-label.example.")).unwrap();
+                    let mut set = RecordSet::with_ttl(name.clone(), RecordType::A, 300);
+                    for k in 0..per {
+                        let address = RData::A(A(Ipv4Addr::from(k)));
+                        set.insert(Record::from_rdata(name.clone(), 300, address), 0);
+                    }
+                    let offer = Offer::Positive {
+                        set,
+                        rank: Rank::AuthAnswer,
+                        validation: Validation::NotPerformed,
+                        proof: Vec::new(),
+                        truncated: false,
+                    };
+                    cache.insert(Instant::ZERO, offer);
+                    Charged {
+                        value: (),
+                        charged: budget.used().saturating_sub(before),
+                        moved: 0,
+                    }
+                });
+            }
+            eprintln!("cost: cache, {per} a set: {}", costs.summary());
+        }
+    }
+}

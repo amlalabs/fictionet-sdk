@@ -28,3 +28,10 @@ mod alloc;
 #[cfg(test)]
 #[path = "../../verification/resources/cost.rs"]
 mod cost;
+
+/// Counts what the code under a Kani proof allocates: see
+/// verification/resources/kani/counting.rs.
+#[cfg(kani)]
+#[allow(unsafe_code)]
+#[path = "../../verification/resources/kani/counting.rs"]
+mod counting;

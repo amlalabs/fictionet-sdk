@@ -2131,6 +2131,12 @@ pub fn hop(packet: &mut [u8]) -> Hop {
 #[path = "../../../verification/packet-udp/kani/ip_header.rs"]
 mod proofs;
 
+/// Bounded proofs that reassembly holds no more than it counts, with every
+/// allocation counted, run with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../verification/packet-udp/kani/resources.rs"]
+mod resource_proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,7 +14,7 @@ A model of `Reassembly` in `src/stdlib/network/ip.rs` that follows
 Modelling choices:
 - Octets are `Nat`s below 256. Time is a `Nat` count of milliseconds; the
   theorems only add and compare times, so the unit does not matter.
-- The code's `HashMap<Key, Partial>` is an association list with distinct
+- The code's `BTreeMap<Key, Partial>` is an association list with distinct
   keys, and its `by_expiry` index is read off that list: the code's
   `check` asserts that the two agree. The cap drops the entry with the
   soonest deadline; between equal deadlines the model drops the first in

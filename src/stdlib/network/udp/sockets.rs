@@ -540,3 +540,10 @@ fn port_unreachable(
 
 #[cfg(test)]
 mod tests;
+
+/// Bounded proofs that a socket pays for what it keeps before it allocates
+/// it, with every allocation counted, run with `cargo kani -Z stubbing -Z
+/// c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../../verification/packet-udp/kani/udp_resources.rs"]
+mod resource_proofs;
