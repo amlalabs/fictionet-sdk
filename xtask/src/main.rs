@@ -18,6 +18,7 @@ mod kani_slot;
 mod layer_verify;
 mod lean_vectors;
 mod mptcp_verify;
+mod qpack_verify;
 mod quic_verify;
 mod resources;
 #[cfg(feature = "shibboleth")]
@@ -43,7 +44,7 @@ fn main() -> Result {
     }
     let mut args = std::env::args().skip(1);
     let task = args.next().ok_or(
-        "expected gate, dns-verify, http-verify, mptcp-verify, hpack-verify, quic-verify, layer-verify or a host command",
+        "expected gate, dns-verify, http-verify, mptcp-verify, hpack-verify, qpack-verify, quic-verify, layer-verify or a host command",
     )?;
     #[cfg(feature = "shibboleth")]
     if task == "shibboleth-infer" {
@@ -63,6 +64,9 @@ fn main() -> Result {
     }
     if task == "quic-verify" {
         return quic_verify::run(&args.collect::<Vec<_>>());
+    }
+    if task == "qpack-verify" {
+        return qpack_verify::run(&args.collect::<Vec<_>>());
     }
     if task == "hpack-verify" {
         return hpack_verify::run(&args.collect::<Vec<_>>());
