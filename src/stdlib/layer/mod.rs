@@ -232,6 +232,10 @@ pub(crate) mod probe;
 #[path = "../../../verification/layer/kani/mod.rs"]
 mod proofs;
 
+#[cfg(kani)]
+#[path = "../../../verification/layer/kani/resources.rs"]
+mod resource_proofs;
+
 pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, FIRST_PLACES, Owned, Place};
 pub use fictionet_buf::{Budget, Charge, Chunk, Held, Pool, Refusals, Starved, Waiter};
 pub use work::{OwnedWork, WorkOwner};

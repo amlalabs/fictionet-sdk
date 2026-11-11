@@ -324,6 +324,17 @@ extern crate self as fictionet;
 #[path = "../verification/resources/kani/counting.rs"]
 mod counting;
 
+/// The unit tests' allocator, which counts what each thread allocates, and
+/// the cost bounds the replays among them hold each step to: see
+/// verification/README.md, "Resource properties".
+#[cfg(test)]
+#[allow(unsafe_code)]
+#[path = "../verification/resources/alloc.rs"]
+mod alloc;
+#[cfg(test)]
+#[path = "../verification/resources/cost.rs"]
+mod cost;
+
 mod attach;
 mod block_on;
 mod cable;

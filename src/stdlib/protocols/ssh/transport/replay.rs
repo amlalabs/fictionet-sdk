@@ -15,6 +15,7 @@
 //! of 2^32, so they wrap during the run.
 
 use super::*;
+use crate::cost::{Charged, Costs, Linear};
 use std::collections::VecDeque;
 
 /// What the client put on the wire, so the replay knows which packet
@@ -243,13 +244,78 @@ impl Client {
     }
 }
 
+/// Nothing allowed per input byte or beyond what a step is charged: every
+/// byte a server step asks for is charged (verification/ssh-layer/README.md,
+/// "Resource properties").
+const CHARGED_ONLY: Linear = Linear {
+    num: 0,
+    den: 1,
+    fixed: 0,
+};
+
+/// Runs one server step on `input` bytes, costed (crate::cost). No moment
+/// of the step may hold more than what the transport says it holds before
+/// it (`held()`), what the layer charges the step itself (`own`: the copy
+/// decoding makes, or a packet's payload and `scratch()`), and what the
+/// transport says it keeps after it beyond that. The step may ask for no
+/// more than that and, since an exchange replaces the state it held (new
+/// keys for old, a proposal for none), the state it held before. The
+/// transport never says it holds more than its `most_held()`, which the
+/// layer charges for it.
+fn costed<T>(
+    costs: &mut Costs,
+    server: &mut Transport,
+    input: usize,
+    own: usize,
+    step: impl FnOnce(&mut Transport) -> T,
+) -> T {
+    let held = server.held();
+    let replaced = Linear {
+        num: 0,
+        den: 1,
+        fixed: held,
+    };
+    let value = costs.step(input, held, replaced, || {
+        let value = step(server);
+        let kept = server.held().saturating_sub(held);
+        Charged {
+            value,
+            charged: own + kept,
+        }
+    });
+    assert!(
+        server.held() <= server.most_held(),
+        "the transport holds {} bytes, past its most_held() of {}",
+        server.held(),
+        server.most_held()
+    );
+    value
+}
+
 /// Replays `trace`, the client asking for strict KEX and EXT_INFO as
 /// given. Without strict KEX, sequence numbers start at `u32::MAX - 1`.
-fn replay(trace: &str, strict: bool, ext: bool) -> bool {
+///
+/// Every server step is costed ([`costed`]), each packet as the layer
+/// charges it: first the copy decoding makes, then its payload and
+/// `scratch()` before it is handled.
+fn replay(trace: &str, strict: bool, ext: bool, costs: &mut Costs) -> bool {
     let host = Arc::new(HostKey::ed25519_from_seed([7; 32]).unwrap());
     let server_id = Identification::new("2.0", "server", None).unwrap();
-    let mut server = Transport::new(host, server_id.clone());
-    server.seed([19; 32]).unwrap();
+    // What the server writes goes into storage made outside its steps,
+    // as the layer's output is paid for apart from the transport.
+    let mut out = Vec::with_capacity(1 << 16);
+    // Making the transport is charged what the layer charges for its state
+    // once, its most_held(); every later step is held to what it says it
+    // holds.
+    let mut server = costs.step(0, 0, CHARGED_ONLY, || {
+        let mut server = Transport::new(host, server_id.clone());
+        server.seed([19; 32]).unwrap();
+        let charged = server.most_held();
+        Charged {
+            value: server,
+            charged,
+        }
+    });
     let mut client = Client {
         id: Identification::new("2.0", "client", None).unwrap(),
         server_id,
@@ -286,7 +352,8 @@ fn replay(trace: &str, strict: bool, ext: bool) -> bool {
         client.inc.sequence = start;
     }
     let mut s2c = Vec::new();
-    server.start(&mut s2c).unwrap();
+    costed(costs, &mut server, 0, 0, |server| server.start(&mut out)).unwrap();
+    s2c.append(&mut out);
     let version = client.id.to_bytes().unwrap();
     client.wire.push_back((version, Sent::Proper));
     let mut steps = 0;
@@ -295,10 +362,28 @@ fn replay(trace: &str, strict: bool, ext: bool) -> bool {
         match action {
             "ServerRecv" => {
                 let (bytes, sent) = client.wire.pop_front().expect("a client packet to read");
-                let handled = server.decode(&bytes, false).and_then(|step| match step {
+                // The layer charges the copy decoding makes before it
+                // decodes.
+                let copy = bytes.len().min(MAX_PACKET + 16);
+                let decoded = costed(costs, &mut server, bytes.len(), copy, |server| {
+                    server.decode(&bytes, false)
+                });
+                let handled = decoded.and_then(|step| match step {
                     Step::Item(event, used) => {
                         assert_eq!(used, bytes.len());
-                        server.handle(event, &mut s2c)
+                        // Then what the packet holds and what handling it
+                        // takes, before it is handled.
+                        let need = match &event {
+                            TransportEvent::Version(_) => 2 * MAX_VERSION_LINE,
+                            TransportEvent::Packet { payload, .. } => {
+                                payload.capacity() + server.scratch(payload)
+                            }
+                        };
+                        let handled = costed(costs, &mut server, 0, need, |server| {
+                            server.handle(event, &mut out).map(drop)
+                        });
+                        s2c.append(&mut out);
+                        handled
                     }
                     _ => panic!("one whole packet decodes"),
                 });
@@ -332,11 +417,18 @@ fn replay(trace: &str, strict: bool, ext: bool) -> bool {
                 };
                 client.send(&Message::Ignore(vec![1]).to_bytes().unwrap(), sent)
             }
-            "ServerApp" | "ServerHandleReply" => server
-                .write_packet(&[94, 0, 0, 0, 0, 2], &mut s2c)
-                .unwrap_or_else(|e| panic!("step {steps} {action}: {e}")),
+            "ServerApp" | "ServerHandleReply" => {
+                costed(costs, &mut server, 0, 0, |server| {
+                    server.write_packet(&[94, 0, 0, 0, 0, 2], &mut out)
+                })
+                .unwrap_or_else(|e| panic!("step {steps} {action}: {e}"));
+                s2c.append(&mut out);
+            }
             "ServerHandleQuiet" => {}
-            "ServerRekey" => server.rekey(&mut s2c).unwrap(),
+            "ServerRekey" => {
+                costed(costs, &mut server, 0, 0, |server| server.rekey(&mut out)).unwrap();
+                s2c.append(&mut out);
+            }
             other => panic!("unknown action {other}"),
         }
     }
@@ -355,11 +447,21 @@ fn transport_traces_replay_on_the_production_transport() {
         "inject" => include_str!("../../../../../verification/ssh-layer/traces/inject.txt"),
         _ => unreachable!(),
     };
-    assert!(!replay(trace("loose"), false, true));
-    assert!(!replay(trace("strict"), true, true));
-    assert!(!replay(trace("wrong"), false, false));
+    let mut all = Costs::new("ssh transport traces");
+    for (name, strict, ext) in [
+        ("loose", false, true),
+        ("strict", true, true),
+        ("wrong", false, false),
+    ] {
+        let mut costs = Costs::new(format!("ssh trace {name}"));
+        assert!(!replay(trace(name), strict, ext, &mut costs));
+        all.absorb(&costs);
+    }
+    let mut costs = Costs::new("ssh trace inject");
     assert!(
-        replay(trace("inject"), true, false),
+        replay(trace("inject"), true, false, &mut costs),
         "the injected IGNORE ends it"
     );
+    all.absorb(&costs);
+    println!("cost: {}", all.summary());
 }

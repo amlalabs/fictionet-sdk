@@ -256,6 +256,53 @@ assumptions or liveness claims. Resource refusal, arbitrary packet parsing,
 cryptographic failure details, memory allocation and transport implementations
 that violate `PacketTransport`'s documented contract are outside these models.
 
+## Resource properties
+
+The method is in `verification/README.md`, "Resource properties". The
+transport has all three layers, run with `cargo xtask layer-verify
+resources` (see `verification/layer/README.md`, which covers the
+`Children` places the channels live in). They found no bug here. A
+channel's received data is paid from its child's receive window, a charge
+the chunks made in it share; `Channel.tla`'s `ReservedBeforeConfirmation`
+and `ReceiveWindow` and the Kani harness `ssh_receive_window` check that
+window, and the channels have no resource store of their own.
+
+**What is charged.** `StandardTransport::poll` (`services/ssh/transport.rs`)
+charges the transport's `most_held()` once, before it decodes anything.
+For each packet it charges the copy decoding makes, the bytes buffered
+and at most `MAX_PACKET + 16`, before decoding; then the payload's
+capacity and `Transport::scratch(payload)` before handling, and a packet
+it has no room for waits, held back with its charge.
+
+| Bound | Constant | Why |
+| --- | --- | --- |
+| a decoding step holds at most what the transport holds (`held()`) plus the copy it is charged, and asks for at most the copy | `min(buffered, MAX_PACKET + 16)` | a packet is opened in the one vector it is copied into; a packet before keys copies its payload and padding and keeps the payload |
+| a handling step holds at most `held()` before it, plus the payload's capacity and `scratch(payload)`, plus what the transport keeps after it beyond `held()` before | `scratch()` | what a KEXINIT's lists, an ECDH_INIT's exchange or a transport message's strings take, each freed before `handle` returns |
+| a step asks for at most that, plus `held()` before it | `held()` | an exchange replaces the state it held: new keys for old, a proposal for none |
+| `held()` never passes `most_held()` | `most_held()` | what the layer charges for the state |
+
+| Layer | Check | Result |
+| --- | --- | --- |
+| Kani (`kani/resources.rs`) | `decoding_a_short_plain_packet_copies_only_the_packet` (16 bytes) and `decoding_a_longer_plain_packet_copies_only_the_packet` (32): `Direction::read` before keys, any payload bytes, with every allocation counted | both pass, 2.7 s and 6.1 s |
+| costed replay (`protocols/ssh/transport/replay.rs`) | the four coverage traces on the production `Transport`, real keys and ciphers: every server step (making it, `start`, each decode and each handle, each write and rekey) held to the bounds above (`resources/cost.rs`) | 83 steps pass |
+| TLA+ (`tla/TransportMemory.tla`) | the state and each packet as stores, in `poll`'s order: `StatePaid`, `PacketPaid` | `TransportMemory_base` passes |
+
+Packets under keys are opened by ring's ChaCha20-Poly1305 and AES-GCM,
+which the Kani harnesses do not run; the replay costs those. The replay's
+transport is charged `held()`, not `most_held()`: `most_held()` allows a
+peer's largest proposal and identification, far more than the traces
+hold, so a step that left its scratch uncharged would still pass against
+it.
+
+Controls, each run and then dropped:
+
+| Control | Layer | Fails |
+| --- | --- | --- |
+| `Transport::exchange_scratch` returning 0 | costed replay | trace `loose`, step 7, the ECDH_INIT: 2,784 bytes live at once against 1,423 held and 37 charged to the step |
+| `Direction::read` copying the whole packet before parsing it | Kani | `decoding asked for more than the packet` |
+| `TransportMemory_without_chargecopyfirst` | TLA+ | `PacketPaid` |
+| `TransportMemory_without_chargescratch` | TLA+ | `PacketPaid` |
+
 ## Rust arithmetic
 
 The positive harnesses are compiled as a child module of `ssh` under `cfg(kani)`.

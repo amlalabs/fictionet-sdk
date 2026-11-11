@@ -3275,3 +3275,7 @@ mod tests {
 #[cfg(kani)]
 #[path = "../../../verification/websocket/kani/frames.rs"]
 mod verification;
+
+#[cfg(kani)]
+#[path = "../../../verification/websocket/kani/resources.rs"]
+mod resource_proofs;

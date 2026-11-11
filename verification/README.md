@@ -92,7 +92,9 @@ layers:
    the standard library's allocation functions with ones that count. To
    use it, include the file at the crate root as `counting` (see its
    header). Write each harness as `counted_proof! { ... }` instead of
-   `#[kani::proof]`, and run it with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+   `#[kani::proof]`, and run it with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates -Z restrict-vtable`
+   (the last keeps a harness that charges a `Budget` within memory, and
+   proves no less).
    Inside the harness, build the state inside `measure` so that the
    counter sees all of it. Take the charge the code pays (the area's
    `most_held()`, or whatever the code charges), then run one step on any
@@ -236,6 +238,32 @@ allocator that fails before its fix (`tests/it/hpack_codec.rs`):
 - The capture dissector's `PartialBlocks::held()` reported the table's
   RFC 7541 size and the length of a waiting block, not their storage:
   1,757 bytes against 3,335 allocated.
+
+The resource properties of the runtime and layer machinery, SSH and
+WebSocket (`cargo xtask layer-verify resources`; `layer/README.md`,
+`world-net/README.md`, `ssh-layer/README.md` and `websocket/README.md`)
+found three more, each fixed with a test that fails before:
+
+- A charged container (`ChargedDeque`, `ChargedVec`, `ChargedBytes`) and
+  `Children`'s places grew by reallocating after charging only the new
+  size, so for the moment the items moved the old allocation and the new
+  were both live past the charge: 192 bytes against a limit of 130. A
+  growth now charges the old allocation with the new in one step, and a
+  shrink charges the smaller allocation before it moves (84530d0d5).
+- `PACKET_COST` left out the backing's record each queued packet keeps
+  alive, so a limited cable of tiny packets held about twice what it
+  counted. `PacketQueue` and the `delay` and `bottleneck` queues kept
+  their packets in a `VecDeque` nothing paid for, and the link queues
+  counted a packet's length, not its capacity. The cost now counts the
+  record, and both queues charge their places as they grow.
+- The WebSocket message decoder grew a fragmented message past its limit
+  by doubling, while `held()` reported its length: twelve bytes allocated
+  at a limit of ten, `held()` nine. The growth now stops at the limit,
+  and `held()` reports the allocation.
+
+`world-net/README.md` also splits the whole world's memory four ways:
+charged payload, bounded engine overhead, topology state and trusted
+application allocations, checked in `world-net/tla/Memory.tla`.
 
 And one difference of order. Since the buffers round, `Representations`
 borrows strings without decoding them, so of two faults in one literal a

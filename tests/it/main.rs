@@ -3,6 +3,12 @@
 
 mod common;
 
+// The replays' cost bounds, on the binary's counting allocator
+// (verification/README.md, "Resource properties").
+use common::alloc;
+#[path = "../../verification/resources/cost.rs"]
+mod cost;
+
 mod allocations;
 mod asn1_codec;
 mod bodies_codec;
@@ -69,6 +75,7 @@ mod tls;
 mod tls_determinism;
 mod tls_write_cancellation;
 mod web;
+mod websocket_costs;
 mod wire_codec;
 mod world_layers;
 mod world_memory;
