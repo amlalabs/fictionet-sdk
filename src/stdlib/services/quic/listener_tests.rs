@@ -212,8 +212,10 @@ fn recycled_engine_handle_routes_only_to_the_new_generation() {
         .sessions
         .insert(Session {
             layer,
-            budget,
-            reservation: lab.budget.charge(1 << 20).unwrap(),
+            share: Share {
+                budget,
+                _paid: lab.budget.charge(1 << 20).unwrap(),
+            },
             announced: false,
             opening: None,
             closing: false,
@@ -432,4 +434,181 @@ fn unpaid_wire_input_is_dropped_before_listener_routing() {
         Admit::Taken
     ));
     assert_eq!(lab.listener.sessions.len(), 1);
+}
+
+impl Lab {
+    /// A second client's first Initial, from another address.
+    fn newcomer(&mut self) -> Admit<DatagramEvent<SocketAddr>> {
+        let mut observe = Observations::new(0);
+        let env = &mut Env::new(
+            Instant::ZERO,
+            self.entropy.as_ref(),
+            &self.budget,
+            &mut observe,
+        );
+        let mut client = QuicLayer::new(
+            env,
+            self.listener.config.endpoint.clone(),
+            None,
+            self.listener.epoch,
+            16,
+            |_| 0u32.into(),
+        )
+        .unwrap();
+        client
+            .connect(
+                env,
+                self.client_config.clone(),
+                "127.0.0.1:4433".parse().unwrap(),
+                "localhost",
+            )
+            .unwrap();
+        let Some(DatagramCommand::Send(initial)) = client.take_command(env) else {
+            panic!("client Initial")
+        };
+        self.listener
+            .on_event(
+                env,
+                DatagramEvent::Datagram(Datagram::new(
+                    initial.into_parts().0,
+                    "127.0.0.1:4445".parse().unwrap(),
+                )),
+            )
+            .unwrap()
+    }
+
+    /// Closes connection `id` and runs it through draining until the
+    /// listener retires it.
+    fn retire(&mut self, id: ChildId) {
+        let mut observe = Observations::new(0);
+        let mut env = Env::new(
+            Instant::ZERO,
+            self.entropy.as_ref(),
+            &self.budget,
+            &mut observe,
+        );
+        let _ = self.listener.on_command(
+            &mut env,
+            MuxCommand::from_op(MuxOp::Close(id, Closing::Done)),
+        );
+        let deadline = self.listener.deadline().unwrap().0;
+        let mut env = Env::new(deadline, self.entropy.as_ref(), &self.budget, &mut observe);
+        self.listener.on_timer(&mut env, ()).unwrap();
+        for _ in 0..40 {
+            self.listener.advance(&mut env).unwrap();
+            if let Some(DatagramCommand::Send(_)) = self.listener.take_command(&mut env) {
+                assert!(matches!(
+                    self.listener
+                        .on_event(&mut env, DatagramEvent::Sent(1))
+                        .unwrap(),
+                    Admit::Taken
+                ));
+            }
+            self.listener.take_event();
+        }
+        assert!(self.listener.sessions.get(id).is_none());
+    }
+}
+
+#[test]
+fn a_connection_pays_from_its_own_share_and_returns_it_once_freed() {
+    let mut lab = Lab::new(1);
+    let id = lab.initial();
+    let share = &lab.listener.sessions.get(id).unwrap().share;
+    // The connection's stream slots and the state of its first flight are
+    // charged to its own budget, which the listener's budget pays for.
+    assert!(share.budget.used() > 0);
+    assert!(lab.budget.used() >= 1 << 20);
+    // Storage the application above still holds when the connection goes.
+    let held = share.budget.charge(1).unwrap();
+    lab.retire(id);
+    assert_eq!(lab.listener.released.as_ref().unwrap().len(), 1);
+    let paid = lab.budget.used();
+    assert!(paid >= 1 << 20);
+
+    // Its share still counts: the newcomer is refused.
+    assert!(matches!(lab.newcomer(), Admit::Taken));
+    assert!(lab.listener.sessions.is_empty());
+    let mut observe = Observations::new(0);
+    let mut env = Env::new(
+        Instant::ZERO,
+        lab.entropy.as_ref(),
+        &lab.budget,
+        &mut observe,
+    );
+    assert!(matches!(
+        lab.listener.take_command(&mut env),
+        Some(DatagramCommand::Send(_))
+    ));
+    assert!(matches!(
+        lab.listener
+            .on_event(&mut env, DatagramEvent::Sent(1))
+            .unwrap(),
+        Admit::Taken
+    ));
+    // Once the last of it is freed, the next newcomer gets the share.
+    drop(held);
+    assert!(matches!(lab.newcomer(), Admit::Taken));
+    assert_eq!(lab.listener.sessions.len(), 1);
+    assert!(lab.listener.released.as_ref().unwrap().is_empty());
+}
+
+#[test]
+fn a_retry_listener_admits_only_a_client_that_returns_its_token() {
+    let mut lab = Lab::new(1);
+    lab.listener.config.validation = AddressValidation::Retry;
+    let mut observe = Observations::new(0);
+    let mut env = Env::new(
+        Instant::ZERO,
+        lab.entropy.as_ref(),
+        &lab.budget,
+        &mut observe,
+    );
+    let remote: SocketAddr = "127.0.0.1:4444".parse().unwrap();
+    let Some(DatagramCommand::Send(initial)) = lab.client.take_command(&mut env) else {
+        panic!("client Initial")
+    };
+    let event = DatagramEvent::Datagram(Datagram::new(initial.into_parts().0, remote));
+    assert!(matches!(
+        lab.client
+            .on_event(&mut env, DatagramEvent::Sent(1))
+            .unwrap(),
+        Admit::Taken
+    ));
+    assert!(matches!(
+        lab.listener.on_event(&mut env, event).unwrap(),
+        Admit::Taken
+    ));
+    // A Retry, and no connection or share for the unproven address.
+    assert!(lab.listener.sessions.is_empty());
+    assert!(lab.budget.used() < 1 << 20);
+    let Some(DatagramCommand::Send(retry)) = lab.listener.take_command(&mut env) else {
+        panic!("Retry")
+    };
+    assert!(matches!(
+        lab.listener
+            .on_event(&mut env, DatagramEvent::Sent(1))
+            .unwrap(),
+        Admit::Taken
+    ));
+    let retry = DatagramEvent::Datagram(Datagram::new(
+        retry.into_parts().0,
+        "127.0.0.1:4433".parse().unwrap(),
+    ));
+    assert!(matches!(
+        lab.client.on_event(&mut env, retry).unwrap(),
+        Admit::Taken
+    ));
+    // The client starts again with the token, and is admitted.
+    lab.client.advance(&mut env).unwrap();
+    let Some(DatagramCommand::Send(initial)) = lab.client.take_command(&mut env) else {
+        panic!("Initial with the token")
+    };
+    let event = DatagramEvent::Datagram(Datagram::new(initial.into_parts().0, remote));
+    assert!(matches!(
+        lab.listener.on_event(&mut env, event).unwrap(),
+        Admit::Taken
+    ));
+    assert_eq!(lab.listener.sessions.len(), 1);
+    assert!(lab.budget.used() >= 1 << 20);
 }

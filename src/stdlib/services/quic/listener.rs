@@ -1,5 +1,5 @@
 use super::*;
-use crate::stdlib::layer::{Charge, Child, CommandOf, Credited, EventOf, Top};
+use crate::stdlib::layer::{Charge, ChargedVec, Child, CommandOf, Credited, EventOf, Top};
 use crate::stdlib::network::{ConnInfo, Transport};
 
 /// Connections accepted on one datagram carrier. Each child is a complete
@@ -14,8 +14,8 @@ type ListenerCommand = CommandOf<Connections>;
 pub struct Accepted {
     /// Its addresses, and the name and protocol TLS settled.
     pub info: ConnInfo,
-    /// What everything the connection holds is charged to: its stream
-    /// slots, the datagrams routed to it, reassembly, sends, and the
+    /// What the connection holds is charged to: its stream slots, the
+    /// datagrams routed to it after the first, reassembly, sends, and the
     /// application above it, when `Children::budgets` hands it this one.
     pub budget: Budget,
 }
@@ -45,19 +45,38 @@ pub struct ListenerConfig {
 
 struct Session {
     layer: QuicLayer,
-    budget: Budget,
-    reservation: Charge,
+    share: Share,
     announced: bool,
     opening: Option<Child>,
     closing: bool,
     routing: bool,
 }
 
-/// A retired connection's share of the listener's budget, kept until
-/// nothing charged to the connection's budget is left.
-struct Released {
+impl Session {
+    /// Calls the connection's engine in the connection's own budget.
+    fn call<R>(
+        &mut self,
+        env: &mut Env<'_, ()>,
+        call: impl FnOnce(&mut QuicLayer, &mut Env<'_, ()>) -> R,
+    ) -> R {
+        let Self { layer, share, .. } = self;
+        env.scoped_in(&share.budget, |report| report, |env| call(layer, env))
+    }
+}
+
+/// One connection's share of the listener's budget: the budget everything
+/// the connection holds is charged to, and the listener's charge that
+/// pays for it.
+struct Share {
     budget: Budget,
-    _reservation: Charge,
+    _paid: Charge,
+}
+
+impl Share {
+    /// Whether everything charged to the connection is freed.
+    fn freed(&self) -> bool {
+        self.budget.used() == 0
+    }
 }
 
 /// One tracked UDP send, either from the endpoint or from a connection.
@@ -84,15 +103,6 @@ impl<T: Copy> Transmission<T> {
     }
 }
 
-/// Runs `call` on one connection in its own budget.
-fn within<R>(
-    env: &mut Env<'_, ()>,
-    budget: &Budget,
-    call: impl FnOnce(&mut Env<'_, ()>) -> R,
-) -> R {
-    env.scoped_in(budget, |report| report, call)
-}
-
 /// A QUIC server listener over one `Datagrams<SocketAddr>` carrier.
 ///
 /// Compose with `Children` to serve a fresh application on each connection,
@@ -111,9 +121,10 @@ fn within<R>(
 /// [`connections`](ListenerConfig::connections), so they never grow. Each
 /// admitted connection then gets a budget of its own,
 /// [`connection_budget`](ListenerConfig::connection_budget) bytes carved
-/// from the listener's: its stream slots, every datagram routed to it, its
-/// reassembly and send storage, and the application above it are charged
-/// there, so a connection that fills its budget slows only itself. A new
+/// from the listener's: its stream slots, the datagrams routed to it after
+/// the first, its reassembly and send storage, and the application above
+/// it are charged there, so a connection that fills its budget slows only
+/// itself. Its first datagram stays on the listener's budget. A new
 /// connection is refused with `CONNECTION_REFUSED` when the listener holds
 /// [`connections`](ListenerConfig::connections) already, or when its budget
 /// cannot pay for one more; existing connections go on. With
@@ -150,7 +161,10 @@ pub struct Listener {
     local: Option<SocketAddr>,
     endpoint: Option<Endpoint>,
     sessions: Slots<Session>,
-    released: Slots<Released>,
+    /// The shares of retired connections whose storage the application
+    /// above still holds, with a place for every connection, made with
+    /// the endpoint.
+    released: Option<ChargedVec<Share>>,
     initialized: bool,
     up: Option<ListenerEvent>,
     down: Option<Datagram<SocketAddr>>,
@@ -166,7 +180,7 @@ impl Listener {
     pub fn new(config: ListenerConfig, epoch: EngineInstant, local: Option<SocketAddr>) -> Self {
         Self {
             sessions: Slots::new(config.connections),
-            released: Slots::new(config.connections),
+            released: None,
             config,
             epoch,
             local,
@@ -187,6 +201,16 @@ impl Listener {
         self.config.connections
     }
 
+    /// The QUIC version of each connection it holds whose handshake has
+    /// settled it, in slot order.
+    pub fn versions(&self) -> impl Iterator<Item = u32> + '_ {
+        self.sessions
+            .ids()
+            .map(|id| &self.sessions.get(id).unwrap().layer)
+            .filter(|layer| layer.connected)
+            .filter_map(QuicLayer::version)
+    }
+
     fn init(&mut self, env: &mut Env<'_, ()>) -> bool {
         if self.initialized {
             return true;
@@ -195,7 +219,7 @@ impl Listener {
         let Some(sessions) = Slots::with_budget(connections, env.budget()) else {
             return false;
         };
-        let Some(released) = Slots::with_budget(connections, env.budget()) else {
+        let Some(released) = ChargedVec::with_places(env.budget(), connections, connections) else {
             return false;
         };
         let mut seed = [0; 32];
@@ -210,7 +234,7 @@ impl Listener {
             return false;
         }
         self.sessions = sessions;
-        self.released = released;
+        self.released = Some(released);
         self.endpoint = Some(endpoint);
         self.initialized = true;
         true
@@ -243,60 +267,46 @@ impl Listener {
     }
 
     fn retire(&mut self, id: ChildId) {
-        let session = self.sessions.remove(id).unwrap();
-        if session.announced {
-            self.up = Some(MuxEvent::Closed(id));
-        }
         let Session {
             layer,
-            budget,
-            reservation,
+            share,
+            announced,
             ..
-        } = session;
-        // The engine's storage goes first; what the application above
-        // still holds goes when it closes the child.
+        } = self.sessions.remove(id).unwrap();
+        if announced {
+            self.up = Some(MuxEvent::Closed(id));
+        }
+        // The engine's storage goes now; what the application above holds
+        // goes when it closes the child.
         drop(layer);
-        if budget.used() > 0 {
-            let _ = self.released.insert(Released {
-                budget,
-                _reservation: reservation,
-            });
+        if !share.freed() {
+            self.released
+                .as_mut()
+                .expect("connections come after the endpoint")
+                .push(share)
+                .unwrap_or_else(|_| unreachable!("a place for every connection"));
         }
     }
 
-    /// Gives the listener back the shares of retired connections whose
-    /// storage is all freed. Returns whether it gave any back.
-    fn reclaim(&mut self) -> bool {
-        let mut reclaimed = false;
-        let mut cursor = None;
-        loop {
-            let Some(id) = self
-                .released
-                .ids()
-                .find(|id| cursor.is_none_or(|cursor| *id > cursor))
-            else {
-                break;
-            };
-            cursor = Some(id);
-            if self.released.get(id).unwrap().budget.used() == 0 {
-                self.released.remove(id);
-                reclaimed = true;
-            }
-        }
-        reclaimed
-    }
-
-    /// A budget, its share of the listener's and its stream slots for one
-    /// more connection, or `None` when the listener has no room for it.
-    fn admit(&mut self, env: &Env<'_, ()>) -> Option<(Budget, Charge, Slots<Channel>)> {
-        self.reclaim();
-        if self.sessions.len() + self.released.len() >= self.config.connections {
+    /// A share of the listener's budget and the stream slots for one more
+    /// connection, or `None` when the listener has no room for it. Shares
+    /// whose storage is all freed come back first.
+    fn admit(&mut self, env: &Env<'_, ()>) -> Option<(Share, Slots<Channel>)> {
+        let released = self.released.as_mut()?;
+        released.retain(|share| !share.freed());
+        if self.sessions.len() + released.len() >= self.config.connections {
             return None;
         }
-        let reservation = env.budget().charge(self.config.connection_budget)?;
+        let paid = env.budget().charge(self.config.connection_budget)?;
         let budget = Budget::new(self.config.connection_budget);
         let channels = Slots::with_budget(self.config.streams, &budget)?;
-        Some((budget, reservation, channels))
+        Some((
+            Share {
+                budget,
+                _paid: paid,
+            },
+            channels,
+        ))
     }
 }
 
@@ -318,8 +328,8 @@ impl Layer for Listener {
             DatagramEvent::Sent(count) => {
                 if let Some(id) = self.flight.complete(count)? {
                     let session = self.sessions.get_mut(id).expect("send owner retained");
-                    let _ = within(env, &session.budget, |env| {
-                        session.layer.on_event(env, DatagramEvent::Sent(1))
+                    let _ = session.call(env, |layer, env| {
+                        layer.on_event(env, DatagramEvent::Sent(1))
                     })?;
                 }
             }
@@ -393,7 +403,7 @@ impl Layer for Listener {
                                 .expect("a Retry fits a UDP payload")
                                 .map_err(|refused| endpoint.ignore(refused.into_incoming()))
                                 .ok()
-                        } else if let Some((budget, reservation, channels)) = self.admit(env) {
+                        } else if let Some((share, channels)) = self.admit(env) {
                             match response
                                 .fill(|buf| {
                                     Ok::<_, ()>(self.endpoint.as_mut().unwrap().accept(
@@ -401,7 +411,7 @@ impl Layer for Listener {
                                         now,
                                         buf,
                                         None,
-                                        Some(&budget),
+                                        Some(&share.budget),
                                     ))
                                 })
                                 .expect("accept response fits a UDP payload")
@@ -419,8 +429,7 @@ impl Layer for Listener {
                                         .sessions
                                         .insert(Session {
                                             layer,
-                                            budget,
-                                            reservation,
+                                            share,
                                             announced: false,
                                             opening: None,
                                             closing: false,
@@ -475,9 +484,7 @@ impl Layer for Listener {
                 let Some(session) = self.sessions.get_mut(id) else {
                     return Ok(Admit::Taken);
                 };
-                let admitted = within(env, &session.budget, |env| {
-                    session.layer.on_command(env, command)
-                })?;
+                let admitted = session.call(env, |layer, env| layer.on_command(env, command))?;
                 return Ok(match admitted {
                     Admit::Taken => Admit::Taken,
                     Admit::Blocked(command) => {
@@ -492,10 +499,9 @@ impl Layer for Listener {
             MuxOp::Close(id, why) => {
                 if let Some(session) = self.sessions.get_mut(id) {
                     session.closing = true;
-                    let close = MuxCommand::control(ControlCommand::Close((self.config.cancel)(why)));
-                    let _ = within(env, &session.budget, |env| {
-                        session.layer.on_command(env, close)
-                    })?;
+                    let close =
+                        MuxCommand::control(ControlCommand::Close((self.config.cancel)(why)));
+                    let _ = session.call(env, |layer, env| layer.on_command(env, close))?;
                 }
             }
         }
@@ -515,7 +521,7 @@ impl Layer for Listener {
         if !self.init(env) {
             return Ok(false);
         }
-        let mut moved = self.reclaim();
+        let mut moved = false;
         // Service every engine even while one application holds its event.
         // Slots bound this scan; no per-packet work queue is allocated.
         let mut cursor = None;
@@ -534,7 +540,7 @@ impl Layer for Listener {
                 }
                 moved = true;
             }
-            moved |= within(env, &session.budget, |env| session.layer.advance(env))?;
+            moved |= session.call(env, |layer, env| layer.advance(env))?;
             if session.closing || (!session.announced && session.layer.ending) {
                 moved |= session.layer.take_event().is_some();
             }
@@ -577,7 +583,7 @@ impl Layer for Listener {
                         session.opening.take().expect("unannounced connection"),
                         Accepted {
                             info,
-                            budget: session.budget.clone(),
+                            budget: session.share.budget.clone(),
                         },
                         0,
                     ));
@@ -607,7 +613,7 @@ impl Layer for Listener {
             let id = self.next(self.send_cursor)?;
             self.send_cursor = Some(id);
             let session = self.sessions.get_mut(id).unwrap();
-            match within(env, &session.budget, |env| session.layer.take_command(env)) {
+            match session.call(env, |layer, env| layer.take_command(env)) {
                 Some(DatagramCommand::Send(datagram)) => {
                     self.flight = Transmission::Connection(id);
                     return Some(DatagramCommand::Send(datagram));
@@ -660,7 +666,7 @@ impl Layer for Listener {
         while let Some(id) = self.after(cursor) {
             cursor = Some(id);
             let session = self.sessions.get_mut(id).unwrap();
-            moved |= within(env, &session.budget, |env| session.layer.on_timer(env, ()))?;
+            moved |= session.call(env, |layer, env| layer.on_timer(env, ()))?;
         }
         Ok(moved)
     }

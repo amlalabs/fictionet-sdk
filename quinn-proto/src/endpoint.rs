@@ -387,9 +387,9 @@ impl Endpoint {
                     // the next datagram, and buffers nothing for it.
                     if self.reserved.is_none()
                         && incoming_buffer
-                        .total_bytes
-                        .checked_add(datagram_len as u64)
-                        .is_some_and(|n| n <= config.incoming_buffer_size)
+                            .total_bytes
+                            .checked_add(datagram_len as u64)
+                            .is_some_and(|n| n <= config.incoming_buffer_size)
                         && self
                             .all_incoming_buffers_total_bytes
                             .checked_add(datagram_len as u64)
@@ -1204,7 +1204,11 @@ impl Endpoint {
             self.index.outgoing_connection_remotes.capacity(),
             self.index.connection_reset_tokens.0.capacity(),
         ];
-        capacities.extend(self.connections.iter().map(|(_, meta)| meta.loc_cids.capacity()));
+        capacities.extend(
+            self.connections
+                .iter()
+                .map(|(_, meta)| meta.loc_cids.capacity()),
+        );
         capacities
     }
 
