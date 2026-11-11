@@ -2,6 +2,7 @@
 
 use fictionet::time::Instant;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use fictionet::stdlib::codec::{self, Wire};
@@ -36,15 +37,191 @@ const SCRATCH: usize = 2 * wire::MAX_FRAME
     + 4 * qpack::MAX_FIELDS * size_of::<qpack::Field>()
     + 4 * qpack::MAX_STRING;
 
+/// What an HTTP/3 server connection shows its peer besides its responses:
+/// the SETTINGS it sends, the unidirectional streams it opens, reserved
+/// frames, and, through [`qpack::Policy`], how it compresses fields.
+///
+/// A world picks one per server with [`Http3::profile`] or
+/// [`Responder::http3_profile`](super::Responder::http3_profile), so its
+/// HTTP/3 looks like the server it stands for. [`Standard`] is the default.
+/// The connection enforces what a profile advertises: the QPACK limits
+/// bound its decoder, and the field section size bounds requests.
+///
+/// ```
+/// use fictionet::stdlib::protocols::qpack::{self, Field, Policy, Style, Table};
+/// use fictionet::stdlib::web::httpd::{Http3Profile, Http3Setting, Http3Stream};
+///
+/// /// A static-only server that sends no field section size.
+/// struct Small;
+/// impl Policy for Small {
+///     fn capacity(&self, _peer: u64) -> u64 { 0 }
+///     fn insert(&self, _: &Field, _: &Table) -> bool { false }
+///     fn style(&self) -> Style { Style::DEFAULT }
+/// }
+/// impl Http3Profile for Small {
+///     fn settings(&self) -> &[Http3Setting] {
+///         &[Http3Setting::QpackTableCapacity(0), Http3Setting::QpackBlockedStreams(0)]
+///     }
+///     fn streams(&self) -> &[Http3Stream] {
+///         &[Http3Stream::Control, Http3Stream::Decoder]
+///     }
+///     fn reserved_frames(&self) -> &[&'static [u8]] { &[] }
+/// }
+/// ```
+pub trait Profile: qpack::Policy {
+    /// SETTINGS entries, in the order they are sent. A QPACK limit left out
+    /// is zero (RFC 9114 section 7.2.4.1).
+    fn settings(&self) -> &[Setting];
+
+    /// The unidirectional streams opened when the connection starts, in
+    /// order. The control stream must be among them. A decoder stream is
+    /// needed when the profile advertises a table capacity, and an encoder
+    /// stream when its policy may use the peer's table (RFC 9204 section
+    /// 4.2 lets a server leave either out otherwise).
+    fn streams(&self) -> &[Local];
+
+    /// Payloads of reserved frames (RFC 9114 section 7.2.8) sent once per
+    /// connection, just before the first response HEADERS. Each gets its
+    /// own reserved type.
+    fn reserved_frames(&self) -> &[&'static [u8]];
+}
+
+/// One entry a [`Profile`] puts in SETTINGS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    /// SETTINGS_MAX_FIELD_SECTION_SIZE. The connection advertises and
+    /// enforces this value, lowered to its [`Limits`] head size and to
+    /// [`wire::MAX_FIELD_SECTION_SIZE`].
+    FieldSectionSize(u64),
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY, the decoder's table limit. At most
+    /// [`qpack::MAX_TABLE_CAPACITY`].
+    QpackTableCapacity(u64),
+    /// SETTINGS_QPACK_BLOCKED_STREAMS. At most [`qpack::MAX_BLOCKED_STREAMS`].
+    QpackBlockedStreams(u64),
+    /// A reserved identifier of the form 0x1f * N + 0x21 with a value of the
+    /// same form, both drawn for each connection (RFC 9114 section 7.2.4.1).
+    Reserved,
+}
+
+/// A unidirectional stream a [`Profile`] opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Local {
+    /// The control stream, which starts with SETTINGS.
+    Control,
+    /// The QPACK encoder stream.
+    Encoder,
+    /// The QPACK decoder stream.
+    Decoder,
+    /// A stream of a reserved type (RFC 9114 section 6.2.3), drawn for each
+    /// connection, carrying these bytes and then closed. Peers ignore it.
+    Reserved(&'static [u8]),
+}
+
+/// The default [`Profile`]. It advertises a 4096-byte table with 16 blocked
+/// streams and its field section size, opens the control, encoder and
+/// decoder streams, sends no reserved frames, and encodes with
+/// [`qpack::Selective`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Standard;
+
+impl qpack::Policy for Standard {
+    fn capacity(&self, peer_max: u64) -> u64 {
+        qpack::Selective.capacity(peer_max)
+    }
+    fn insert(&self, field: &qpack::Field, table: &qpack::Table) -> bool {
+        qpack::Selective.insert(field, table)
+    }
+    fn style(&self) -> qpack::Style {
+        qpack::Selective.style()
+    }
+}
+
+impl Profile for Standard {
+    fn settings(&self) -> &[Setting] {
+        const SETTINGS: [Setting; 3] = [
+            Setting::FieldSectionSize(wire::MAX_FIELD_SECTION_SIZE),
+            Setting::QpackTableCapacity(4096),
+            Setting::QpackBlockedStreams(16),
+        ];
+        &SETTINGS
+    }
+    fn streams(&self) -> &[Local] {
+        &[Local::Control, Local::Encoder, Local::Decoder]
+    }
+    fn reserved_frames(&self) -> &[&'static [u8]] {
+        &[]
+    }
+}
+
+/// What a connection takes from its [`Profile`] once, checked.
+struct Advertised {
+    qpack: qpack::Settings,
+    /// The advertised SETTINGS_MAX_FIELD_SECTION_SIZE, before lowering.
+    fields: Option<u64>,
+}
+
+impl Advertised {
+    /// Panics on a profile that repeats an entry, exceeds the codec's
+    /// limits, or leaves out a stream it needs: those are programming
+    /// errors in the profile, found the first time it is used.
+    fn of(profile: &dyn Profile) -> Self {
+        let settings = profile.settings();
+        let mut capacity = None;
+        let mut blocked = None;
+        let mut fields = None;
+        for setting in settings {
+            let (slot, value) = match *setting {
+                Setting::FieldSectionSize(v) => (&mut fields, v),
+                Setting::QpackTableCapacity(v) => (&mut capacity, v),
+                Setting::QpackBlockedStreams(v) => (&mut blocked, v),
+                Setting::Reserved => continue,
+            };
+            assert!(slot.replace(value).is_none(), "{setting:?} appears twice");
+        }
+        let qpack = qpack::Settings::new(
+            capacity.unwrap_or(0),
+            usize::try_from(blocked.unwrap_or(0)).unwrap_or(usize::MAX),
+        )
+        .expect("QPACK limits within the codec's maxima");
+        let streams = profile.streams();
+        let count = |kind: Local| streams.iter().filter(|s| **s == kind).count();
+        assert_eq!(count(Local::Control), 1, "one control stream");
+        assert!(count(Local::Encoder) <= 1 && count(Local::Decoder) <= 1);
+        assert!(
+            qpack.table_capacity() == 0 || count(Local::Decoder) == 1,
+            "a table capacity needs a decoder stream"
+        );
+        assert!(
+            profile.capacity(qpack::MAX_TABLE_CAPACITY) == 0 || count(Local::Encoder) == 1,
+            "a policy that uses the table needs an encoder stream"
+        );
+        assert!(streams.len() <= usize::from(u8::MAX));
+        Self { qpack, fields }
+    }
+}
+
+/// The connection's profile.
+fn chosen(profile: &Option<Arc<dyn Profile>>) -> &dyn Profile {
+    profile.as_deref().unwrap_or(&Standard)
+}
+
+/// A reserved identifier, 0x1f * N + 0x21 below 2^62 (RFC 9114 sections
+/// 6.2.3, 7.2.4.1 and 7.2.8).
+fn reserved_id(entropy: &dyn fictionet::Entropy) -> u64 {
+    const N: u64 = (wire::MAX_VARINT - 0x21) / 0x1f + 1;
+    0x1f * (entropy.random_u64() % N) + 0x21
+}
+
 /// HTTP/3 for one server connection whose TLS configuration negotiates `h3`.
 /// Compose below it a [`QuicLayer`](fictionet::stdlib::services::quic::QuicLayer),
 /// and above it the same [`HttpExchange`] children as HTTP/2.
 /// [`super::Responder::http3`] supplies the SDK's handler children.
 ///
-/// QPACK accepts dynamic references within [`qpack::Settings`]. Responses
-/// reference only acknowledged inserts, so they never block on QPACK. Server
-/// push and extended CONNECT are not enabled. The peer must allow at least
-/// three unidirectional streams for the control and QPACK streams.
+/// A [`Profile`] sets what the connection advertises and how it encodes;
+/// [`Standard`] is the default. QPACK accepts dynamic references within the
+/// advertised limits. Responses reference only acknowledged inserts, so they
+/// never block on QPACK. Server push and extended CONNECT are not enabled.
+/// The peer must allow as many unidirectional streams as the profile opens.
 ///
 /// Stream inputs, slots, response bytes and escaped request fields carry
 /// budget charges. The existing allocating codecs run with a conservative
@@ -60,7 +237,11 @@ pub struct Http3 {
     critical: Critical,
     decoder: qpack::Table,
     encoder: qpack::Encoder,
+    /// None until [`Http3::profile`]: [`Standard`], with no allocation.
+    profile: Option<Arc<dyn Profile>>,
     qpack: qpack::Settings,
+    advertised_fields: Option<u64>,
+    reserved_sent: bool,
     decoder_charge: Option<Charge>,
     encoder_charge: Option<Charge>,
     decoder_output: Option<Chunk>,
@@ -123,7 +304,7 @@ impl Sending {
 struct Channel {
     lower: Child,
     stream: u64,
-    local: Option<u8>,
+    local: Option<Local>,
     critical: bool,
     input: Reader,
     request: Option<wire::RequestStream>,
@@ -155,7 +336,13 @@ struct Channel {
 }
 
 impl Channel {
-    fn new(lower: Child, stream: Stream, local: Option<u8>, budget: &Budget, limit: u64) -> Self {
+    fn new(
+        lower: Child,
+        stream: Stream,
+        local: Option<Local>,
+        budget: &Budget,
+        limit: u64,
+    ) -> Self {
         let id = u64::from(stream.id);
         let request = (!stream.local && stream.id.dir() == Dir::Bi).then(|| {
             wire::RequestStream::new(id, wire::MessageSide::Request, false)
@@ -171,7 +358,7 @@ impl Channel {
             lower,
             stream: id,
             local,
-            critical: local.is_some(),
+            critical: local.is_some_and(|l| !matches!(l, Local::Reserved(_))),
             input: codec::Stream::in_storage(decoder, 0, ChargedBytes::new(budget)),
             request,
             peer_encoder: false,
@@ -197,7 +384,8 @@ impl Channel {
             finish: false,
             fin_sent: false,
             reset: None,
-            stop_sent: false,
+            // A local unidirectional stream has no receiving side to stop.
+            stop_sent: local.is_some(),
             reset_sent: false,
             retiring: false,
             lost: false,
@@ -220,9 +408,11 @@ impl Channel {
 }
 
 impl Http3 {
-    /// A server connection with these per-request limits.
+    /// A server connection with these per-request limits and the
+    /// [`Standard`] profile.
     pub fn new(limits: Limits) -> Self {
         let streams = (limits.streams as usize).min(4096);
+        let advertised = Advertised::of(&Standard);
         Self {
             limits,
             channels: Slots::new(streams + 6),
@@ -232,9 +422,12 @@ impl Http3 {
             local_opened: 0,
             opening: false,
             critical: Critical::default(),
-            decoder: qpack::Table::new(qpack::Settings::default().table_capacity()),
+            decoder: qpack::Table::new(advertised.qpack.table_capacity()),
             encoder: qpack::Encoder::new(0, wire::MAX_FIELD_SECTION_SIZE),
-            qpack: qpack::Settings::default(),
+            profile: None,
+            qpack: advertised.qpack,
+            advertised_fields: advertised.fields,
+            reserved_sent: false,
             decoder_charge: None,
             encoder_charge: None,
             decoder_output: None,
@@ -261,14 +454,17 @@ impl Http3 {
         self
     }
 
-    /// Chooses the QPACK limits advertised by this connection before it opens.
-    pub fn qpack(mut self, settings: qpack::Settings) -> Self {
-        assert!(
-            !self.initialized,
-            "QPACK settings follow connection creation"
-        );
-        self.qpack = settings;
-        self.decoder = qpack::Table::new(settings.table_capacity());
+    /// Chooses what this connection advertises and how it encodes, before
+    /// it opens. Panics on a profile that repeats a SETTINGS entry, exceeds
+    /// [`qpack::MAX_TABLE_CAPACITY`] or [`qpack::MAX_BLOCKED_STREAMS`], or
+    /// leaves out a stream it needs.
+    pub fn profile(mut self, profile: Arc<dyn Profile>) -> Self {
+        assert!(!self.initialized, "the profile precedes the connection");
+        let advertised = Advertised::of(profile.as_ref());
+        self.decoder = qpack::Table::new(advertised.qpack.table_capacity());
+        self.qpack = advertised.qpack;
+        self.advertised_fields = advertised.fields;
+        self.profile = Some(profile);
         self
     }
 
@@ -284,7 +480,9 @@ impl Http3 {
     }
 
     fn field_limit(&self) -> u64 {
-        (self.limits.head.head as u64).min(wire::MAX_FIELD_SECTION_SIZE)
+        (self.limits.head.head as u64)
+            .min(wire::MAX_FIELD_SECTION_SIZE)
+            .min(self.advertised_fields.unwrap_or(u64::MAX))
     }
 
     fn init(&mut self, budget: &Budget) -> bool {
@@ -411,22 +609,28 @@ impl Http3 {
                             self.peer_fields = settings
                                 .get(wire::setting::MAX_FIELD_SECTION_SIZE)
                                 .unwrap_or(u64::MAX);
+                            let peer_max = settings
+                                .get(wire::setting::QPACK_MAX_TABLE_CAPACITY)
+                                .unwrap_or(0);
+                            let capacity = chosen(&self.profile).capacity(peer_max).min(peer_max);
+                            // Required Insert Counts depend on the peer's
+                            // maximum, but an encoder that never uses its
+                            // table needs neither them nor table storage.
                             let mut encoder = qpack::Encoder::new(
-                                settings
-                                    .get(wire::setting::QPACK_MAX_TABLE_CAPACITY)
-                                    .unwrap_or(0),
+                                if capacity == 0 { 0 } else { peer_max },
                                 self.peer_fields,
                             );
                             let Some(charge) = env.budget().charge(encoder.most_held()) else {
                                 self.fail(code::EXCESSIVE_LOAD);
                                 return;
                             };
-                            if encoder.table().max_capacity() != 0 {
-                                let instruction = encoder
-                                    .set_capacity(encoder.table().max_capacity())
-                                    .unwrap();
+                            let capacity = capacity.min(encoder.table().max_capacity());
+                            if capacity != 0 {
+                                let instruction = encoder.set_capacity(capacity).unwrap();
                                 self.encoder_output =
-                                    encode(env.budget(), &instruction, qpack::MAX_INTEGER_BYTES);
+                                    styled(env.budget(), qpack::MAX_INTEGER_BYTES, |out| {
+                                        instruction.write_styled(chosen(&self.profile).style(), out)
+                                    });
                                 if self.encoder_output.is_none() {
                                     self.fail(code::EXCESSIVE_LOAD);
                                     return;
@@ -712,8 +916,10 @@ impl Http3 {
                 bytes
                     .fill(|out| {
                         for field in &fields {
-                            if let Some(instruction) = self.encoder.warm(field) {
-                                instruction.write(out)?;
+                            if let Some(instruction) =
+                                self.encoder.warm(field, chosen(&self.profile))
+                            {
+                                instruction.write_styled(chosen(&self.profile).style(), out)?;
                             }
                         }
                         Ok::<(), qpack::Error>(())
@@ -732,10 +938,48 @@ impl Http3 {
             wire::HeaderKind::Trailers
         };
         let section = headers.section(&mut self.encoder, stream, kind).ok()?;
-        let payload = section.to_bytes().ok()?;
-        let bound = payload.len() + wire::MAX_FRAME_HEADER;
-        encode(env.budget(), &wire::Frame::Headers(payload), bound)
+        let mut payload = Vec::new();
+        section
+            .write_styled(chosen(&self.profile).style(), &mut payload)
+            .ok()?;
+        // Reserved frames go once, before the first response HEADERS.
+        let reserved: &[&[u8]] = if status.is_some() && !self.reserved_sent {
+            chosen(&self.profile).reserved_frames()
+        } else {
+            &[]
+        };
+        let bound = reserved
+            .iter()
+            .try_fold(payload.len() + wire::MAX_FRAME_HEADER, |n, frame| {
+                n.checked_add(frame.len() + wire::MAX_FRAME_HEADER)
+            })?;
+        let entropy = env.entropy();
+        let bytes = styled(env.budget(), bound, |out| {
+            use fictionet::stdlib::protocols::quic;
+            for frame in reserved {
+                quic::VarInt(reserved_id(entropy))
+                    .write(out)
+                    .map_err(drop)?;
+                quic::VarInt(frame.len() as u64).write(out).map_err(drop)?;
+                out.extend_from_slice(frame);
+            }
+            wire::Frame::Headers(payload).write(out).map_err(drop)
+        })?;
+        self.reserved_sent |= status.is_some();
+        Some(bytes)
     }
+}
+
+/// Writes at most `bound` bytes into a charged chunk.
+fn styled<E>(
+    budget: &Budget,
+    bound: usize,
+    write: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+) -> Option<Chunk> {
+    let mut bytes = ChargedBytes::with_capacity(budget, bound)?;
+    bytes.fill(write).ok()?;
+    bytes.trim();
+    Some(bytes.into_chunk())
 }
 
 fn encode<T: Wire>(budget: &Budget, value: &T, bound: usize) -> Option<Chunk> {
@@ -778,6 +1022,10 @@ impl Layer for Http3 {
         self.scan = self.channels.len() + 1;
         match event {
             MuxEvent::Control(ControlEvent::Connected) => self.connected = true,
+            MuxEvent::Control(ControlEvent::Unopened(_)) => {
+                self.local_opened += 1;
+                self.opening = false;
+            }
             MuxEvent::Control(ControlEvent::Lost(_)) | MuxEvent::Control(ControlEvent::Ended) => {
                 self.closing = true;
                 self.gone = true;
@@ -795,7 +1043,9 @@ impl Layer for Http3 {
                     self.fail(code::STREAM_CREATION_ERROR);
                     return Ok(Admit::Taken);
                 }
-                let local = stream.local.then_some(self.local_opened);
+                let local = stream
+                    .local
+                    .then(|| chosen(&self.profile).streams()[usize::from(self.local_opened)]);
                 let mut channel =
                     Channel::new(lower, stream, local, env.budget(), self.field_limit());
                 if channel.request.is_some() {
@@ -1120,11 +1370,21 @@ impl Layer for Http3 {
         if self.closing {
             return None;
         }
-        if self.connected && self.local_opened < 3 && !self.opening {
+        if self.connected
+            && usize::from(self.local_opened) < chosen(&self.profile).streams().len()
+            && !self.opening
+        {
             self.opening = true;
-            return Some(MuxCommand::control(ControlCommand::OpenOrClose {
-                direction: Dir::Uni,
-                error: VarInt::from_u32(code::STREAM_CREATION_ERROR as u32),
+            // A reserved stream is optional: a peer that allows too few
+            // streams for it still gets the critical ones.
+            let next = chosen(&self.profile).streams()[usize::from(self.local_opened)];
+            return Some(MuxCommand::control(if matches!(next, Local::Reserved(_)) {
+                ControlCommand::OpenIfAllowed(Dir::Uni)
+            } else {
+                ControlCommand::OpenOrClose {
+                    direction: Dir::Uni,
+                    error: VarInt::from_u32(code::STREAM_CREATION_ERROR as u32),
+                }
             }));
         }
         let ready = |id: ChildId| {
@@ -1134,8 +1394,8 @@ impl Layer for Http3 {
                 || channel.local.is_some() && !channel.response_started
                 || channel.sending.is_none()
                     && match channel.local {
-                        Some(1) => self.encoder_output.is_some(),
-                        Some(2) => self.decoder_output.is_some(),
+                        Some(Local::Encoder) => self.encoder_output.is_some(),
+                        Some(Local::Decoder) => self.decoder_output.is_some(),
                         _ => false,
                     }
                 || channel
@@ -1145,7 +1405,7 @@ impl Layer for Http3 {
                 || channel.finish
                     && channel.sending.is_none()
                     && (!channel.fin_sent || !channel.stop_sent)
-                || channel.local == Some(0)
+                || channel.local == Some(Local::Control)
                     && self.shutdown.is_some()
                     && !self.goaway_sent
                     && channel.sending.is_none()
@@ -1183,38 +1443,54 @@ impl Layer for Http3 {
         if let Some(local) = channel.local
             && !channel.response_started
         {
+            use fictionet::stdlib::protocols::quic;
+            let entropy = env.entropy();
             let bytes = match local {
-                0 => {
-                    use fictionet::stdlib::protocols::quic;
-                    let limit = self.field_limit();
-                    let settings = [
-                        wire::setting::MAX_FIELD_SECTION_SIZE,
-                        limit,
-                        wire::setting::QPACK_MAX_TABLE_CAPACITY,
-                        self.qpack.table_capacity(),
-                        wire::setting::QPACK_BLOCKED_STREAMS,
-                        self.qpack.blocked_streams() as u64,
-                    ];
-                    let length = settings
+                Local::Control => {
+                    let entries = chosen(&self.profile)
+                        .settings()
                         .iter()
-                        .map(|v| quic::varint_len(*v).unwrap() as u64)
-                        .sum();
-                    let mut bytes = ChargedBytes::with_capacity(env.budget(), 64)?;
-                    bytes
-                        .fill(|out| {
-                            for value in [0, 4, length].into_iter().chain(settings) {
-                                quic::VarInt(value).write(out)?;
-                            }
-                            Ok::<(), quic::Error>(())
+                        .map(|setting| {
+                            let (id, value) = match *setting {
+                                Setting::FieldSectionSize(_) => {
+                                    (wire::setting::MAX_FIELD_SECTION_SIZE, self.field_limit())
+                                }
+                                Setting::QpackTableCapacity(_) => (
+                                    wire::setting::QPACK_MAX_TABLE_CAPACITY,
+                                    self.qpack.table_capacity(),
+                                ),
+                                Setting::QpackBlockedStreams(_) => (
+                                    wire::setting::QPACK_BLOCKED_STREAMS,
+                                    self.qpack.blocked_streams() as u64,
+                                ),
+                                Setting::Reserved => (reserved_id(entropy), reserved_id(entropy)),
+                            };
+                            wire::Setting { id, value }
                         })
-                        .ok()?;
-                    bytes.into_chunk()
+                        .collect();
+                    let frame = wire::Frame::Settings(wire::Settings { entries });
+                    styled(
+                        env.budget(),
+                        1 + wire::MAX_FRAME_HEADER + wire::MAX_SETTINGS_BYTES,
+                        |out| {
+                            out.push(0);
+                            frame.write(out)
+                        },
+                    )?
                 }
-                1 => Chunk::copy_of(env.budget(), &[2])?,
-                _ => Chunk::copy_of(env.budget(), &[3])?,
+                Local::Encoder => Chunk::copy_of(env.budget(), &[2])?,
+                Local::Decoder => Chunk::copy_of(env.budget(), &[3])?,
+                Local::Reserved(payload) => styled(env.budget(), 8 + payload.len(), |out| {
+                    quic::VarInt(reserved_id(entropy)).write(out)?;
+                    out.extend_from_slice(payload);
+                    Ok::<(), quic::Error>(())
+                })?,
             };
+            // A reserved stream ends after its bytes.
+            let finish = matches!(local, Local::Reserved(_));
             let channel = self.channels.get_mut(id).unwrap();
             channel.response_started = true;
+            channel.finish = finish;
             channel.write_deadline = Some(env.now() + self.limits.write_timeout);
             channel.sending = Some(Sending {
                 bytes,
@@ -1225,8 +1501,8 @@ impl Layer for Http3 {
         let channel = self.channels.get_mut(id).unwrap();
         if channel.sending.is_none() {
             let bytes = match channel.local {
-                Some(1) => self.encoder_output.take(),
-                Some(2) => self.decoder_output.take(),
+                Some(Local::Encoder) => self.encoder_output.take(),
+                Some(Local::Decoder) => self.decoder_output.take(),
                 _ => None,
             };
             if let Some(bytes) = bytes {
@@ -1240,7 +1516,7 @@ impl Layer for Http3 {
             }
         }
         let channel = self.channels.get_mut(id).unwrap();
-        if channel.local == Some(0)
+        if channel.local == Some(Local::Control)
             && channel.sending.is_none()
             && !self.goaway_sent
             && let Some(cutoff) = self.shutdown

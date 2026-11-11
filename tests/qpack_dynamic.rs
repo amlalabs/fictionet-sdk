@@ -9,7 +9,8 @@ mod cost;
 use cost::{Charged, Costs, Linear};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::protocols::qpack::{
-    self, DecoderInstruction, Encoder, EncoderInstruction, Field, SectionResult, Table,
+    self, DecoderInstruction, Encoder, EncoderInstruction, Field, Policy, SectionResult, Selective,
+    Style, Table,
 };
 
 #[test]
@@ -120,14 +121,15 @@ fn warm_policy_excludes_sensitive_changing_and_static_fields() {
         Field::new("content-length", "100"),
         Field::new("content-type", "application/json"),
     ] {
-        assert!(encoder.warm(&field).is_none());
+        assert!(encoder.warm(&field, &Selective).is_none());
     }
     let mut field = Field::new("server", "private");
     field.never_index = true;
-    assert!(encoder.warm(&field).is_none());
+    assert!(encoder.warm(&field, &Selective).is_none());
+    assert!(encoder.warm(&field, &Every).is_none());
     field.never_index = false;
-    assert!(encoder.warm(&field).is_some());
-    assert!(encoder.warm(&field).is_none());
+    assert!(encoder.warm(&field, &Selective).is_some());
+    assert!(encoder.warm(&field, &Every).is_none());
     let bytes = encoder.section(0, &[field]).unwrap().to_bytes().unwrap();
     assert_eq!(
         bytes[0], 0,
@@ -143,11 +145,32 @@ fn advertised_limits_are_representable_and_bounded() {
     assert!(qpack::Settings::new(4096, 257).is_none());
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Policy {
-    Static,
-    Stable,
-    All,
+/// Never uses the dynamic table.
+struct StaticOnly;
+impl Policy for StaticOnly {
+    fn capacity(&self, _: u64) -> u64 {
+        0
+    }
+    fn insert(&self, _: &Field, _: &Table) -> bool {
+        false
+    }
+    fn style(&self) -> Style {
+        Style::DEFAULT
+    }
+}
+
+/// Inserts every field the encoder's shared rules allow.
+struct Every;
+impl Policy for Every {
+    fn capacity(&self, peer_max: u64) -> u64 {
+        peer_max
+    }
+    fn insert(&self, _: &Field, _: &Table) -> bool {
+        true
+    }
+    fn style(&self) -> Style {
+        Style::DEFAULT
+    }
 }
 
 #[derive(Default, Debug)]
@@ -159,12 +182,8 @@ struct Bytes {
     warm: usize,
 }
 
-fn measure(workload: &[Vec<Field>], policy: Policy, feedback_every: usize) -> Bytes {
-    let capacity = if matches!(policy, Policy::Static) {
-        0
-    } else {
-        4096
-    };
+fn measure(workload: &[Vec<Field>], policy: &dyn Policy, feedback_every: usize) -> Bytes {
+    let capacity = policy.capacity(4096).min(4096);
     let mut encoder = Encoder::new(capacity, qpack::MAX_FIELD_SECTION_SIZE);
     let mut decoder = Table::new(capacity);
     let mut bytes = Bytes::default();
@@ -176,22 +195,7 @@ fn measure(workload: &[Vec<Field>], policy: Policy, feedback_every: usize) -> By
     let mut feedback = Vec::new();
     for (i, fields) in workload.iter().enumerate() {
         for field in fields {
-            let instruction = match policy {
-                Policy::Static => None,
-                Policy::Stable => encoder.warm(field),
-                Policy::All
-                    if !field.never_index
-                        && qpack::static_find(&field.name, &field.value).is_none()
-                        && encoder.table().find(&field.name, &field.value).is_none() =>
-                {
-                    encoder
-                        .insert(&field.name, &field.value)
-                        .ok()
-                        .map(|(_, instruction)| instruction)
-                }
-                Policy::All => None,
-            };
-            if let Some(instruction) = instruction {
+            if let Some(instruction) = encoder.warm(field, policy) {
                 bytes.instructions += instruction.to_bytes().unwrap().len();
                 decoder.apply(instruction).unwrap();
             }
@@ -303,11 +307,16 @@ fn realistic_field_sets_report_all_qpack_wire_bytes() {
         ("api", api),
     ] {
         let workload: Vec<_> = (0..20).map(make).collect();
-        for policy in [Policy::Static, Policy::Stable, Policy::All] {
+        let policies: [(&str, &dyn Policy); 3] = [
+            ("static", &StaticOnly),
+            ("selective", &Selective),
+            ("all", &Every),
+        ];
+        for (policy, rules) in policies {
             for feedback_every in [1, 4] {
-                let bytes = measure(&workload, policy, feedback_every);
+                let bytes = measure(&workload, rules, feedback_every);
                 println!(
-                    "qpack {name} policy={policy:?} feedback_every={feedback_every} sections={} encoder={} decoder={} total={} cold={} last={}",
+                    "qpack {name} policy={policy} feedback_every={feedback_every} sections={} encoder={} decoder={} total={} cold={} last={}",
                     bytes.sections,
                     bytes.instructions,
                     bytes.feedback,
@@ -370,4 +379,68 @@ fn stalled_acknowledgments_bound_the_encoder_and_fall_back_to_literals() {
     });
     assert!(costs.live() <= encoder.held());
     costs.print();
+}
+
+#[test]
+fn style_changes_only_how_strings_and_sensitivity_are_written() {
+    use fictionet::stdlib::protocols::{huffman, qpack::Huffman};
+    // A value whose Huffman code is exactly as long as the value.
+    let tie = (b'!'..=b'~')
+        .flat_map(|a| (b'!'..=b'~').map(move |b| [a, b]))
+        .find(|v| huffman::encoded_len(v).unwrap() == v.len())
+        .expect("a two-character tie");
+    let mut secret = Field::new("x-secret", "token");
+    secret.never_index = true;
+    let fields = vec![Field::new("x-tie", tie), secret];
+    let section = Encoder::new(0, qpack::MAX_FIELD_SECTION_SIZE)
+        .section(0, &fields)
+        .unwrap();
+    let mut lengths = Vec::new();
+    for huffman in [Huffman::Shorter, Huffman::NotLonger, Huffman::Never] {
+        for never_index in [true, false] {
+            let mut bytes = Vec::new();
+            section
+                .write_styled(
+                    Style {
+                        huffman,
+                        never_index,
+                    },
+                    &mut bytes,
+                )
+                .unwrap();
+            let SectionResult::Fields { fields: back, .. } =
+                qpack::decode_section(&Table::new(0), 0, &bytes).unwrap()
+            else {
+                panic!("static section")
+            };
+            assert_eq!(back.len(), 2);
+            assert_eq!(
+                (&back[0].name, &back[0].value),
+                (&fields[0].name, &fields[0].value)
+            );
+            assert!(!back[0].never_index);
+            assert_eq!(back[1].value, b"token");
+            assert_eq!(back[1].never_index, never_index);
+            // The tie's value is the first field's last string: its length
+            // prefix carries the Huffman bit.
+            let tie_prefix = bytes[2 + 1 + huffman_name_len(&bytes[2..])];
+            assert_eq!(tie_prefix & 0x80 != 0, huffman == Huffman::NotLonger);
+            lengths.push((huffman, bytes.len()));
+        }
+    }
+    let longest = lengths.iter().map(|(_, n)| *n).max().unwrap();
+    assert!(
+        lengths
+            .iter()
+            .all(|(h, n)| *h == Huffman::Never || *n < longest)
+    );
+}
+
+/// The encoded length of a literal field line's name, after its first byte.
+fn huffman_name_len(line: &[u8]) -> usize {
+    // Literal with literal name: 001NHxxx with a 3-bit length prefix.
+    assert_eq!(line[0] & 0xe0, 0x20);
+    let length = (line[0] & 0x07) as usize;
+    assert!(length < 7, "short names only");
+    length
 }

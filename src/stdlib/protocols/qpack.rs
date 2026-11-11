@@ -26,6 +26,14 @@
 //! with [`Wire::write`] and apply peer acknowledgments between decoded items.
 //! The encoder only references entries the peer has acknowledged.
 //!
+//! What the encoder inserts, how much table it uses, and how it writes
+//! strings is a [`Policy`], given as code. [`Encoder::warm`] asks it about
+//! each field, and [`FieldSection::write_styled`] and
+//! [`EncoderInstruction::write_styled`] write in its [`Style`]: when to use
+//! Huffman code, and whether sensitive fields carry the never-indexed bit.
+//! [`Selective`] is the default. HTTP/3 servers pick a policy as part of a
+//! profile (`stdlib::web::httpd::Http3Profile`).
+//!
 //! ```
 //! use fictionet::stdlib::{codec::Wire, protocols::qpack::{self, Encoder, Field, Table, SectionResult}};
 //!
@@ -148,6 +156,118 @@ impl Default for Settings {
             table_capacity: 4096,
             blocked_streams: 16,
         }
+    }
+}
+
+/// When a writer codes a string in Huffman code. A decoder reads every
+/// choice; the choice only changes the bytes on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Huffman {
+    /// Only when the code is shorter than the string.
+    #[default]
+    Shorter,
+    /// Whenever the code is no longer than the string, so a tie is coded.
+    NotLonger,
+    /// Never: every string is written as it is.
+    Never,
+}
+
+/// How an encoder writes strings and sensitive fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Style {
+    /// When strings are Huffman coded.
+    pub huffman: Huffman,
+    /// Whether a sensitive field carries the never-indexed bit, which tells
+    /// intermediaries not to index it. Sensitive fields are never inserted
+    /// into the dynamic table either way.
+    pub never_index: bool,
+}
+
+impl Style {
+    /// Huffman code when shorter, and the never-indexed bit on sensitive
+    /// fields. [`Wire::write`] writes in this style.
+    pub const DEFAULT: Self = Self {
+        huffman: Huffman::Shorter,
+        never_index: true,
+    };
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// How an encoder uses the dynamic table and writes its output.
+///
+/// The [`Encoder`] keeps the rules every policy shares: it never inserts a
+/// sensitive field, an exact static match or an entry the table already
+/// holds; it never evicts an entry still in use; and field sections only
+/// reference entries the peer has acknowledged. A policy chooses within
+/// those rules. [`Selective`] is the default.
+///
+/// ```
+/// use fictionet::stdlib::protocols::qpack::{self, Field, Policy, Style, Table};
+///
+/// /// Never uses the dynamic table, and writes Huffman code on ties.
+/// struct StaticOnly;
+/// impl Policy for StaticOnly {
+///     fn capacity(&self, _peer: u64) -> u64 { 0 }
+///     fn insert(&self, _: &Field, _: &Table) -> bool { false }
+///     fn style(&self) -> Style {
+///         Style { huffman: qpack::Huffman::NotLonger, never_index: false }
+///     }
+/// }
+/// assert_eq!(StaticOnly.capacity(4096), 0);
+/// ```
+pub trait Policy: Send + Sync {
+    /// The dynamic table capacity the encoder sets when the peer allows
+    /// `peer_max` bytes. The encoder lowers a larger answer to `peer_max`.
+    /// Zero leaves the table unused: no Set Dynamic Table Capacity
+    /// instruction and no inserts.
+    fn capacity(&self, peer_max: u64) -> u64;
+
+    /// Whether to insert `field`, given the table as the encoder has built
+    /// it. Asked only for fields the shared rules allow.
+    fn insert(&self, field: &Field, table: &Table) -> bool;
+
+    /// How strings and sensitive fields are written.
+    fn style(&self) -> Style;
+}
+
+/// The default encoder policy. It uses as much table as the peer allows,
+/// and inserts fields that tend to repeat across a connection's messages
+/// (`:authority`, `user-agent`, `accept-language`, `content-type`,
+/// `cache-control`, `server`, `vary`, `strict-transport-security` and
+/// `content-security-policy`) when one takes at most half the table.
+/// Dates, lengths, entity tags, cookies and request identifiers change
+/// from message to message and are never inserted. It writes in
+/// [`Style::DEFAULT`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Selective;
+
+impl Policy for Selective {
+    fn capacity(&self, peer_max: u64) -> u64 {
+        peer_max
+    }
+
+    fn insert(&self, field: &Field, table: &Table) -> bool {
+        matches!(
+            field.name.as_slice(),
+            b":authority"
+                | b"user-agent"
+                | b"accept-language"
+                | b"content-type"
+                | b"cache-control"
+                | b"server"
+                | b"vary"
+                | b"strict-transport-security"
+                | b"content-security-policy"
+        ) && field.size() <= table.capacity() / 2
+    }
+
+    fn style(&self) -> Style {
+        Style::DEFAULT
     }
 }
 
@@ -458,11 +578,22 @@ fn exact<T>(result: Result<(T, usize), Error>, len: usize) -> Result<T, Error> {
     Ok(value)
 }
 
-/// Appends `s` as a string with a `prefix`-bit length, Huffman-coded if
-/// that is shorter. Callers check [`MAX_STRING`] first.
-fn put_string(out: &mut Vec<u8>, prefix: u8, flags: u8, s: &[u8]) -> Result<(), Error> {
+/// Appends `s` as a string with a `prefix`-bit length, Huffman-coded when
+/// `huffman` says so. Callers check [`MAX_STRING`] first.
+fn put_string(
+    out: &mut Vec<u8>,
+    prefix: u8,
+    flags: u8,
+    s: &[u8],
+    huffman: Huffman,
+) -> Result<(), Error> {
     let h = huffman::encoded_len(s).map_err(|_| Error::Unwritable)?;
-    if h < s.len() {
+    let coded = match huffman {
+        Huffman::Shorter => h < s.len(),
+        Huffman::NotLonger => h <= s.len(),
+        Huffman::Never => false,
+    };
+    if coded {
         put_integer(out, prefix, flags | (1 << prefix), h as u64)?;
         huffman::encode(s, out).map_err(|_| Error::Unwritable)?;
     } else {
@@ -1076,15 +1207,22 @@ impl Wire for FieldSection {
         })
     }
 
-    /// Writes a complete section. Refuses invalid lines and excessive encoded size or field count.
+    /// Writes a complete section in [`Style::DEFAULT`]. Refuses invalid lines and excessive encoded size or field count.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.write_styled(Style::DEFAULT, out)
+    }
+}
+
+impl FieldSection {
+    /// Writes a complete section in `style`, as [`Wire::write`] does otherwise.
+    pub fn write_styled(&self, style: Style, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.representations.len() > MAX_FIELDS {
             return Err(Error::Unwritable);
         }
         let mut bytes = Vec::new();
         self.prefix.write(&mut bytes)?;
         for rep in &self.representations {
-            rep.write(&mut bytes)?;
+            rep.write_styled(style, &mut bytes)?;
             if bytes.len() > MAX_SECTION_BYTES {
                 return Err(Error::Unwritable);
             }
@@ -1361,27 +1499,21 @@ impl Encoder {
         self.table.most_held() + 3 * MAX_OUTSTANDING * size_of::<Outstanding>()
     }
 
-    /// Inserts a stable, reusable field when space permits. Sensitive fields,
-    /// exact static matches and existing entries never cause an insertion.
-    /// This deliberately avoids speculative references: `section` still waits
-    /// for feedback before using the inserted entry.
-    pub fn warm(&mut self, field: &Field) -> Option<EncoderInstruction> {
+    /// Inserts `field` when `policy` wants it and the table has room.
+    /// Sensitive fields, exact static matches and existing entries never
+    /// cause an insertion, whatever the policy. This avoids speculative
+    /// references: `section` still waits for feedback before using the
+    /// inserted entry.
+    pub fn warm(
+        &mut self,
+        field: &Field,
+        policy: &(impl Policy + ?Sized),
+    ) -> Option<EncoderInstruction> {
         if field.never_index
-            || !matches!(
-                field.name.as_slice(),
-                b":authority"
-                    | b"user-agent"
-                    | b"accept-language"
-                    | b"content-type"
-                    | b"cache-control"
-                    | b"server"
-                    | b"vary"
-                    | b"strict-transport-security"
-                    | b"content-security-policy"
-            )
-            || field.size() > self.table.capacity() / 2
+            || field.size() > self.table.capacity()
             || static_find(&field.name, &field.value).is_some()
             || self.table.find(&field.name, &field.value).is_some()
+            || !policy.insert(field, &self.table)
         {
             return None;
         }
@@ -1792,7 +1924,16 @@ impl Wire for EncoderInstruction {
     /// Writes one instruction, using Huffman strings when shorter. Refuses oversized strings,
     /// integer overflow, capacity above MAX_TABLE_CAPACITY, and invalid static name indexes.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.write_styled(Style::DEFAULT, out)
+    }
+}
+
+impl EncoderInstruction {
+    /// Writes one instruction with strings Huffman-coded as `style` says,
+    /// and refuses what [`Wire::write`] refuses.
+    pub fn write_styled(&self, style: Style, out: &mut Vec<u8>) -> Result<(), Error> {
         check_encoder_instruction(self).map_err(|_| Error::Unwritable)?;
+        let huffman = style.huffman;
         match self {
             EncoderInstruction::SetCapacity(c) => put_integer(out, 5, 0x20, *c)?,
             EncoderInstruction::InsertWithNameRef {
@@ -1801,11 +1942,11 @@ impl Wire for EncoderInstruction {
                 value,
             } => {
                 put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)?;
-                put_string(out, 7, 0, value)?;
+                put_string(out, 7, 0, value, huffman)?;
             }
             EncoderInstruction::InsertWithLiteralName { name, value } => {
-                put_string(out, 5, 0x40, name)?;
-                put_string(out, 7, 0, value)?;
+                put_string(out, 5, 0x40, name, huffman)?;
+                put_string(out, 7, 0, value, huffman)?;
             }
             EncoderInstruction::Duplicate(i) => put_integer(out, 5, 0, *i)?,
         }
@@ -1864,9 +2005,20 @@ impl Wire for Representation {
         exact(parsed, bytes.len())
     }
 
-    /// Writes one field line, using Huffman strings when shorter. Refuses integers above
+    /// Writes one field line in [`Style::DEFAULT`]. Refuses integers above
     /// MAX_VARINT and strings longer than MAX_STRING.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.write_styled(Style::DEFAULT, out)
+    }
+}
+
+impl Representation {
+    /// Writes one field line in `style`, and refuses what [`Wire::write`]
+    /// refuses. Without [`Style::never_index`], no line carries the
+    /// never-indexed bit.
+    pub fn write_styled(&self, style: Style, out: &mut Vec<u8>) -> Result<(), Error> {
+        let huffman = style.huffman;
+        let n = |never_index: &bool| *never_index && style.never_index;
         let (index, name, value): (u64, &[u8], &[u8]) = match self {
             Self::Indexed { index, .. } | Self::IndexedPostBase(index) => (*index, &[], &[]),
             Self::LiteralNameRef { index, value, .. }
@@ -1890,26 +2042,32 @@ impl Wire for Representation {
                 value,
             } => {
                 let flags = 0x40
-                    | if *never_index { 0x20 } else { 0 }
+                    | if n(never_index) { 0x20 } else { 0 }
                     | if *static_table { 0x10 } else { 0 };
                 put_integer(out, 4, flags, *index)?;
-                put_string(out, 7, 0, value)?;
+                put_string(out, 7, 0, value, huffman)?;
             }
             Representation::LiteralPostBaseNameRef {
                 never_index,
                 index,
                 value,
             } => {
-                put_integer(out, 3, if *never_index { 0x08 } else { 0 }, *index)?;
-                put_string(out, 7, 0, value)?;
+                put_integer(out, 3, if n(never_index) { 0x08 } else { 0 }, *index)?;
+                put_string(out, 7, 0, value, huffman)?;
             }
             Representation::LiteralName {
                 never_index,
                 name,
                 value,
             } => {
-                put_string(out, 3, if *never_index { 0x30 } else { 0x20 }, name)?;
-                put_string(out, 7, 0, value)?;
+                put_string(
+                    out,
+                    3,
+                    if n(never_index) { 0x30 } else { 0x20 },
+                    name,
+                    huffman,
+                )?;
+                put_string(out, 7, 0, value, huffman)?;
             }
         }
         Ok(())
