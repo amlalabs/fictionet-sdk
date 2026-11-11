@@ -71,6 +71,8 @@ mod tls;
 mod tls_determinism;
 mod tls_write_cancellation;
 mod web;
+mod websocket_costs;
 mod wire_codec;
 mod world_layers;
+mod world_memory;
 mod writer_allocation;

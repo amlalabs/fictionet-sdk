@@ -79,6 +79,7 @@ fn message_fragments_stay_within_their_charge_and_copy_linearly() {
             || Charged {
                 value: Messages::for_receiver(Side::Client).with_limit(LIMIT),
                 charged: 0,
+                moved: 0,
             },
         );
         for bytes in &frames {
@@ -96,6 +97,7 @@ fn message_fragments_stay_within_their_charge_and_copy_linearly() {
                 Charged {
                     value: step,
                     charged: payload + LIMIT,
+                    moved: 0,
                 }
             });
             assert!(step.is_ok(), "{split:?}: {step:?}");
