@@ -1,6 +1,6 @@
 use std::{fmt, net::SocketAddr};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut};
 
 use crate::{coding::BufExt, packet::PartialDecode, Instant, ResetToken, MAX_CID_SIZE};
 
@@ -8,6 +8,8 @@ use crate::{coding::BufExt, packet::PartialDecode, Instant, ResetToken, MAX_CID_
 #[derive(Debug)]
 pub struct ConnectionEvent(pub(crate) ConnectionEventInner);
 
+// Keep packet events inline; boxing them would add an allocation per datagram.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum ConnectionEventInner {
     /// A datagram has been received for the Connection
@@ -23,7 +25,7 @@ pub(crate) struct DatagramConnectionEvent {
     pub(crate) remote: SocketAddr,
     pub(crate) ecn: Option<EcnCodepoint>,
     pub(crate) first_decode: PartialDecode,
-    pub(crate) remaining: Option<BytesMut>,
+    pub(crate) remaining: Option<crate::PacketBuffer>,
 }
 
 /// Events sent from a Connection to an Endpoint

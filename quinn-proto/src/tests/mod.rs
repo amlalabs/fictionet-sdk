@@ -136,6 +136,60 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 #[test]
+fn charged_wire_storage_survives_decryption_and_partial_stream_reads() {
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+    pair.client_send(client, stream).write(b"abcdefgh").unwrap();
+    pair.client_send(client, stream).finish().unwrap();
+    pair.drive_client();
+    let budget = fictionet_buf::Budget::new(64 << 10);
+    let mut response = Vec::new();
+    let mut queued = Vec::new();
+    while let Some((now, ecn, bytes)) = pair.server.inbound.pop_front() {
+        let data = PacketBuffer::copy_from(&budget, &bytes).unwrap();
+        match pair.server.endpoint.handle_buffer(
+            now,
+            pair.client.addr,
+            None,
+            ecn,
+            data,
+            &mut response,
+        ) {
+            Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                assert_eq!(handle, server);
+                queued.push(event);
+            }
+            _ => panic!("established connection receives its packet"),
+        }
+    }
+    assert!(!queued.is_empty());
+    assert!(budget.used() > 0);
+    for event in queued {
+        pair.server
+            .connections
+            .get_mut(&server)
+            .unwrap()
+            .handle_event(event);
+    }
+    assert_eq!(pair.server_streams(server).accept(Dir::Uni), Some(stream));
+    assert!(budget.used() > 0);
+    let mut recv = pair.server_recv(server, stream);
+    let mut chunks = recv.read(true).unwrap();
+    let first = chunks.next(3).unwrap().unwrap();
+    assert_eq!(&first.bytes[..], b"abc");
+    let rest = chunks.next(16).unwrap().unwrap();
+    assert_eq!(&rest.bytes[..], b"defgh");
+    assert!(chunks.next(16).unwrap().is_none());
+    let _ = chunks.finalize();
+    drop(pair);
+    drop(first);
+    assert!(budget.used() > 0);
+    drop(rest);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn charged_stream_write_survives_a_lost_flight() {
     let mut pair = Pair::default();
     let (client, server) = pair.connect();

@@ -7,7 +7,8 @@ use std::{
     sync::Arc,
 };
 
-use bytes::{Bytes, BytesMut};
+use crate::PacketBuffer;
+use bytes::Bytes;
 use frame::StreamMetaVec;
 
 use rand::{rngs::StdRng, RngExt, SeedableRng};
@@ -2037,7 +2038,7 @@ impl Connection {
         packet_number: u64,
         first_packet_len: usize,
         packet: InitialPacket,
-        remaining: Option<BytesMut>,
+        remaining: Option<PacketBuffer>,
     ) -> Result<(), ConnectionError> {
         let span = trace_span!("first recv");
         let _guard = span.enter();
@@ -2251,12 +2252,12 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
-        data: BytesMut,
+        data: PacketBuffer,
     ) {
         self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
         let mut remaining = Some(data);
         while let Some(data) = remaining {
-            match PartialDecode::new(
+            match PartialDecode::new_buffer(
                 data,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
                 &[self.version],
@@ -4192,9 +4193,9 @@ mod tests {
             assert!(rest.is_none());
             let mut packet = packet.finish(Some(&*keys.header.remote)).unwrap();
             assert_eq!(packet.header_data.len(), 40 + token_len);
-            keys.packet
-                .remote
-                .decrypt(0, &packet.header_data, &mut packet.payload)
+            packet
+                .payload
+                .decrypt(&*keys.packet.remote, 0, &packet.header_data)
                 .unwrap();
             let mut frames = frame::Iter::new(packet.payload.freeze())
                 .unwrap()

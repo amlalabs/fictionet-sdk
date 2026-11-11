@@ -1128,3 +1128,74 @@ routing and incoming queues, stream receive state, packet recovery and TLS
 allocations likewise remain in scope for whole-engine admission. The new
 listener's connection and stream limits must not be presented as that
 missing heap bound.
+
+## Reserved wire backings
+
+`PacketBuffer::copy_from` reserves the input payload, shared backing metadata
+and the first immutable-owner descriptor before copying. The reservation
+follows the mutable backing through endpoint queues, coalesced packets,
+header removal and decryption. Each mutable split reserves its immutable
+owner before splitting. Freezing keeps the original buffer and its charges
+inside `Bytes::from_owner`; frame slices and clones share that owner without
+another allocation. The last view releases the backing, including when an
+application retains stream bytes after the connection has been dropped.
+
+`Endpoint::handle_buffer` accepts this storage. The old `handle(BytesMut)`
+entry point remains unbudgeted for compatibility. The bound covers the
+current bytes crate's mutable shared metadata and immutable owner layout;
+the allocation checks must run when that dependency changes. Packet keys
+are still the supplied provider's responsibility: this storage claim uses
+the existing rustls provider's in-place decryption, not arbitrary allocating
+implementations of the packet-key trait.
+
+Five Kani harnesses call production allocation and split methods with every
+four-byte input, using only the shared allocation stubs. Refusal against a
+zero-byte budget allocates nothing. Copying and either split direction,
+followed by freezing both halves, stay within the actual reservation and
+request at most one input copy plus the backing and owner metadata. All five
+pass, as does the allocator sanity harness. The refused-split harness also
+checks zero allocation and preservation of the source pointer, bytes and
+reservation. The combined split harness was
+terminated without a verdict; separate prefix and suffix harnesses preserve
+both operations and all their assertions and finish successfully. Run:
+
+```sh
+cargo kani -p fictionet-quinn-proto --lib -Z stubbing -Z c-ffi \
+  -Z mem-predicates -Z restrict-vtable --harness packet_storage_ \
+  --harness the_counter_sees_every_allocation
+```
+
+The allocation replay covers empty, one-byte, 64-byte, 1,200-byte and
+65,527-byte input. It measures copying, mutable splitting, freezing and
+immutable cloning/slicing as distinct steps. The refusal replay covers
+zero room and insufficient metadata room; refused prefix and suffix splits
+preserve the source bytes, pointer and reservation with no allocation.
+A protected endpoint regression retains received slices after partial
+stream reads and after dropping the connection, checking payment through
+the final slice. Another regression checks that mutable packet views stay
+disjoint and freeze without copying their payload.
+
+`PacketStorage.tla` models one backing and three mutable/immutable owners,
+with frame slices sharing immutable owners. Its base passes: 1,184 generated
+states, 369 distinct states and depth eleven. The three controls violate
+`StoragePaid`, `SplitReserved` and `StoragePaid` when copy admission, split
+admission or last-view retention is removed. The shared resource store also
+checks the limit and tracked storage. Units abstract backing and descriptor
+sizes; this is not a byte-level packet parser or a production trace replay.
+Run its four configurations with the scoped TLC invocation and shared
+resource library described above.
+
+These bounds cover wire storage, including retained views, not all receive
+storage. Reassembly compaction can still copy into uncharged storage, and
+its heap nodes, interval sets and stream records remain outside this claim.
+TLS queues, recovery metadata and endpoint routing also remain unbudgeted.
+Whole-engine budgeting is still the next build-out priority, before the
+remaining version-two work and unresolved older proofs. No rustls files
+changed.
+
+Validation for the wire-storage engine step: all 351 engine tests and three
+engine doctests pass. Clippy with warnings denied passes for the SDK and
+engine on all targets. Cargo doc succeeds with the existing redundant-link
+warning in `network/packet.rs`. The `quic_wire_admission` benchmark measures
+charged input copying at 1,200 and 65,527 bytes with ten samples; it is not
+a transport throughput measurement.

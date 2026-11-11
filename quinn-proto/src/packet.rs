@@ -1,6 +1,9 @@
 use std::{cmp::Ordering, io, ops::Range, str};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+mod storage;
+pub use storage::PacketBuffer;
 use thiserror::Error;
 
 use crate::{
@@ -24,7 +27,7 @@ use crate::{
 #[derive(Debug)]
 pub struct PartialDecode {
     plain_header: ProtectedHeader,
-    buf: io::Cursor<BytesMut>,
+    buf: io::Cursor<PacketBuffer>,
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -35,7 +38,22 @@ impl PartialDecode {
         cid_parser: &(impl ConnectionIdParser + ?Sized),
         supported_versions: &[u32],
         grease_quic_bit: bool,
-    ) -> Result<(Self, Option<BytesMut>), PacketDecodeError> {
+    ) -> Result<(Self, Option<PacketBuffer>), PacketDecodeError> {
+        Self::new_buffer(
+            bytes.into(),
+            cid_parser,
+            supported_versions,
+            grease_quic_bit,
+        )
+    }
+
+    /// Begin decoding reserved wire storage, preserving payment on the remainder.
+    pub fn new_buffer(
+        bytes: PacketBuffer,
+        cid_parser: &(impl ConnectionIdParser + ?Sized),
+        supported_versions: &[u32],
+        grease_quic_bit: bool,
+    ) -> Result<(Self, Option<PacketBuffer>), PacketDecodeError> {
         let mut buf = io::Cursor::new(bytes);
         let plain_header =
             ProtectedHeader::decode(&mut buf, cid_parser, supported_versions, grease_quic_bit)?;
@@ -50,7 +68,7 @@ impl PartialDecode {
                 "packet too short to contain payload length",
             )),
             Ordering::Greater => {
-                let rest = Some(buf.get_mut().split_off(packet_len));
+                let rest = Some(buf.get_mut().split_off(packet_len)?);
                 Ok((Self { plain_header, buf }, rest))
             }
         }
@@ -130,7 +148,7 @@ impl PartialDecode {
             let header_len = buf.position() as usize;
             let mut bytes = buf.into_inner();
 
-            let header_data = bytes.split_to(header_len).freeze();
+            let header_data = bytes.split_to(header_len)?.freeze();
             let token = header_data.slice(token_pos.start..token_pos.end);
             return Ok(Packet {
                 header: Header::Initial(InitialHeader {
@@ -194,13 +212,13 @@ impl PartialDecode {
         let mut bytes = buf.into_inner();
         Ok(Packet {
             header,
-            header_data: bytes.split_to(header_len).freeze(),
+            header_data: bytes.split_to(header_len)?.freeze(),
             payload: bytes,
         })
     }
 
     fn decrypt_header(
-        buf: &mut io::Cursor<BytesMut>,
+        buf: &mut io::Cursor<PacketBuffer>,
         header_crypto: &dyn crypto::HeaderKey,
     ) -> Result<PacketNumber, PacketDecodeError> {
         let packet_length = buf.get_ref().len();
@@ -221,7 +239,7 @@ impl PartialDecode {
 pub(crate) struct Packet {
     pub(crate) header: Header,
     pub(crate) header_data: Bytes,
-    pub(crate) payload: BytesMut,
+    pub(crate) payload: PacketBuffer,
 }
 
 impl Packet {
@@ -237,7 +255,7 @@ impl Packet {
 pub(crate) struct InitialPacket {
     pub(crate) header: InitialHeader,
     pub(crate) header_data: Bytes,
-    pub(crate) payload: BytesMut,
+    pub(crate) payload: PacketBuffer,
 }
 
 impl From<InitialPacket> for Packet {
@@ -574,8 +592,8 @@ impl ProtectedHeader {
     }
 
     /// Decode a plain header from given buffer, with given [`ConnectionIdParser`].
-    pub fn decode(
-        buf: &mut io::Cursor<BytesMut>,
+    pub fn decode<T: AsRef<[u8]>>(
+        buf: &mut io::Cursor<T>,
         cid_parser: &(impl ConnectionIdParser + ?Sized),
         supported_versions: &[u32],
         grease_quic_bit: bool,
@@ -992,10 +1010,9 @@ mod tests {
             packet.header_data[..],
             hex!("c0000000010806b858ec6f80452b0000402100")[..]
         );
-        server
-            .packet
-            .remote
-            .decrypt(0, &packet.header_data, &mut packet.payload)
+        packet
+            .payload
+            .decrypt(&*server.packet.remote, 0, &packet.header_data)
             .unwrap();
         assert_eq!(packet.payload[..], [0; 16]);
         match packet.header {

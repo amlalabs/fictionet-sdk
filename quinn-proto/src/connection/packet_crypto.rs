@@ -104,8 +104,9 @@ pub(super) fn decrypt_packet_body(
         &next_crypto.unwrap().remote
     };
 
-    crypto
-        .decrypt(number, &packet.header_data, &mut packet.payload)
+    packet
+        .payload
+        .decrypt(&**crypto, number, &packet.header_data)
         .map_err(|_| {
             trace!("decryption failed with packet number {}", number);
             None

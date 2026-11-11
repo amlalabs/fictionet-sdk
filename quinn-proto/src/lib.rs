@@ -88,8 +88,8 @@ pub use crate::endpoint::{
 
 mod packet;
 pub use packet::{
-    ConnectionIdParser, FixedLengthConnectionIdParser, LongType, PacketDecodeError, PartialDecode,
-    ProtectedHeader, ProtectedInitialHeader,
+    ConnectionIdParser, FixedLengthConnectionIdParser, LongType, PacketBuffer, PacketDecodeError,
+    PartialDecode, ProtectedHeader, ProtectedInitialHeader,
 };
 
 mod shared;

@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::PacketBuffer;
 use bytes::{BufMut, Bytes, BytesMut};
 use rand::{
     rngs::{StdRng, SysRng},
@@ -155,7 +156,7 @@ impl Endpoint {
         None
     }
 
-    /// Process an incoming UDP datagram
+    /// Process an incoming UDP datagram using the legacy unbudgeted buffer.
     pub fn handle(
         &mut self,
         now: Instant,
@@ -165,9 +166,22 @@ impl Endpoint {
         data: BytesMut,
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
+        self.handle_buffer(now, remote, local_ip, ecn, data.into(), buf)
+    }
+
+    /// Process incoming wire storage, retaining its reservation with packet views.
+    pub fn handle_buffer(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        data: PacketBuffer,
+        buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
-        let event = match PartialDecode::new(
+        let event = match PartialDecode::new_buffer(
             data,
             &FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len()),
             &self.config.supported_versions,
@@ -615,13 +629,12 @@ impl Endpoint {
 
         let first_packet_len = incoming.packet.header_data.len() + incoming.packet.payload.len();
         if incoming
-            .crypto
             .packet
-            .remote
+            .payload
             .decrypt(
+                &*incoming.crypto.packet.remote,
                 packet_number,
                 &incoming.packet.header_data,
-                &mut incoming.packet.payload,
             )
             .is_err()
         {
@@ -1197,7 +1210,7 @@ pub struct Incoming {
     addresses: FourTuple,
     ecn: Option<EcnCodepoint>,
     packet: InitialPacket,
-    rest: Option<BytesMut>,
+    rest: Option<PacketBuffer>,
     crypto: Keys,
     token: IncomingToken,
     incoming_idx: usize,
