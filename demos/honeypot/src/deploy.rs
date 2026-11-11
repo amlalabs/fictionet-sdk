@@ -3,27 +3,34 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use fictionet_host::xdp::InterfaceName;
 use honeypot_world::Args;
 use honeypot_world::config::{Flag, SshAuth};
 use honeypot_world::record::{CompanyHost, Configuration, Listener, Reachability, SshAuthPolicy};
 
-pub const HELP: &str = "honeypot run [OPTIONS]\n\
+pub const HELP: &str = "honeypot run --interface NAME [OPTIONS]\n\
+  --interface NAME        The data ENA the honeypot takes over with native XDP\n\
   --state-dir PATH        Protected persistent identity, key, and run evidence\n\
   --address IPV4 [--address-v6 IPV6]   The server's addresses on the link\n\
   --gateway IPV4 [--gateway-v6 IPV6]   The link's gateways\n\
+  --public-address IPV4   The public address mapped to --address, recorded only\n\
   --ssh PORT [--http PORT] [--http-profile caddy|nginx]\n\
   --mcp PORT --a2a PORT --fleet PORT   Northbank simulated company services\n\
   --ssh-auth accept|reject|password:VALUE\n\
   --queue-bytes N --max-record-bytes N --rotate-bytes N --retain-files N\n\
   --restricted-evidence  Retain exact decrypted SSH bytes in protected files\n\
   --version              Build version\n\
-This build has no packet path: run checks its options, then refuses to start.\n";
+run refuses an interface that has an address or a route, carries a connection,\n\
+is not an ENA, or does not read back MTU 1500 and one queue after it sets them.\n";
 
 pub struct Options {
     pub args: Args,
+    pub interface: InterfaceName,
+    pub public_address: Option<Ipv4Addr>,
     pub state_dir: PathBuf,
     pub restricted_evidence: bool,
     pub queue_bytes: usize,
@@ -63,6 +70,12 @@ impl Options {
     }
 
     fn resolve(mut values: BTreeMap<String, Vec<String>>) -> fictionet::Result<Self> {
+        let interface: InterfaceName = take(&mut values, "interface")
+            .ok_or_else(|| fictionet::Error::msg("run needs --interface NAME"))?
+            .parse()?;
+        let public_address: Option<Ipv4Addr> = take(&mut values, "public-address")
+            .map(|v| v.parse())
+            .transpose()?;
         let state_dir = take(&mut values, "state-dir")
             .unwrap_or_else(|| "honeypot-state".into())
             .into();
@@ -114,6 +127,8 @@ impl Options {
         }
         Ok(Self {
             args,
+            interface,
+            public_address,
             state_dir,
             restricted_evidence,
             queue_bytes,
@@ -128,6 +143,8 @@ impl Options {
         let config = &self.args.config;
         Configuration {
             build: env!("CARGO_PKG_VERSION").into(),
+            interface: self.interface.as_str().into(),
+            public_address: self.public_address,
             address: config.address,
             address_v6: config.address_v6,
             persona: "Ubuntu 24.04 / Linux 6.8".into(),
@@ -308,18 +325,38 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_and_unknown_options() {
-        assert!(options("run --ssh 22 --gateway 192.0.2.1").is_ok());
+        let parsed = options("run --interface ens6 --ssh 22 --gateway 192.0.2.1").unwrap();
+        assert_eq!(parsed.interface.as_str(), "ens6");
+        assert_eq!(parsed.public_address, None);
         for line in [
-            "--ssh 0",
-            "--ssh 22 --http 22",
-            "--queue-bytes 1",
-            "--state-dir a --state-dir b",
-            "--ssh 53 --mcp 8081",
-            "--address 10.44.0.11 --mcp 8081",
-            "--unknown 1",
+            "--ssh 22",
+            "--interface ens6/x",
+            "--interface ens6 --interface ens7",
+            "--interface ens6 --public-address 2001:db8::1",
+            "--interface ens6 --ssh 0",
+            "--interface ens6 --ssh 22 --http 22",
+            "--interface ens6 --queue-bytes 1",
+            "--interface ens6 --state-dir a --state-dir b",
+            "--interface ens6 --ssh 53 --mcp 8081",
+            "--interface ens6 --address 10.44.0.11 --mcp 8081",
+            "--interface ens6 --unknown 1",
         ] {
             assert!(options(line).is_err(), "{line}");
         }
+    }
+
+    #[test]
+    fn the_public_address_is_recorded_and_not_used_as_the_server_address() {
+        let parsed =
+            options("run --interface ens6 --address 10.0.2.20 --public-address 203.0.113.9")
+                .unwrap();
+        let configuration = parsed.configuration();
+        assert_eq!(configuration.address, Ipv4Addr::new(10, 0, 2, 20));
+        assert_eq!(
+            configuration.public_address,
+            Some(Ipv4Addr::new(203, 0, 113, 9))
+        );
+        assert_eq!(configuration.interface, "ens6");
     }
 
     #[test]
@@ -334,6 +371,8 @@ mod tests {
         ));
         let options = Options::parse([
             "run".into(),
+            "--interface".into(),
+            "ens6".into(),
             "--state-dir".into(),
             state.to_str().unwrap().into(),
             "--ssh-auth".into(),

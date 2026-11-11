@@ -18,6 +18,7 @@ filesystem = ["dep:libc"]
 default = ["proxy"]
 proxy = ["fictionet/web-proxy"]
 raw-ethernet = []
+af-xdp = ["raw-ethernet", "dep:libc"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2", optional = true }

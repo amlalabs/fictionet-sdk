@@ -114,7 +114,11 @@ pub struct Frame {
     pub rx_queue_dropped: u64,
     /// Frames the full transmit queue discarded since the last record taken.
     pub tx_queue_dropped: u64,
-    /// Frames the card dropped. Unknown: no backend reports it.
+    /// Received frames the driver's path lost before the receive queue,
+    /// since the last record taken: for AF_XDP, the socket's `rx_dropped`
+    /// and `rx_ring_full`, read once a second, plus frames whose length the
+    /// attachment does not carry. `None` when the attachment has no device
+    /// counters, as an in-memory one has none: unknown, not zero.
     pub nic_rx_dropped: Option<u64>,
     /// The frame's length.
     pub length: usize,
@@ -141,6 +145,8 @@ pub enum Lifecycle {
     Configuration(Box<Configuration>),
     /// The packet backend is attached.
     BackendAttached {
+        /// The interface and how it is attached.
+        backend: Backend,
         /// Never tested from inside.
         public_reachability: Reachability,
     },
@@ -157,7 +163,71 @@ pub enum Lifecycle {
         status: Stopped,
         /// Why it failed.
         error: Option<String>,
+        /// The AF_XDP socket's loss counters as last read, if read.
+        xsk_statistics: Option<XskCounters>,
     },
+}
+
+/// The data interface, taken over through native XDP and an AF_XDP socket.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backend {
+    /// The interface's name.
+    pub interface: String,
+    /// The interface's index.
+    pub ifindex: u32,
+    /// The interface's MAC address, colon-separated hex.
+    pub mac: String,
+    /// The driver, from ethtool.
+    pub driver: String,
+    /// The driver's version.
+    pub driver_version: String,
+    /// The device firmware's version.
+    pub firmware_version: String,
+    /// The device's bus address.
+    pub bus: String,
+    /// The MTU, read back after setting it.
+    pub mtu: u32,
+    /// The receive queue the socket is bound to.
+    pub queue: u32,
+    /// Combined channels, read back after setting them.
+    pub combined_channels: u32,
+    /// The device's maximum combined channels.
+    pub max_combined_channels: u32,
+    /// How the XDP program is attached.
+    pub attach_mode: AttachMode,
+    /// How the AF_XDP socket is bound.
+    pub bind_mode: BindMode,
+}
+
+/// How the XDP program is attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMode {
+    /// In the driver. There is no fallback to generic XDP.
+    Native,
+}
+
+/// How the AF_XDP socket is bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindMode {
+    /// The kernel copies frames between the driver and the UMEM.
+    Copy,
+}
+
+/// The AF_XDP socket's loss counters, from `XDP_STATISTICS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XskCounters {
+    /// Received frames dropped other than for a full RX ring.
+    pub rx_dropped: u64,
+    /// Received frames dropped because the RX ring was full.
+    pub rx_ring_full: u64,
+    /// Times the kernel found the fill ring empty.
+    pub rx_fill_ring_empty: u64,
+    /// Invalid RX descriptors.
+    pub rx_invalid: u64,
+    /// Invalid TX descriptors.
+    pub tx_invalid: u64,
 }
 
 /// Whether the sensor is reachable from the internet. The executable never
@@ -184,6 +254,11 @@ pub enum Stopped {
 pub struct Configuration {
     /// The executable's version.
     pub build: String,
+    /// The data interface the honeypot takes over.
+    pub interface: String,
+    /// The public address mapped to `address`. Recorded only: the world
+    /// uses `address`, which NAT puts in inbound packets.
+    pub public_address: Option<Ipv4Addr>,
     /// The server's IPv4 address.
     pub address: Ipv4Addr,
     /// The server's IPv6 address.
@@ -595,6 +670,21 @@ mod tests {
                 bytes: Vec::new(),
             }),
             Record::Lifecycle(Lifecycle::BackendAttached {
+                backend: Backend {
+                    interface: "ens6".into(),
+                    ifindex: 3,
+                    mac: "0a:00:00:00:00:02".into(),
+                    driver: "ena".into(),
+                    driver_version: "6.12.0".into(),
+                    firmware_version: String::new(),
+                    bus: "0000:00:06.0".into(),
+                    mtu: 1500,
+                    queue: 0,
+                    combined_channels: 1,
+                    max_combined_channels: 2,
+                    attach_mode: AttachMode::Native,
+                    bind_mode: BindMode::Copy,
+                },
                 public_reachability: Reachability::NotTested,
             }),
             Record::Lifecycle(Lifecycle::LocalReady {
@@ -604,9 +694,18 @@ mod tests {
             Record::Lifecycle(Lifecycle::Shutdown {
                 status: Stopped::Failed,
                 error: Some("stopped".into()),
+                xsk_statistics: Some(XskCounters {
+                    rx_dropped: 1,
+                    rx_ring_full: 2,
+                    rx_fill_ring_empty: 3,
+                    rx_invalid: 0,
+                    tx_invalid: 0,
+                }),
             }),
             Record::Lifecycle(Lifecycle::Configuration(Box::new(Configuration {
                 build: "0.0.0".into(),
+                interface: "ens6".into(),
+                public_address: Some("198.51.100.20".parse().unwrap()),
                 address: "203.0.113.10".parse().unwrap(),
                 address_v6: Some("2001:db8::10".parse().unwrap()),
                 persona: "Ubuntu 24.04 / Linux 6.8".into(),

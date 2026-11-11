@@ -182,6 +182,43 @@ in the search world and xtask. It passes terminated path storage and aligned
 writable output, checks success, then reads initialized fields. No generic
 foreign-call framework, added dependency or runtime registry is needed.
 
+### AF_XDP backend
+
+`host/src/xdp/` (feature `af-xdp`, Linux only) is the crate's one other unsafe
+boundary, allowed on the module in `host/src/lib.rs`. It drives one interface
+through `bpf(2)`, an AF_XDP socket and shared ring memory, with no libbpf.
+Workstation tests cover the pure parts: instruction encoding, ring
+arithmetic over heap memory, the frame ledger against a kernel double, the
+attribute and ethtool layouts, and the startup checks. Every site that binds a
+socket or loads a program runs only on the EC2 instance (Stage 7).
+
+| Current site | Verdict and invariant |
+| --- | --- |
+| `host/src/xdp/bpf.rs:85`, `:89` | New `unsafe fn bpf`: the attribute struct is a live exclusive `#[repr(C)]` value of exactly the size passed; pointer fields are the caller's contract. |
+| `host/src/xdp/bpf.rs:108` | New: a descriptor the kernel just returned is owned once. |
+| `host/src/xdp/bpf.rs:137`, `:233` | New: map-create and link-create attributes carry no pointers. |
+| `host/src/xdp/bpf.rs:154` | New: key and value are live 4-byte locals, the map's sizes, read only during the call. |
+| `host/src/xdp/bpf.rs:201` | New: instructions are `struct bpf_insn` layout with the stated count; the license is NUL-terminated; the 64 KiB log buffer is exclusive and writable for its stated size. All outlive the call. |
+| `host/src/xdp/ring.rs:78` | New `Send`: ring pointers refer to memory the owner keeps mapped; indexes are atomics and slots are handed over by acquire/release. |
+| `host/src/xdp/ring.rs:89`, `:92`, `:145`, `:147`, `:211`, `:213` | New `unsafe fn new`: the caller guarantees a mapping valid for the reported layout, aligned index words and slots, alive as long as the ring, with one peer in the opposite role. |
+| `host/src/xdp/ring.rs:110`, `:115`, `:120`, `:127` | New: index words are aligned, in bounds and accessed only atomically; the slot index is masked below the ring size. |
+| `host/src/xdp/ring.rs:174`, `:234` | New: a producer writes only slots between the consumer index and one ring past it, before publishing with release; a consumer reads only slots below the acquired producer index, before releasing them. |
+| `host/src/xdp/ring.rs:277`–`:312` | New test double: rings over one leaked boxed slice, freed once on drop after every ring made from it. |
+| `host/src/xdp/datapath.rs:111`, `:121` | New `Send` and `unsafe fn new`: the UMEM pointer covers `UMEM_LEN` bytes owned by the socket and dropped after the datapath; only the kernel touches it otherwise, as the rings direct. |
+| `host/src/xdp/datapath.rs:281` | New: an RX frame is read only after the RX ring hands it over and before it returns to the fill ring; the range is checked inside one receive frame. |
+| `host/src/xdp/datapath.rs:289` | New: a TX frame is written only while on the free list, which no ring holds; the length is at most 2,036 bytes, under the 4 KiB frame. |
+| `host/src/xdp/datapath.rs:361`, `:383`, `:445` | New test double: the kernel side writes frames it took from the fill ring and reads frames posted on the TX ring, over a boxed UMEM that outlives the datapath. |
+| `host/src/xdp/interface.rs:484`–`:521` | New: getifaddrs success is checked; nodes, names and addresses are read only while the list lives, each address cast by its family; the list is freed once. |
+| `host/src/xdp/interface.rs:581`, `:586` | New: socket takes scalars; success is checked before owning the descriptor once. |
+| `host/src/xdp/interface.rs:604`–`:660` | New `unsafe fn request`: a zeroed `ifreq` names the interface and points at the ethtool struct the command reads and writes (`ethtool_drvinfo`, `ethtool_channels`, no pointer fields), live and exclusive for the ioctl. |
+| `host/src/xdp/socket.rs:26`, `:41`, `:66` | New `Mapping`: mmap result checked against `MAP_FAILED`; unmapped once with its length, after every ring and the datapath that point into it have dropped (field order in `XdpSocket`). |
+| `host/src/xdp/socket.rs:90`, `:112` | New: socket options pass a live value and its exact size; getsockopt results shorter than the struct are refused. |
+| `host/src/xdp/socket.rs:181`, `:189` | New: AF_XDP socket creation checked before owning the descriptor once. |
+| `host/src/xdp/socket.rs:255`, `:265` | New: rings are built over the kernel's ring mappings with the offsets it reported and the size registered; the UMEM is registered with this socket only. |
+| `host/src/xdp/socket.rs:276` | New: bind reads a complete `sockaddr_xdp` of its exact size. |
+| `host/src/xdp/socket.rs:348` | New: a zero-length `sendto` with null buffer and address reads no user memory. |
+| `host/src/xdp/socket.rs:386` | New: poll gets a live two-entry array and its length; the kernel writes only `revents`. |
+
 ## Vendored and remaining sources
 
 `rustls/src/lib.rs:300` already has `#![forbid(unsafe_code, unused_must_use)]`.

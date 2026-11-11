@@ -4,6 +4,8 @@
 //! `Interface`. Each direction holds at most 64 frames. When the receive
 //! queue is full, the driver keeps reading and counts discarded frames.
 //! [`RawAttachment::in_memory`] gives the driver's side as a [`RawWire`].
+//! With the `af-xdp` feature, [`RawPump`] drives a real interface through
+//! an AF_XDP socket.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +16,7 @@ use fictionet::{Cx, Error, Result};
 use tokio::sync::{mpsc, oneshot};
 
 const CAPACITY: usize = 64;
-const MAX_FRAME: usize = 2036;
+pub(crate) const MAX_FRAME: usize = 2036;
 
 /// Complete Ethernet bytes, including the Ethernet header, without a frame checksum.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,12 +37,35 @@ pub struct RawAttachment {
     receiver: RawReceiver,
     mac: [u8; 6],
     receive_stats: QueueStats,
+    device_stats: Option<DeviceStats>,
 }
 
-/// Losses from one attachment queue. Device and backend losses are unknown.
+/// Losses from one attachment queue. Device and backend losses are in
+/// [`DeviceStats`], where the driver reports them.
 #[derive(Clone, Default)]
 pub struct QueueStats {
     queue_dropped: Arc<AtomicU64>,
+}
+
+/// Frames the driver's path lost before they reached the receive queue,
+/// for drivers that can count them.
+#[derive(Clone, Default)]
+pub struct DeviceStats {
+    rx_dropped: Arc<AtomicU64>,
+}
+
+impl DeviceStats {
+    /// Received frames discarded before the attachment's queue, since the
+    /// driver started. The count never goes down.
+    pub fn rx_dropped(&self) -> u64 {
+        self.rx_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Raises the count to `total`, a running total the driver read.
+    #[cfg_attr(not(all(target_os = "linux", feature = "af-xdp")), allow(dead_code))]
+    pub(crate) fn record_rx_dropped(&self, total: u64) {
+        self.rx_dropped.fetch_max(total, Ordering::Relaxed);
+    }
 }
 
 impl QueueStats {
@@ -50,7 +75,7 @@ impl QueueStats {
         self.queue_dropped.load(Ordering::Relaxed)
     }
 
-    fn enqueue<T>(&self, sender: &mpsc::Sender<T>, value: T) -> Result<bool> {
+    pub(crate) fn enqueue<T>(&self, sender: &mpsc::Sender<T>, value: T) -> Result<bool> {
         match sender.try_send(value) {
             Ok(()) => Ok(true),
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -82,7 +107,7 @@ pub struct RawReceiver {
     failure: Arc<Mutex<Option<Error>>>,
 }
 
-enum Command {
+pub(crate) enum Command {
     Frame(EthernetFrame),
     Flush(oneshot::Sender<()>),
 }
@@ -120,6 +145,12 @@ impl RawAttachment {
     /// The device's configured Ethernet address.
     pub fn mac_address(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// A live view of the driver's losses before the receive queue, or
+    /// `None` when the driver cannot count them, as on an in-memory wire.
+    pub fn device_stats(&self) -> Option<DeviceStats> {
+        self.device_stats.clone()
     }
 
     /// Separates reception from transmission for independent world tasks.
@@ -164,6 +195,25 @@ impl RawAttachment {
     /// and come from the returned [`RawWire`]. Each direction holds 64
     /// frames, as one to a NIC does.
     pub fn in_memory(mac: [u8; 6]) -> (RawAttachment, RawWire) {
+        let (attachment, driver) = Self::driven(mac, None);
+        let Driver {
+            incoming,
+            outgoing,
+            receive_stats,
+            failure: _,
+        } = driver;
+        (
+            attachment,
+            RawWire {
+                incoming,
+                outgoing,
+                receive_stats,
+            },
+        )
+    }
+
+    /// An attachment and the side a driver thread holds.
+    pub(crate) fn driven(mac: [u8; 6], device_stats: Option<DeviceStats>) -> (Self, Driver) {
         let (incoming, rx) = mpsc::channel(CAPACITY);
         let (tx, outgoing) = mpsc::channel(CAPACITY);
         let failure = Arc::new(Mutex::new(None));
@@ -175,16 +225,42 @@ impl RawAttachment {
                     stats: QueueStats::default(),
                     failure: failure.clone(),
                 },
-                receiver: RawReceiver { rx, failure },
+                receiver: RawReceiver {
+                    rx,
+                    failure: failure.clone(),
+                },
                 mac,
                 receive_stats: receive_stats.clone(),
+                device_stats,
             },
-            RawWire {
+            Driver {
                 incoming,
                 outgoing,
                 receive_stats,
+                failure,
             },
         )
+    }
+}
+
+/// The driver thread's side of an attachment.
+pub(crate) struct Driver {
+    /// Frames to the world.
+    pub incoming: mpsc::Sender<ReceivedFrame>,
+    /// Frames and flushes from the world.
+    pub outgoing: mpsc::Receiver<Command>,
+    /// Counts frames the full queue to the world discarded.
+    pub receive_stats: QueueStats,
+    /// The error the world sees once the driver stops on one.
+    pub failure: Arc<Mutex<Option<Error>>>,
+}
+
+impl Driver {
+    /// Records why the driver stopped. The world's receive and send report
+    /// it once the queues drain and this side is dropped.
+    #[cfg_attr(not(all(target_os = "linux", feature = "af-xdp")), allow(dead_code))]
+    pub fn fail(&self, error: Error) {
+        *self.failure.lock().unwrap() = Some(error);
     }
 }
 
@@ -285,6 +361,92 @@ impl RawSender {
         let (tx, rx) = oneshot::channel();
         self.command(fcx, Command::Flush(tx)).await?;
         fcx.race(None, rx).await?.map_err(|_| closed(&self.failure))
+    }
+}
+
+/// Runs an [`XdpSocket`](crate::xdp::XdpSocket) on its own thread and
+/// gives the world its attachment. Keep it outside `fictionet::run`.
+///
+/// The thread stops when the world drops its attachment, on
+/// [`Self::shutdown`], or on an error, which it records in the
+/// attachment's failure slot so the world's next receive or send reports
+/// it. Stopping drops the socket, which takes the XDP program off the
+/// interface; frames still queued are discarded.
+#[cfg(all(target_os = "linux", feature = "af-xdp"))]
+pub struct RawPump {
+    shared: Arc<crate::xdp::pump::Shared>,
+    thread: Option<std::thread::JoinHandle<Result>>,
+}
+
+#[cfg(all(target_os = "linux", feature = "af-xdp"))]
+impl RawPump {
+    /// Starts the pump thread and returns the world's attachment, with the
+    /// interface's MAC address and the socket's loss counters.
+    pub fn attach(socket: crate::xdp::XdpSocket) -> io::Result<(Self, RawAttachment)> {
+        use crate::xdp::pump;
+        let device = DeviceStats::default();
+        let (attachment, mut driver) =
+            RawAttachment::driven(socket.attached().mac, Some(device.clone()));
+        let (wake, woken) = pump::wake_pair()?;
+        let shared = Arc::new(pump::Shared {
+            stop: Default::default(),
+            wake,
+            statistics: Mutex::new(None),
+            device,
+        });
+        let thread_shared = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("af-xdp".into())
+            .spawn(move || {
+                let run = std::panic::AssertUnwindSafe(|| {
+                    pump::run(socket, &mut driver, &thread_shared, &woken)
+                });
+                let result = std::panic::catch_unwind(run)
+                    .unwrap_or_else(|_| Err(Error::msg("the AF_XDP pump thread panicked")));
+                if let Err(error) = &result {
+                    driver.fail(error.clone());
+                }
+                // Dropping the driver's side after the failure is recorded
+                // lets the world's waiters see it.
+                drop(driver);
+                result
+            })?;
+        Ok((
+            Self {
+                shared,
+                thread: Some(thread),
+            },
+            attachment,
+        ))
+    }
+
+    /// The socket's loss counters as last read, once a second.
+    pub fn statistics(&self) -> Option<crate::xdp::XskStatistics> {
+        *self.shared.statistics.lock().unwrap()
+    }
+
+    /// Stops the thread, detaches the program, and reports the error that
+    /// stopped the pump, if one did.
+    pub fn shutdown(mut self) -> Result {
+        self.stop_and_join()
+    }
+
+    fn stop_and_join(&mut self) -> Result {
+        self.shared.stop.store(true, Ordering::Release);
+        std::task::Wake::wake_by_ref(&self.shared.wake);
+        match self.thread.take() {
+            Some(thread) => thread
+                .join()
+                .map_err(|_| Error::msg("the AF_XDP pump thread panicked"))?,
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "af-xdp"))]
+impl Drop for RawPump {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
     }
 }
 
