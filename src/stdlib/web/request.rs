@@ -119,11 +119,11 @@ impl Head {
         })
     }
 
-    /// The head of an HTTP/2 request, in the block its connection decoded
+    /// The head of an HTTP/2 or HTTP/3 request, in the block its connection decoded
     /// it into: `fields` holds the pseudo-fields first, and the connection
-    /// checked them as RFC 9113 section 8.3 asks. `None` for a method,
+    /// checked their HTTP pseudo-field and field rules. `None` for a method,
     /// scheme, authority or path that is not visible ASCII.
-    pub(crate) fn http2(fields: Fields) -> Option<Self> {
+    pub(crate) fn multiplexed(fields: Fields, version: Version) -> Option<Self> {
         let pseudo = fields
             .iter()
             .take_while(|(name, _)| name.starts_with(b":"))
@@ -132,7 +132,7 @@ impl Head {
         let head = Self {
             fields,
             pseudo,
-            version: Version::Http2,
+            version,
         };
         let pseudo_visible = head
             .fields
@@ -283,8 +283,13 @@ impl Head {
         request = match self.version {
             Version::Http10 => request.version(http::Version::HTTP_10).uri(self.target()),
             Version::Http11 => request.version(http::Version::HTTP_11).uri(self.target()),
-            Version::Http2 => {
-                let request = request.version(http::Version::HTTP_2);
+            Version::Http2 | Version::Http3 => {
+                let version = if self.version == Version::Http3 {
+                    http::Version::HTTP_3
+                } else {
+                    http::Version::HTTP_2
+                };
+                let request = request.version(version);
                 match self.pseudo(b":authority") {
                     Some(authority) => {
                         let mut uri = http::Uri::builder().authority(authority);
@@ -302,7 +307,7 @@ impl Head {
         };
         let mut cookie: Option<Vec<u8>> = None;
         for (name, value) in self.fields() {
-            if self.version == Version::Http2 && name == b"cookie" {
+            if matches!(self.version, Version::Http2 | Version::Http3) && name == b"cookie" {
                 match &mut cookie {
                     Some(joined) => {
                         joined.extend_from_slice(b"; ");

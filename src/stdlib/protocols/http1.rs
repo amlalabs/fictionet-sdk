@@ -226,6 +226,8 @@ pub enum Version {
     Http11,
     /// HTTP/2 request metadata; not a valid HTTP/1 wire version.
     Http2,
+    /// HTTP/3 request metadata; not a valid HTTP/1 wire version.
+    Http3,
 }
 
 impl Version {
@@ -235,6 +237,7 @@ impl Version {
             Self::Http10 => "HTTP/1.0",
             Self::Http11 => "HTTP/1.1",
             Self::Http2 => "HTTP/2.0",
+            Self::Http3 => "HTTP/3.0",
         }
     }
 }
@@ -1944,7 +1947,7 @@ fn fields<'a>(
     headers: impl Iterator<Item = (&'a [u8], &'a [u8])> + Clone,
     version: Version,
 ) -> Result<Fields, Error> {
-    if version == Version::Http2 {
+    if matches!(version, Version::Http2 | Version::Http3) {
         return Err(Error::StartLine);
     }
     let mut result = Fields {

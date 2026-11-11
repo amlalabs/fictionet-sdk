@@ -5,6 +5,13 @@ now wired into a single-connection Fictionet layer. Owned stream writes retain c
 payloads, but engine metadata and the legacy byte APIs are not budgeted. This directory records evidence as that work grows;
 it does not claim verification of the whole transport or HTTP/3.
 
+The current server composes HTTP/3 and static QPACK over `QuicLayer` into
+the SDK's existing web handlers, with independent quiche interoperability.
+See [HTTP/3 handlers over QUIC streams](#http3-handlers-over-quic-streams)
+for the latest implementation and proof boundaries. Earlier sections record
+the state at each step. Remaining priorities are shared listener routing,
+whole-engine budgeting, the remaining version-two work and unresolved proofs.
+
 The intended boundary is a layer over the world's datagram carrier, with
 typed multiplexed streams and application datagrams above it. The engine
 must remain sans-I/O. Directional stream errors, datagram send completion,
@@ -857,3 +864,134 @@ adapter slots, checks receive-end and write-completion ordering before
 closure, and checks that no reset was emitted. Removing retirement makes
 the test fail at its first missing closure; restoring it passes. The TLS
 fixture now accepts an ALPN value for the HTTP/3 interoperability tests.
+
+## HTTP/3 handlers over QUIC streams
+
+`web::httpd::Http3` now implements a server connection with `Quic` below
+and `Mux<HttpExchange, Top, Opening>` above. `Responder::http3` composes it
+with the existing `Respond` children. A stack is
+`Chain::new(quic_layer, responder.http3())`; the caller configures its QUIC
+TLS server to negotiate `h3` and supplies connection metadata through
+`Responder::conn`. The stack still serves one connection. Shared UDP
+listener routing and its world-host integration are the next build-out step.
+
+The coordinator opens the control and both QPACK streams, sends SETTINGS,
+and enforces peer critical-stream uniqueness, SETTINGS ordering and critical
+stream closure. The QPACK profile advertises zero dynamic-table capacity
+and zero blocked streams. Static references, literal fields and Huffman
+strings work in both directions, including sensitive field marks. Dynamic
+insertions that exceed that capacity fail the connection. No dynamic
+references or section acknowledgments can arise in this profile. Dynamic
+compression, blocked-section scheduling, server push and extended CONNECT
+are not enabled.
+
+Requests use the existing HTTP/3 message validator, including content-length
+and trailer ordering. Their retained fields become the same charged head
+carrier used by HTTP/2, with HTTP/3 version metadata and cookie joining.
+Bodies reach independently credited exchange children. Trailers wait for
+FIN and final content-length validation before completing a request. The
+shared handler adapter supplies body limits and deadlines, asynchronous
+replies, streamed responses, body suppression, virtual-host routing and
+delivery observations. Header and stalled-write deadlines use `Env` time.
+Request cancellation and malformed-message errors retire one exchange;
+framing, compression and critical-stream errors close the connection.
+
+One output frame per stream remains owned until all its pieces have been
+handed to QUIC and their local write completions received. Response body
+credit is returned at that completion. Completion accounting runs in the
+event handler and its notification uses the urgent path, including while
+request input is blocked. GOAWAY rejects requests at or above the admitted
+cutoff, permits lower identifiers arriving out of order and drains admitted
+exchanges. It leaves the transport open for retransmission until peer closure
+or the configured QUIC idle timeout: local write completion means the engine
+accepted bytes and cannot justify dropping queued response data. The public
+exchange carrier now preserves HTTP/3 application error codes in its closure
+event.
+
+A peer granting only two unidirectional streams initially stalled the
+coordinator behind its third open command. The new generic
+`ControlCommand::OpenOrClose` permits an application to require a stream or
+close with its own error when peer stream credit or adapter slots are
+exhausted. HTTP/3 uses `H3_STREAM_CREATION_ERROR`. The independent regression
+fails on the prior blocking open and passes with this command.
+
+Independent interoperability uses quiche's HTTP/3 implementation and
+BoringSSL, with certificate verification enabled and `h3` negotiated. Each
+of two runs serves forty POST requests, four concurrently, with twenty
+thousand body bytes each, through sixteen adapter slots. One returns
+collected responses; the other polls streamed responses through `Pending`
+and sends request and response trailers. The tests check exact echoed
+bytes, status, content length policy, split-cookie joining, HTTP/3 metadata,
+trailers and all forty delivery observations. Packets cross the SDK's
+`Datagrams<SocketAddr>` carrier in memory; this is not a host UDP-listener
+test. The existing QUIC loss, duplication, reordering and both-role
+interoperability tests also pass; no HTTP/3-specific lossy replay is claimed.
+
+Eighteen coordinator regressions cover fragmented critical prefixes,
+duplicate critical streams, FIN and reset, missing and repeated SETTINGS,
+forbidden dynamic capacity and push streams, ignored unknown streams,
+sibling progress under receive backpressure, trailer and length validation,
+directional cancellation, empty DATA before FIN, both deadlines, GOAWAY
+cutoffs, sensitive field marks, storage refusal and completion through a
+blocked receive event.
+
+`Http3Critical.tla` models critical-stream lifetime, completion arithmetic
+and connection-slot reservation order. The base passes with 261 generated
+states, 168 distinct states and depth seven. Its four controls violate
+`OneOfEach`, `CriticalOpen`, `PaidStorage` and `CompletionOwned` respectively.
+The resource store also checks `WithinLimit` and `Tracks`. Allocation size
+is one abstract slot-store unit; it is not a byte bound on the codecs or
+whole coordinator. The model does not replay production traces or prove
+handler scheduling, message validation, QPACK compression or cryptography.
+Run the configurations with the scoped TLC command and shared resource
+library described above, with `Http3Critical.tla` as the module.
+
+Two Kani harnesses call the production `Critical::accept` and
+`Sending::complete` methods. Critical-stream admission passes over six
+arbitrary type choices, arbitrary unknown and push identifiers, and a
+zero-allocation bound using the shared counting stubs. Completion passes
+for arbitrary sixty-four-bit flight counts, completions and body counts,
+with either no unsent bytes or one arbitrary unsent byte. It checks
+excess-completion refusal without mutation, exact retirement and that
+unsent bytes prevent completion. The shared allocator sanity harness also
+passes. No production functions are stubbed. Run under the required scope:
+
+```sh
+cargo kani -p fictionet --lib -Z stubbing -Z c-ffi -Z mem-predicates \
+  -Z restrict-vtable --harness http3_critical_types \
+  --harness http3_write_completion --harness the_counter_sees_every_allocation
+```
+
+The separate `http3_refuses_connection_storage_before_allocating` harness
+has no verdict. It was stopped after more than three minutes expanding
+budget, mutex and destructor paths before solving. Its assertions remain;
+the successful replay does not substitute for this allocation proof.
+
+The allocation replay constructs the production coordinator and admits its
+connection event with a zero-byte budget and a sufficient budget. The two
+slot stores are reserved before allocation. Every measured allocation must
+fit the actual reservations; there are no input bytes, and the fixed costs
+are those charged slots. This covers initial connection storage only.
+Input buffers, request fields and output payloads carry budget charges;
+the allocating frame and QPACK codecs run under a conservative temporary
+reservation. Per-chunk backing metadata and complete codec cost bounds,
+including linear copying across fragmented input, still need resource
+proofs and replays. Whole-engine budgeting remains unfinished.
+
+Two scratch mutations were tested and removed. Omitting the critical-type
+duplicate check fails the Kani decision assertion. Allocating the initial
+channel slots against an unrelated unlimited budget fails the resource
+replay: 4,824 bytes live against zero charged. Restoring both changes passes
+the unchanged checks again. These controls add no test-only production path.
+
+Validation on this step: all 4,368 SDK library tests, including the eighteen
+coordinator regressions, and 1,413 integration tests passed. The isolated
+layer/interoperability suite passes all 27 tests. All 302 SDK doctests pass.
+Clippy with warnings denied and rustfmt pass. Cargo doc succeeds with the
+pre-existing redundant-link warning in `network/packet.rs`. The decoder
+benchmark ran the QPACK long-instruction cases at both configured sizes;
+this is not an HTTP/3 server throughput measurement.
+No rustls files changed. Remaining build-out priority is listener
+routing, whole-engine budgeting, version two, then the previously
+unfinished proofs. A full HTTP/3 client/proxy and optional dynamic QPACK
+profile are separate from this working server profile.

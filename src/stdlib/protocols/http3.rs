@@ -1,8 +1,8 @@
 //! HTTP/3 frames, streams and field sections, with no I/O.
 //!
-//! A real client cannot reach HTTP/3 requests with these codecs alone,
-//! because the stdlib has no QUIC transport that completes the protected
-//! handshake.
+//! The server connection layer is [`Http3`](fictionet::stdlib::web::httpd::Http3),
+//! over [`QuicLayer`](fictionet::stdlib::services::quic::QuicLayer). These codecs
+//! also work independently on ordered QUIC stream bytes.
 //!
 //! Callers supply ordered QUIC stream bytes. This module follows
 //! [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114), uses the sibling

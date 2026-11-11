@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn configuration() -> quiche::Config {
+pub(super) fn configuration() -> quiche::Config {
     let dir = tempfile::tempdir().unwrap();
     let certificate = dir.path().join("certificate.pem");
     let key = dir.path().join("key.pem");

@@ -1247,6 +1247,7 @@ fn version_of(head: &Head) -> Version {
         http1::Version::Http10 => Version::HTTP_10,
         http1::Version::Http11 => Version::HTTP_11,
         http1::Version::Http2 => Version::HTTP_2,
+        http1::Version::Http3 => Version::HTTP_3,
     }
 }
 

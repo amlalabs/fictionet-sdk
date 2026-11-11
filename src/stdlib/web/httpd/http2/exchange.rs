@@ -1,4 +1,4 @@
-//! The carrier between an HTTP/2 connection and the exchange on each of
+//! The carrier between a multiplexed HTTP connection and the exchange on each of
 //! its streams.
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -10,7 +10,8 @@ use fictionet::time::Instant;
 
 /// One HTTP exchange on a multiplexed connection: the request comes up, the
 /// response goes down. An HTTP/2 stream is one; [`Http2`](super::Http2)
-/// offers one child of this port per stream.
+/// offers one child of this port per stream. [`Http3`](super::super::Http3)
+/// uses this same exchange carrier over QUIC.
 ///
 /// The request's head opens the child ([`Opening`]). Its body comes up as
 /// [`ExchangeEvent::Data`] within the credit the child grants, and its end
@@ -49,8 +50,8 @@ pub struct Opening {
 }
 
 /// A request's head as the connection decoded and checked it: its fields,
-/// pseudo-fields first, in the one block HPACK decoded them into
-/// ([`Fields`]). The block carries what pays for it, so whoever holds the
+/// pseudo-fields first, in the connection's retained block ([`Fields`]).
+/// The block carries what pays for it, so whoever holds the
 /// head holds its charge, and the block goes back to the connection when
 /// the head is dropped. Reading it allocates nothing;
 /// [`to_http`](Self::to_http) makes an [`http::Request`] of it, which does.
@@ -64,6 +65,7 @@ pub struct Opening {
 pub struct RequestHead {
     fields: Fields,
     content_length: Option<u64>,
+    version: crate::stdlib::protocols::http1::Version,
 }
 
 impl RequestHead {
@@ -72,6 +74,20 @@ impl RequestHead {
         RequestHead {
             fields,
             content_length,
+            version: crate::stdlib::protocols::http1::Version::Http2,
+        }
+    }
+
+    /// The HTTP version carried by this exchange.
+    pub fn version(&self) -> crate::stdlib::protocols::http1::Version {
+        self.version
+    }
+
+    pub(in super::super) fn http3(fields: Fields, content_length: Option<u64>) -> Self {
+        Self {
+            fields,
+            content_length,
+            version: crate::stdlib::protocols::http1::Version::Http3,
         }
     }
 
@@ -143,7 +159,7 @@ impl RequestHead {
             .saturating_add(size_of::<http::request::Parts>())
     }
 
-    /// The head as an [`http::Request`], its version HTTP/2, its URI made
+    /// The head as an [`http::Request`], with the exchange's version and its URI made
     /// from the pseudo-fields, and its fields in a map, a client's split
     /// `cookie` fields joined with `"; "` (RFC 9113 section 8.2.3). It
     /// allocates. `None` for an authority or path the `http` crate does
@@ -184,7 +200,13 @@ impl RequestHead {
         let mut request = http::Request::builder()
             .method(method)
             .uri(http::Uri::from_parts(uri).ok()?)
-            .version(http::Version::HTTP_2)
+            .version(
+                if self.version == crate::stdlib::protocols::http1::Version::Http3 {
+                    http::Version::HTTP_3
+                } else {
+                    http::Version::HTTP_2
+                },
+            )
             .body(())
             .ok()?;
         *request.headers_mut() = headers;
@@ -203,7 +225,7 @@ pub struct RequestTrailers {
 
 impl RequestTrailers {
     /// Trailers the connection checked.
-    pub(super) fn new(fields: Fields) -> RequestTrailers {
+    pub(in super::super) fn new(fields: Fields) -> RequestTrailers {
         RequestTrailers { fields }
     }
 
@@ -261,6 +283,8 @@ pub enum Ending {
     /// The stream was reset, by the peer or by the connection, with this
     /// code.
     Reset(ErrorCode),
+    /// An HTTP/3 application error code.
+    ApplicationReset(u64),
     /// The connection is closing, or gone.
     Gone,
 }

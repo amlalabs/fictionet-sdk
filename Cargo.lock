@@ -1768,6 +1768,7 @@ dependencies = [
  "fictionet",
  "fictionet-quinn-proto",
  "fictionet-rustls",
+ "http",
  "quiche",
  "ring",
  "tempfile",

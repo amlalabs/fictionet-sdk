@@ -12,7 +12,18 @@ mod tests {
     // sides of the independent-peer integration.
     include!("../../src/stdlib/services/quic/tests.rs");
 
+    mod http3 {
+        include!("http3.rs");
+    }
+
     mod interop {
         include!("interop.rs");
     }
 }
+
+#[cfg(test)]
+#[path = "../../verification/resources/alloc.rs"]
+mod alloc;
+#[cfg(test)]
+#[path = "../../verification/resources/cost.rs"]
+mod cost;
