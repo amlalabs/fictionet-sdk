@@ -589,10 +589,14 @@ impl Bindings {
 
 #[cfg(test)]
 mod tests {
-    use super::super::hosts::{PortSpec, UdpStart};
+    use super::super::hosts::{DatagramServer, PortSpec};
     use super::super::*;
     use super::*;
+    use fictionet::stdlib::layer::{Budget, Datagrams};
+    use fictionet::stdlib::network::ConnInfo;
+    use fictionet::stdlib::services::stack::Boxed;
     use fictionet::stdlib::test_support::rounds;
+    use std::net::SocketAddr;
 
     fn pools(v4: &str, v6: &str) -> Pools {
         Pools {
@@ -740,6 +744,15 @@ mod tests {
         );
     }
 
+    /// A UDP server whose host is never placed.
+    struct Uncommitted;
+
+    impl DatagramServer for Uncommitted {
+        fn stack(&self, _: &Cx, _: &ConnInfo) -> (Boxed<Datagrams<SocketAddr>>, Budget) {
+            panic!("not committed")
+        }
+    }
+
     #[test]
     fn failed_hosts_give_their_automatic_addresses_back() {
         fictionet::block_on(fictionet::lab(
@@ -748,9 +761,9 @@ mod tests {
                 let shared = network(&fcx, "10.0.0.0/24", Some("2001:db8::/64"));
                 let bind = || {
                     let mut host = Host::new("bind.test").dns_name("bind.test");
-                    let start: UdpStart = Arc::new(|_, _, _| panic!("not committed"));
-                    host.ports.push((0, PortSpec::Udp(start.clone())));
-                    host.ports.push((49152, PortSpec::Udp(start)));
+                    let server: Arc<dyn DatagramServer> = Arc::new(Uncommitted);
+                    host.ports.push((0, PortSpec::Udp(server.clone())));
+                    host.ports.push((49152, PortSpec::Udp(server)));
                     host
                 };
                 let rejected = [
