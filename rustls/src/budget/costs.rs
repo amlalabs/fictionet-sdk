@@ -219,3 +219,35 @@ fn a_hello_is_charged_what_parsing_it_holds() {
     }
     std::println!("cost: {}", all.summary());
 }
+
+/// A record holding a hello and then 4,000 empty handshake messages, four
+/// bytes each, into an acceptor, as one step: the handshake deframer cuts
+/// the record a message at a time, so it holds two spans, not one for
+/// each message, and the bytes live at once stay within the most the
+/// budget was charged and those spans. It held 180,768 bytes against
+/// 21,346 charged when it cut the whole record at once.
+#[test]
+fn a_record_of_many_messages_is_cut_a_message_at_a_time() {
+    let wire = hello(0, &[]);
+    let mut record = Vec::from(&wire[5..]);
+    for _ in 0..4_000 {
+        record.extend_from_slice(&[0, 0, 0, 0]);
+    }
+    let mut framed = Vec::from([22u8, 3, 1]);
+    framed.extend_from_slice(&u16::try_from(record.len()).unwrap().to_be_bytes());
+    framed.extend_from_slice(&record);
+    let mut costs = Costs::new("a record of many messages");
+    let limit = Limit::new(1 << 24);
+    costs.step(framed.len(), JOINING_SPANS, accepting(), || {
+        let mut acceptor = Acceptor::with_budget(limit.clone());
+        let mut rest = &framed[..];
+        acceptor.read_tls(&mut rest).unwrap();
+        // The hello is taken, or refused with what follows it.
+        assert!(!matches!(acceptor.accept(), Ok(None)));
+        Charged {
+            value: (),
+            charged: limit.most(),
+        }
+    });
+    std::println!("cost: {}", costs.summary());
+}

@@ -50,6 +50,12 @@ pub(crate) struct Delocator<'b> {
 }
 
 impl<'b> Delocator<'b> {
+    /// The buffer the ranges are in.
+    #[inline]
+    pub(crate) fn slice(&self) -> &'b [u8] {
+        self.slice
+    }
+
     #[inline]
     pub(crate) fn new(slice: &'b [u8]) -> Self {
         Self { slice }
