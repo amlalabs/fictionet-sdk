@@ -19,7 +19,7 @@ mod cost;
 use ::alloc::vec::Vec;
 
 use super::testing::Limit;
-use crate::msgs::deframer::handshake::FragmentSpan;
+use super::JOINING_SPANS;
 use crate::msgs::message::MAX_WIRE_SIZE;
 use crate::server::Acceptor;
 use cost::{Charged, Costs, Linear};
@@ -35,11 +35,6 @@ fn hello_a_byte_a_record(len: usize) -> Vec<Vec<u8>> {
         .map(|byte| Vec::from([22, 3, 1, 0, 1, byte]))
         .collect()
 }
-
-/// The hello's deframer keeps its message's spans between records: the
-/// part joined so far and the record arriving, coalesced at once, in the
-/// first capacity a vector of them takes (four, for elements this small).
-const JOINING_SPANS: usize = 4 * size_of::<FragmentSpan>();
 
 /// What joining a handshake message from records asks of the allocator.
 ///
