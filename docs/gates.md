@@ -188,6 +188,9 @@ work slice's Kani slots (`xtask/src/kani_slot.rs`): its `MemoryHigh` divided
 by the run's memory cap, shared by every worktree. A run waits while all are
 taken. Past `MemoryHigh` the kernel reclaims from every process in the slice
 at once, and a CBMC process then does its own work at a few percent of a core.
+Before the slot, a run takes its Cargo target directory alone (`kani.lock`
+there): Kani rewrites each harness's goto binary in place under
+`target/kani/`, so two runs in one target directory break each other.
 
 Do not mix expected-failure ablations into a passing group or interpret an
 arbitrary nonzero exit as an expected counterexample. Retain their documented

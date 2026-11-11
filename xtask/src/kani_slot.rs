@@ -8,22 +8,70 @@
 //! reclaim, so it did its own work at about 3% of a core. So a run takes
 //! one of `MemoryHigh / memory` slots first, the slots shared by every
 //! worktree of the user, and waits while all are taken.
+//!
+//! A run also holds its Cargo target directory alone. Kani rewrites each
+//! harness's goto binary in place under `target/kani/`, so two runs in one
+//! target directory overwrite each other's files mid-run and the second
+//! fails in `goto-instrument` (exit 6). Runs in different worktrees, with
+//! different target directories, still run side by side.
 
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use crate::Result;
 
-/// A taken slot, held until dropped.
+/// A taken slot and the run's target directory, both held until dropped.
 pub struct Slot {
-    _file: File,
+    _target: File,
+    _slot: File,
 }
 
-/// Waits for a slot for a run capped at `memory` (systemd's form, such as
-/// `14G`), and holds it.
-pub fn take(memory: &str) -> Result<Slot> {
+/// Waits for the target directory of a run from `root`, then for a slot
+/// for a run capped at `memory` (systemd's form, such as `14G`), and holds
+/// both. The directory comes first so that a run waiting on another run in
+/// the same directory does not keep a slot from runs elsewhere.
+pub fn take(root: &Path, memory: &str) -> Result<Slot> {
+    let target = target_lock(root)?;
+    let slot = slot(memory)?;
+    Ok(Slot {
+        _target: target,
+        _slot: slot,
+    })
+}
+
+/// Locks `kani.lock` in the target directory Cargo will use from `root`:
+/// `CARGO_TARGET_DIR`, else `root/target`.
+fn target_lock(root: &Path) -> Result<File> {
+    let dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|dir| {
+            if dir.is_absolute() {
+                dir
+            } else {
+                root.join(dir)
+            }
+        })
+        .unwrap_or_else(|| root.join("target"));
+    std::fs::create_dir_all(&dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("kani.lock"))?;
+    if file.try_lock().is_err() {
+        println!(
+            "waiting for another Kani run in {} to finish",
+            dir.display()
+        );
+        file.lock()?;
+    }
+    Ok(file)
+}
+
+/// Waits for one of the slice's slots for a run capped at `memory`.
+fn slot(memory: &str) -> Result<File> {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -39,7 +87,7 @@ pub fn take(memory: &str) -> Result<Slot> {
                 .write(true)
                 .open(dir.join(format!("slot-{n}")))?;
             if file.try_lock().is_ok() {
-                return Ok(Slot { _file: file });
+                return Ok(file);
             }
         }
         if !said {
