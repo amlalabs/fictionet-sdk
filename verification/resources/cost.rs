@@ -35,7 +35,7 @@ use crate::alloc::measuring_left;
 
 /// `per * input + fixed` bytes, with `per` a fraction `num / den`.
 #[derive(Clone, Copy, Debug)]
-pub struct Linear {
+pub(crate) struct Linear {
     /// The numerator of the bytes allowed per input byte.
     pub num: usize,
     /// Its denominator.
@@ -46,7 +46,7 @@ pub struct Linear {
 
 impl Linear {
     /// The bytes allowed for `input` bytes of input.
-    pub fn at(&self, input: usize) -> usize {
+    pub(crate) fn at(&self, input: usize) -> usize {
         input
             .saturating_mul(self.num)
             .div_ceil(self.den)
@@ -55,7 +55,7 @@ impl Linear {
 }
 
 /// The cost of one session's steps, checked as they run.
-pub struct Costs {
+pub(crate) struct Costs {
     session: String,
     steps: usize,
     /// Bytes live from the session's allocations, after the last step.
@@ -69,7 +69,7 @@ pub struct Costs {
 }
 
 /// The step's work, and what it charged to a budget besides.
-pub struct Charged<T> {
+pub(crate) struct Charged<T> {
     /// What the step returns.
     pub value: T,
     /// Bytes the step itself charged to a budget, such as a block it grew.
@@ -78,8 +78,8 @@ pub struct Charged<T> {
 
 impl Costs {
     /// A session named `session` in failure messages, with nothing live.
-    pub fn new(session: impl Into<String>) -> Costs {
-        Costs {
+    pub(crate) fn new(session: impl Into<String>) -> Self {
+        Self {
             session: session.into(),
             steps: 0,
             live: 0,
@@ -93,14 +93,14 @@ impl Costs {
     /// the charge when the bound rises, and gives none of it back until
     /// it closes, as the HTTP/2 server holds its HPACK table's: the most
     /// `bound` this session has passed, `bound` included.
-    pub fn held_charge(&mut self, bound: usize) -> usize {
+    pub(crate) fn held_charge(&mut self, bound: usize) -> usize {
         self.charge = self.charge.max(bound);
         self.charge
     }
 
     /// Runs one step on `input` bytes, with `charge` paid for what the
     /// session holds, and checks it against `charge` and `linear`.
-    pub fn step<T>(
+    pub(crate) fn step<T>(
         &mut self,
         input: usize,
         charge: usize,
@@ -141,7 +141,7 @@ impl Costs {
 
     /// Takes in another session's steps and closest calls, for a summary
     /// over many sessions.
-    pub fn absorb(&mut self, other: &Costs) {
+    pub(crate) fn absorb(&mut self, other: &Self) {
         self.steps += other.steps;
         let (p, a) = other.closest_charge;
         if p * self.closest_charge.1 > self.closest_charge.0 * a {
@@ -154,7 +154,7 @@ impl Costs {
     }
 
     /// One line: the steps checked, and the closest each bound came.
-    pub fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         format!(
             "{} steps within their charge and linear bound; closest: {} of {} bytes \
              charged, {} of {} bytes allowed",
