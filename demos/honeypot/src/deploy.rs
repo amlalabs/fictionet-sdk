@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -18,7 +17,6 @@ pub const HELP: &str = "honeypot run [OPTIONS]\n\
   --ssh PORT [--http PORT] [--http-profile caddy|nginx]\n\
   --mcp PORT --a2a PORT --fleet PORT   Northbank simulated company services\n\
   --ssh-auth accept|reject|password:VALUE\n\
-  --metrics IP:PORT       Explicit management Prometheus listener\n\
   --queue-bytes N --max-record-bytes N --rotate-bytes N --retain-files N\n\
   --restricted-evidence  Retain exact decrypted SSH bytes in protected files\n\
   --version              Build version\n\
@@ -27,7 +25,6 @@ This build has no packet path: run checks its options, then refuses to start.\n"
 pub struct Options {
     pub args: Args,
     pub state_dir: PathBuf,
-    pub metrics: Option<SocketAddr>,
     pub restricted_evidence: bool,
     pub queue_bytes: usize,
     pub max_record_bytes: usize,
@@ -69,14 +66,6 @@ impl Options {
         let state_dir = take(&mut values, "state-dir")
             .unwrap_or_else(|| "honeypot-state".into())
             .into();
-        let metrics: Option<SocketAddr> = take(&mut values, "metrics")
-            .map(|v| v.parse())
-            .transpose()?;
-        if metrics.is_some_and(|address| address.port() == 0) {
-            return Err(fictionet::Error::msg(
-                "metrics requires an explicit nonzero port",
-            ));
-        }
         let restricted_evidence = boolean(&mut values, "restricted-evidence")?;
         let queue_bytes = number(&mut values, "queue-bytes", 8 * 1024 * 1024)?;
         let max_record_bytes = number(&mut values, "max-record-bytes", 1024 * 1024)?;
@@ -126,7 +115,6 @@ impl Options {
         Ok(Self {
             args,
             state_dir,
-            metrics,
             restricted_evidence,
             queue_bytes,
             max_record_bytes,
@@ -147,7 +135,7 @@ impl Options {
             "burst_window_ms": self.args.config.burst.window.as_millis(), "burst_syns": self.args.config.burst.syns,
             "gateway": self.args.config.gateway, "gateway_v6": format!("{:?}", self.args.config.gateway_v6),
             "observations": ["mptcp", "ipv4_options", "ssh", "port_zero", "trap", "tcp_wire", "dns_wire", "tls_client_hello"],
-            "state_dir": self.state_dir, "metrics": self.metrics, "restricted_evidence": self.restricted_evidence,
+            "state_dir": self.state_dir, "restricted_evidence": self.restricted_evidence,
             "queue_bytes": self.queue_bytes, "max_record_bytes": self.max_record_bytes,
             "rotate_bytes": self.rotate_bytes, "retain_files_per_stream": self.retain_files, "observation_state_limit_per_map": honeypot_world::observe::STATE_LIMIT,
             "connection_limit": honeypot_world::CONNECTION_LIMIT,
@@ -280,7 +268,6 @@ mod tests {
             "--ssh 0",
             "--ssh 22 --http 22",
             "--queue-bytes 1",
-            "--metrics 127.0.0.1:0",
             "--state-dir a --state-dir b",
             "--ssh 53 --mcp 8081",
             "--address 10.44.0.11 --mcp 8081",

@@ -11,10 +11,9 @@ use std::time::Duration;
 
 use deploy::{Options, State};
 use fictionet_host::raw::RawAttachment;
-use honeypot_world::evidence::{Metrics, Writer, WriterConfig};
+use honeypot_world::evidence::{Writer, WriterConfig};
 use honeypot_world::{Clock, observe::Sinks};
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn main() -> fictionet::Result {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
@@ -90,19 +89,13 @@ async fn serve(
 ) -> fictionet::Result {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let metrics = match options.metrics {
-        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
-        None => None,
-    };
     let config = options.args.config.clone();
     let clock = Clock::starting_now();
-    let health = writer.metrics_handle();
     writer.record(&json!({"event": "backend_attached", "public_reachability": "not_tested"}))?;
     let raw_sink = writer.raw_sink();
     fictionet::run(fictionet::Seed::random(), move |fcx| {
         let started = honeypot_world::start_raw(&fcx, &config, clock, sinks, raw, raw_sink);
         if started.is_ok() {
-            if let Some(listener) = metrics { fcx.spawn(move |fcx| metrics_server(fcx, listener, health)); }
             fcx.spawn(move |fcx| async move {
                 fcx.race(None, async { tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} } }).await?;
                 fcx.cancel();
@@ -115,31 +108,4 @@ async fn serve(
         }
         std::future::ready(started.map(drop))
     }).await
-}
-
-async fn metrics_server(
-    fcx: fictionet::Cx,
-    listener: tokio::net::TcpListener,
-    metrics: Metrics,
-) -> fictionet::Result {
-    loop {
-        let (mut socket, _) = fcx.race(None, listener.accept()).await??;
-        let request = async {
-            let mut buffer = [0; 1024];
-            let count = socket.read(&mut buffer).await?;
-            let (status, body) = if buffer[..count].starts_with(b"GET /metrics HTTP/1.") {
-                ("200 OK", metrics.prometheus())
-            } else {
-                ("404 Not Found", String::new())
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await
-        };
-        let _ = fcx
-            .race(None, tokio::time::timeout(Duration::from_secs(2), request))
-            .await?;
-    }
 }

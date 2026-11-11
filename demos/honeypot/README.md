@@ -154,7 +154,7 @@ socket's `send_to` start traffic through the same `internet` attachment used
 for incoming traffic and replies, and on the Ethernet link through the same
 gateway. SSH input never starts traffic, and the executable runs no program.
 
-## Evidence and metrics
+## Evidence
 
 Files are named by stream, run and rotation index. `events-*.jsonl` contains
 versioned JSON objects with sensor/run identity, monotonic event sequence,
@@ -195,14 +195,14 @@ leave incomplete final records; restart preserves those files and starts new
 ones instead of appending into damaged tails. No automatic repair of old files
 is attempted.
 
-`--metrics 127.0.0.1:9108` enables a management HTTP listener. Prometheus
-scrapes `/metrics`. Metrics have bounded labels and remain readable during
-writer failure. They include queue occupancy, capture/event loss, write and sync
-failures, last persistence, port-zero observations and SSH authentication
-completions, MPTCP signals, and backend readiness. These observation counters
-describe records processed by the writer, not lossless ingress totals. Written
-event totals include Ethernet sidecars generated after queue admission.
-Software queue loss never substitutes for unknown NIC loss.
+The writer keeps health counters that stay readable during writer failure:
+queue occupancy, capture/event loss, write and sync failures, last
+persistence, port-zero observations and SSH authentication completions, MPTCP
+signals, and backend readiness. The observation counters describe records
+processed by the writer, not lossless ingress totals. Written event totals
+include Ethernet sidecars generated after queue admission. The executable
+prints the counters to standard error when it stops. Software queue loss
+never substitutes for unknown NIC loss.
 
 Observer maps each have a hard limit of 4096 entries and emit capacity loss
 records. Established service connections share a 256-connection guard.

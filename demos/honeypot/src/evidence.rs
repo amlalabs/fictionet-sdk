@@ -1,4 +1,4 @@
-//! Bounded evidence admission, independent file writing, and local health metrics.
+//! Bounded evidence admission, independent file writing, and health counters.
 //!
 //! A successful sink write means queued, not persisted. Files are synchronized
 //! at most one second after the worker next gets CPU and disk access, and on
@@ -177,35 +177,6 @@ impl Metrics {
             capture_bytes: c.capture_bytes.load(Ordering::Relaxed),
             backend_ready: c.backend_ready.load(Ordering::Relaxed),
         }
-    }
-
-    /// Prometheus text with a fixed set of aggregate metric names.
-    pub fn prometheus(&self) -> String {
-        let Value::Object(values) =
-            serde_json::to_value(self.snapshot()).expect("integer counters")
-        else {
-            unreachable!()
-        };
-        let mut text = String::new();
-        for (name, value) in values {
-            let gauge = matches!(
-                name.as_str(),
-                "queued_bytes"
-                    | "queued_records"
-                    | "last_write_us"
-                    | "last_sync_us"
-                    | "backend_ready"
-            );
-            let suffix = if gauge { "" } else { "_total" };
-            let kind = if gauge { "gauge" } else { "counter" };
-            let value = value
-                .as_bool()
-                .map_or_else(|| value.to_string(), |value| u8::from(value).to_string());
-            text.push_str(&format!(
-                "# TYPE honeypot_{name}{suffix} {kind}\nhoneypot_{name}{suffix} {value}\n"
-            ));
-        }
-        text
     }
 }
 
@@ -1258,12 +1229,6 @@ mod tests {
         assert_eq!(metrics.write_failures, 1);
         assert!(metrics.sync_failures >= 1);
         assert_eq!(metrics.queued_bytes, 0);
-        assert!(
-            admission
-                .metrics
-                .prometheus()
-                .contains("honeypot_dropped_events_total 1")
-        );
         assert_eq!(
             block_kinds(&fs::read(&dir.files("ip-")[0]).unwrap()),
             [0x0a0d0d0a, 1, 6]
