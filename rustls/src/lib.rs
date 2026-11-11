@@ -297,7 +297,11 @@
 //!
 
 // Require docs for public APIs, deny unsafe code, etc.
-#![forbid(unsafe_code, unused_must_use)]
+#![forbid(unused_must_use)]
+// Unsafe code only in the allocators that count what the tests and the
+// Kani proofs allocate (verification/resources), each allowed by name.
+#![cfg_attr(not(any(test, kani)), forbid(unsafe_code))]
+#![cfg_attr(any(test, kani), deny(unsafe_code))]
 #![cfg_attr(not(any(read_buf, bench, coverage_nightly)), forbid(unstable_features))]
 #![warn(
     clippy::alloc_instead_of_core,
@@ -384,6 +388,18 @@ mod log {
 #[cfg(test)]
 #[macro_use]
 mod test_macros;
+
+/// Counts what the code under a Kani proof allocates: see
+/// verification/resources/kani/counting.rs.
+#[cfg(kani)]
+#[allow(
+    unsafe_code,
+    unreachable_pub,
+    missing_docs,
+    clippy::std_instead_of_core
+)]
+#[path = "../../verification/resources/kani/counting.rs"]
+mod counting;
 
 /// This internal `sync` module aliases the `Arc` implementation to allow downstream forks
 /// of rustls targeting architectures without atomic pointers to replace the implementation

@@ -18,6 +18,8 @@ use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
 #[path = "tls_capture.rs"]
 mod capture;
+#[path = "tls_costs.rs"]
+mod costs;
 #[path = "tls_layer.rs"]
 mod layer;
 #[path = "tls_stack.rs"]

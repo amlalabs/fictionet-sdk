@@ -967,10 +967,20 @@ mod connection {
             }
         }
 
+        /// Whether the last [`Self::accept`] found the `ClientHello` whole but
+        /// the budget had no room for what parsing it allocates: call
+        /// [`Self::accept`] again once memory frees, before reading more.
+        pub fn wants_budget(&self) -> bool {
+            self.inner.as_ref().is_some_and(|conn| conn.wants_budget())
+        }
+
         /// Check if a `ClientHello` message has been received.
         ///
         /// Returns `Ok(None)` if the complete `ClientHello` has not yet been received.
-        /// Do more I/O and then call this function again.
+        /// Do more I/O and then call this function again. With a budget, the
+        /// room for what parsing the hello allocates is charged before it is
+        /// parsed, and kept by the [`Accepted`] while it holds the hello; without
+        /// that room this returns `Ok(None)` and [`Self::wants_budget`] says so.
         ///
         /// Returns `Ok(Some(accepted))` if the connection has been accepted. Call
         /// `accepted.into_connection()` to continue. Do not call this function again.
@@ -1137,9 +1147,11 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
 ///
 /// Contains the state required to resume the connection through [`Accepted::into_connection()`].
 pub struct Accepted {
-    connection: ConnectionCommon<ServerConnectionData>,
+    // The hello first: fields drop in order, and the connection holds the
+    // room charged for what the hello took to parse.
     message: Message<'static>,
     sig_schemes: Vec<SignatureScheme>,
+    connection: ConnectionCommon<ServerConnectionData>,
 }
 
 impl Accepted {
@@ -1242,19 +1254,27 @@ impl Accepted {
                     .map(|()| new)
             }),
         };
-        self.connection.core.common_state.release_step();
+        // The hello is done with, and the room for what parsing it took
+        // goes back with it.
+        let Self {
+            message,
+            sig_schemes,
+            mut connection,
+        } = self;
+        drop((message, sig_schemes));
+        connection.core.common_state.release_step();
         let new = match new {
             Ok(new) => new,
             Err(err) => {
                 return Err(IntoConnectionError::Failed(
                     err,
-                    AcceptedAlert::from(self.connection),
+                    AcceptedAlert::from(connection),
                 ))
             }
         };
 
-        self.connection.replace_state(new);
-        Ok(self.connection)
+        connection.replace_state(new);
+        Ok(connection)
     }
 
     fn client_hello_payload<'a>(message: &'a Message<'_>) -> &'a ClientHelloPayload {

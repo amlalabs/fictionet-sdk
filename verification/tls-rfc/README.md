@@ -10,7 +10,10 @@ spec. Real runs of rustls are tied to the models three ways: handshake logs
 and record logs replayed by TLC, and Lean vectors replayed by Rust tests.
 
 The SDK's own layer around rustls (credit, completions, close) is the
-`tls` area; what a replacement TLS must keep is `tls-contract`.
+`tls` area; what a replacement TLS must keep is `tls-contract`. What
+rustls and the layer allocate, and that it is paid for before it grows
+and copied a bounded number of times, is in `tls/README.md`, "Resource
+properties" (`cargo xtask tls-verify resources`).
 
 ## What is proved
 

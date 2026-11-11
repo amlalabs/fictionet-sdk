@@ -50,6 +50,12 @@ pub(crate) struct Delocator<'b> {
 }
 
 impl<'b> Delocator<'b> {
+    /// The buffer the ranges are in.
+    #[inline]
+    pub(crate) fn slice(&self) -> &'b [u8] {
+        self.slice
+    }
+
     #[inline]
     pub(crate) fn new(slice: &'b [u8]) -> Self {
         Self { slice }
@@ -166,6 +172,12 @@ impl BufferProgress {
     }
 }
 
+/// TLS allows for handshake messages of up to 16MB.  We
+/// restrict that to 64KB to limit potential for denial-of-
+/// service.
+#[cfg(feature = "std")]
+const MAX_HANDSHAKE_SIZE: usize = 0xffff;
+
 #[derive(Default, Debug)]
 pub(crate) struct DeframerVecBuffer {
     /// Buffer of data read from the socket, in the process of being parsed into messages.
@@ -190,22 +202,29 @@ impl DeframerVecBuffer {
     }
 
     /// Makes `buf` `len` bytes long, paying for the capacity first. Refuses,
-    /// changing nothing, if the budget has no room. A smaller length gives
-    /// the capacity past it back.
+    /// changing nothing, if the budget has no room.
+    ///
+    /// A buffer that must grow grows to at least twice its capacity, up to
+    /// `most`, so that a message joined from many records is moved to a
+    /// larger allocation a few times, not once a record. Growing moves the
+    /// bytes to a new allocation while the old one is still held, so both
+    /// are paid for until the old one is freed. The capacity stays until
+    /// the buffer empties ([`Self::release_if_empty`]): giving part of it
+    /// back would move the bytes again.
     #[must_use = "a refused growth must not be followed by a write past the length"]
-    fn resize(&mut self, len: usize) -> bool {
+    fn resize(&mut self, len: usize, most: usize) -> bool {
         let capacity = self.buf.capacity();
         if len > capacity {
-            if !self.paid.grow_by(len - capacity) {
+            let grown = len.max(Ord::min(capacity * 2, most));
+            if !self.paid.grow_by(grown) {
                 return false;
             }
-            self.buf.reserve_exact(len - self.buf.len());
+            self.buf.reserve_exact(grown - self.buf.len());
+            // The old allocation is freed: its charge goes back, and so
+            // does any the new one does not hold.
+            self.paid.shrink_by(capacity + grown - self.buf.capacity());
         }
         self.buf.resize(len, 0);
-        if len < capacity {
-            self.buf.shrink_to(len);
-            self.paid.shrink_by(capacity - self.buf.capacity());
-        }
         true
     }
 
@@ -285,9 +304,9 @@ impl DeframerVecBuffer {
     /// Reads bytes from `rd` up to the end of the record arriving, and no
     /// further. The buffer holds the parts of a handshake message being
     /// joined, which end at `joined`, and after them at most one record:
-    /// the one arriving. It grows to exactly what that record takes, paid
-    /// for before it grows: its header first, then the rest once the header
-    /// says how long the record is and is checked to be a record's header.
+    /// the one arriving. It grows to hold that record, paid for before it
+    /// grows: its header first, then the rest once the header says how
+    /// long the record is and is checked to be a record's header.
     ///
     /// Fails, having read nothing, with [`io::ErrorKind::OutOfMemory`] if
     /// the buffer must grow and the budget has no room,
@@ -327,14 +346,9 @@ impl DeframerVecBuffer {
         result
     }
 
-    /// Sizes `buf` to exactly what the record arriving takes, or its header
-    /// while that is incomplete.
+    /// Sizes `buf` to what the record arriving takes, or its header while
+    /// that is incomplete: its length exactly, its capacity perhaps more.
     fn prepare_read(&mut self, joined: usize, joining: bool) -> Result<(), NoRoom> {
-        /// TLS allows for handshake messages of up to 16MB.  We
-        /// restrict that to 64KB to limit potential for denial-of-
-        /// service.
-        const MAX_HANDSHAKE_SIZE: usize = 0xffff;
-
         // We allow a maximum of 64k of buffered data for handshake messages
         // only: the parts of the message joined so far stay in the buffer
         // ahead of the record arriving.
@@ -351,7 +365,7 @@ impl DeframerVecBuffer {
         // A record that would take a message being joined past the most it
         // may hold is read up to the limit; processing it fails then.
         let need = Ord::min(end, allow_max);
-        if need != self.buf.len() && !self.resize(need) {
+        if need != self.buf.len() && !self.resize(need, allow_max) {
             return Err(NoRoom::Unpaid);
         }
 
@@ -377,7 +391,7 @@ impl DeframerVecBuffer {
         let len = bytes.len();
         let start = self.used;
         let end = start + len;
-        if self.buf.len() < end && !self.resize(end) {
+        if self.buf.len() < end && !self.resize(end, end.max(MAX_HANDSHAKE_SIZE)) {
             return None;
         }
         self.buf[start..end].copy_from_slice(bytes);
@@ -445,3 +459,10 @@ impl<'a> DeframerSliceBuffer<'a> {
         &mut self.buf[self.discard..]
     }
 }
+
+/// Bounded proofs that the read buffer holds no more than it is charged
+/// and moves what it holds a few times as a message is joined, with every
+/// allocation counted, run with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(all(kani, feature = "std"))]
+#[path = "../../../../verification/tls/kani/deframer.rs"]
+mod resource_proofs;

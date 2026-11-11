@@ -6,6 +6,9 @@
 /// bounds (see verification/README.md, "Resource properties").
 #[path = "../../../verification/resources/alloc.rs"]
 pub mod alloc;
+/// The cost bounds of a replay's steps, on that allocator.
+#[path = "../../../verification/resources/cost.rs"]
+pub mod cost;
 pub mod echo_stack;
 pub mod io;
 pub mod line_stack;

@@ -16,9 +16,16 @@ use crate::lean_vectors::{Report, logged, scoped};
 
 /// The Kani harnesses `harnesses` of `package`'s library, with the
 /// allocation functions stubbed by their counting ones (`-Z stubbing`) and
-/// `malloc` under them (`-Z c-ffi`), which tell a live allocation from a dangling pointer (`-Z mem-predicates`). Each harness must report
-/// `VERIFICATION:- SUCCESSFUL`.
-pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Result<Report> {
+/// `malloc` under them (`-Z c-ffi`), which tell a live allocation from a dangling pointer (`-Z mem-predicates`), and Kani's
+/// `flags` besides. Each harness must report `VERIFICATION:- SUCCESSFUL`.
+/// What Kani prints goes to `kani-<package>.out`.
+pub fn kani(
+    root: &Path,
+    out: &Path,
+    package: &str,
+    flags: &[&str],
+    harnesses: &[&str],
+) -> Result<Report> {
     let mut report = Report::new("kani");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = scoped(cargo, "14G");
@@ -35,12 +42,13 @@ pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Resul
         "mem-predicates",
         "--exact",
     ]);
+    command.args(flags);
     for harness in harnesses {
         command.arg("--harness").arg(harness);
     }
     let (text, ran) = logged(
         command.env("CARGO_BUILD_JOBS", "8").current_dir(root),
-        &out.join("kani.out"),
+        &out.join(format!("kani-{package}.out")),
     )?;
     // Kani prints each harness's name, then its verdict.
     let mut current = None;
@@ -57,12 +65,12 @@ pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Resul
     for harness in harnesses {
         match verdicts.iter().find(|(name, _)| name == harness) {
             Some((_, true)) => report.pass(format!("{harness}: successful")),
-            Some((_, false)) => report.fail(format!("{harness}: failed; see kani.out")),
-            None => report.fail(format!("{harness}: no verdict; see kani.out")),
+            Some((_, false)) => report.fail(format!("{harness}: failed; see kani-{package}.out")),
+            None => report.fail(format!("{harness}: no verdict; see kani-{package}.out")),
         }
     }
     if !ran && verdicts.iter().all(|(_, ok)| *ok) {
-        report.fail("cargo kani failed; see kani.out".to_string());
+        report.fail(format!("cargo kani failed; see kani-{package}.out"));
     }
     Ok(report)
 }

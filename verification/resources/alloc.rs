@@ -12,7 +12,7 @@ use std::cell::Cell;
 
 struct RefusingAllocator;
 
-thread_local! {
+std::thread_local! {
     static REFUSE_LARGE: Cell<bool> = const { Cell::new(false) };
     pub(crate) static MEASUREMENT: Cell<Option<Measurement>> = const { Cell::new(None) };
 }

@@ -60,15 +60,14 @@ impl HandshakeDeframer {
                 version: msg.version,
                 size: None,
                 bounds: containing_buffer.locate(msg.payload),
+                cut: true,
             });
             return;
         }
 
         // otherwise, we can expect `msg` to contain a handshake header introducing
         // a new message (and perhaps several of them.)
-        for span in DissectHandshakeIter::new(msg, containing_buffer) {
-            self.spans.push(span);
-        }
+        self.spans.extend(dissect_first(msg, containing_buffer));
     }
 
     /// Returns a `BufferProgress` that skips over unprocessed handshake data.
@@ -78,10 +77,15 @@ impl HandshakeDeframer {
 
     /// Do we have a message ready? ie, would `iter().next()` return `Some`?
     pub(crate) fn has_message_ready(&self) -> bool {
-        match self.spans.first() {
-            Some(span) => span.is_complete(),
-            None => false,
-        }
+        self.ready_len().is_some()
+    }
+
+    /// The length of the message ready, header included, if one is.
+    pub(crate) fn ready_len(&self) -> Option<usize> {
+        self.spans
+            .first()
+            .filter(|span| span.is_complete())
+            .map(|span| span.bounds.len())
     }
 
     /// Do we have any message data, partial or otherwise?
@@ -204,7 +208,7 @@ impl HandshakeDeframer {
             payload: delocator.slice_from_range(&first.bounds),
         };
 
-        for (i, span) in DissectHandshakeIter::new(msg, &delocator.locator()).enumerate() {
+        for (i, span) in dissect_first(msg, &delocator.locator()).enumerate() {
             self.spans.insert(index + i, span);
         }
     }
@@ -221,6 +225,27 @@ impl HandshakeDeframer {
                 .find_map(|(i, span)| (!span.is_complete()).then_some(i))
         })
     }
+}
+
+/// The spans of `msg`'s handshake messages, at most two: the first
+/// message's, and the rest of `msg` not yet cut into messages, which is cut
+/// a message at a time as the ones before it are taken
+/// ([`HandshakeIter`]'s drop). A record of many messages, each as small as
+/// four bytes, holds two spans, not one for each.
+fn dissect_first(
+    msg: InboundPlainMessage<'_>,
+    containing_buffer: &Locator,
+) -> impl Iterator<Item = FragmentSpan> {
+    let version = msg.version;
+    let mut dissect = DissectHandshakeIter::new(msg, containing_buffer);
+    let first = dissect.next();
+    let rest = (!dissect.payload.is_empty()).then(|| FragmentSpan {
+        version,
+        size: None,
+        bounds: containing_buffer.locate(dissect.payload),
+        cut: false,
+    });
+    first.into_iter().chain(rest)
 }
 
 struct DissectHandshakeIter<'a, 'b> {
@@ -255,6 +280,7 @@ impl Iterator for DissectHandshakeIter<'_, '_> {
                 version: self.version,
                 size: None,
                 bounds: bounds.clone(),
+                cut: true,
             });
         }
 
@@ -276,6 +302,7 @@ impl Iterator for DissectHandshakeIter<'_, '_> {
             version: self.version,
             size: Some(size),
             bounds: bounds.clone(),
+            cut: true,
         })
     }
 }
@@ -320,6 +347,19 @@ impl<'b> Iterator for HandshakeIter<'_, 'b> {
 impl Drop for HandshakeIter<'_, '_> {
     fn drop(&mut self) {
         self.deframer.spans.drain(..self.index);
+        // The rest of a record, once the messages before it are taken, is
+        // cut for its next message: it is the last span.
+        if self.deframer.spans.first().is_some_and(|span| !span.cut) {
+            let rest = self.deframer.spans.remove(0);
+            let slice = self.containing_buffer.slice();
+            let msg = InboundPlainMessage {
+                typ: ContentType::Handshake,
+                version: rest.version,
+                payload: &slice[rest.bounds],
+            };
+            let spans = dissect_first(msg, &Locator::new(slice));
+            self.deframer.spans.extend(spans);
+        }
         // Every message handed out: the spans of a finished flight go.
         if self.deframer.spans.is_empty() {
             self.deframer.spans = Vec::new();
@@ -328,7 +368,7 @@ impl Drop for HandshakeIter<'_, '_> {
 }
 
 #[derive(Debug)]
-struct FragmentSpan {
+pub(crate) struct FragmentSpan {
     /// version taken from containing message.
     version: ProtocolVersion,
 
@@ -340,6 +380,11 @@ struct FragmentSpan {
 
     /// bounds of the handshake message, including header
     bounds: Range<usize>,
+
+    /// Whether this is one message's span, or the start of one. `false`
+    /// for the rest of a record not yet cut into messages
+    /// ([`dissect_first`]), which is always the last span.
+    cut: bool,
 }
 
 impl FragmentSpan {

@@ -139,7 +139,9 @@ impl Job for Pick {
 ///
 /// The connection's budget pays for every buffer it holds, rustls's own
 /// included: the bytes waiting for the rest of their record, the records
-/// going down, the handshake records rustls queues, and the hello snapshot.
+/// going down, the handshake records rustls queues, what parsing each of
+/// the client's handshake messages holds (the hello's until it is
+/// answered), and the hello snapshot.
 /// A buffer the budget has no room for waits: the layer takes no more input,
 /// keeps the write it could not pay for, and goes on when memory frees. An
 /// idle connection holds no buffer. It is charged the hello and the room
@@ -405,6 +407,36 @@ impl TlsLayer {
         self.completed_plaintext_bytes = 0;
     }
 
+    /// Asks the acceptor for the client's hello: taken once it is whole and
+    /// the budget pays for what parsing it holds, which the hello keeps
+    /// until it is answered. Until then the acceptor stays, and
+    /// [`Self::hello_waits`] says whether it is the room it waits for.
+    fn accept(&mut self) {
+        let Some(acceptor) = self.acceptor.as_mut() else {
+            return;
+        };
+        match acceptor.accept() {
+            Ok(Some(accepted)) => {
+                self.accepted = Some(accepted);
+                self.acceptor = None;
+            }
+            Ok(None) => {}
+            Err((error, alert)) => {
+                if self.first_byte == Some(22) {
+                    self.alert = Some(alert);
+                }
+                self.acceptor = None;
+                self.fail(Self::protocol_error(error));
+            }
+        }
+    }
+
+    /// The client's hello is whole, and waits for the budget to pay for
+    /// what parsing it holds.
+    fn hello_waits(&self) -> bool {
+        self.acceptor.as_ref().is_some_and(Acceptor::wants_budget)
+    }
+
     /// Answers the client's hello with `config`. `false` if the budget had
     /// no room for the server's flight: the hello and the config are kept
     /// to try again when memory frees.
@@ -658,34 +690,16 @@ impl TlsLayer {
                 self.pump(budget)?;
                 return Ok(None);
             };
-            let end = record_end(input, joined);
-            if joined != 0 && end > JOINED {
-                self.fail(HandshakeError::Failed(
-                    "a handshake message outgrew the most a message may be joined in".into(),
-                ));
-                continue;
+            match join(input, &mut chunk, joined, budget)? {
+                Joined::Took => {}
+                Joined::Unpaid => return Ok(Some(chunk)),
+                Joined::Outgrew => {
+                    self.fail(HandshakeError::Failed(
+                        "a handshake message outgrew the most a message may be joined in".into(),
+                    ));
+                    continue;
+                }
             }
-            let take = end.saturating_sub(input.len()).min(chunk.len());
-            // The rest of a record goes in after what is held, in place
-            // when the buffer has room. A new buffer has room for the
-            // whole record arriving, and while a message is being joined
-            // for twice what is held, so that joining a message from many
-            // records copies what is held a few times, not once a record.
-            if input.extend_within(&chunk[..take]).is_err() {
-                let room = match joined {
-                    0 => end,
-                    _ => end.max(input.len() * 2).min(JOINED),
-                };
-                let Some(mut bytes) = Chunk::block(budget, 0, room) else {
-                    return Ok(Some(chunk));
-                };
-                bytes
-                    .extend_within(input)
-                    .and_then(|()| bytes.extend_within(&chunk[..take]))
-                    .map_err(|_| HandshakeError::Failed("a record outgrew its buffer".into()))?;
-                *input = bytes;
-            }
-            chunk.advance(take);
             self.pump(budget)?;
         }
     }
@@ -701,6 +715,55 @@ impl TlsLayer {
             self.plaintext_completion = None;
         }
     }
+}
+
+/// What [`join`] did with the start of a chunk.
+enum Joined {
+    /// It took the bytes, up to the end of the record arriving.
+    Took,
+    /// The input held needs a larger buffer and the budget has no room:
+    /// nothing was taken.
+    Unpaid,
+    /// The parts of the handshake message being joined would need more
+    /// than [`JOINED`]: nothing was taken, and the connection fails.
+    Outgrew,
+}
+
+/// Takes the start of `chunk` into `input`, the bytes held, up to the end
+/// of the record arriving after `joined` bytes of them, which rustls is
+/// joining as a handshake message. The bytes go in after what is held, in
+/// place when the buffer has room. Otherwise they go with what is held
+/// into a new buffer, paid for first while the old one is still held, with
+/// room for the whole record arriving and, while a message is being
+/// joined, for twice what is held, up to [`JOINED`]: joining a message from
+/// many records copies what is held a few times, not once a record.
+fn join(
+    input: &mut Chunk,
+    chunk: &mut Chunk,
+    joined: usize,
+    budget: &Budget,
+) -> Result<Joined, HandshakeError> {
+    let end = record_end(input, joined);
+    if joined != 0 && end > JOINED {
+        return Ok(Joined::Outgrew);
+    }
+    let take = end.saturating_sub(input.len()).min(chunk.len());
+    if input.extend_within(&chunk[..take]).is_err() {
+        let room = match joined {
+            0 => end,
+            _ => end.max(input.len() * 2).min(JOINED),
+        };
+        let Some(mut bytes) = Chunk::block(budget, 0, room) else {
+            return Ok(Joined::Unpaid);
+        };
+        bytes
+            .extend_within(input)
+            .and_then(|()| bytes.extend_within(&chunk[..take]))
+            .map_err(|_| HandshakeError::Failed("a record outgrew its buffer".into()))?;
+        *input = bytes;
+    }
+    chunk.advance(take);
+    Ok(Joined::Took)
 }
 
 /// Where the record arriving after `joined` bytes of `input` ends, or its
@@ -814,7 +877,21 @@ impl Layer for TlsLayer {
                         Some(rest) => rest,
                         None => return Ok(Admit::Taken),
                     }
-                } else if let Some(acceptor) = self.acceptor.as_mut() {
+                } else if self.acceptor.is_some() {
+                    // A whole hello waiting for the room to parse it is
+                    // taken first: nothing more is read before it.
+                    if self.hello_waits() {
+                        self.accept();
+                        if self.failed {
+                            return Ok(Admit::Closed(StreamEvent::Data(chunk)));
+                        }
+                        if self.hello_waits() || self.accepted.is_some() {
+                            return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
+                        }
+                    }
+                    let Some(acceptor) = self.acceptor.as_mut() else {
+                        return Ok(Admit::Closed(StreamEvent::Data(chunk)));
+                    };
                     let mut chunk = chunk;
                     self.first_byte.get_or_insert(chunk[0]);
                     let n = match acceptor.read_tls(&mut &chunk[..]) {
@@ -834,20 +911,7 @@ impl Layer for TlsLayer {
                         }
                     };
                     chunk.advance(n);
-                    match acceptor.accept() {
-                        Ok(Some(accepted)) => {
-                            self.accepted = Some(accepted);
-                            self.acceptor = None;
-                        }
-                        Ok(None) => {}
-                        Err((error, alert)) => {
-                            if self.first_byte == Some(22) {
-                                self.alert = Some(alert);
-                            }
-                            self.acceptor = None;
-                            self.fail(Self::protocol_error(error));
-                        }
-                    }
+                    self.accept();
                     chunk
                 } else {
                     return Ok(Admit::Closed(StreamEvent::Data(chunk)));
@@ -956,6 +1020,16 @@ impl Layer for TlsLayer {
                 return Ok(true);
             }
             return Ok(false);
+        }
+        // Memory freed since the budget had no room to parse the hello.
+        if self.hello_waits() {
+            self.accept();
+            if self.hello_waits() {
+                return Ok(false);
+            }
+            if self.failed {
+                return Ok(true);
+            }
         }
         if self.hello.is_none()
             && let Some(accepted) = self.accepted.as_ref()
@@ -1089,6 +1163,13 @@ impl Layer for TlsLayer {
 #[cfg(kani)]
 #[path = "../../../../verification/tls/kani/LayerProof.rs"]
 mod proofs;
+
+/// Bounded proofs that the input joined for a handshake message stays
+/// within its budget and is moved a few times, with every allocation
+/// counted, run with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../../verification/tls/kani/join.rs"]
+mod resource_proofs;
 
 impl super::Negotiation for TlsLayer {
     fn handshake(&self) -> super::Handshake<'_> {

@@ -7,6 +7,7 @@
 //! | `tls-verify vectors [seed]` | writes the Lean model's vectors (`lake exe gen`) and replays them against the real rustls: `record_vectors` (`rustls/src/budget/tests/record_vectors.rs`) and `nonce_vectors` (`rustls/src/common_state/nonce_vectors.rs`); the seed defaults to 1 |
 //! | `tls-verify handshake-trace` | logs real handshakes of the vendored server (`rustls/src/server/hs_trace.rs`) and checks each log against `verification/tls-rfc/tla/Handshake.tla` with `HandshakeTrace.tla` (`tls_verify_handshake.rs`) |
 //! | `tls-verify record-trace` | logs a real budgeted server and client under seeded schedules (`rustls/src/budget/record_trace.rs`) and checks each log against `verification/tls-rfc/tla/Record.tla` with `RecordTrace.tla` (`tls_verify_record.rs`) |
+//! | `tls-verify resources` | the resource properties (`verification/tls/README.md`): the counted Kani harnesses of rustls's read buffer, `Join.tla`'s configs, and the costed replays of rustls (`budget::costs`) and the layer (`tests/it/tls_costs.rs`) |
 //!
 //! Everything is written under a fresh run directory in `tls-verify/` in
 //! Cargo's target directory (`CARGO_TARGET_DIR`, or `target/`). `LAKE`
@@ -16,6 +17,42 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Result;
+use crate::lean_vectors::{Report, scoped};
+use crate::resources;
+
+/// The counter's own check, then rustls's read buffer as a message is
+/// joined in it (`verification/tls/kani/deframer.rs`).
+const KANI_RUSTLS: [&str; 4] = [
+    "counting::proofs::the_counter_sees_every_allocation",
+    "msgs::deframer::buffers::resource_proofs::reading_a_record_stays_within_its_charge",
+    "msgs::deframer::buffers::resource_proofs::joining_three_records_stays_within_its_charge",
+    "msgs::deframer::buffers::resource_proofs::joining_eight_records_copies_linearly",
+];
+
+// The layer's harnesses (`verification/tls/kani/join.rs`) are not run
+// here: the three-record one did not finish in 25 minutes, CBMC following
+// the budget's atomics and its lock (verification/tls/README.md, "Kani").
+
+/// A call through a trait object (a budget, a reader, an error's drop) is
+/// resolved to the types that implement it, not every function of its
+/// shape; without it the harnesses did not finish.
+const KANI_FLAGS: [&str; 2] = ["-Z", "restrict-vtable"];
+
+/// `Join.tla`'s configs: the code, and a control for each rule.
+const TLC_RESOURCES: [&str; 5] = [
+    "Join_base.cfg",
+    "Join_without_doubling.cfg",
+    "Join_without_chargeold.cfg",
+    "Join_without_cap.cfg",
+    "Join_without_parseroom.cfg",
+];
+
+/// The costed replays: a package's tests, filtered, each of whose steps is
+/// held to its bounds (`verification/resources/cost.rs`).
+const REPLAYS: [(&str, &[&str], &str); 2] = [
+    ("fictionet-rustls", &["--lib"], "budget::costs"),
+    ("fictionet", &["--test", "it"], "tls::costs"),
+];
 
 /// Runs `tls-verify` with the arguments after it.
 pub fn run(args: &[String]) -> Result {
@@ -26,10 +63,67 @@ pub fn run(args: &[String]) -> Result {
         ["vectors", seed] => vectors(&Paths::new()?, seed.parse()?),
         ["handshake-trace"] => crate::tls_verify_handshake::trace(),
         ["record-trace"] => crate::tls_verify_record::record(),
-        _ => {
-            Err("expected tls-verify lean, vectors [seed], handshake-trace or record-trace".into())
+        ["resources"] => {
+            let report = resources_report(&Paths::new()?)?;
+            report.print();
+            report.result("tls-verify")
+        }
+        _ => Err(
+            "expected tls-verify lean, vectors [seed], handshake-trace, record-trace or resources"
+                .into(),
+        ),
+    }
+}
+
+/// The resource properties: Kani, TLC and the costed replays.
+fn resources_report(paths: &Paths) -> Result<Report> {
+    let mut report = Report::new("resources");
+    report.absorb(resources::kani(
+        &paths.root,
+        &paths.out,
+        "fictionet-rustls",
+        &KANI_FLAGS,
+        &KANI_RUSTLS,
+    )?);
+    report.absorb(resources::tlc(
+        &paths.root,
+        &paths.out,
+        &paths.root.join("verification/tls/tla"),
+        "Join",
+        &TLC_RESOURCES,
+    )?);
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    for (package, target, filter) in REPLAYS {
+        let log = paths.out.join(format!("costs-{package}.out"));
+        let (text, passed) = crate::lean_vectors::logged(
+            scoped(&cargo, "8G")
+                .args(["test", "-p", package])
+                .args(target)
+                .args(["--", "--nocapture", filter])
+                .env("CARGO_BUILD_JOBS", "8")
+                .current_dir(&paths.root),
+            &log,
+        )?;
+        let costs: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("cost: "))
+            .collect();
+        for line in &costs {
+            report.pass(format!("{package}: {}", line.trim()));
+        }
+        if !passed {
+            report.fail(format!(
+                "{package} {filter}: a cost bound broke; see {}",
+                log.display()
+            ));
+        } else if costs.is_empty() {
+            report.fail(format!(
+                "{package} {filter}: no session was costed; see {}",
+                log.display()
+            ));
         }
     }
+    Ok(report)
 }
 
 /// Where the sources are and where the results go.

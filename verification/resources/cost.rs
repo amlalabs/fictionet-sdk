@@ -31,7 +31,9 @@
 // Each binary that includes it uses only part of it.
 #![allow(dead_code)]
 
-use crate::alloc::measuring_left;
+use std::string::String;
+
+use super::alloc::measuring_left;
 
 /// `per * input + fixed` bytes, with `per` a fraction `num / den`.
 #[derive(Clone, Copy, Debug)]
@@ -155,7 +157,7 @@ impl Costs {
 
     /// One line: the steps checked, and the closest each bound came.
     pub(crate) fn summary(&self) -> String {
-        format!(
+        std::format!(
             "{} steps within their charge and linear bound; closest: {} of {} bytes \
              charged, {} of {} bytes allowed",
             self.steps,

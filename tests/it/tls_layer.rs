@@ -315,6 +315,66 @@ fn fill(budget: &Budget) -> fictionet::stdlib::layer::Charge {
     budget.charge(budget.limit() - budget.used()).unwrap()
 }
 
+/// A whole hello the budget has no room to parse waits, parsed by nothing
+/// and holding nothing unpaid, and is taken when memory frees.
+#[test]
+fn a_hello_without_room_to_parse_waits_for_memory_and_then_goes() {
+    block_on(lab(Seed::from_u64(22), |fcx| async move {
+        let ca = Ca::new(&fcx, "Test CA")?;
+        let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
+        let client_config = client_config(&fcx, &ca, &[b"http/1.1"]);
+        let mut client = rustls::ClientConnection::new(
+            client_config,
+            rustls::pki_types::ServerName::try_from("example.test").unwrap(),
+        )?;
+        let budget = Budget::new(256 << 10);
+        let mut server = Harness::with_budget(
+            Seed::from_u64(22),
+            tls::TlsLayer::new(config.clone()),
+            budget.clone(),
+        );
+        let hello = client_output(&mut client);
+        let (last, first) = hello.split_last().unwrap();
+        server.push(first)?;
+        assert!(server.work().is_none());
+
+        // The last byte needs no more buffer, only the room to parse.
+        let others = fill(&budget);
+        let refusals = server.driver().refusals();
+        let ((), held) = crate::common::alloc::left_allocated(|| {
+            server.push(&[*last]).unwrap();
+        });
+        assert!(server.work().is_none(), "a hello was parsed unpaid");
+        assert!(server.layer().hello().is_none());
+        assert!(server.layer().failure().is_none());
+        // What rustls keeps of the waiting message is where it lies in the
+        // read buffer, paid for: its spans, at most four of a version, an
+        // optional size and a range (48 bytes at most each), and nothing
+        // parsed.
+        const SPANS: i128 = 4 * 48;
+        assert!(
+            held <= SPANS,
+            "the step kept {held} bytes the budget had no room for"
+        );
+        assert!(server.driver().budget().refused_since(refusals));
+
+        drop(others);
+        server.settle()?;
+        assert!(server.work().is_some(), "the hello was not taken");
+        server.complete(Some(config))?;
+        for _ in 0..32 {
+            receive(&mut client, &server.take_output());
+            server.push(&client_output(&mut client))?;
+            if !client.is_handshaking() && !server.layer().is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.layer().is_handshaking());
+        Ok(())
+    }))
+    .unwrap();
+}
+
 #[test]
 fn a_flight_without_room_waits_for_memory_and_then_goes() {
     block_on(lab(Seed::from_u64(21), |fcx| async move {
