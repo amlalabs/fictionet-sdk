@@ -439,8 +439,12 @@ connection with `COMPRESSION_ERROR` (`HeaderBlocks::read_fragment`), so
 an error (it clears only the entries) never meets another block. A
 header block past the block limit ends the connection with
 `ENHANCE_YOUR_CALM` before any decoding (`HeaderBlocks::read_fragment`),
-and one without room to join its CONTINUATION fragments waits for memory
-like the trailers (`HeaderBlocks::reserve`), the table untouched.
+and one without room to keep its CONTINUATION fragments waits for memory
+like the trailers (`HeaderBlocks::join`), the table untouched. Fragments
+are kept in segments that never move and decoded across them where they
+lie (`hpack::Block`), never joined; `tests/hpack_vectors.rs` decodes every
+block of the `blocks` sessions both whole and cut into pieces of one to
+seven bytes, and holds the two to the same result.
 
 ### What the Lean model leaves out
 

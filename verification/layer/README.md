@@ -190,6 +190,18 @@ grew to eight places against a limit of eleven before; the budget's own
 tests are `a_growth_that_moves_takes_the_old_allocation_with_it` and
 `a_charge_tried_without_room_is_no_refusal`.
 
+**Storage that never moves.** The move is real memory, so storage that
+grows by much, such as HTTP/2's header blocks and request bodies
+(`verification/http/README.md`), is kept in `ChargedSegments`: a growth
+charges and allocates one more segment, copying nothing, and the room
+left is in the last segment alone, under an eighth of what is held or
+256 bytes, and under 16 KiB. Tests:
+`segments_grow_without_moving_what_they_hold` (no segment written before
+moves, the capacity stays within that bound, the charge is the
+allocation, a refusal changes nothing) and
+`segments_keep_their_floor_and_take_a_known_length_once` (`charged.rs`).
+The random calls of the containers' model do not include them.
+
 **What is charged.** Each container pays from a `Budget` before it
 allocates; the harnesses give it a budget of its own, so its limit is the
 charge. The report store has a budget of its own (`Observations::bounded`)

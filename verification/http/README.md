@@ -826,34 +826,55 @@ cargo test -p fictionet --test it http_resources
 to the connection's budget before it is allocated: a pool slot, a block
 of its own (`Chunk::block`), or the largest block the budget has room for
 (`Budget::charge_within`); the first delivery is taken as it came and
-charged its capacity (`Chunk::repay`). An HTTP/2 header block is joined
-in `ChargedBytes` (`HeaderBlocks::join`), and `Respond` collects a body
-in `ChargedBytes` (`collect_into`). A response body goes down in chunks
-its child charged, within the credit the connection gives
+charged its capacity (`Chunk::repay`). An HTTP/2 header block split
+across frames or pieces is kept in `ChargedSegments`
+(`HeaderBlocks::join`) and decoded across them where they lie
+(`hpack::Block`). `Respond` keeps a body in `ChargedSegments` too
+(`collect_into`): one segment of exactly its `content-length` when that
+is known, taken with its first bytes. A response body goes down in
+chunks its child charged, within the credit the connection gives
 (`SEND_CREDIT`, `more_credit`); received DATA is held within the receive
 window the connection advertised.
 
-**The growth rule.** Each join replaces full storage with storage twice
-as large, up to its limit (the head limit, the block limit, the body
-limit), and when the budget has no room for that, with the largest it has
-room for, if that holds what is needed. A head or header block the
-budget has no room for waits for memory; a body ends with `503`.
+**The growth rule.** An HTTP/1 head replaces full storage with storage
+twice what it holds, up to the head limit, and when the budget has no
+room for that, with the largest it has room for, if that holds what is
+needed. HTTP/2 storage never moves: a piece fills the room in the last
+segment, and the rest takes one new segment, charged before it is
+allocated, of the rest or an eighth of what is held if that is more,
+between 256 bytes and 16 KiB, never past the limit, and down to the rest
+or 256 bytes when the budget has no room for more. A body of known
+length never grows. A head or header block the budget has no room for
+waits for memory; a body ends with `503`. A handler reads a body in full
+as one chunk, so a body of unknown length kept in more than one segment
+is copied once, when it is handed on, into a chunk of its length charged
+first (`Body::from_segments`), or ends with `503` if there is no room.
 
 ### TLA+
 
-`tla/Assembly.tla` is one join, threaded through a store
-(`resources/tla/Resources.tla`) in the code's order: charge the new
-block, allocate it, copy what is held, free the old block, give its
-charge back. A unit of `UnitLimit` comes in pieces of `PieceSizes`; the
-rest of the budget (another of the client's connections) takes and frees
-room between units, and within one when `BudgetMovesInUnit`. `copied`
-counts the bytes moves copy into fresh storage. Invariants:
-`AssemblyPaid` (no moment held more than was reserved then),
-`AssemblyWithinLimit`, `AssemblyTracks`, and `LinearCopy`
-(`copied <= CopyPer * received`), with `CopyPer` 2 for doubling the
-capacity (the capacities moved out of form a doubling series under twice
-the last, which the unit passed) and 3 for doubling what is held, as
-HTTP/1 does (each copy is more than twice the one two moves before).
+`tla/Assembly.tla` is one unit kept from pieces, threaded through a
+store (`resources/tla/Resources.tla`) in the code's order. Moving
+storage charges the new block, allocates it, copies what is held, frees
+the old block and gives its charge back; segmented storage
+(`Segmented`) charges and allocates one more segment and copies nothing.
+A unit of `UnitLimit`, or of a length known from its first piece
+(`Known`), comes in pieces of `PieceSizes`; a body of unknown length in
+more than one segment is copied whole once when it is handed on
+(`JoinWhole`). The rest of the budget (another of the client's
+connections) takes and frees room between units, and within one when
+`BudgetMovesInUnit`. `copied` counts the bytes moves and joins copy into
+fresh storage. Invariants: `AssemblyPaid` (no moment held more than was
+reserved then), `AssemblyWithinLimit`, `AssemblyTracks`, `LinearCopy`
+(`copied <= CopyPer * received`), with `CopyPer` 1 for segments (the one
+join), 2 for doubling the capacity (the capacities moved out of form a
+doubling series under twice the last, which the unit passed) and 3 for
+doubling what is held, as HTTP/1 does (each copy is more than twice the
+one two moves before), and `HeldBound`
+(`Share * peak <= HeldShares * input + Share * HeldFixed`, the most held
+at any moment against the unit's size: its known length, or what
+arrived). For a header block the bound is the block, a share of it and
+the floor; for a body of known length, its length; for a body of
+unknown length, the body twice, for the join, and a share.
 
 `tla/SendHold.tla` is two streams' responses and the connection's
 received DATA: the child's chunks queue within its credit, frames go
@@ -871,8 +892,12 @@ what the client may still send at most the window), `QueuesTrack`,
 | --- | --- |
 | `Assembly_head_base` | passes: `RequestStream::push`, `UnitLimit` 12, pieces of 1 to 3, budget 24 |
 | `Assembly_head_long_base` | passes: the same a byte a delivery, `UnitLimit` 24, budget 48 |
-| `Assembly_block_base` | passes: `HeaderBlocks::join` with a floor of 2, growth charged whole |
-| `Assembly_body_base` | passes: `collect_into`, a refusal ending the body, growth charged whole |
+| `Assembly_block_base` | passes: `HeaderBlocks::join` in segments, a floor of 2, `HeldBound` of the block, a share and the floor |
+| `Assembly_block_budgetmoves_base` | passes: the same with the rest of the budget moving before every piece |
+| `Assembly_body_base` | passes: `collect_into` of unknown length, a refusal ending the body, the join when handed on, `HeldBound` of twice the body and a share |
+| `Assembly_body_length_base` | passes: `collect_into` of known length, `HeldBound` of the length |
+| `Assembly_block_moving` | violates `HeldBound`: header blocks in `ChargedBytes`, doubling, each move charged whole (the storage before this round) |
+| `Assembly_body_moving` | violates `HeldBound`: a body of known length doubling in `ChargedBytes`, past its length |
 | `Assembly_head_without_double` | violates `LinearCopy`: the head assembly before 3271cfe52 |
 | `Assembly_head_without_largestwhenrefused` | violates `LinearCopy`: the head assembly at 3271cfe52, a block of exactly the need when doubling does not fit |
 | `Assembly_head_without_chargefirst` | violates `AssemblyPaid`: a block allocated before it is charged |
@@ -885,8 +910,8 @@ what the client may still send at most the window), `QueuesTrack`,
 | `SendHold_without_topupcredit` | violates `QueueWithinCredit`: credit per frame sent, not topped up to `SEND_CREDIT` |
 | `SendHold_without_returncreditwhenfreed` | violates `ReceiveWithinWindow`: WINDOW_UPDATE for DATA still held |
 
-Each config ran in under 20 seconds on November 10, 2026 (TLC 2.19,
-two workers); the passing ones generated 50,310 to 355,892 states.
+Each config ran in under 20 seconds on November 11, 2026 (TLC 2.19,
+two workers); the passing ones generated 18,081 to 355,892 states.
 
 `Resources.tla`'s `Paid` used to compare a step's peak with the
 reservation it ended with. A move releases the old block's charge at its
@@ -897,11 +922,13 @@ give their stated results with it, with the state counts of before.
 ### Kani
 
 `kani/collect.rs`, compiled into `respond.rs`, runs `collect_into` on a
-body of eight one-byte pieces, with every allocation counted, under a
-roomy budget and, in its own harness, one of 3 bytes, where a growth
-that charges its move is refused at the third piece. The
-pieces are written out, not looped, so the unwinding bound stays at 3,
-which the budget's own loops need. `kani/resources.rs`, compiled into
+body of two one-byte pieces, with every allocation counted: of unknown
+length under a roomy budget and under one of exactly what it asks for
+(`UNKNOWN`: the least segment and the first places), and of known length
+under one of its length and a place (`KNOWN`), where a growth that moved
+would need the old allocation beside the new. The pieces are written
+out, not looped, so the unwinding bound stays at 3, which the budget's
+own loops need. `kani/resources.rs`, compiled into
 `http1.rs`, runs the production `RequestStream::push` on a head of ten
 pieces of 64 bytes, with pools of 4- and 8-byte slots and a 1 KiB head
 limit, under a roomy budget and one of 350 or 500 bytes, where doubling
@@ -910,16 +937,23 @@ block dropped gives its charge back through the budget's wakers.
 
 | Harness | Bound | Result, November 10, 2026 |
 | --- | --- | --- |
-| `a_collected_body_copies_linearly` | the joins ask for at most `JOIN_PER` (4) times the bytes taken, on a roomy budget | passes, 258.4 s (105.3 s with a choice of two budgets, before 84530d0d5) |
 | `a_backing_is_within_its_constant` | a one-byte chunk asks for at most its byte and `BACKING` (128) | passes, 0.1 s |
 | `the_counter_sees_every_allocation` | the counter's own check | passes, 20.8 s |
-| `a_collected_body_stays_within_its_charge` | on a budget of `TIGHT` (3), the most live at once is at most what was live before and `TIGHT`, and the joins ask for at most `JOIN_PER` times the bytes taken | does not fit: out of 14 GiB in CBMC's propositional reduction, on a budget of 3 or 6; before 84530d0d5, with the bound against the charge at the end, it failed on `ChargedBytes` growth in 78.3 s |
+| `a_collected_body_moves_nothing` | every piece is taken; the body asks for at most `UNKNOWN`, on a roomy budget | does not fit: CBMC killed at 14 GiB in the solver after 36 s of symbolic execution (two pieces), 72 s (three) |
+| `a_collected_body_stays_within_its_charge` | on a budget of `UNKNOWN`, every piece is taken, the most live at once is at most what was live before and `UNKNOWN`, and the body asks for at most `UNKNOWN` | does not fit: killed at 14 GiB after 122 s of symbolic execution (three pieces); with eight, 745 s |
+| `a_body_of_known_length_is_reserved_once` | on a budget of `KNOWN`, every piece is taken, the most live at once is at most what was live before and `KNOWN`, and the body asks for at most `KNOWN` | does not fit: killed at 14 GiB after 147 s of symbolic execution (two pieces), 522 s (three) |
 | `a_head_in_pieces_within_a_roomy_budget_copies_linearly` | the most live at once is at most what was live once the stream was made, the budget's limit, three backings and a piece; the pushes ask for at most `JOIN_PER` times the bytes taken, both slots and `HEAD_BLOCKS` (8) backings | not finished: still in CBMC's symbolic execution after an hour, at 9.7 GiB |
 | `a_head_in_pieces_within_a_tight_budget_copies_linearly` | the same | not run: it is the roomy harness with a choice of two budgets |
 
-`cargo xtask http-verify resources` runs the three that pass. The
-layer area's `charged_bytes_grow_within_their_budget_100` and `_160`
-prove the growth the tight harness was for. The head
+`cargo xtask http-verify resources` runs the two that pass. The body
+harnesses stay in the file. The one they replace,
+`a_collected_body_copies_linearly`, ran `collect_into` on `ChargedBytes`
+in 258.4 s with eight pieces; each call now also charges and grows the
+segments' places in a `ChargedVec`, and the formula no longer fits at
+two. The bounds they state are held instead by
+`a_body_of_known_length_is_reserved_once` (`respond.rs`), the
+`ChargedSegments` tests in `charged.rs`, `Assembly.tla` and
+`a_body_in_many_data_frames_is_collected_linearly`. The head
 harnesses stay in the file. Their first version, twenty 3-byte pieces
 looped with an unwinding bound of 22, ran out of 14 GiB; ten pieces
 written out did not finish in an hour. Each push charges and releases the
@@ -934,9 +968,10 @@ that fits, also under twice the unit. `HEAD_BLOCKS` is 8: the first
 delivery, both pool slots, the doubling blocks up to the limit, and one
 more.
 
-| Mutation, in a scratch copy | Harness | Failed check |
-| --- | --- | --- |
-| `collect_into` growing to exactly its length and the piece, as `Respond::collect` did before bf20d67f4 | `a_collected_body_copies_linearly` | `collecting the body copied more than its bytes allow` (100.5 s) |
+Before this round, a mutation of `collect_into` growing to exactly its
+length and the piece, as `Respond::collect` did before bf20d67f4, failed
+`a_collected_body_copies_linearly` in 100.5 s. The moving storage's
+controls are now `Assembly_block_moving` and `Assembly_body_moving`.
 
 ### The replay
 
@@ -1005,24 +1040,36 @@ replaced `http1::RequestHead` with `web::Head`; it now uses `Head`.
 allocations at once with only the new charged. The layer area fixed it
 at the root (84530d0d5): a growth charges the old allocation with the
 new while the bytes move. `Assembly_block_without_chargewhole` and
-`Assembly_body_without_chargewhole` are now controls of the old growth.
-The Kani harness that would show the body within a tight budget,
-`a_collected_body_stays_within_its_charge`, no longer fits in 14 GiB
-(above); the layer area's harnesses prove the growth itself.
+`Assembly_body_without_chargewhole` are controls of the growth before
+that. The memory of the move is real, and three `serve_limits` HTTP/2
+tests sized to the old rule failed on it, so HTTP/2 storage no longer
+moves: header blocks and bodies are kept in `ChargedSegments`, a body of
+known length is reserved once, and the blocks are decoded across the
+segments. `Assembly_block_moving` and `Assembly_body_moving` are the
+moving storage, held to the bound the segments keep.
 
 - **A budget that moves with the pieces.** With the largest-that-fits
   rule, a client whose other connections free a little room before each
-  piece makes each block one piece larger
-  (`Assembly_head_budgetmoves`). With the budget as it stands, a unit
-  moves at most once more.
+  piece makes each HTTP/1 head block one piece larger
+  (`Assembly_head_budgetmoves`). With the budget as it stands, a head
+  moves at most once more. HTTP/2 storage does not move, so it does not
+  copy more (`Assembly_block_budgetmoves_base`).
+- **A body of unknown length is copied once when it is handed on.** A
+  handler reads a body in full as one chunk, so an HTTP/2 body without
+  `content-length` kept in more than one segment is copied into a chunk
+  of its length when it is handed on, and for that moment the budget
+  holds the body twice (`Assembly_body_base`'s `HeldShares`).
 
 ### What these checks leave out
 
-HTTP/2 has no vectors, so its joins and holds are checked by the models,
-the Kani harness on `collect_into` and the tests, not by a costed
-replay. The Kani harnesses do not reach `HeaderBlocks::join` (its growth
-is `ChargedBytes`', above) or the send queue, which `SendHold.tla`
-models. The send deadline is checked in the model and by
+HTTP/2 has no vectors, so its storage and holds are checked by the
+models, the Kani harnesses on `collect_into` and the tests, not by a
+costed replay. The Kani harnesses do not reach `HeaderBlocks::join`
+(its storage is `ChargedSegments`, which the layer's tests check, and
+`hpack_vectors` decodes every block in pieces) or the send queue, which
+`SendHold.tla` models. The model leaves out the places of segments, a
+fixed size each, which the Kani harnesses and
+`a_body_in_many_data_frames_is_collected_linearly` count. The send deadline is checked in the model and by
 `a_response_held_back_by_the_clients_window_is_reset_after_the_write_timeout`.
 The replay serves with a handler that allocates nothing; handlers' own
 storage is outside the connection's accounting.

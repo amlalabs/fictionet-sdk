@@ -17,7 +17,7 @@ mod cost;
 use cost::{Charged, Costs, Linear};
 use fictionet::stdlib::protocols::fields::Fields;
 use fictionet::stdlib::protocols::hpack::{
-    DynamicTable, Encoder, Error, Field, MAX_DECODED, STATIC_TABLE, Table,
+    Block, DynamicTable, Encoder, Error, Field, MAX_DECODED, STATIC_TABLE, Table,
 };
 use fictionet::stdlib::protocols::{huffman, prefix_int};
 use fictionet::{Budget, Chunk};
@@ -76,6 +76,7 @@ const NOTHING: Linear = Linear {
 
 /// A block decoded: the fields kept, with their never-indexed flags, and
 /// how many were left out.
+#[derive(Debug, PartialEq)]
 struct Decoded {
     headers: Vec<Field>,
     more: usize,
@@ -87,6 +88,21 @@ fn decode(table: &mut Table, block: &[u8]) -> Result<Decoded, Error> {
     let bound = table.most_block(block.len(), MAX_DECODED).bytes();
     let mut out = Fields::in_block(Chunk::block(&Budget::unlimited(), 0, bound.max(1)).unwrap());
     table.decode_block(block, &mut out, &Budget::unlimited(), MAX_DECODED)?;
+    Ok(read(&out))
+}
+
+/// [`decode`] of `block` kept in pieces of `cut` bytes, as a server keeps
+/// a block split across frames or deliveries, read where they lie.
+fn decode_in_pieces(table: &mut Table, block: &[u8], cut: usize) -> Result<Decoded, Error> {
+    let pieces: Vec<Vec<u8>> = block.chunks(cut).map(<[u8]>::to_vec).collect();
+    let bound = table.most_block(block.len(), MAX_DECODED).bytes();
+    let mut out = Fields::in_block(Chunk::block(&Budget::unlimited(), 0, bound.max(1)).unwrap());
+    table.decode_block(
+        Block::pieces(&pieces),
+        &mut out,
+        &Budget::unlimited(),
+        MAX_DECODED,
+    )?;
     Ok(read(&out))
 }
 
@@ -271,12 +287,19 @@ fn blocks() {
         session += 1;
         let mut costs = Costs::new(format!("blocks session {session}"));
         let mut table = Table::new(size(&case["settings"]));
-        for step in case["steps"].as_array().unwrap() {
+        // The same session read in pieces, cut every one to seven bytes:
+        // each block decodes as the block whole does.
+        let mut cut = Table::new(size(&case["settings"]));
+        for (n, step) in case["steps"].as_array().unwrap().iter().enumerate() {
             if let Some(limit) = step.get("ack") {
                 table.set_settings_limit(size(limit));
+                cut.set_settings_limit(size(limit));
                 continue;
             }
-            let got = decode_costed(&mut table, &hex(&step["block"]), &mut costs);
+            let block = hex(&step["block"]);
+            let got = decode_costed(&mut table, &block, &mut costs);
+            let in_pieces = decode_in_pieces(&mut cut, &block, 1 + (session + n) % 7);
+            assert_eq!(in_pieces, got, "{step}: in pieces");
             if let Some(error) = step.get("error") {
                 let Err(got) = got else {
                     panic!("{case}: {step}: accepted")
@@ -295,6 +318,7 @@ fn blocks() {
                 .map(|e| (hex(&e[0]), hex(&e[1])))
                 .collect();
             assert_eq!(entries(&table), want, "{step}");
+            assert_eq!(entries(&cut), want, "{step}: in pieces");
             assert_eq!(table.table_size(), size(&step["size"]), "{step}");
             assert_eq!(table.table_capacity(), size(&step["max"]), "{step}");
         }
