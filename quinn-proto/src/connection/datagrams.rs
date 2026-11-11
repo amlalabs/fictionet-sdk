@@ -124,21 +124,17 @@ impl DatagramState {
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
+        encoded_size: usize,
         window: &Option<usize>,
     ) -> Result<bool, TransportError> {
-        let window = match window {
-            None => {
-                return Err(TransportError::PROTOCOL_VIOLATION(
-                    "unexpected DATAGRAM frame",
-                ));
-            }
-            Some(x) => *x,
-        };
+        let window = receive_window(encoded_size, *window)?;
 
         let size_with_overhead = datagram.data.len() + size_of::<Datagram>();
 
         if size_with_overhead > window {
-            return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
+            // A legal frame may not fit with its heap metadata. Resource
+            // pressure permits a local drop, not a connection error.
+            return Ok(false);
         }
 
         let was_empty = self.incoming.is_empty();
@@ -225,6 +221,23 @@ impl DatagramState {
     }
 }
 
+fn receive_window(encoded_size: usize, window: Option<usize>) -> Result<usize, TransportError> {
+    let Some(window) = window.filter(|window| *window != 0) else {
+        return Err(TransportError::PROTOCOL_VIOLATION(
+            "unexpected DATAGRAM frame",
+        ));
+    };
+    // Transport parameters cap the advertised frame size at this value.
+    if encoded_size > window.min(u16::MAX as usize) {
+        return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
+    }
+    Ok(window)
+}
+
+#[cfg(kani)]
+#[path = "../../../verification/quic/kani/datagrams.rs"]
+mod proofs;
+
 #[derive(Default)]
 pub(super) struct DatagramBuffer {
     queue: VecDeque<Datagram>,
@@ -265,6 +278,39 @@ impl DatagramBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receive_checks_wire_size_before_storage() {
+        use crate::frame::{Frame, Iter};
+        for wire in [
+            &[0x30, 42][..],
+            &[0x31, 1, 42][..],
+            &[0x31, 0x40, 1, 42][..],
+            &[0x40, 0x31, 0x40, 1, 42][..],
+        ] {
+            let mut frames = Iter::new(Bytes::copy_from_slice(wire)).unwrap();
+            let (frame, encoded_size) = frames.next_with_size().unwrap();
+            assert_eq!(encoded_size, wire.len());
+            assert!(frames.next().is_none());
+            let Frame::Datagram(datagram) = frame.unwrap() else {
+                panic!("datagram frame")
+            };
+            for window in [None, Some(0), Some(wire.len() - 1)] {
+                let mut state = DatagramState::default();
+                assert!(state
+                    .received(datagram.clone(), encoded_size, &window)
+                    .is_err());
+                assert!(state.incoming.is_empty());
+            }
+            let mut state = DatagramState::default();
+            assert!(!state
+                .received(datagram.clone(), encoded_size, &Some(wire.len()))
+                .unwrap());
+            assert!(state.incoming.is_empty());
+            assert!(state.received(datagram, encoded_size, &Some(128)).unwrap());
+            assert_eq!(state.recv().unwrap(), &[42][..]);
+        }
+    }
 
     #[test]
     fn make_space_for_accounts_for_new_datagram() {

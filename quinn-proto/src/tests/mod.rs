@@ -2360,6 +2360,30 @@ fn datagram_send_recv() {
 }
 
 #[test]
+fn datagram_storage_pressure_does_not_close_the_connection() {
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            datagram_receive_buffer_size: Some(16),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client, server) = pair.connect();
+    let maximum = pair.client_datagrams(client).max_size().unwrap();
+    pair.client_datagrams(client)
+        .send(Bytes::from(vec![42; maximum]), false)
+        .unwrap();
+    pair.drive();
+    assert!(!pair.server_conn_mut(server).is_closed());
+    assert!(!pair.client_conn_mut(client).is_closed());
+    assert!(pair.server_datagrams(server).recv().is_none());
+    pair.client_conn_mut(client).ping();
+    pair.drive();
+    assert!(!pair.server_conn_mut(server).is_closed());
+}
+
+#[test]
 fn datagram_recv_buffer_overflow() {
     let _guard = subscribe();
     const PAYLOAD_WINDOW: usize = 100;

@@ -429,3 +429,29 @@ workspace formatting check pass after adding the regression.
 All 302 SDK doctests and three engine doctests pass. Rustdoc builds both
 libraries, retaining the pre-existing redundant-link warning in
 `network/packet.rs`.
+
+## Datagram wire admission
+
+The engine compared a received datagram's payload plus heap metadata with
+its advertised wire limit. A legal frame could therefore close a connection
+whose receive storage was small. The new protected-peer regression failed
+on that closure before the fix. Storage pressure now drops the datagram
+without closing the connection. The frame iterator retains the actual
+encoded size, including non-minimal type and length integers, and admission
+checks that size against the advertised limit before considering storage.
+A disabled or zero-size advertisement rejects every datagram.
+
+All 326 engine tests and three doctests pass. The parser regression covers
+both frame forms and wider integer encodings, rejection without queue
+mutation, local drops, and successful delivery. Kani's
+`datagram_wire_limits_are_independent_of_storage` passes without stubs over
+arbitrary machine-sized frame sizes and optional receive windows. It calls
+the production guard; it does not prove the parser or queue implementation.
+
+`DatagramReceive_base.cfg` passes with 502 generated states, 70 distinct,
+depth four. Both the storage-as-wire and omitted-header controls violate
+`WireAdmission`; the reachability control violates `NoDelivery`. The model
+covers wire admission, local drops and oldest-first eviction. It does not
+replay production traces, count heap storage or establish a resource bound.
+Run these configs with `DatagramReceive.tla`, and the Kani harness with the
+same commands and scope above.

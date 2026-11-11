@@ -2772,7 +2772,8 @@ impl Connection {
         let mut close = None;
         let payload_len = payload.len();
         let mut ack_eliciting = false;
-        for result in frame::Iter::new(payload)? {
+        let mut frames = frame::Iter::new(payload)?;
+        while let Some((result, encoded_size)) = frames.next_with_size() {
             let frame = result?;
             let span = match frame {
                 Frame::Padding => continue,
@@ -2988,10 +2989,11 @@ impl Connection {
                     token_store.insert(server_name, token);
                 }
                 Frame::Datagram(datagram) => {
-                    if self
-                        .datagrams
-                        .received(datagram, &self.config.datagram_receive_buffer_size)?
-                    {
+                    if self.datagrams.received(
+                        datagram,
+                        encoded_size,
+                        &self.config.datagram_receive_buffer_size,
+                    )? {
                         self.events.push_back(Event::DatagramReceived);
                     }
                 }

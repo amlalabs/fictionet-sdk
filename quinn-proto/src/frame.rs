@@ -548,6 +548,14 @@ pub(crate) struct Iter {
 }
 
 impl Iter {
+    /// Parse a frame while retaining its actual wire size, including
+    /// non-minimal variable-length integers.
+    pub(crate) fn next_with_size(&mut self) -> Option<(Result<Frame, InvalidFrame>, usize)> {
+        let before = self.bytes.len();
+        let frame = self.next()?;
+        Some((frame, before - self.bytes.len()))
+    }
+
     pub(crate) fn new(payload: Bytes) -> Result<Self, TransportError> {
         if payload.is_empty() {
             // "An endpoint MUST treat receipt of a packet containing no frames as a
