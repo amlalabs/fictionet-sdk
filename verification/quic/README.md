@@ -1556,3 +1556,157 @@ the `ServerSessionValue` codec in `msgs/persist.rs`, and
 
 Layer: `QuicLayer::version`, `with_address_validation` and the Retry
 branch of the layer's datagram handling.
+
+## Standard interoperability over version two
+
+`tests/quic-ngtcp2` runs the
+[QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)'s
+test cases over version 2. The SDK's `QuicLayer` runs against ngtcp2
+1.25.0, with nghttp3 1.18.0 and the system OpenSSL 3.6, in both roles.
+ngtcp2 implements RFC 9369 and RFC 9368 independently of the vendored
+engine. `peer.c` wraps it with no sockets and no clock: the test hands it
+every datagram and timestamp, so both endpoints share one virtual clock
+on one simulated link. The crate has its own test binary, because quiche's
+BoringSSL defines the same symbols as OpenSSL.
+
+The link follows the runner's network simulator. It has a 15 ms one-way
+delay and a 10 Mbps bottleneck with a queue of 25 packets. `drop-rate`
+and `corrupt-rate` decide each packet as the simulator's
+`drop-rate-error-model.cc` and `corrupt-rate-error-model.cc` do. Each
+packet is impaired with the given probability, but never more than three
+in a row. Corruption replaces one of the first 51 bytes of the datagram,
+so it often hits the QUIC header. Version Negotiation packets are not
+corrupted. Every random choice comes from the case's seed, so a failure
+repeats exactly. The test reads the long header type of every datagram
+from its version's type bits, as the runner's packet traces do.
+
+Each case uses the runner's files and checks from `testcases_quic.py`.
+Where the runner requires version 1, these cases require version 2 on
+both sides. Unless a case says otherwise, the client's first flight is
+in version 1 and offers 2 then 1, and the server prefers 2. So every
+connection reaches version 2 by compatible negotiation, as the runner's
+`v2` case sets it up. Every case also requires every Handshake packet in
+both directions to be in version 2. The file bytes must match exactly.
+The `v2`, `handshake` and `transfer` cases also require the server to
+receive the client's close with error code 0.
+
+| Case | Files | SDK client, ngtcp2 server | ngtcp2 client, SDK server |
+| --- | --- | --- | --- |
+| `v2`: the runner's version checks | 1 KB | passed | passed |
+| `handshake`, no Retry | 1 KB | passed | passed |
+| `handshake` with a version 2 first flight | 1 KB | passed | passed |
+| `transfer` | 2, 3 and 5 MB | passed | passed |
+| `retry`, Retry in version 1, then upgrade | 10 KB | passed | passed |
+| `retry` with a version 2 first flight | 10 KB | passed | passed |
+| `http3` | 5 KB, 10 KB and 500 KB | no SDK HTTP/3 client | passed |
+| `handshakeloss`, 30% | 50 connections of 1 KB | passed | passed |
+| `transferloss`, 2% | 2 MB | passed | passed |
+| `handshakecorruption`, 30% | 50 connections of 1 KB | passed | passed |
+| `transfercorruption`, 2% | 2 MB | passed | passed |
+| `versionnegotiation` into version 2 | 1 KB | passed | not run |
+
+The `v2` case applies the runner's checks: a client Initial in version 1,
+a server Initial in version 2, and only version 2 in both directions'
+Handshake packets. The retry cases require a Retry carrying a token in
+the client's first version (RFC 9369 section 4.1), and a later client
+Initial carrying that token. A server may answer each datagram of a
+two-datagram first flight with a Retry; the client follows only the
+first. The
+`http3` case fetches through the SDK's HTTP/3 server and requires status
+200. In `versionnegotiation`, the ngtcp2 server accepts only version 2, so
+the SDK client's version 1 Initial draws a Version Negotiation packet. The
+client then starts again in version 2, and the server's Version
+Information passes its downgrade check. The reverse direction needs an
+ngtcp2 client that restarts after Version Negotiation, which `peer.c` does
+not do. The loss and corruption cases also require that the link dropped,
+or corrupted, at least one packet.
+
+All thirteen tests pass. Run `cargo test --locked -p fictionet-quic-ngtcp2`
+under the scope above. It needs `libngtcp2`, `libngtcp2_crypto_ossl`,
+`libnghttp3` and OpenSSL 3.5 or later, found through `pkg-config`.
+
+quiche 0.30.1 accepts only version 1: its `version_is_supported` matches
+only `0x00000001`, and it sends no Version Information. It cannot run
+any version 2 case. Two tests in `tests/quic-interop` instead check that
+version 2 capable endpoints still work with it. An SDK client that offers
+versions 2 and 1, and an SDK server that prefers version 2, each complete
+the exchange with quiche in version 1. All 39 tests in that crate pass.
+No other independent implementation runs here without Docker. Upstream
+quinn shares the vendored engine's code, and curl's HTTP/3 uses the same
+ngtcp2. aioquic, msquic, lsquic and picoquic are not installed.
+
+### The server's choice across packets
+
+The first run of the `v2` case failed with the SDK as server: the
+connection stayed in version 1. ngtcp2 puts eleven CRYPTO frames in its
+first Initial packet and leaves bytes 134 to 140 of the ClientHello for
+its second, on purpose. The server read the client's offer only from its
+first packet, in at most eight CRYPTO frames, so it never upgraded an
+ngtcp2 client. It also missed any offer that fell in a later packet.
+
+The server now starts every connection in the client's version and
+chooses in `Connection::choose_version`. The choice is made on each
+Initial CRYPTO frame, before the TLS session reads anything. The client's
+Initial crypto stream stays in its assembler, where it is already bounded
+by `crypto_buffer_size`, 16 KiB by default, and charged to the reassembly
+budget. The `version::first_flight` reader now reads that stream in place, through the
+`Received` trait, which the assembler implements. It returns one of three
+outcomes. `Found` is the offer, read from bytes that have arrived even
+where other parts of the ClientHello have not. `Arriving` means more is
+needed. `Absent` means the stream does not start with a ClientHello, or
+the whole ClientHello arrived without a valid offer. The server waits on
+`Arriving` and keeps the client's version on `Absent`. Reading a byte looks
+at every buffered piece, so past 64 pieces (`MAX_OFFER_PIECES`) the server
+keeps the client's version.
+
+When the server moves to another version, `switch_server_version` charges
+the original Initial keys it keeps before deriving the new ones. It then
+starts a TLS session whose Version Information names the new version.
+Without budget it stays in the client's version. The server may already
+have sent an acknowledgment in the original version; the runner's `v2`
+check allows that. `Endpoint::compatible_upgrade` and the one-packet
+CRYPTO frame collector are gone. This changes several proof targets in
+[QUIC version two](#quic-version-two). The first-flight reader is now
+`client_offer` over `Received`, with no `CryptoData`. The charge before
+derivation is in `Connection::switch_server_version`, not the endpoint.
+`Negotiation::server` takes the server's transport parameters, which
+`chose` releases. The limit of one packet and eight frames in that
+section's Limits no longer applies.
+
+The new two-engine test
+`a_server_reads_an_offer_spread_over_reordered_initial_packets` delivers
+a two-datagram ClientHello with the second datagram first. The server's
+first packet then holds no start of the ClientHello. It passes, and it
+fails on the previous engine. The `v2` case also fails on the previous
+engine and passes with the change. The first-flight unit tests cover an
+offer read across a gap, an offer still arriving, and whole ClientHellos
+without a valid offer. All 389 engine library tests, the 31 SDK QUIC
+tests, and the 39 tests of `tests/quic-interop` pass. Clippy with
+warnings denied passes for the engine and both interoperability crates.
+
+### Controls
+
+Each control below was a temporary change, reverted afterwards.
+
+- `the_version_2_checks_reject_a_connection_that_stays_in_version_1` runs
+  both roles with a server that prefers version 1. Both sides end in
+  version 1, and the `v2` and per-case checks reject the run.
+- Encoding version 2 with version 1's long header type bits
+  (`TypeBits::of`) fails the `v2` and version 2 first flight cases against
+  ngtcp2. Five of the six SDK-to-SDK `versions` layer tests still pass
+  with the same bug, since the engine agrees with itself.
+- Giving version 2 Retry packets version 1's integrity key and nonce fails
+  the version 2 `retry` case. The `retry` case, whose Retry is in
+  version 1, still passes.
+- Restoring the old engine fails the `v2` case and the reordered-packet
+  test.
+
+### Limits
+
+These runs share virtual time, so they say nothing about real-time
+behavior. The ngtcp2 server in `peer.c` holds one connection. When
+corruption damages the Destination Connection ID of a first Initial, it
+replaces a connection that never answered with one for the next first
+Initial. A real server would keep both. HTTP/3 runs in one direction only.
+Resumption, 0-RTT, key update and connection migration over version 2 are
+not among these cases.
