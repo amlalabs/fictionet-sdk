@@ -430,8 +430,8 @@ pub fn infer(trace: &Trace, enrollment: Option<&Enrollment>) -> Result<Inference
             ..
         } = gate
         {
-            if target.contains("check") {
-                distinct_checks.insert(target.clone());
+            if *host_checks > 0 && target.contains("check") {
+                distinct_checks.insert(target.split('?').next().unwrap_or(target).to_owned());
                 overlapped |= *host_checks > 1;
             }
         }
