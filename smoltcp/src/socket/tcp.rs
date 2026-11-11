@@ -16,6 +16,8 @@ use crate::wire::{
 
 mod reno;
 mod rx;
+#[cfg(test)]
+mod store_costs;
 #[cfg(kani)]
 #[path = "../../../verification/tcp-store/kani/mod.rs"]
 mod store_proofs;
@@ -25,11 +27,15 @@ mod tx;
 
 pub use self::rx::SEGMENTS;
 
-/// The bytes a socket's stores allocate when it is made, for the places of
-/// the chunks they retain, [`SEGMENTS`] each way: all a connection holds
-/// beside the chunks themselves, which carry their own charges.
-pub const PLACES: usize =
-    SEGMENTS * (2 * mem::size_of::<Chunk>() + mem::size_of::<(usize, Chunk)>());
+/// The bytes a socket's stores hold besides the bytes of their chunks,
+/// which carry their own charges: the places of the chunks they retain,
+/// [`SEGMENTS`] each way, allocated when the socket is made, and the
+/// header of each backing they retain ([`Chunk::HEADER`]), which no
+/// chunk's charge counts, with one more each way for the block a join
+/// makes while the two it joins are still held.
+pub const PLACES: usize = SEGMENTS
+    * (2 * mem::size_of::<Chunk>() + mem::size_of::<(usize, Chunk)>() + 2 * Chunk::HEADER)
+    + 2 * Chunk::HEADER;
 use self::rx::RxStore;
 use self::tx::TxStore;
 pub use self::tx::{HEADROOM, Piece};

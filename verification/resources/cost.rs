@@ -12,7 +12,10 @@
 //!   justified where the bound is made. Every byte a step copies into
 //!   fresh storage is first asked for, so a step that copies what it
 //!   holds on each delivery, which is quadratic over a stream, breaks this
-//!   bound as its input grows.
+//!   bound as its input grows. An [`amortized`](Costs::amortized) session
+//!   holds the bound over its steps together instead, for a holder that
+//!   copies each byte a bounded number of times, but not in the step that
+//!   brought it.
 //!
 //! A bound that fails names its session and step and both sides of the
 //! inequality. Build what a session replays inside its steps (the table,
@@ -66,6 +69,13 @@ pub struct Costs {
     closest_charge: (usize, usize),
     /// The step that came closest to its linear bound: (requested, allowed).
     closest_linear: (usize, usize),
+    /// Whether the linear bound holds over the session's steps together
+    /// ([`amortized`](Self::amortized)) rather than each step's.
+    amortized: bool,
+    /// Bytes asked for by every step so far.
+    total_requested: usize,
+    /// What the linear bounds of every step so far allow together.
+    total_allowed: usize,
 }
 
 /// The step's work, and what it charged to a budget besides.
@@ -91,6 +101,21 @@ impl Costs {
             charge: 0,
             closest_charge: (0, 1),
             closest_linear: (0, 1),
+            amortized: false,
+            total_requested: 0,
+            total_allowed: 0,
+        }
+    }
+
+    /// A session whose linear bound holds over its steps together: what
+    /// they ask for in all is at most what their bounds allow in all. For a holder that copies
+    /// each byte a bounded number of times but not in the step it came
+    /// in, as a store that joins blocks to free places does. The charge
+    /// still holds at every step.
+    pub fn amortized(session: impl Into<String>) -> Costs {
+        Costs {
+            amortized: true,
+            ..Costs::new(session)
         }
     }
 
@@ -129,12 +154,19 @@ impl Costs {
             .at(input)
             .saturating_add(done.charged)
             .saturating_add(done.moved);
+        self.total_requested = self.total_requested.saturating_add(stats.bytes_requested);
+        self.total_allowed = self.total_allowed.saturating_add(bound);
+        let (requested, bound) = if self.amortized {
+            (self.total_requested, self.total_allowed)
+        } else {
+            (stats.bytes_requested, bound)
+        };
         assert!(
-            stats.bytes_requested <= bound,
-            "{} step {step}: {} bytes asked for on {input} bytes of input, past \
-             {linear:?} and {} the step charged and {} it moved",
+            requested <= bound,
+            "{} step {step}: {requested} bytes asked for{} on {input} bytes of input, \
+             past {bound} allowed by {linear:?}, {} the step charged and {} it moved",
             self.session,
-            stats.bytes_requested,
+            if self.amortized { " in all" } else { "" },
             done.charged,
             done.moved,
         );
@@ -142,8 +174,8 @@ impl Costs {
         if peak * self.closest_charge.1 > self.closest_charge.0 * allowed {
             self.closest_charge = (peak, allowed);
         }
-        if stats.bytes_requested * self.closest_linear.1 > self.closest_linear.0 * bound {
-            self.closest_linear = (stats.bytes_requested, bound.max(1));
+        if requested * self.closest_linear.1 > self.closest_linear.0 * bound {
+            self.closest_linear = (requested, bound.max(1));
         }
         done.value
     }

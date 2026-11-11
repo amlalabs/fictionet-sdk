@@ -11,7 +11,9 @@ publish = false
 autoexamples = false
 
 [lints.rust]
-unsafe_code = "forbid"
+# Denied, not forbidden, so that the counting allocator of the resource
+# properties, compiled only into tests and proofs, can allow it.
+unsafe_code = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(kani)'] }
 
 [dependencies]

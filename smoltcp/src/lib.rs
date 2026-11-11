@@ -18,3 +18,13 @@ pub mod wire;
 
 #[cfg(test)]
 mod tests;
+
+// The counting allocator and the cost recorder of the resource properties
+// (verification/README.md), for the stores' costed sessions.
+#[cfg(test)]
+#[allow(unsafe_code)]
+#[path = "../../verification/resources/alloc.rs"]
+mod alloc;
+#[cfg(test)]
+#[path = "../../verification/resources/cost.rs"]
+mod cost;
