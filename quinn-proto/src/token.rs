@@ -80,24 +80,26 @@ impl TokenLog for NoneTokenLog {
 pub trait TokenStore: Send + Sync {
     /// Potentially store a token for later one-time use
     ///
-    /// Called when a NEW_TOKEN frame is received from the server.
-    fn insert(&self, server_name: &str, token: Bytes);
+    /// Called when a NEW_TOKEN frame is received from the server. The version is
+    /// the wire version of the connection that received it.
+    fn insert(&self, server_name: &str, version: u32, token: Bytes);
 
-    /// Try to find and take a token that was stored with the given server name
+    /// Try to find and take a token stored with this server name and wire version.
+    /// A token from another version must never be returned.
     ///
     /// The same token must never be returned from `take` twice, as doing so can be used to
     /// de-anonymize a client's traffic.
     ///
     /// Called when trying to connect to a server. It is always ok for this to return `None`.
-    fn take(&self, server_name: &str) -> Option<Bytes>;
+    fn take(&self, server_name: &str, version: u32) -> Option<Bytes>;
 }
 
 /// Null implementation of [`TokenStore`], which does not store any tokens
 pub struct NoneTokenStore;
 
 impl TokenStore for NoneTokenStore {
-    fn insert(&self, _: &str, _: Bytes) {}
-    fn take(&self, _: &str) -> Option<Bytes> {
+    fn insert(&self, _: &str, _: u32, _: Bytes) {}
+    fn take(&self, _: &str, _: u32) -> Option<Bytes> {
         None
     }
 }
@@ -138,7 +140,8 @@ impl IncomingToken {
         //
         // > If the token is invalid, then the server SHOULD proceed as if the client did not have
         // > a validated address, including potentially sending a Retry packet.
-        let Some(retry) = Token::decode(&*server_config.token_key, &header.token) else {
+        let Some(retry) = Token::decode(&*server_config.token_key, header.version, &header.token)
+        else {
             return Ok(unvalidated);
         };
 
@@ -213,7 +216,7 @@ impl Token {
     }
 
     /// Encode and encrypt
-    pub(crate) fn encode(&self, key: &dyn HandshakeTokenKey) -> Vec<u8> {
+    pub(crate) fn encode(&self, key: &dyn HandshakeTokenKey, version: u32) -> Vec<u8> {
         let mut buf = Vec::new();
 
         // Encode payload
@@ -237,14 +240,14 @@ impl Token {
 
         // Encrypt
         let aead_key = key.aead_from_hkdf(&self.nonce.to_le_bytes());
-        aead_key.seal(&mut buf, &[]).unwrap();
+        aead_key.seal(&mut buf, &version.to_be_bytes()).unwrap();
         buf.extend(&self.nonce.to_le_bytes());
 
         buf
     }
 
     /// Decode and decrypt
-    fn decode(key: &dyn HandshakeTokenKey, raw_token_bytes: &[u8]) -> Option<Self> {
+    fn decode(key: &dyn HandshakeTokenKey, version: u32, raw_token_bytes: &[u8]) -> Option<Self> {
         // Decrypt
 
         // MSRV: split_at_checked requires 1.80.0
@@ -255,7 +258,9 @@ impl Token {
 
         let aead_key = key.aead_from_hkdf(nonce_bytes);
         let mut sealed_token = sealed_token.to_vec();
-        let data = aead_key.open(&mut sealed_token, &[]).ok()?;
+        let data = aead_key
+            .open(&mut sealed_token, &version.to_be_bytes())
+            .ok()?;
 
         // Decode payload
         let mut reader = &data[..];
@@ -419,10 +424,49 @@ mod test {
         let mut master_key = [0; 64];
         rng.fill_bytes(&mut master_key);
         let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
-        let encoded = token.encode(&prk);
-        let decoded = Token::decode(&prk, &encoded).expect("token didn't decrypt / decode");
+        let encoded = token.encode(&prk, 1);
+        let decoded = Token::decode(&prk, 1, &encoded).expect("token didn't decrypt / decode");
         assert_eq!(token.nonce, decoded.nonce);
         decoded.payload
+    }
+
+    #[test]
+    fn tokens_authenticate_the_exact_wire_version() {
+        let key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&[17; 64]);
+        for version in [1, 0x6b33_43cf, 0xff00_0021] {
+            for payload in [
+                TokenPayload::Retry {
+                    address: "[::1]:4433".parse().unwrap(),
+                    orig_dst_cid: ConnectionId::new(&[3; 8]),
+                    issued: UNIX_EPOCH + Duration::from_secs(42),
+                },
+                TokenPayload::Validation {
+                    ip: "::1".parse().unwrap(),
+                    issued: UNIX_EPOCH + Duration::from_secs(42),
+                },
+            ] {
+                let token = Token::new(payload, &mut rand::rng());
+                let encoded = token.encode(&key, version);
+                for receiving_version in [0, 1, 0x6b33_43cf, 0xff00_0021] {
+                    assert_eq!(
+                        Token::decode(&key, receiving_version, &encoded).is_some(),
+                        version == receiving_version,
+                    );
+                }
+
+                // Tokens issued without version authentication are no longer accepted.
+                let aead = key.aead_from_hkdf(&token.nonce.to_le_bytes());
+                let mut old = encoded[..encoded.len() - 16].to_vec();
+                let plain = aead
+                    .open(&mut old, &version.to_be_bytes())
+                    .unwrap()
+                    .to_vec();
+                old = plain;
+                aead.seal(&mut old, &[]).unwrap();
+                old.extend_from_slice(&token.nonce.to_le_bytes());
+                assert!(Token::decode(&key, version, &old).is_none());
+            }
+        }
     }
 
     #[test]
@@ -497,6 +541,6 @@ mod test {
         invalid_token.put_slice(&random_data);
 
         // Assert: garbage sealed data returns err
-        assert!(Token::decode(&prk, &invalid_token).is_none());
+        assert!(Token::decode(&prk, 1, &invalid_token).is_none());
     }
 }

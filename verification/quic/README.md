@@ -759,3 +759,88 @@ verdict. A separate run with arithmetic refinement also reached the solver
 and was stopped without a verdict. These runs did not exhaust their memory
 limits. The arbitrary seed domain and complete RNG-state equality assertion
 remain unchanged; this does not close the previously recorded BBR proof gap.
+
+## Version-bound address tokens
+
+The client token-store contract now includes the connection's exact wire
+version on insertion and retrieval. `TokenMemoryCache` keeps that version
+alongside each token and removes only the first matching token. A miss
+preserves tokens from other versions. The existing per-server count limit
+covers all versions together, with oldest-first eviction; changing versions
+does not multiply the cache limit. Custom `TokenStore` implementations must
+adopt the new version argument and enforce that contract.
+
+Retry and NEW_TOKEN protection now authenticates the four-byte wire version
+as AEAD associated data. The server supplies the received Initial's version
+when opening a token, before considering its payload or consulting the
+replay log. A token from a different version leaves the address unvalidated
+and does not consume the log entry. Tokens issued by the preceding code,
+which authenticated no version, are also rejected; clients can establish a
+fresh connection and obtain new tokens. The token's wire length is unchanged.
+
+This supplies the address-token isolation required by
+[RFC 9369 section five](https://www.rfc-editor.org/rfc/rfc9369.html#section-5).
+It does not enable version two. TLS session tickets still need independent
+version binding, alongside packet mappings and protection, outgoing Version
+Information and negotiation policy. No rustls files changed in this step.
+
+The protected-peer regression first failed when a connection using a draft
+wire alias reused a version-one token. It now makes four connections across
+the two versions, checking independent validation and later reuse. Its cache
+fixture holds both versions' tokens; a separate test exercises eviction at
+the ordinary two-token limit. Other regressions use the production AEAD
+with version one, version two and a draft alias, checking both token kinds,
+wrong-version rejection, old-token rejection and unchanged replay-log state.
+These token-level version-two cases do not exercise a version-two transport.
+
+`TokenVersions.tla` models issuance, two cache slots shared by two versions,
+first-match extraction, eviction and server validation of tokens that a peer
+can present independently of the honest cache. The base passes with 4,736
+generated states, 744 distinct states and depth eight. Omitting the client
+check violates `ClientVersion`, omitting server binding violates
+`ServerVersion`, retaining a taken token violates `TakenOnce`, and the
+reachability control violates `NoValidation`. Run its five configs under
+the same scoped TLC command as above. The model assumes authenticated token
+versions; it proves neither cryptography nor replay-log behavior and does
+not replay production traces or count allocated bytes.
+
+Kani's `token_queue_removes_only_the_first_matching_version` passes without
+production stubs. It executes `CacheEntry::take` on two distinct payloads
+with arbitrary stored and requested 32-bit versions, including equal
+versions. It checks the returned payload, exact remaining length and the
+version and payload of every remaining entry. Returned values and the
+fixture are left undropped to exclude destructor paths. Run it with
+`cargo kani -p fictionet-quinn-proto --lib -Z stubbing -Z restrict-vtable
+--harness token_queue_removes_only_the_first_matching_version`, under the
+required scope. This is a bounded queue-operation proof, not a proof of
+cache hashing, eviction, mutexes, cryptography or the whole connection.
+
+Two broader harnesses remain without verdicts. The full-cache harness was
+stopped after four minutes expanding hash-map paths, before the solver.
+The repeated-extraction queue harness exhausted the fourteen-gigabyte
+scope during propositional conversion, both with default object bits and
+with ten object bits. Excluding returned-value destructors did not make
+that sequence fit. Their version and extraction assertions remain present
+in `kani/token_cache.rs`; the one-step proof does not replace them.
+
+Two production mutations were tested and removed. Restoring empty AEAD
+associated data in both sealing and opening fails both server version
+regressions. Ignoring the cache's version filter fails its ordinary test
+and the one-step Kani assertion about the returned token. The restored Kani
+harness passes again with the same arbitrary version domain and assertions.
+
+All 346 engine library tests, three engine doctests, 21 isolated layer and
+interoperability tests and 4,348 SDK library tests pass. Clippy with warnings
+denied and the workspace formatting check pass. Rustdoc builds both
+libraries with the existing redundant link warning in `network/packet.rs`. The existing sparse-reassembly
+benchmark runs at sixteen and sixty-four kibibytes; it measures the legacy
+codec. The cache remains count-limited, not charged to a Fictionet budget;
+adding a version to its descriptors is not a whole-engine resource claim.
+Whole-engine budgeting, HTTP/3 with QPACK, listener routing, version two
+and the earlier unfinished proofs remain outstanding.
+
+The unchanged BBR entropy assertions were also tried with CBMC's SMT backend
+and the installed Z3 solver. CBMC exited during SSA conversion with an
+internal `map::at` error, before a solver verdict. An equivalent spelling
+using plain boolean assertions had the same result and was reverted. This
+is a tool failure, not a production counterexample or a completed proof.

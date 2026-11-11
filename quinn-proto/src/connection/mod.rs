@@ -267,7 +267,7 @@ impl Connection {
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
-        let connection_side = ConnectionSide::from(side_args);
+        let connection_side = ConnectionSide::new(side_args, version);
         let side = connection_side.side();
         let initial_space = PacketSpace {
             crypto: Some(crypto.initial_keys(&init_cid, side)),
@@ -2987,7 +2987,7 @@ impl Connection {
                         return Err(TransportError::FRAME_ENCODING_ERROR("empty token"));
                     }
                     trace!("got new token");
-                    token_store.insert(server_name, token);
+                    token_store.insert(server_name, self.version, token);
                 }
                 Frame::Datagram(datagram) => {
                     if self.datagrams.received(
@@ -3409,7 +3409,7 @@ impl Connection {
                 &mut self.rng,
             );
             let new_token = NewToken {
-                token: token.encode(&*server_config.token_key).into(),
+                token: token.encode(&*server_config.token_key, self.version).into(),
             };
 
             if buf.len() + new_token.size() >= max_size {
@@ -3866,16 +3866,13 @@ impl ConnectionSide {
             Self::Server { .. } => Side::Server,
         }
     }
-}
-
-impl From<SideArgs> for ConnectionSide {
-    fn from(side: SideArgs) -> Self {
+    fn new(side: SideArgs, version: u32) -> Self {
         match side {
             SideArgs::Client {
                 token_store,
                 server_name,
             } => Self::Client {
-                token: token_store.take(&server_name).unwrap_or_default(),
+                token: token_store.take(&server_name, version).unwrap_or_default(),
                 token_store,
                 server_name,
             },
@@ -4156,7 +4153,7 @@ mod tests {
         ] {
             config
                 .token_store
-                .insert("localhost", vec![0; token_len].into());
+                .insert("localhost", 1, vec![0; token_len].into());
             let mut endpoint =
                 crate::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
             let now = Instant::now();

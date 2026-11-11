@@ -13,6 +13,8 @@ use crate::token::TokenStore;
 
 /// `TokenStore` implementation that stores up to `N` tokens per server name for up to a
 /// limited number of server names, in-memory
+///
+/// Tokens retain their wire version. The per-server limit covers all versions together.
 #[derive(Debug)]
 pub struct TokenMemoryCache(Mutex<State>);
 
@@ -27,13 +29,13 @@ impl TokenMemoryCache {
 }
 
 impl TokenStore for TokenMemoryCache {
-    fn insert(&self, server_name: &str, token: Bytes) {
+    fn insert(&self, server_name: &str, version: u32, token: Bytes) {
         trace!(%server_name, "storing token");
-        self.0.lock().unwrap().store(server_name, token)
+        self.0.lock().unwrap().store(server_name, version, token)
     }
 
-    fn take(&self, server_name: &str) -> Option<Bytes> {
-        let token = self.0.lock().unwrap().take(server_name);
+    fn take(&self, server_name: &str, version: u32) -> Option<Bytes> {
+        let token = self.0.lock().unwrap().take(server_name, version);
         trace!(%server_name, found=%token.is_some(), "taking token");
         token
     }
@@ -66,7 +68,7 @@ impl State {
         }
     }
 
-    fn store(&mut self, server_name: &str, token: Bytes) {
+    fn store(&mut self, server_name: &str, version: u32, token: Bytes) {
         if self.max_server_names == 0 {
             // the rest of this method assumes that we can always insert a new entry so long as
             // we're willing to evict a pre-existing entry. thus, an entry limit of 0 is an edge
@@ -89,7 +91,7 @@ impl State {
                     debug_assert!(tokens.len() == self.max_tokens_per_server);
                     tokens.pop_front().unwrap();
                 }
-                tokens.push_back(token);
+                tokens.push_back((version, token));
             }
             hash_map::Entry::Vacant(hmap_entry) => {
                 // key does not yet exist, create a new one, evicting the oldest if necessary
@@ -101,7 +103,10 @@ impl State {
                     None
                 };
 
-                hmap_entry.insert(self.lru.insert(CacheEntry::new(server_name, token)));
+                hmap_entry.insert(
+                    self.lru
+                        .insert(CacheEntry::new(server_name, version, token)),
+                );
 
                 // for borrowing reasons, we must defer removing the evicted hmap entry to here
                 if let Some(removed_slot) = removed_key {
@@ -112,13 +117,12 @@ impl State {
         };
     }
 
-    fn take(&mut self, server_name: &str) -> Option<Bytes> {
+    fn take(&mut self, server_name: &str, version: u32) -> Option<Bytes> {
         let slab_key = *self.lookup.get(server_name)?;
 
         // pop from entry's token queue
         let entry = self.lru.get_mut(slab_key);
-        // unwrap safety: we never leave tokens empty
-        let token = entry.tokens.pop_front().unwrap();
+        let token = entry.take(version)?;
 
         if entry.tokens.is_empty() {
             // token stack emptied, remove entry
@@ -135,14 +139,22 @@ impl State {
 struct CacheEntry {
     server_name: Arc<str>,
     // invariant: tokens is never empty
-    tokens: VecDeque<Bytes>,
+    tokens: VecDeque<(u32, Bytes)>,
 }
 
 impl CacheEntry {
+    fn take(&mut self, version: u32) -> Option<Bytes> {
+        let position = self
+            .tokens
+            .iter()
+            .position(|(stored, _)| *stored == version)?;
+        self.tokens.remove(position).map(|(_, token)| token)
+    }
+
     /// Construct with a single token
-    fn new(server_name: Arc<str>, token: Bytes) -> Self {
+    fn new(server_name: Arc<str>, version: u32, token: Bytes) -> Self {
         let mut tokens = VecDeque::new();
-        tokens.push_back(token);
+        tokens.push_back((version, token));
         Self {
             server_name,
             tokens,
@@ -160,6 +172,22 @@ mod tests {
 
     fn new_rng() -> impl Rng {
         Pcg32::new(0xdeadbeefdeadbeef, 0xdeadbeefdeadbeef)
+    }
+
+    #[test]
+    fn versions_share_the_limit_but_not_their_tokens() {
+        let cache = TokenMemoryCache::new(1, 2);
+        cache.insert("host", 1, Bytes::from_static(b"old"));
+        cache.insert("host", 0x6b33_43cf, Bytes::from_static(b"other"));
+        cache.insert("host", 1, Bytes::from_static(b"new"));
+        assert!(cache.take("host", 0xff00_0021).is_none());
+        assert!(cache.take("elsewhere", 1).is_none());
+        assert_eq!(cache.take("host", 1).unwrap(), b"new"[..]);
+        assert!(cache.take("host", 1).is_none());
+        assert_eq!(cache.take("host", 0x6b33_43cf).unwrap(), b"other"[..]);
+        assert!(cache.take("host", 0x6b33_43cf).is_none());
+        assert!(cache.0.lock().unwrap().lookup.is_empty());
+        assert!(cache.0.lock().unwrap().lru.is_empty());
     }
 
     #[test]
@@ -196,7 +224,7 @@ mod tests {
                             cache_1.remove(0);
                         }
                     }
-                    cache_2.insert(&server_name.to_string(), token);
+                    cache_2.insert(&server_name.to_string(), 1, token);
                 } else {
                     // take
                     println!("TAKE {server_name}");
@@ -214,7 +242,7 @@ mod tests {
                             token
                         });
                     println!("EXPECTING {expecting:?}");
-                    assert_eq!(cache_2.take(&server_name.to_string()), expecting);
+                    assert_eq!(cache_2.take(&server_name.to_string(), 1), expecting);
                 }
             }
         }
@@ -225,9 +253,9 @@ mod tests {
         // test that this edge case doesn't panic
         let cache = TokenMemoryCache::new(0, 2);
         for i in 0..10 {
-            cache.insert(&i.to_string(), Bytes::from(vec![i]));
+            cache.insert(&i.to_string(), 1, Bytes::from(vec![i]));
             for j in 0..10 {
-                assert!(cache.take(&j.to_string()).is_none());
+                assert!(cache.take(&j.to_string(), 1).is_none());
             }
         }
     }
@@ -237,10 +265,14 @@ mod tests {
         // test that this edge case doesn't panic
         let cache = TokenMemoryCache::new(256, 0);
         for i in 0..10 {
-            cache.insert(&i.to_string(), Bytes::from(vec![i]));
+            cache.insert(&i.to_string(), 1, Bytes::from(vec![i]));
             for j in 0..10 {
-                assert!(cache.take(&j.to_string()).is_none());
+                assert!(cache.take(&j.to_string(), 1).is_none());
             }
         }
     }
 }
+
+#[cfg(kani)]
+#[path = "../../verification/quic/kani/token_cache.rs"]
+mod proofs;

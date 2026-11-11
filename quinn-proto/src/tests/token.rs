@@ -8,6 +8,76 @@ use super::*;
 use crate::packet::{FixedLengthConnectionIdParser, Header, ProtectedHeader};
 
 #[test]
+fn mismatched_token_versions_leave_the_address_unvalidated() {
+    use crate::packet::{InitialHeader, PacketNumber};
+    use crate::token::{IncomingToken, Token, TokenPayload};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Log(AtomicUsize);
+    impl TokenLog for Log {
+        fn check_and_insert(
+            &self,
+            _: u128,
+            _: SystemTime,
+            _: Duration,
+        ) -> Result<(), TokenReuseError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let log = Arc::new(Log(AtomicUsize::new(0)));
+    let mut config = server_config();
+    config.validation_token.log = log.clone();
+    let address = "[::1]:4433".parse().unwrap();
+    let original = ConnectionId::new(&[3; 8]);
+    for version in [1, 0x6b33_43cf, 0xff00_0021] {
+        for retry in [false, true] {
+            let payload = if retry {
+                TokenPayload::Retry {
+                    address,
+                    orig_dst_cid: original,
+                    issued: config.time_source.now(),
+                }
+            } else {
+                TokenPayload::Validation {
+                    ip: address.ip(),
+                    issued: config.time_source.now(),
+                }
+            };
+            let encoded = Token::new(payload, &mut rand::rng()).encode(&*config.token_key, version);
+            let mut header = InitialHeader {
+                src_cid: ConnectionId::new(&[4; 8]),
+                dst_cid: ConnectionId::new(&[5; 8]),
+                token: encoded.into(),
+                number: PacketNumber::U8(0),
+                version: version ^ 2,
+            };
+            let before = log.0.load(Ordering::SeqCst);
+            let incoming = IncomingToken::from_header(&header, &config, address)
+                .ok()
+                .unwrap();
+            assert!(!incoming.validated);
+            assert_eq!(incoming.orig_dst_cid, header.dst_cid);
+            assert!(incoming.retry_src_cid.is_none());
+            assert_eq!(log.0.load(Ordering::SeqCst), before);
+
+            header.version = version;
+            let incoming = IncomingToken::from_header(&header, &config, address)
+                .ok()
+                .unwrap();
+            assert!(incoming.validated);
+            assert_eq!(
+                incoming.orig_dst_cid,
+                if retry { original } else { header.dst_cid }
+            );
+            assert_eq!(incoming.retry_src_cid, retry.then_some(header.dst_cid));
+            assert_eq!(log.0.load(Ordering::SeqCst), before + usize::from(!retry));
+        }
+    }
+}
+
+#[test]
 fn oversized_cached_initial_token() {
     let _guard = subscribe();
     for (token_len, mtu, fits) in [
@@ -28,7 +98,7 @@ fn oversized_cached_initial_token() {
             .initial_mtu(mtu);
         config
             .token_store
-            .insert("localhost", vec![0; token_len].into());
+            .insert("localhost", 1, vec![0; token_len].into());
         let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let now = Instant::now();
         let (_, mut conn) = endpoint
@@ -186,6 +256,34 @@ fn retry_token_expired() {
 }
 
 #[test]
+fn cached_tokens_stay_with_their_connection_version() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut config = client_config();
+    // Keep both versions' tokens while each completed connection issues two more.
+    config.token_store(Arc::new(TokenMemoryCache::new(1, 8)));
+    for (version, validated) in [
+        (1, false),
+        (0xff00_0021, false),
+        (1, true),
+        (0xff00_0021, true),
+    ] {
+        config.version(version);
+        pair.server.handle_incoming = Box::new(move |incoming| {
+            assert_eq!(incoming.remote_address_validated(), validated);
+            IncomingConnectionBehavior::Accept
+        });
+        let (client, _) = pair.connect_with(config.clone());
+        let now = pair.time;
+        pair.client_conn_mut(client)
+            .close(now, VarInt(0), Bytes::new());
+        pair.drive();
+        assert_eq!(pair.client.known_connections(), 0);
+        assert_eq!(pair.server.known_connections(), 0);
+    }
+}
+
+#[test]
 fn use_token() {
     let _guard = subscribe();
     let mut pair = Pair::default();
@@ -310,14 +408,14 @@ fn use_same_token_twice() {
     struct EvilTokenStore(Mutex<Bytes>);
 
     impl TokenStore for EvilTokenStore {
-        fn insert(&self, _server_name: &str, token: Bytes) {
+        fn insert(&self, _server_name: &str, _version: u32, token: Bytes) {
             let mut lock = self.0.lock().unwrap();
             if lock.is_empty() {
                 *lock = token;
             }
         }
 
-        fn take(&self, _server_name: &str) -> Option<Bytes> {
+        fn take(&self, _server_name: &str, _version: u32) -> Option<Bytes> {
             let lock = self.0.lock().unwrap();
             if lock.is_empty() {
                 None
