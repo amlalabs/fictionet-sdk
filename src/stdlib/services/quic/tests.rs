@@ -25,7 +25,10 @@ impl quinn_proto::TimeSource for Calendar {
     }
 }
 
-fn configs(entropy: Arc<dyn Entropy>) -> (ClientConfig, ServerConfig, Arc<EndpointConfig>) {
+fn configs(
+    entropy: Arc<dyn Entropy>,
+    datagrams: bool,
+) -> (ClientConfig, ServerConfig, Arc<EndpointConfig>) {
     let cert = rustls::pki_types::CertificateDer::from(
         include_bytes!("../../../../tests/it/fixtures/tls/p256.cert.der").to_vec(),
     );
@@ -57,7 +60,7 @@ fn configs(entropy: Arc<dyn Entropy>) -> (ClientConfig, ServerConfig, Arc<Endpoi
         .stream_receive_window(4096u32.into())
         .receive_window(32768u32.into())
         .send_window(32768)
-        .datagram_receive_buffer_size(None);
+        .datagram_receive_buffer_size(datagrams.then_some(4096));
     let transport = Arc::new(transport);
     let mut client = ClientConfig::new(Arc::new(
         quinn_proto::crypto::rustls::QuicClientConfig::try_from(client).unwrap(),
@@ -128,8 +131,12 @@ struct Pair {
 
 impl Pair {
     fn new() -> Self {
+        Self::with_datagrams(false)
+    }
+
+    fn with_datagrams(datagrams: bool) -> Self {
         let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(7)));
-        let (client, server, endpoint) = configs(entropy.clone());
+        let (client, server, endpoint) = configs(entropy.clone(), datagrams);
         let epoch = std::time::Instant::now();
         let address: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let make = |server, client: Option<ClientConfig>| {
@@ -481,7 +488,16 @@ fn closing_retires_the_lower_carrier_after_the_drain_timer() {
 
 #[test]
 fn queued_writes_do_not_postpone_reading_the_reverse_direction() {
-    let mut pair = Pair::new();
+    exercise_queued_writes(false);
+}
+
+#[test]
+fn queued_application_datagrams_do_not_postpone_stream_reads() {
+    exercise_queued_writes(true);
+}
+
+fn exercise_queued_writes(datagrams: bool) {
+    let mut pair = Pair::with_datagrams(datagrams);
     pair.handshake();
     pair.client
         .command(MuxCommand::control(ControlCommand::Open(Dir::Bi)));
@@ -501,14 +517,26 @@ fn queued_writes_do_not_postpone_reading_the_reverse_direction() {
     pair.server.command(server.send(StreamCommand::Write(
         Chunk::copy_of(pair.server.driver.budget(), b"reply").unwrap(),
     )));
-    pair.server.driver.run().unwrap();
-    assert!(Pair::transfer(&mut pair.server, &mut pair.client, false));
+    if datagrams {
+        pair.client
+            .command(MuxCommand::control(ControlCommand::ReceiveDatagrams(8)));
+        for _ in 0..8 {
+            let data = Chunk::copy_of(pair.server.driver.budget(), b"datagram").unwrap();
+            pair.server.command(application_datagram(data, false));
+            pair.server.driver.run().unwrap();
+            assert!(Pair::transfer(&mut pair.server, &mut pair.client, false));
+        }
+    } else {
+        pair.server.driver.run().unwrap();
+        assert!(Pair::transfer(&mut pair.server, &mut pair.client, false));
+    }
     let entropy = SeededEntropy::new(Seed::from_u64(8));
     let budget = pair.client.driver.budget().clone();
     let mut observed = Observations::new(0);
     let mut env = Env::new(pair.client.driver.now(), &entropy, &budget, &mut observed);
     let mut written = 0;
     let mut read = false;
+    let mut received_datagrams = 0;
     for _ in 0..10 {
         pair.client.driver.layer_mut().advance(&mut env).unwrap();
         while let Some(event) = pair.client.driver.layer_mut().take_event() {
@@ -517,6 +545,9 @@ fn queued_writes_do_not_postpone_reading_the_reverse_direction() {
                 MuxEvent::Child(_, StreamEvent::Data(bytes)) => {
                     assert_eq!(bytes.as_ref(), b"reply");
                     read = true;
+                }
+                MuxEvent::Control(ControlEvent::Datagram(DatagramEvent::Datagram(_))) => {
+                    received_datagrams += 1
                 }
                 _ => {}
             }
@@ -527,6 +558,10 @@ fn queued_writes_do_not_postpone_reading_the_reverse_direction() {
     }
     assert!(read, "reading progresses before the write queue drains");
     assert!(written < 100);
+    assert!(
+        received_datagrams < 8,
+        "reading progresses before the datagram queue drains"
+    );
 }
 
 #[test]
@@ -746,4 +781,221 @@ fn sustained_streams_survive_loss_duplicates_and_reordering() {
     drop(links);
     drop(pair);
     assert!(budgets.iter().all(|budget| budget.used() == 0));
+}
+
+fn application_datagram(bytes: Chunk, tracked: bool) -> MuxCommand<ByteStream<VarInt>, Control> {
+    let datagram = Datagram::new(bytes, ());
+    MuxCommand::control(ControlCommand::Datagram(DatagramCommand::Send(
+        if tracked {
+            datagram.with_completion()
+        } else {
+            datagram
+        },
+    )))
+}
+
+fn datagram_payloads(peer: &Peer) -> Vec<Vec<u8>> {
+    peer.events
+        .iter()
+        .filter_map(|event| match event {
+            MuxEvent::Control(ControlEvent::Datagram(DatagramEvent::Datagram(datagram))) => {
+                Some(datagram.payload().to_vec())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn datagram_completions(peer: &Peer) -> u64 {
+    peer.events
+        .iter()
+        .filter_map(|event| match event {
+            MuxEvent::Control(ControlEvent::Datagram(DatagramEvent::Sent(count))) => Some(count),
+            _ => None,
+        })
+        .sum()
+}
+
+#[test]
+fn application_datagrams_are_whole_and_independently_credited() {
+    let mut pair = Pair::with_datagrams(true);
+    pair.handshake();
+    for (index, payload) in [&b"first"[..], &b""[..], &b"last"[..]]
+        .into_iter()
+        .enumerate()
+    {
+        for peer in [&mut pair.client, &mut pair.server] {
+            let bytes = Chunk::copy_of(peer.driver.budget(), payload).unwrap();
+            peer.command(application_datagram(bytes, true));
+        }
+        pair.drive();
+        for _ in 0..10 {
+            if datagram_completions(&pair.client) == index as u64 + 1
+                && datagram_completions(&pair.server) == index as u64 + 1
+            {
+                break;
+            }
+            pair.tick();
+        }
+    }
+    for peer in [&pair.client, &pair.server] {
+        assert!(datagram_payloads(peer).is_empty());
+        assert_eq!(datagram_completions(peer), 3);
+    }
+    pair.client
+        .command(MuxCommand::control(ControlCommand::ReceiveDatagrams(1)));
+    pair.drive();
+    assert_eq!(datagram_payloads(&pair.client), [b"first".to_vec()]);
+    assert!(datagram_payloads(&pair.server).is_empty());
+    pair.client
+        .command(MuxCommand::control(ControlCommand::ReceiveDatagrams(2)));
+    pair.server
+        .command(MuxCommand::control(ControlCommand::ReceiveDatagrams(3)));
+    pair.drive();
+    for peer in [&pair.client, &pair.server] {
+        assert_eq!(
+            datagram_payloads(peer),
+            [b"first".to_vec(), vec![], b"last".to_vec()]
+        );
+    }
+}
+
+#[test]
+fn application_send_waits_for_lower_completion_and_keeps_refused_payload() {
+    let mut pair = Pair::with_datagrams(true);
+    pair.handshake();
+    let bytes = Chunk::copy_of(pair.client.driver.budget(), b"first").unwrap();
+    pair.client.command(application_datagram(bytes, true));
+    let budget = Budget::new(4);
+    let second = Chunk::copy_of(&budget, b"next").unwrap();
+    let pointer = second.as_ptr();
+    let Admit::Blocked(command) = pair
+        .client
+        .driver
+        .command(application_datagram(second, true))
+        .unwrap()
+    else {
+        panic!("one pending application datagram")
+    };
+    let MuxOp::Control(ControlCommand::Datagram(DatagramCommand::Send(datagram))) =
+        command.into_op()
+    else {
+        panic!("same command")
+    };
+    assert_eq!(datagram.payload().as_ptr(), pointer);
+    assert_eq!(datagram.payload(), b"next");
+    assert!(datagram.wants_completion());
+    assert_eq!(budget.used(), 4);
+    for _ in 0..10 {
+        pair.client.driver.run().unwrap();
+        assert!(pair.client.driver.layer_mut().take_urgent().is_none());
+        if let Some(DatagramCommand::Send(_)) = pair.client.driver.take_command() {
+            assert!(pair.client.driver.layer_mut().take_urgent().is_none());
+            assert!(matches!(
+                pair.client.driver.deliver(DatagramEvent::Sent(1)).unwrap(),
+                Admit::Taken
+            ));
+            if let Some(event) = pair.client.driver.layer_mut().take_urgent() {
+                assert!(matches!(
+                    event,
+                    MuxEvent::Control(ControlEvent::Datagram(DatagramEvent::Sent(1)))
+                ));
+                assert!(Quic::urgent(&event));
+                assert!(pair.client.driver.layer_mut().take_urgent().is_none());
+                return;
+            }
+        }
+        let at = pair.client.driver.deadline().unwrap();
+        pair.client.driver.set_now(at);
+    }
+    panic!("application datagram never retired");
+}
+
+#[test]
+fn unsupported_and_unpaid_datagrams_preserve_ownership() {
+    for enabled in [false, true] {
+        let mut pair = Pair::with_datagrams(enabled);
+        pair.handshake();
+        let source = Budget::new(4);
+        let bytes = Chunk::copy_of(&source, b"held").unwrap();
+        let pointer = bytes.as_ptr();
+        let budget = pair.client.driver.budget();
+        let _full = budget.charge(budget.limit() - budget.used()).unwrap();
+        let result = pair
+            .client
+            .driver
+            .command(application_datagram(bytes, true))
+            .unwrap();
+        let command = match result {
+            Admit::Blocked(command) if enabled => command,
+            Admit::Closed(command) if !enabled => command,
+            _ => panic!("refusal must preserve the command"),
+        };
+        let MuxOp::Control(ControlCommand::Datagram(DatagramCommand::Send(datagram))) =
+            command.into_op()
+        else {
+            panic!("datagram")
+        };
+        assert_eq!(datagram.payload().as_ptr(), pointer);
+        assert_eq!(datagram.payload(), b"held");
+        assert!(datagram.wants_completion());
+        assert_eq!(source.used(), 4);
+        assert!(pair.client.driver.layer_mut().take_urgent().is_none());
+    }
+}
+
+#[test]
+fn oversized_application_datagrams_retire_locally_without_closing() {
+    let mut pair = Pair::with_datagrams(true);
+    pair.handshake();
+    let maximum = pair
+        .client
+        .events
+        .iter()
+        .find_map(|event| match event {
+            MuxEvent::Control(ControlEvent::DatagramSize(Some(limit))) => Some(*limit),
+            _ => None,
+        })
+        .unwrap();
+    let bytes = Chunk::copy_of(pair.client.driver.budget(), &vec![0; maximum + 1]).unwrap();
+    pair.client.command(application_datagram(bytes, true));
+    pair.drive();
+    assert_eq!(datagram_completions(&pair.client), 1);
+    assert!(datagram_payloads(&pair.server).is_empty());
+    pair.client
+        .command(MuxCommand::control(ControlCommand::Open(Dir::Bi)));
+    pair.drive();
+    pair.client.opened();
+}
+
+#[test]
+fn application_completion_passes_blocked_application_input() {
+    let mut pair = Pair::with_datagrams(true);
+    pair.handshake();
+    pair.client
+        .command(MuxCommand::control(ControlCommand::ReceiveDatagrams(1)));
+    let input = Chunk::copy_of(pair.server.driver.budget(), b"pending").unwrap();
+    pair.server.command(application_datagram(input, false));
+    let output = Chunk::copy_of(pair.client.driver.budget(), b"reply").unwrap();
+    pair.client.command(application_datagram(output, true));
+    let mut completed = false;
+    for _ in 0..100 {
+        pair.server.driver.run().unwrap();
+        Pair::transfer(&mut pair.server, &mut pair.client, false);
+        pair.client.driver.run().unwrap();
+        Pair::transfer(&mut pair.client, &mut pair.server, false);
+        if let Some(event) = pair.client.driver.layer_mut().take_urgent() {
+            assert!(matches!(
+                event,
+                MuxEvent::Control(ControlEvent::Datagram(DatagramEvent::Sent(1)))
+            ));
+            assert!(Quic::urgent(&event));
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed);
+    pair.drive();
+    assert_eq!(datagram_payloads(&pair.client), [b"pending".to_vec()]);
+    assert!(pair.client.driver.layer_mut().take_urgent().is_none());
 }

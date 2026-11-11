@@ -52,16 +52,17 @@ fn configuration() -> quiche::Config {
     config
 }
 
-fn exchange(sdk_client: bool) {
+fn exchange(sdk_client: bool, datagrams: bool) {
     const REQUEST: &[u8] = b"request over independent QUIC";
     const RESPONSE: &[u8] = b"response over independent QUIC";
-    let pair = Pair::new();
+    let pair = Pair::with_datagrams(datagrams);
     let (mut sdk, other) = if sdk_client {
         (pair.client, pair.server.address)
     } else {
         (pair.server, pair.client.address)
     };
     let mut config = configuration();
+    config.enable_dgram(datagrams, 8, 8);
     let cid = quiche::ConnectionId::from_ref(&[19; 16]);
     let mut stock = if sdk_client {
         quiche::accept(&cid, None, other, sdk.address, &mut config).unwrap()
@@ -79,11 +80,21 @@ fn exchange(sdk_client: bool) {
     let mut sdk_fin = false;
     let mut stock_fin = false;
     let mut wire = [0; 65535];
+    let mut sdk_datagrams = Vec::new();
+    let mut stock_datagrams = Vec::new();
+    let mut sdk_datagram_sends = 0;
+    let mut sdk_datagram_completions = 0;
+    let mut stock_datagram_sent = false;
     for _ in 0..1000 {
         sdk.driver.run().unwrap();
         while let Some(event) = sdk.driver.layer_mut().take_event() {
             match event {
-                MuxEvent::Control(ControlEvent::Connected) => connected = true,
+                MuxEvent::Control(ControlEvent::Connected) => {
+                    connected = true;
+                    if datagrams { sdk.command(MuxCommand::control(ControlCommand::ReceiveDatagrams(2))); }
+                }
+                MuxEvent::Control(ControlEvent::Datagram(DatagramEvent::Datagram(datagram))) => sdk_datagrams.push(datagram.payload().to_vec()),
+                MuxEvent::Control(ControlEvent::Datagram(DatagramEvent::Sent(n))) => sdk_datagram_completions += n,
                 MuxEvent::Control(ControlEvent::Lost(reason)) => {
                     panic!("SDK connection lost: {reason}")
                 }
@@ -116,6 +127,12 @@ fn exchange(sdk_client: bool) {
             sdk.command(child.send(StreamCommand::End));
             sdk_sent = true;
         }
+        if datagrams && connected && sdk_datagram_sends < 2 && sdk_datagram_completions == sdk_datagram_sends {
+            let data = if sdk_datagram_sends == 0 { b"SDK datagram".as_slice() } else { b"".as_slice() };
+            let bytes = Chunk::copy_of(sdk.driver.budget(), data).unwrap();
+            sdk.command(application_datagram(bytes, true));
+            sdk_datagram_sends += 1;
+        }
         if let Some(command) = sdk.driver.take_command() {
             let DatagramCommand::Send(datagram) = command else {
                 panic!("premature SDK closure")
@@ -138,6 +155,18 @@ fn exchange(sdk_client: bool) {
             ));
         }
         if stock.is_established() {
+            if datagrams && !stock_datagram_sent {
+                stock.dgram_send(b"quiche datagram").unwrap();
+                stock.dgram_send(b"").unwrap();
+                stock_datagram_sent = true;
+            }
+            loop {
+                match stock.dgram_recv(&mut wire) {
+                    Ok(n) => stock_datagrams.push(wire[..n].to_vec()),
+                    Err(quiche::Error::Done) => break,
+                    Err(error) => panic!("independent datagram receive: {error}"),
+                }
+            }
             for stream in stock.readable() {
                 assert_eq!(stream, 0);
                 loop {
@@ -176,9 +205,14 @@ fn exchange(sdk_client: bool) {
                 Err(error) => panic!("independent packet send: {error}"),
             }
         }
-        if sdk_fin && stock_fin {
+        if sdk_fin && stock_fin && (!datagrams || (sdk_datagrams.len() == 2 && stock_datagrams.len() == 2 && sdk_datagram_completions == 2)) {
             break;
         }
+    }
+    if datagrams {
+        assert_eq!(sdk_datagrams, [b"quiche datagram".to_vec(), vec![]]);
+        assert_eq!(stock_datagrams, [b"SDK datagram".to_vec(), vec![]]);
+        assert_eq!(sdk_datagram_completions, 2);
     }
     assert!(connected && stock.is_established());
     assert!(sdk_fin && stock_fin);
@@ -189,10 +223,20 @@ fn exchange(sdk_client: bool) {
 
 #[test]
 fn client_exchanges_protected_stream_data_with_quiche() {
-    exchange(true);
+    exchange(true, false);
 }
 
 #[test]
 fn server_exchanges_protected_stream_data_with_quiche() {
-    exchange(false);
+    exchange(false, false);
+}
+
+#[test]
+fn client_exchanges_application_datagrams_with_quiche() {
+    exchange(true, true);
+}
+
+#[test]
+fn server_exchanges_application_datagrams_with_quiche() {
+    exchange(false, true);
 }

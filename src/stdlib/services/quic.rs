@@ -2,7 +2,8 @@
 //!
 //! A layer owns one connection and its endpoint routing state. Its lower
 //! carrier must retire tracked sends, including local drops. It offers
-//! independently credited, directionally cancellable byte streams above.
+//! independently credited, directionally cancellable byte streams above,
+//! plus the connection's application datagram carrier in its control port.
 //! The engine does no socket I/O. The caller supplies its monotonic epoch;
 //! every subsequent timestamp is derived from the layer environment.
 //!

@@ -15,7 +15,8 @@ use crate::stdlib::layer::{
 };
 use crate::time::Instant;
 
-/// One QUIC connection, with one byte carrier per stream.
+/// One QUIC connection, with one byte carrier per stream and the connection's
+/// `Datagrams<()>` carrier carried by `Control`.
 pub type Quic = Mux<ByteStream<VarInt>, Control, Stream>;
 type Up = MuxEvent<ByteStream<VarInt>, Control, Stream>;
 type Command = MuxCommand<ByteStream<VarInt>, Control>;
@@ -26,6 +27,10 @@ pub enum Control {}
 impl Port for Control {
     type Event = ControlEvent;
     type Command = ControlCommand;
+
+    fn urgent(event: &ControlEvent) -> bool {
+        matches!(event, ControlEvent::Datagram(event) if Datagrams::<()>::urgent(event))
+    }
 }
 
 /// Commands that affect the connection.
@@ -34,6 +39,11 @@ pub enum ControlCommand {
     Open(Dir),
     /// Start graceful connection closure with an application error code.
     Close(VarInt),
+    /// A command on the connection's application datagram carrier. `End`
+    /// closes the connection using the caller's generic closure policy.
+    Datagram(DatagramCommand<()>),
+    /// Grant receive credit, in whole application datagrams, including empty ones.
+    ReceiveDatagrams(u64),
 }
 
 /// Connection events.
@@ -41,6 +51,12 @@ pub enum ControlCommand {
 pub enum ControlEvent {
     /// The TLS handshake completed. Early application data is not exposed.
     Connected,
+    /// The largest sendable application payload, or no datagram support.
+    /// Announced after the handshake and whenever the active path changes it.
+    DatagramSize(Option<usize>),
+    /// An event on the connection's application datagram carrier. Send
+    /// completions retire local attempts, including drops, not peer delivery.
+    Datagram(DatagramEvent<()>),
     /// The connection was lost. Child handles will be retired.
     Lost(quinn_proto::ConnectionError),
     /// Connection closure and its draining period finished.
@@ -145,6 +161,50 @@ pub struct QuicLayer {
     lower_ended: bool,
     cancel: fn(Closing) -> VarInt,
     accept_dir: Dir,
+    datagram_send: DatagramSend,
+    datagram_receive: u64,
+    datagram_limit: Option<Option<usize>>,
+    datagram_turn: bool,
+    datagrams_ended: bool,
+}
+
+/// One application send, followed through packet construction and the
+/// lower carrier's completion. A local drop has no packet to wait for.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+enum DatagramSend {
+    #[default]
+    Idle,
+    Queued(bool),
+    Flight(bool),
+    Ready,
+}
+
+impl DatagramSend {
+    fn retired(&mut self) {
+        if let Self::Queued(tracked) | Self::Flight(tracked) = *self {
+            *self = if tracked { Self::Ready } else { Self::Idle };
+        }
+    }
+
+    fn packet(&mut self, pending: bool) {
+        if !pending && let Self::Queued(tracked) = *self {
+            *self = Self::Flight(tracked);
+        }
+    }
+
+    fn completed(&mut self) {
+        if matches!(self, Self::Flight(_)) {
+            self.retired();
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        if *self != Self::Ready {
+            return false;
+        }
+        *self = Self::Idle;
+        true
+    }
 }
 
 /// One tracked send can be outside the layer at a time. Preparing a packet
@@ -212,6 +272,11 @@ impl QuicLayer {
             lower_ended: false,
             cancel,
             accept_dir: Dir::Bi,
+            datagram_send: DatagramSend::Idle,
+            datagram_receive: 0,
+            datagram_limit: None,
+            datagram_turn: true,
+            datagrams_ended: false,
         })
     }
 
@@ -338,6 +403,22 @@ impl QuicLayer {
         false
     }
 
+    fn read_datagram(&mut self, budget: &Budget) -> bool {
+        if self.up.is_some() || self.datagram_receive == 0 {
+            return false;
+        }
+        let connection = &mut self.connection.as_mut().unwrap().1;
+        let Some(chunk) = connection.datagrams().recv_chunk(budget) else {
+            return false;
+        };
+        self.datagram_receive -= 1;
+        self.up = Some(MuxEvent::Control(ControlEvent::Datagram(
+            DatagramEvent::Datagram(Datagram::new(chunk, ())),
+        )));
+        self.datagram_turn = false;
+        true
+    }
+
     fn write_channel(connection: &mut Connection, channel: &mut Channel, budget: &Budget) -> bool {
         if let Some(front) = channel.pending.front_mut() {
             match connection
@@ -450,6 +531,9 @@ impl Layer for QuicLayer {
         match event {
             DatagramEvent::Sent(count) => {
                 self.flight.complete(count)?;
+                if count == 1 {
+                    self.datagram_send.completed();
+                }
             }
             DatagramEvent::Ended => {
                 self.lower_ended = true;
@@ -457,6 +541,10 @@ impl Layer for QuicLayer {
                 self.down = None;
                 self.flight = Flight::default();
                 self.deadline = None;
+                self.datagram_send = DatagramSend::Idle;
+                if let Some((_, connection)) = self.connection.as_mut() {
+                    connection.datagrams().discard_chunk();
+                }
             }
             DatagramEvent::Datagram(datagram) => {
                 if self.lower_ended {
@@ -547,6 +635,47 @@ impl Layer for QuicLayer {
         let refused = |op| Admit::Blocked(MuxCommand::from_op(op));
         let closed = |op| Admit::Closed(MuxCommand::from_op(op));
         match command.into_op() {
+            MuxOp::Control(ControlCommand::ReceiveDatagrams(credit)) => {
+                self.datagram_receive = self
+                    .datagram_receive
+                    .checked_add(credit)
+                    .ok_or(Error::Credit)?;
+            }
+            MuxOp::Control(ControlCommand::Datagram(DatagramCommand::Send(datagram))) => {
+                if !self.connected || self.datagram_send != DatagramSend::Idle {
+                    return Ok(refused(MuxOp::Control(ControlCommand::Datagram(
+                        DatagramCommand::Send(datagram),
+                    ))));
+                }
+                let tracked = datagram.wants_completion();
+                let (mut data, ()) = datagram.into_parts();
+                let result = connection.datagrams().send_chunk(&mut data, env.budget());
+                let restore = |data| {
+                    let datagram = Datagram::new(data, ());
+                    MuxOp::Control(ControlCommand::Datagram(DatagramCommand::Send(
+                        if tracked {
+                            datagram.with_completion()
+                        } else {
+                            datagram
+                        },
+                    )))
+                };
+                match result {
+                    Ok(true) => self.datagram_send = DatagramSend::Queued(tracked),
+                    Ok(false) => return Ok(refused(restore(data))),
+                    Err(quinn_proto::SendDatagramError::TooLarge) => {
+                        if tracked {
+                            self.datagram_send = DatagramSend::Ready;
+                        }
+                    }
+                    Err(_) => return Ok(closed(restore(data))),
+                }
+            }
+            MuxOp::Control(ControlCommand::Datagram(DatagramCommand::End)) => {
+                connection.close(now, (self.cancel)(Closing::Done), bytes::Bytes::new());
+                self.ending = true;
+                self.datagram_send = DatagramSend::Idle;
+            }
             MuxOp::Control(ControlCommand::Open(dir)) => {
                 if !self.connected
                     || self.up.is_some()
@@ -562,6 +691,7 @@ impl Layer for QuicLayer {
             MuxOp::Control(ControlCommand::Close(code)) => {
                 connection.close(now, code, bytes::Bytes::new());
                 self.ending = true;
+                self.datagram_send = DatagramSend::Idle;
             }
             MuxOp::Credit(id, credit) | MuxOp::Window(id, credit, _) => {
                 if let Some(channel) = self.channels.get_mut(id) {
@@ -658,6 +788,7 @@ impl Layer for QuicLayer {
                     }
                     quinn_proto::Event::ConnectionLost { reason } => {
                         self.ending = true;
+                        self.datagram_send = DatagramSend::Idle;
                         self.notice = Some(ControlEvent::Lost(reason));
                     }
                     quinn_proto::Event::Stream(event) => match event {
@@ -700,6 +831,12 @@ impl Layer for QuicLayer {
                 self.channels.remove(id);
                 self.up = Some(MuxEvent::Closed(id));
                 moved = true;
+            } else if !self.datagrams_ended {
+                self.datagrams_ended = true;
+                self.up = Some(MuxEvent::Control(ControlEvent::Datagram(
+                    DatagramEvent::Ended,
+                )));
+                moved = true;
             } else if !self.ended
                 && (self.lower_ended
                     || self.connection.as_ref().is_none_or(|(_, c)| c.is_drained()))
@@ -710,6 +847,22 @@ impl Layer for QuicLayer {
             }
         }
         if self.connected && !self.ending {
+            let connection = &mut self.connection.as_mut().unwrap().1;
+            if matches!(self.datagram_send, DatagramSend::Queued(_))
+                && !connection.datagrams().has_pending_chunk()
+            {
+                self.datagram_send.retired();
+                moved = true;
+            }
+            let limit = connection.datagrams().max_size();
+            if self.up.is_none() && self.datagram_limit != Some(limit) {
+                self.datagram_limit = Some(limit);
+                self.up = Some(MuxEvent::Control(ControlEvent::DatagramSize(limit)));
+                moved = true;
+            }
+            if self.datagram_turn {
+                moved |= self.read_datagram(env.budget());
+            }
             if self.up.is_none() && self.channels.len() < self.channels.limit() {
                 let connection = &mut self.connection.as_mut().unwrap().1;
                 let other = match self.accept_dir {
@@ -737,6 +890,9 @@ impl Layer for QuicLayer {
             if let Some(id) = next {
                 self.cursor = Some(id);
                 if self.step_channel(id, env.budget()) {
+                    if matches!(self.up, Some(MuxEvent::Child(..) | MuxEvent::Credit(..))) {
+                        self.datagram_turn = true;
+                    }
                     self.scan = self.channels.len();
                     moved = true;
                 } else {
@@ -744,6 +900,7 @@ impl Layer for QuicLayer {
                     moved |= self.scan > 0;
                 }
             }
+            moved |= self.read_datagram(env.budget());
         }
         if !self.lower_ended {
             self.update_deadline();
@@ -772,6 +929,14 @@ impl Layer for QuicLayer {
                 self.wire = Some(bytes);
                 return None;
             };
+            self.datagram_send.packet(
+                self.connection
+                    .as_mut()
+                    .unwrap()
+                    .1
+                    .datagrams()
+                    .has_pending_chunk(),
+            );
             self.down =
                 Some(Datagram::new(bytes.into_chunk(), transmit.destination).with_completion());
         }
@@ -792,6 +957,11 @@ impl Layer for QuicLayer {
     }
 
     fn take_urgent(&mut self) -> Option<Up> {
+        if self.datagram_send.take() {
+            return Some(MuxEvent::Control(ControlEvent::Datagram(
+                DatagramEvent::Sent(1),
+            )));
+        }
         let id = self.channels.ids().find(|id| {
             if matches!(&self.up, Some(MuxEvent::Opened(child, ..)) if child.id() == *id) {
                 return false;

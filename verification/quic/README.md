@@ -491,10 +491,82 @@ backings and refusal, not repayment, wire encoding or the complete engine.
 
 `a_paid_datagram_moves_into_its_slot_without_allocating` retains the same
 bounds in Kani over arbitrary four-byte input. It uses the shared
-allocation stubs, without stubbing production functions. Its run has no
-verdict recorded yet; the ordinary allocation test is not a substitute.
+allocation stubs, without stubbing production functions. Its run was stopped after more than fourteen minutes expanding paths,
+without reaching the solver or the memory cap. It has no proof verdict;
+the ordinary allocation test is not a substitute.
 Run it with `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
 -Z c-ffi -Z mem-predicates -Z restrict-vtable --harness
 a_paid_datagram_moves_into_its_slot_without_allocating` under the required
 scope. Receive storage, recovery, TLS, routing and other engine metadata
 still prevent any whole-engine resource claim.
+
+## Application datagram carrier
+
+`Control` now carries the connection's `Datagrams<()>` commands and events
+alongside its stream controls. These datagrams belong to the connection,
+not a QUIC stream. `ReceiveDatagrams` grants credit in whole datagrams,
+including empty ones. `DatagramSize` announces the sendable payload limit
+after the handshake and when it changes. This carrier uses the charged
+engine slot above. Unsupported sends return the original command as
+closed; a busy slot or budget refusal returns it as blocked. Oversized
+sends are local drops. `DatagramCommand::End` closes the connection with
+the supplied generic closure policy, while `ControlCommand::Close` takes
+an explicit application error code.
+
+A tracked send remains outstanding through engine serialization and the
+lower datagram carrier's completion. It then emits one urgent `Sent(1)`,
+including when the lower carrier locally drops its packet. Local size
+eviction also retires an attempt. Closure cancels outstanding completions.
+Completion does not report peer acknowledgment or application delivery.
+Stream receives and datagram receives alternate when both can progress;
+queued writes do not give datagrams priority over ready stream data.
+
+The isolated interoperability crate's 20 tests pass. Its four independent
+peer tests now cover streams alone and streams with application datagrams,
+in both endpoint roles. The datagram cases exchange a nonempty message and
+an empty message each way with quiche. Shared layer regressions cover
+receive credit, same-backing refusal, unavailable budgets, local size
+drops, lower-send completion gating, urgent completion past pending receive
+input, and stream reads before queued writes and datagrams drain.
+
+`application_completion_requires_retirement_and_is_taken_once` passes Kani
+without stubbing production functions over eight arbitrary completion-state
+operations and both tracked/untracked sends. It checks local drops, lower
+retirement and exactly-once extraction. It does not prove the scheduler or
+that a particular encrypted packet contains a particular datagram.
+Run it with `cargo kani -p fictionet --lib -Z stubbing --harness
+application_completion_requires_retirement_and_is_taken_once`.
+
+`DatagramSend.tla` models the charged input, inline slot, separately charged
+wire output and lower completion. Its base passes: 42 generated states,
+28 distinct, depth six. The resource model checks the transient copy while
+input and output coexist; freeing and releasing reservations are separate
+steps. Copy-on-admission violates `PaidBacking`, premature completion
+violates `AfterRetirement`, repeated extraction violates `Once`, and the
+reachability control violates `NoReport`. Run its five configurations with
+the shared resource library as for `SendBacking`. This model has no
+production trace replay and does not cover receive storage, cancellation,
+packet recovery or cryptography.
+
+The full receive-path Kani harness was retried unchanged. It still fails
+inside the compiler's intrinsic handling before producing a proof verdict.
+Restricting virtual call targets and compiling tracing out did not resolve
+it. The selected guard proofs and completion proof remain separate from
+that unresolved full-path harness.
+
+Application datagrams are now integrated, but this remains an incomplete
+QUIC and HTTP/3 build-out. Outstanding work includes whole-engine resource
+admission and all three resource evidence layers, the HTTP/3 coordinator
+and handler integration, multi-connection listener routing, QUIC version
+two, ECN/local-address carrier metadata, and broader transport refinement
+and production trace replay. Existing unfinished allocation and BBR proofs
+remain unfinished unless a later section records a verdict.
+
+Final Cargo checks for this datagram step pass: 4,347 SDK library tests,
+1,413 integration tests, the SSH transport integration test, all 302 SDK
+doctests, and the engine and independent-peer suites recorded above.
+Rustdoc builds both libraries with the existing redundant-link warning in
+`network/packet.rs`. The existing `quic_sparse_reassembly` benchmark runs
+at 16 KiB and 64 KiB; it still measures the legacy codec, not throughput of
+the new datagram carrier. Clippy with warnings denied and the workspace
+formatting check pass.
