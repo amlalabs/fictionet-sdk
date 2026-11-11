@@ -1,20 +1,26 @@
 use tracing::{debug, trace};
 
 use crate::connection::spaces::PacketSpace;
-use crate::crypto::{HeaderKey, KeyPair, PacketKey};
+use crate::crypto::{HeaderKey, KeyPair, Keys, PacketKey};
 use crate::packet::{Packet, PartialDecode, SpaceId};
 use crate::token::ResetToken;
 use crate::Instant;
 use crate::{TransportError, RESET_TOKEN_SIZE};
 
 /// Removes header protection of a packet, or returns `None` if the packet was dropped
+///
+/// `other_initial` holds the Initial keys of another version, used for an
+/// Initial packet in that version during version negotiation.
 pub(super) fn unprotect_header(
     partial_decode: PartialDecode,
     spaces: &[PacketSpace; 3],
     zero_rtt_crypto: Option<&ZeroRttCrypto>,
     stateless_reset_token: Option<ResetToken>,
+    other_initial: Option<&Keys>,
 ) -> Option<UnprotectHeaderResult> {
-    let header_crypto = if partial_decode.is_0rtt() {
+    let header_crypto = if let Some(keys) = other_initial.filter(|_| partial_decode.is_initial()) {
+        Some(&*keys.header.remote)
+    } else if partial_decode.is_0rtt() {
         if let Some(crypto) = zero_rtt_crypto {
             Some(&*crypto.header)
         } else {
@@ -65,7 +71,8 @@ pub(super) struct UnprotectHeaderResult {
     pub(super) stateless_reset: bool,
 }
 
-/// Decrypts a packet's body in-place
+/// Decrypts a packet's body in-place, an Initial one with `other_initial`
+/// when given
 pub(super) fn decrypt_packet_body(
     packet: &mut Packet,
     spaces: &[PacketSpace; 3],
@@ -73,6 +80,7 @@ pub(super) fn decrypt_packet_body(
     conn_key_phase: bool,
     prev_crypto: Option<&PrevCrypto>,
     next_crypto: Option<&KeyPair<Box<dyn PacketKey>>>,
+    other_initial: Option<&Keys>,
 ) -> Result<Option<DecryptPacketResult>, Option<TransportError>> {
     if !packet.header.is_protected() {
         // Unprotected packets also don't have packet numbers
@@ -84,7 +92,9 @@ pub(super) fn decrypt_packet_body(
     let packet_key_phase = packet.header.key_phase();
 
     let mut crypto_update = false;
-    let crypto = if packet.header.is_0rtt() {
+    let crypto = if let Some(keys) = other_initial.filter(|_| space == SpaceId::Initial) {
+        &keys.packet.remote
+    } else if packet.header.is_0rtt() {
         &zero_rtt_crypto.unwrap().packet
     } else if packet_key_phase == conn_key_phase || space != SpaceId::Data {
         &spaces[space].crypto.as_ref().unwrap().packet.remote

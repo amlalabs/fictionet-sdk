@@ -22,6 +22,7 @@ use crate::{
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
     shared::ConnectionId,
+    version::{VersionList, QUIC_V1, QUIC_V2},
     Duration, RandomConnectionIdGenerator, SystemTime, TokenLog, TokenMemoryCache, TokenStore,
     VarInt, VarIntBoundsExceeded, DEFAULT_SUPPORTED_VERSIONS, MAX_CID_SIZE,
 };
@@ -566,8 +567,11 @@ pub struct ClientConfig {
     /// Provider that populates the destination connection ID of Initial Packets
     pub(crate) initial_dst_cid_provider: Arc<WithRng<ConnectionId>>,
 
-    /// QUIC protocol version to use
+    /// QUIC protocol version of the first flight
     pub(crate) version: u32,
+
+    /// Versions the client accepts, most preferred first
+    pub(crate) preferred_versions: VersionList,
 }
 
 impl ClientConfig {
@@ -580,7 +584,9 @@ impl ClientConfig {
             initial_dst_cid_provider: Arc::new(|rng| {
                 RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid(rng)
             }),
-            version: 1,
+            version: QUIC_V1,
+            preferred_versions: VersionList::new(&[QUIC_V2, QUIC_V1])
+                .expect("both versions are implemented"),
         }
     }
 
@@ -614,9 +620,24 @@ impl ClientConfig {
         self
     }
 
-    /// Set the QUIC version to use
+    /// Set the QUIC version of the first flight, the Original Version of
+    /// RFC 9368. It must be one of the preferred versions.
+    ///
+    /// Defaults to version 1, which servers widely parse; the server may
+    /// then switch to a preferred compatible version such as version 2.
     pub fn version(&mut self, version: u32) -> &mut Self {
         self.version = version;
+        self
+    }
+
+    /// Set the versions this client accepts, most preferred first
+    ///
+    /// The compatible ones are offered in Version Information so a server
+    /// can switch the connection to one of them without a round trip. After
+    /// a Version Negotiation packet the client starts again in the first of
+    /// them that the server lists. Defaults to versions 2 and 1.
+    pub fn preferred_versions(&mut self, versions: VersionList) -> &mut Self {
+        self.preferred_versions = versions;
         self
     }
 }

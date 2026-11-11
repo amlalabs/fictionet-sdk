@@ -21,6 +21,7 @@ use crate::{
     coding::{BufExt, BufMutExt, UnexpectedEnd},
     config::{EndpointConfig, ServerConfig, TransportConfig},
     shared::ConnectionId,
+    version::{VersionInformation, VersionList},
     ResetToken, Side, TransportError, VarInt, LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT,
     RESET_TOKEN_SIZE, TIMER_GRANULARITY,
 };
@@ -105,6 +106,10 @@ macro_rules! make_struct {
             /// When present, it is included during serialization but ignored during deserialization.
             pub(crate) grease_transport_parameter: Option<ReservedTransportParameter>,
 
+            /// Version Information (RFC 9368 section 3): sent by every
+            /// connection, and the peer's known entries once received
+            pub(crate) version_information: Option<VersionInformation>,
+
             /// Defines the order in which transport parameters are serialized.
             ///
             /// This field is initialized only for outgoing `TransportParameters` instances and
@@ -132,6 +137,7 @@ macro_rules! make_struct {
                     stateless_reset_token: None,
                     preferred_address: None,
                     grease_transport_parameter: None,
+                    version_information: None,
                     write_order: None,
                 }
             }
@@ -386,6 +392,17 @@ impl TransportParameters {
                         w.write(x);
                     }
                 }
+                TransportParameterId::VersionInformation => {
+                    if let Some(info) = self.version_information {
+                        let available = info.available.as_slice();
+                        w.write_var(id as u64);
+                        w.write_var(4 * (1 + available.len() as u64));
+                        w.write(info.chosen);
+                        for &version in available {
+                            w.write(version);
+                        }
+                    }
+                }
                 id => {
                     macro_rules! write_params {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
@@ -414,11 +431,11 @@ impl TransportParameters {
         Self::read_inner(side, None, r)
     }
 
-    /// Decode peer parameters for a connection that does not switch versions.
+    /// Decode peer parameters whose Chosen Version must be `version`.
     ///
-    /// Version Information is checked in place, without retaining the peer's
-    /// list. Compatible negotiation and fallback after a Version Negotiation
-    /// packet need additional selection and downgrade checks before use.
+    /// A server passes the version of the client's first flight; a client
+    /// passes the negotiated version. The peer's list is reduced to the known
+    /// versions it names, so retaining it does not allocate.
     pub(crate) fn read_for_version<R: Buf>(
         side: Side,
         version: u32,
@@ -430,7 +447,6 @@ impl TransportParameters {
     fn read_inner<R: Buf>(side: Side, version: Option<u32>, r: &mut R) -> Result<Self, Error> {
         // Initialize to protocol-specified defaults
         let mut params = Self::default();
-        let mut got_version_information = false;
 
         // State to check for duplicate transport parameters.
         macro_rules! param_state {
@@ -453,16 +469,6 @@ impl TransportParameters {
                 return Err(Error::Malformed);
             }
             let len = len as usize;
-            // Version Information is receive-only until version negotiation is
-            // implemented. Its list is validated without allocating storage.
-            if id == 0x11 {
-                if got_version_information {
-                    return Err(Error::Malformed);
-                }
-                got_version_information = true;
-                read_version_information(side, len, version, r)?;
-                continue;
-            }
             let Ok(id) = TransportParameterId::try_from(id) else {
                 // unknown transport parameters are ignored
                 r.advance(len);
@@ -512,6 +518,13 @@ impl TransportParameters {
                     _ => return Err(Error::Malformed),
                 },
                 TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
+                TransportParameterId::VersionInformation => {
+                    if params.version_information.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.version_information =
+                        Some(read_version_information(side, len, version, r)?);
+                }
                 _ => {
                     macro_rules! parse {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
@@ -578,7 +591,7 @@ fn read_version_information(
     len: usize,
     version: Option<u32>,
     r: &mut impl Buf,
-) -> Result<u32, Error> {
+) -> Result<VersionInformation, Error> {
     if len < 4 || len % 4 != 0 || len > r.remaining() {
         return Err(Error::Malformed);
     }
@@ -587,12 +600,15 @@ fn read_version_information(
         return Err(Error::IllegalValue);
     }
     let mut includes_chosen = false;
+    let mut available = VersionList::EMPTY;
+    let mut unknown_available = false;
     for _ in 1..len / 4 {
-        let available = r.get::<u32>()?;
-        if available == 0 {
+        let version = r.get::<u32>()?;
+        if version == 0 {
             return Err(Error::IllegalValue);
         }
-        includes_chosen |= available == chosen;
+        includes_chosen |= version == chosen;
+        unknown_available |= !available.push(version);
     }
     if side.is_server() && !includes_chosen {
         return Err(Error::IllegalValue);
@@ -600,7 +616,11 @@ fn read_version_information(
     if version.is_some_and(|version| version != chosen) {
         return Err(Error::VersionMismatch);
     }
-    Ok(chosen)
+    Ok(VersionInformation {
+        chosen,
+        available,
+        unknown_available,
+    })
 }
 
 #[cfg(kani)]
@@ -715,11 +735,14 @@ pub(crate) enum TransportParameterId {
 
     // https://datatracker.ietf.org/doc/html/draft-ietf-quic-ack-frequency#section-10.1
     MinAckDelayDraft07 = 0xFF04DE1B,
+
+    // https://www.rfc-editor.org/rfc/rfc9368.html#section-3
+    VersionInformation = 0x11,
 }
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 21] = [
+    const SUPPORTED: [Self; 22] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -741,6 +764,7 @@ impl TransportParameterId {
         Self::RetrySourceConnectionId,
         Self::GreaseQuicBit,
         Self::MinAckDelayDraft07,
+        Self::VersionInformation,
     ];
 }
 
@@ -780,6 +804,7 @@ impl TryFrom<u64> for TransportParameterId {
             id if Self::RetrySourceConnectionId == id => Self::RetrySourceConnectionId,
             id if Self::GreaseQuicBit == id => Self::GreaseQuicBit,
             id if Self::MinAckDelayDraft07 == id => Self::MinAckDelayDraft07,
+            id if Self::VersionInformation == id => Self::VersionInformation,
             _ => return Err(()),
         };
         Ok(param)
@@ -825,7 +850,8 @@ mod test {
         for words in [&[1][..], &[1, 2][..]] {
             let bytes: Vec<_> = words.iter().flat_map(|x: &u32| x.to_be_bytes()).collect();
             assert_eq!(
-                read_version_information(Side::Client, bytes.len(), None, &mut bytes.as_slice()),
+                read_version_information(Side::Client, bytes.len(), None, &mut bytes.as_slice())
+                    .map(|info| info.chosen),
                 Ok(1)
             );
             assert_eq!(
@@ -840,7 +866,8 @@ mod test {
                 for split in 0..=bytes.len() {
                     let mut fragmented = bytes[..split].chain(&bytes[split..]);
                     assert_eq!(
-                        read_version_information(side, bytes.len(), None, &mut fragmented),
+                        read_version_information(side, bytes.len(), None, &mut fragmented)
+                            .map(|info| info.chosen),
                         Ok(1)
                     );
                     assert_eq!(fragmented.remaining(), 0);

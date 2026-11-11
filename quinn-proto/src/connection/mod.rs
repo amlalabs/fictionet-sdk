@@ -60,6 +60,10 @@ use packet_builder::PacketBuilder;
 mod packet_crypto;
 use packet_crypto::{PrevCrypto, ZeroRttCrypto};
 
+mod negotiation;
+use negotiation::{Admission, LongKind, Reaction};
+pub(crate) use negotiation::{Negotiation, OtherInitial};
+
 mod paths;
 pub use paths::RttEstimator;
 use paths::{PathData, PathResponses};
@@ -245,8 +249,10 @@ pub struct Connection {
     datagrams: DatagramState,
     /// Connection level statistics
     stats: ConnectionStats,
-    /// QUIC version used for the connection.
+    /// QUIC version used for the connection: the negotiated one once known
     version: u32,
+    /// Version negotiation state (RFC 9368)
+    negotiation: Negotiation,
 }
 
 impl Connection {
@@ -259,12 +265,14 @@ impl Connection {
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
         crypto: Box<dyn crypto::Session>,
+        initial_keys: Keys,
         cid_gen: &dyn ConnectionIdGenerator,
         now: Instant,
         version: u32,
         allow_mtud: bool,
         rng_seed: [u8; 32],
         side_args: SideArgs,
+        negotiation: Negotiation,
         datagram_receive_budget: Option<&fictionet_buf::Budget>,
         reassembly_budget: Option<&fictionet_buf::Budget>,
     ) -> Self {
@@ -273,7 +281,7 @@ impl Connection {
         let connection_side = ConnectionSide::new(side_args, version);
         let side = connection_side.side();
         let initial_space = PacketSpace {
-            crypto: Some(crypto.initial_keys(&init_cid, side)),
+            crypto: Some(initial_keys),
             ..PacketSpace::new(now)
         };
         let state = State::Handshake(state::Handshake {
@@ -368,6 +376,7 @@ impl Connection {
             rng,
             stats: ConnectionStats::default(),
             version,
+            negotiation,
         };
         this.streams.reassembly_budget = reassembly_budget.cloned();
         if path_validated {
@@ -379,6 +388,12 @@ impl Connection {
             this.init_0rtt();
         }
         this
+    }
+
+    /// The QUIC version of the connection: the negotiated version once the
+    /// handshake has settled it (RFC 9368)
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     /// Returns the next time at which `handle_timeout` should be called
@@ -2123,6 +2138,12 @@ impl Connection {
         crypto: &frame::Crypto,
         payload_len: usize,
     ) -> Result<(), TransportError> {
+        if self.side.is_client() && space == SpaceId::Initial && !self.negotiation.settled {
+            // RFC 9369 section 4.1: CRYPTO in the original version means the
+            // server kept it.
+            self.negotiation.settled = true;
+            self.negotiation.other = None;
+        }
         let expected = if !self.state.is_handshake() {
             SpaceId::Data
         } else if self.highest_space == SpaceId::Initial {
@@ -2266,10 +2287,11 @@ impl Connection {
         self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
         let mut remaining = Some(data);
         while let Some(data) = remaining {
+            let versions = self.negotiation.decodable(self.side.side(), self.version);
             match PartialDecode::new_buffer(
                 data,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
-                &[self.version],
+                versions.as_slice(),
                 self.endpoint_config.grease_quic_bit,
             ) {
                 Ok((partial_decode, rest)) => {
@@ -2291,14 +2313,168 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
     ) {
+        let admission = match partial_decode.long_header() {
+            Some((ty, version)) => {
+                let admission = self.negotiation.admit(
+                    self.side.side(),
+                    self.version,
+                    LongKind::of(ty),
+                    version,
+                );
+                if admission == Admission::Try && !self.prepare_other_initial(version) {
+                    return;
+                }
+                admission
+            }
+            None => Admission::Current,
+        };
+        if admission == Admission::Drop {
+            trace!("dropping a packet in a version this connection does not use for it");
+            return;
+        }
+        let other = match admission {
+            Admission::Other | Admission::Try => {
+                self.negotiation.other.as_ref().map(|other| &other.keys)
+            }
+            Admission::Current | Admission::Drop => None,
+        };
         if let Some(decoded) = packet_crypto::unprotect_header(
             partial_decode,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
+            other,
         ) {
-            self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
+            self.handle_packet(
+                now,
+                remote,
+                ecn,
+                decoded.packet,
+                decoded.stateless_reset,
+                admission,
+            );
         }
+    }
+
+    /// The connection ID the current Initial keys derive from
+    fn initial_key_cid(&self) -> ConnectionId {
+        self.retry_src_cid.unwrap_or(self.initial_dst_cid)
+    }
+
+    /// Hold a client's Initial keys for `version`, which the server may have
+    /// switched to, charging their storage first. Returns false, dropping the
+    /// packet, when the budget refuses them.
+    fn prepare_other_initial(&mut self, version: u32) -> bool {
+        if self
+            .negotiation
+            .other
+            .as_ref()
+            .is_some_and(|other| other.version == version)
+        {
+            return true;
+        }
+        let Some(current) = self.spaces[SpaceId::Initial].crypto.as_ref() else {
+            return false;
+        };
+        let charge = match &self.reassembly_budget {
+            Some(budget) => match budget.charge(current.heap_size()) {
+                Some(charge) => Some(charge),
+                None => {
+                    debug!("no budget for the Initial keys of another version");
+                    return false;
+                }
+            },
+            None => None,
+        };
+        // Release the previous candidate before deriving another.
+        self.negotiation.other = None;
+        let Ok(keys) = self
+            .crypto
+            .initial_keys(version, &self.initial_key_cid(), Side::Client)
+        else {
+            return false;
+        };
+        self.negotiation.other = Some(OtherInitial::new(version, keys, charge));
+        true
+    }
+
+    /// Adopt the version of a server Initial that authenticated under the
+    /// keys tried for it (RFC 9369 section 4.1): its CRYPTO data and the rest
+    /// of the handshake use that version.
+    fn adopt_tried_version(&mut self, admission: Admission) -> Result<(), TransportError> {
+        if admission != Admission::Try {
+            return Ok(());
+        }
+        let Some(OtherInitial { version, keys, .. }) = self.negotiation.other.take() else {
+            unreachable!("a tried packet has tried keys");
+        };
+        self.crypto
+            .set_negotiated_version(version)
+            .map_err(|_| TransportError::INTERNAL_ERROR("TLS refused the negotiated version"))?;
+        debug!(version, "the server negotiated a compatible version");
+        self.version = version;
+        self.negotiation.settled = true;
+        self.spaces[SpaceId::Initial].crypto = Some(keys);
+        Ok(())
+    }
+
+    /// Start a new first flight in `version` after a Version Negotiation
+    /// packet (RFC 9368 section 2.1). Nothing sent so far belongs to it.
+    fn restart_in_version(&mut self, now: Instant, version: u32) -> Result<(), ConnectionError> {
+        let negotiation = Negotiation::client(
+            version,
+            self.negotiation.preference,
+            true,
+            *self.negotiation.client_params(),
+        );
+        let ConnectionSide::Client {
+            ref crypto,
+            ref server_name,
+            ref mut token,
+            ref token_store,
+        } = self.side
+        else {
+            unreachable!("only clients react to Version Negotiation");
+        };
+        let session = crypto
+            .clone()
+            .start_session(version, server_name, negotiation.client_params())
+            .map_err(|_| ConnectionError::VersionMismatch)?;
+        let keys = session
+            .initial_keys(version, &self.initial_dst_cid, Side::Client)
+            .map_err(|_| ConnectionError::VersionMismatch)?;
+        *token = token_store.take(server_name, version).unwrap_or_default();
+        debug!(version, "starting again after Version Negotiation");
+        self.crypto = session;
+        self.version = version;
+        self.negotiation = negotiation;
+
+        let next_packet_number = self.spaces[SpaceId::Initial].next_packet_number;
+        self.discard_space(now, SpaceId::Initial);
+        self.spaces[SpaceId::Initial] = PacketSpace {
+            crypto: Some(keys),
+            next_packet_number,
+            ..PacketSpace::new(now)
+        };
+        if self.zero_rtt_enabled {
+            // 0-RTT of the abandoned attempt was never read.
+            self.zero_rtt_enabled = false;
+            self.zero_rtt_crypto = None;
+            self.streams.zero_rtt_rejected();
+            self.spaces[SpaceId::Data].pending = Retransmits::default();
+            let sent_packets = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
+            for packet in sent_packets.into_values() {
+                self.remove_in_flight(&packet);
+            }
+        }
+        self.state = State::Handshake(state::Handshake {
+            rem_cid_set: false,
+            expected_token: Bytes::new(),
+            client_hello: None,
+        });
+        self.write_crypto();
+        self.init_0rtt();
+        Ok(())
     }
 
     fn handle_packet(
@@ -2308,6 +2484,7 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         packet: Option<Packet>,
         stateless_reset: bool,
+        admission: Admission,
     ) {
         self.stats.udp_rx.ios += 1;
         if let Some(ref packet) = packet {
@@ -2331,9 +2508,16 @@ impl Connection {
         let decrypted = match packet {
             None => Err(None),
             Some(mut packet) => self
-                .decrypt_packet(now, &mut packet)
+                .decrypt_packet(now, &mut packet, admission)
                 .map(move |number| (packet, number)),
         };
+        // An Initial that authenticated under tried keys settles the version
+        // before its frames are read.
+        let decrypted = decrypted.and_then(|decrypted| {
+            self.adopt_tried_version(admission)
+                .map(|()| decrypted)
+                .map_err(Some)
+        });
         let result = match decrypted {
             _ if stateless_reset => {
                 debug!("got stateless reset");
@@ -2550,9 +2734,16 @@ impl Connection {
                     self.on_packet_acked(now, info);
                 };
 
+                self.negotiation.other = None;
+                let keys = self
+                    .crypto
+                    .initial_keys(self.version, &rem_cid, self.side.side())
+                    .map_err(|_| {
+                        TransportError::INTERNAL_ERROR("Retry in an unsupported version")
+                    })?;
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
                 self.spaces[SpaceId::Initial] = PacketSpace {
-                    crypto: Some(self.crypto.initial_keys(&rem_cid, self.side.side())),
+                    crypto: Some(keys),
                     next_packet_number: self.spaces[SpaceId::Initial].next_packet_number,
                     crypto_offset: client_hello.len() as u64,
                     ..PacketSpace::new(now)
@@ -2600,6 +2791,10 @@ impl Connection {
                 self.on_path_validated();
 
                 self.process_early_payload(now, packet)?;
+                if self.side.is_server() {
+                    // RFC 9369 section 4.1
+                    self.negotiation.other = None;
+                }
                 if self.state.is_closed() {
                     return Ok(());
                 }
@@ -2619,6 +2814,7 @@ impl Connection {
                                 frame: None,
                                 reason: "transport parameters missing".into(),
                             })?;
+                    self.negotiation.check_server(&params, self.version)?;
 
                     if self.has_0rtt() {
                         if !self.crypto.early_data_accepted().unwrap() {
@@ -2706,21 +2902,27 @@ impl Connection {
                 Ok(())
             }
             Header::VersionNegotiate { .. } => {
-                if self.total_authed_packets > 1 {
+                // Servers ignore Version Negotiation (RFC 9368 section 2.1).
+                if self.side.is_server() || self.total_authed_packets > 1 {
                     return Ok(());
                 }
-                let supported = packet
-                    .payload
-                    .chunks(4)
-                    .any(|x| match <[u8; 4]>::try_from(x) {
-                        Ok(version) => self.version == u32::from_be_bytes(version),
-                        Err(_) => false,
-                    });
-                if supported {
-                    return Ok(());
+                let listed = |version: u32| {
+                    packet
+                        .payload
+                        .chunks_exact(4)
+                        .any(|x| x == version.to_be_bytes())
+                };
+                match self
+                    .negotiation
+                    .react(listed, &self.endpoint_config.supported_versions)
+                {
+                    Reaction::Ignore => Ok(()),
+                    Reaction::Restart(version) => self.restart_in_version(now, version),
+                    Reaction::Fail => {
+                        debug!("remote doesn't support our version");
+                        Err(ConnectionError::VersionMismatch)
+                    }
                 }
-                debug!("remote doesn't support our version");
-                Err(ConnectionError::VersionMismatch)
             }
             Header::Short { .. } => unreachable!(
                 "short packets received during handshake are discarded in handle_packet"
@@ -3582,7 +3784,14 @@ impl Connection {
         &mut self,
         now: Instant,
         packet: &mut Packet,
+        admission: Admission,
     ) -> Result<Option<u64>, Option<TransportError>> {
+        let other = match admission {
+            Admission::Other | Admission::Try => {
+                self.negotiation.other.as_ref().map(|other| &other.keys)
+            }
+            Admission::Current | Admission::Drop => None,
+        };
         let result = packet_crypto::decrypt_packet_body(
             packet,
             &self.spaces,
@@ -3590,6 +3799,7 @@ impl Connection {
             self.key_phase,
             self.prev_crypto.as_ref(),
             self.next_crypto.as_ref(),
+            other,
         )?;
 
         let result = match result {
@@ -3676,6 +3886,7 @@ impl Connection {
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
+            None,
         )?;
 
         let mut packet = decrypted_header.packet?;
@@ -3686,6 +3897,7 @@ impl Connection {
             self.key_phase,
             self.prev_crypto.as_ref(),
             self.next_crypto.as_ref(),
+            None,
         )
         .ok()?;
 
@@ -3860,6 +4072,8 @@ enum ConnectionSide {
         token: Bytes,
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        /// The crypto configuration, to start again in another version
+        crypto: Arc<dyn crypto::ClientConfig>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -3893,10 +4107,12 @@ impl ConnectionSide {
             SideArgs::Client {
                 token_store,
                 server_name,
+                crypto,
             } => Self::Client {
                 token: token_store.take(&server_name, version).unwrap_or_default(),
                 token_store,
                 server_name,
+                crypto,
             },
             SideArgs::Server {
                 server_config,
@@ -3912,6 +4128,7 @@ pub(crate) enum SideArgs {
     Client {
         token_store: Arc<dyn TokenStore>,
         server_name: String,
+        crypto: Arc<dyn crypto::ClientConfig>,
     },
     Server {
         server_config: Arc<ServerConfig>,
@@ -4189,7 +4406,8 @@ mod tests {
                 .unwrap();
             let keys = conn
                 .crypto
-                .initial_keys(&conn.initial_dst_cid, Side::Server);
+                .initial_keys(conn.version, &conn.initial_dst_cid, Side::Server)
+                .unwrap();
             let space = &mut conn.spaces[SpaceId::Initial];
             for pn in (0..32).step_by(2) {
                 space.pending_acks.insert_one(pn, now);

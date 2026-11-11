@@ -42,6 +42,9 @@ pub(super) struct Pair {
     /// Number of spin bit flips
     pub(super) spins: u64,
     last_spin: bool,
+    /// The sender and version of every delivered datagram that starts with
+    /// a long header, in delivery order
+    pub(super) long_versions: Vec<(Side, u32)>,
 }
 
 impl Pair {
@@ -85,6 +88,7 @@ impl Pair {
             spins: 0,
             last_spin: false,
             congestion_experienced: false,
+            long_versions: Vec::new(),
         }
     }
 
@@ -156,6 +160,7 @@ impl Pair {
                 socket.send_to(&buffer, packet.destination).unwrap();
             }
             if self.server.addr == packet.destination {
+                record_long_version(&mut self.long_versions, Side::Client, &buffer);
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
                 self.server.inbound.push_back((
                     self.time + self.latency,
@@ -180,6 +185,7 @@ impl Pair {
                 socket.send_to(&buffer, packet.destination).unwrap();
             }
             if self.client.addr == packet.destination {
+                record_long_version(&mut self.long_versions, Side::Server, &buffer);
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
                 self.client.inbound.push_back((
                     self.time + self.latency,
@@ -311,6 +317,13 @@ pub(super) enum IncomingConnectionBehavior {
     Reject,
     Retry,
     Wait,
+}
+
+fn record_long_version(versions: &mut Vec<(Side, u32)>, sender: Side, datagram: &[u8]) {
+    if datagram[0] & packet::LONG_HEADER_FORM != 0 && datagram.len() >= 5 {
+        let version = u32::from_be_bytes(datagram[1..5].try_into().unwrap());
+        versions.push((sender, version));
+    }
 }
 
 pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavior {

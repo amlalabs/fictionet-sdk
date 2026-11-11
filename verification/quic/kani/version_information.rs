@@ -20,8 +20,8 @@ fn version_information_validates_all_versions_and_the_peer_role() {
         && second != 0
         && (!server || chosen == first || chosen == second);
     assert_eq!(result.is_ok(), valid);
-    if let Ok(version) = result {
-        assert_eq!(version, chosen);
+    if let Ok(info) = result {
+        assert_eq!(info.chosen, chosen);
         assert!(input.is_empty());
     }
 }
@@ -46,7 +46,7 @@ counted_proof! {
         } else if chosen != connection {
             assert!(matches!(result, Err(Error::VersionMismatch)));
         } else {
-            assert_eq!(result, Ok(connection));
+            assert_eq!(result.map(|info| info.chosen), Ok(connection));
         }
         assert!(cost.peak <= 0);
         assert!(cost.requested <= 0);

@@ -169,9 +169,16 @@ pub mod fuzzing {
     }
 }
 
-/// The QUIC protocol version implemented.
+/// The QUIC versions an endpoint accepts by default, most preferred first
+///
+/// A server switches a compatible first flight to the first of these the
+/// client offers. Version 1 comes first, so a version 1 first flight stays
+/// in version 1 and keeps its tickets and tokens usable by the next version 1
+/// first flight (RFC 9369 section 5); version 2 first flights are accepted.
+/// A server that prefers version 2 lists it first.
 pub const DEFAULT_SUPPORTED_VERSIONS: &[u32] = &[
-    0x00000001,
+    version::QUIC_V1,
+    version::QUIC_V2,
     0xff00_001d,
     0xff00_001e,
     0xff00_001f,

@@ -22,7 +22,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
-    connection::{Connection, ConnectionError, SideArgs},
+    connection::{Connection, ConnectionError, Negotiation, OtherInitial, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
@@ -35,6 +35,7 @@ use crate::{
     },
     token::{IncomingToken, InvalidRetryTokenError, Token, TokenPayload},
     transport_parameters::{PreferredAddress, TransportParameters},
+    version::{client_version_information, select_compatible, VersionInformation, VersionList},
     Duration, Instant, ResetToken, Side, Transmit, TransportConfig, TransportError, INITIAL_MTU,
     MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE,
 };
@@ -382,7 +383,9 @@ impl Endpoint {
         if remote.port() == 0 || remote.ip().is_unspecified() {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
-        if !self.config.supported_versions.contains(&config.version) {
+        if !self.config.supported_versions.contains(&config.version)
+            || !config.preferred_versions.contains(config.version)
+        {
             return Err(ConnectError::UnsupportedVersion);
         }
 
@@ -399,13 +402,28 @@ impl Endpoint {
             None,
             &mut self.rng,
         );
-        let tls = config
+        // Offer only versions this endpoint can also receive.
+        let preference = VersionList::known(
+            config
+                .preferred_versions
+                .as_slice()
+                .iter()
+                .copied()
+                .filter(|version| self.config.supported_versions.contains(version)),
+        );
+        let negotiation = Negotiation::client(config.version, preference, false, params);
+        let started = config
             .crypto
-            .start_session(config.version, server_name, &params)
-            .inspect_err(|_| {
-                // Remove just issued connection id
-                self.index.connection_ids.remove(&loc_cid);
-            })?;
+            .clone()
+            .start_session(config.version, server_name, negotiation.client_params())
+            .and_then(|tls| {
+                let keys = tls.initial_keys(config.version, &remote_id, Side::Client)?;
+                Ok((tls, keys))
+            });
+        let (tls, initial_keys) = started.inspect_err(|_| {
+            // Remove just issued connection id
+            self.index.connection_ids.remove(&loc_cid);
+        })?;
 
         let conn = self.add_connection(
             ch,
@@ -419,11 +437,14 @@ impl Endpoint {
             },
             now,
             tls,
+            initial_keys,
             config.transport,
             SideArgs::Client {
                 token_store: config.token_store,
                 server_name: server_name.into(),
+                crypto: config.crypto,
             },
+            negotiation,
         );
         Ok((ch, conn))
     }
@@ -680,23 +701,60 @@ impl Endpoint {
             });
         }
 
-        let tls = server_config.crypto.clone().start_session(version, &params);
+        // Compatible version negotiation (RFC 9368 section 2.3) decides the
+        // version before the TLS session answers the ClientHello.
+        let original = version;
+        let upgrade = self.compatible_upgrade(
+            &server_config,
+            original,
+            &dst_cid,
+            &incoming.crypto,
+            &incoming.packet.payload,
+        );
+        let negotiated = upgrade.as_ref().map_or(original, |upgrade| upgrade.0);
+        params.version_information = Some(VersionInformation {
+            chosen: negotiated,
+            available: VersionList::known(self.config.supported_versions.iter().copied()),
+            unknown_available: false,
+        });
+        let mut tls = server_config
+            .crypto
+            .clone()
+            .start_session(original, &params);
+        let (initial_keys, other) = match upgrade {
+            Some((_, keys, other)) if tls.set_negotiated_version(negotiated).is_ok() => {
+                (keys, Some(other))
+            }
+            _ => {
+                let Ok(keys) = server_config.crypto.initial_keys(original, &dst_cid) else {
+                    unreachable!("the first packet was read with this version");
+                };
+                (keys, None)
+            }
+        };
+        let negotiated = if other.is_some() {
+            negotiated
+        } else {
+            original
+        };
         let transport_config = server_config.transport.clone();
         let mut conn = self.add_connection(
             ch,
-            version,
+            negotiated,
             dst_cid,
             loc_cid,
             src_cid,
             incoming.addresses,
             incoming.received_at,
             tls,
+            initial_keys,
             transport_config,
             SideArgs::Server {
                 server_config,
                 pref_addr_cid,
                 path_validated: remote_address_validated,
             },
+            Negotiation::server(original, other),
         );
         self.index.insert_initial(dst_cid, ch);
 
@@ -847,6 +905,45 @@ impl Endpoint {
         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
     }
 
+    /// The version a server switches a client's first flight in `original` to,
+    /// with the connection's Initial keys in that version and the original
+    /// keys it retains for the client's later Initial packets. `None` keeps
+    /// the original version: no compatible offer was found in `payload`, the
+    /// decrypted first packet, or the budget refused the retained keys.
+    fn compatible_upgrade(
+        &self,
+        server_config: &ServerConfig,
+        original: u32,
+        dst_cid: &ConnectionId,
+        original_keys: &Keys,
+        payload: &[u8],
+    ) -> Option<(u32, Keys, OtherInitial)> {
+        let client = client_version_information(payload)?;
+        if client.chosen != original {
+            // Validation of the transport parameters closes the connection.
+            return None;
+        }
+        let negotiated =
+            select_compatible(original, &self.config.supported_versions, &client.available);
+        if negotiated == original {
+            return None;
+        }
+        let charge = match &self.reassembly_budget {
+            Some(budget) => Some(budget.charge(original_keys.heap_size())?),
+            None => None,
+        };
+        let retained = server_config.crypto.initial_keys(original, dst_cid).ok()?;
+        let keys = server_config
+            .crypto
+            .initial_keys(negotiated, dst_cid)
+            .ok()?;
+        Some((
+            negotiated,
+            keys,
+            OtherInitial::new(original, retained, charge),
+        ))
+    }
+
     fn add_connection(
         &mut self,
         ch: ConnectionHandle,
@@ -857,8 +954,10 @@ impl Endpoint {
         addresses: FourTuple,
         now: Instant,
         tls: Box<dyn crypto::Session>,
+        initial_keys: Keys,
         transport_config: Arc<TransportConfig>,
         side_args: SideArgs,
+        negotiation: Negotiation,
     ) -> Connection {
         let mut rng_seed = [0; 32];
         self.rng.fill_bytes(&mut rng_seed);
@@ -873,12 +972,14 @@ impl Endpoint {
             addresses.remote,
             addresses.local_ip,
             tls,
+            initial_keys,
             self.local_cid_generator.as_ref(),
             now,
             version,
             self.allow_mtud,
             rng_seed,
             side_args,
+            negotiation,
             self.datagram_receive_budget.as_ref(),
             self.reassembly_budget.as_ref(),
         );

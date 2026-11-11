@@ -34,7 +34,9 @@ impl From<Side> for rustls::Side {
 
 /// A rustls TLS session
 pub struct TlsSession {
-    version: Version,
+    /// The version of the session's first flight
+    original_version: u32,
+    /// The negotiated version, used for handshake and 1-RTT keys
     wire_version: u32,
     got_handshake_data: bool,
     next_secrets: Option<Secrets>,
@@ -52,8 +54,29 @@ impl TlsSession {
 }
 
 impl crypto::Session for TlsSession {
-    fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
-        initial_keys(self.version, *dst_cid, side, &self.suite)
+    fn initial_keys(
+        &self,
+        version: u32,
+        dst_cid: &ConnectionId,
+        side: Side,
+    ) -> Result<Keys, UnsupportedVersion> {
+        Ok(initial_keys(
+            interpret_version(version)?,
+            *dst_cid,
+            side,
+            &self.suite,
+        ))
+    }
+
+    fn set_negotiated_version(&mut self, version: u32) -> Result<(), UnsupportedVersion> {
+        let negotiated = interpret_version(version)?;
+        match &mut self.inner {
+            Connection::Client(conn) => conn.set_negotiated_version(negotiated),
+            Connection::Server(conn) => conn.set_negotiated_version(negotiated),
+        }
+        .map_err(|_| UnsupportedVersion)?;
+        self.wire_version = version;
+        Ok(())
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
@@ -133,9 +156,14 @@ impl crypto::Session for TlsSession {
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
         match self.inner.quic_transport_parameters() {
             None => Ok(None),
+            // A client's Chosen Version is the version of its first flight
+            // (RFC 9368 section 4); a server's is the negotiated version.
             Some(buf) => match TransportParameters::read_for_version(
                 self.side(),
-                self.wire_version,
+                match self.side() {
+                    Side::Server => self.original_version,
+                    Side::Client => self.wire_version,
+                },
                 &mut io::Cursor::new(buf),
             ) {
                 Ok(params) => Ok(Some(params)),
@@ -258,6 +286,11 @@ impl crypto::HeaderKey for Box<dyn HeaderProtectionKey> {
     fn sample_size(&self) -> usize {
         self.sample_len()
     }
+
+    fn heap_size(&self) -> usize {
+        // The rustls key behind this box; ring keys hold no further heap.
+        size_of_val(&**self)
+    }
 }
 
 /// Authentication data for (rustls) TLS session
@@ -348,7 +381,7 @@ impl crypto::ClientConfig for QuicClientConfig {
         let wire_version = version;
         let version = interpret_version(version)?;
         Ok(Box::new(TlsSession {
-            version,
+            original_version: wire_version,
             wire_version,
             got_handshake_data: false,
             next_secrets: None,
@@ -506,7 +539,7 @@ impl crypto::ServerConfig for QuicServerConfig {
         let wire_version = version;
         let version = interpret_version(version).unwrap();
         Box::new(TlsSession {
-            version,
+            original_version: wire_version,
             wire_version,
             got_handshake_data: false,
             next_secrets: None,
@@ -667,6 +700,11 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
 
     fn integrity_limit(&self) -> u64 {
         (**self).integrity_limit()
+    }
+
+    fn heap_size(&self) -> usize {
+        // The rustls key behind this box; ring keys hold no further heap.
+        size_of_val(&**self)
     }
 }
 

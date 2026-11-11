@@ -98,12 +98,13 @@ impl PacketBuilder {
                 },
                 key_phase: conn.key_phase,
             },
+            // 0-RTT stays in the original version (RFC 9369 section 4.1).
             SpaceId::Data => Header::Long {
                 ty: LongType::ZeroRtt,
                 src_cid: conn.handshake_cid,
                 dst_cid,
                 number,
-                version,
+                version: conn.negotiation.original,
             },
             SpaceId::Handshake => Header::Long {
                 ty: LongType::Handshake,

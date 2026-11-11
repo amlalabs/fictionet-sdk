@@ -15,6 +15,9 @@
 
 use std::fmt;
 
+mod first_flight;
+pub(crate) use first_flight::client_version_information;
+
 /// QUIC version 1 ([RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html))
 pub const QUIC_V1: u32 = 0x0000_0001;
 
@@ -127,6 +130,16 @@ impl VersionList {
         self.len == 0
     }
 
+    /// The versions of this list a first flight of `chosen` converts to,
+    /// keeping this list's order
+    pub fn compatible_with(&self, chosen: u32) -> Self {
+        Self::known(
+            self.as_slice()
+                .iter()
+                .copied()
+                .filter(|&version| compatible(chosen, version)),
+        )
+    }
     /// The first version of this list in `offered`: a client's choice from a
     /// Version Negotiation packet (RFC 9368 section 2.1)
     pub(crate) fn first_offered(&self, offered: impl Fn(u32) -> bool) -> Option<u32> {

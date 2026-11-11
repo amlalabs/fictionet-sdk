@@ -3,7 +3,7 @@ use std::{cmp::Ordering, io, ops::Range, str};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 #[cfg(all(test, feature = "rustls-ring"))]
-mod rfc9369_vectors;
+pub(crate) mod rfc9369_vectors;
 mod storage;
 pub use storage::PacketBuffer;
 use thiserror::Error;
@@ -116,6 +116,19 @@ impl PartialDecode {
         match self.plain_header {
             ProtectedHeader::Long { ty, .. } => ty == LongType::ZeroRtt,
             _ => false,
+        }
+    }
+
+    /// The type and version of a long header packet other than Version
+    /// Negotiation
+    pub(crate) fn long_header(&self) -> Option<(LongHeaderType, u32)> {
+        match self.plain_header {
+            ProtectedHeader::Initial(ref header) => Some((LongHeaderType::Initial, header.version)),
+            ProtectedHeader::Long { ty, version, .. } => {
+                Some((LongHeaderType::Standard(ty), version))
+            }
+            ProtectedHeader::Retry { version, .. } => Some((LongHeaderType::Retry, version)),
+            ProtectedHeader::Short { .. } | ProtectedHeader::VersionNegotiate { .. } => None,
         }
     }
 
@@ -978,7 +991,7 @@ mod tests {
             src_cid: ConnectionId::new(&[]),
             dst_cid: dcid,
             token: Bytes::new(),
-            version: crate::DEFAULT_SUPPORTED_VERSIONS[0],
+            version: crate::version::QUIC_V1,
         });
         let encode = header.encode(&mut buf);
         let header_len = buf.len();

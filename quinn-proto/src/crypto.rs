@@ -26,8 +26,21 @@ pub mod rustls;
 
 /// A cryptographic session (commonly TLS)
 pub trait Session: Send + Sync + 'static {
-    /// Create the initial set of keys given the client's initial destination ConnectionId
-    fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys;
+    /// Create the Initial keys of `version` given the client's initial destination ConnectionId
+    fn initial_keys(
+        &self,
+        version: u32,
+        dst_cid: &ConnectionId,
+        side: Side,
+    ) -> Result<Keys, UnsupportedVersion>;
+
+    /// Switch to a compatible version (RFC 9368 section 2.3) before handshake keys exist
+    ///
+    /// Handshake and 1-RTT keys then use `version`, and so does the check of
+    /// a server's Chosen Version. A server still expects the client's Chosen
+    /// Version to be the version the session started with. 0-RTT keys keep
+    /// that version too.
+    fn set_negotiated_version(&mut self, version: u32) -> Result<(), UnsupportedVersion>;
 
     /// Get data negotiated during the handshake, if available
     ///
@@ -115,6 +128,20 @@ pub struct Keys {
     pub packet: KeyPair<Box<dyn PacketKey>>,
 }
 
+impl Keys {
+    /// Heap bytes of the four keys, including their boxes
+    pub fn heap_size(&self) -> usize {
+        size_of_val(&*self.header.local)
+            + self.header.local.heap_size()
+            + size_of_val(&*self.header.remote)
+            + self.header.remote.heap_size()
+            + size_of_val(&*self.packet.local)
+            + self.packet.local.heap_size()
+            + size_of_val(&*self.packet.remote)
+            + self.packet.remote.heap_size()
+    }
+}
+
 /// Client-side configuration for the crypto protocol
 pub trait ClientConfig: Send + Sync {
     /// Start a client session with this configuration
@@ -168,6 +195,8 @@ pub trait PacketKey: Send + Sync {
     /// Maximum number of incoming packets that may fail decryption before the connection must be
     /// abandoned
     fn integrity_limit(&self) -> u64;
+    /// Heap bytes this key occupies, so storage for another key can be charged first
+    fn heap_size(&self) -> usize;
 }
 
 /// Keys used to protect packet headers
@@ -178,6 +207,8 @@ pub trait HeaderKey: Send + Sync {
     fn encrypt(&self, pn_offset: usize, packet: &mut [u8]);
     /// The sample size used for this key's algorithm
     fn sample_size(&self) -> usize;
+    /// Heap bytes this key occupies, so storage for another key can be charged first
+    fn heap_size(&self) -> usize;
 }
 
 /// A key for signing with HMAC-based algorithms
