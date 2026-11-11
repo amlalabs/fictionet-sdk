@@ -84,3 +84,138 @@ fn a_hello_joined_from_one_byte_records_is_moved_a_few_times() {
     });
     std::println!("cost: {}", costs.summary());
 }
+
+/// A TLS 1.3 ClientHello with `suites` cipher suites, and `big`, an
+/// extension (its type, then its body) after the ones every hello needs,
+/// in records of at most 2^14 bytes.
+fn hello(suites: u16, big: &[u8]) -> Vec<u8> {
+    let mut ext = Vec::new();
+    // supported_versions: TLS 1.3.
+    ext.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+    // supported_groups: x25519.
+    ext.extend_from_slice(&[0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d]);
+    // signature_algorithms: rsa_pss_rsae_sha256.
+    ext.extend_from_slice(&[0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x08, 0x04]);
+    if !big.is_empty() {
+        ext.extend_from_slice(&big[..2]);
+        ext.extend_from_slice(&u16::try_from(big.len() - 2).unwrap().to_be_bytes());
+        ext.extend_from_slice(&big[2..]);
+    }
+    let mut body = Vec::from([0x03, 0x03]);
+    body.extend_from_slice(&[0x11; 32]);
+    body.push(0);
+    body.extend_from_slice(&(2 * (suites + 1)).to_be_bytes());
+    body.extend_from_slice(&[0x13, 0x01]);
+    for suite in 0..suites {
+        body.extend_from_slice(&(0x5000 + suite).to_be_bytes());
+    }
+    body.extend_from_slice(&[0x01, 0x00]);
+    body.extend_from_slice(&u16::try_from(ext.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(&ext);
+    let mut message = Vec::from([1u8]);
+    message.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+    message.extend_from_slice(&body);
+    let mut wire = Vec::new();
+    for part in message.chunks(1 << 14) {
+        wire.extend_from_slice(&[22, 3, 1]);
+        wire.extend_from_slice(&u16::try_from(part.len()).unwrap().to_be_bytes());
+        wire.extend_from_slice(part);
+    }
+    wire
+}
+
+/// An extension of `count` elements, each `element(i)`, after a list
+/// length of two bytes.
+fn listed(typ: u16, count: u16, element: impl Fn(u16) -> Vec<u8>) -> Vec<u8> {
+    let list: Vec<u8> = (0..count).flat_map(element).collect();
+    let mut ext = Vec::from(typ.to_be_bytes());
+    ext.extend_from_slice(&u16::try_from(list.len()).unwrap().to_be_bytes());
+    ext.extend_from_slice(&list);
+    ext
+}
+
+/// Hellos near the most a message may be, each made of the elements that
+/// are largest in memory for their bytes on the wire.
+fn large_hellos() -> [(&'static str, Vec<u8>); 3] {
+    [
+        (
+            "one-byte key shares",
+            hello(
+                0,
+                &listed(0x0033, 11_000, |i| {
+                    [&(0x1000 + i).to_be_bytes()[..], &[0, 1, 7]].concat()
+                }),
+            ),
+        ),
+        (
+            "one-byte protocol names",
+            hello(0, &listed(0x0010, 30_000, |i| Vec::from([1, i as u8]))),
+        ),
+        ("cipher suites", hello(30_000, &[])),
+    ]
+}
+
+/// What reading and accepting a hello asks of the allocator: joining its
+/// records ([`JOINING`]), and parsing it (`budget::parse_room`, whose
+/// fixed part is in `fixed` and whose 3 x 25 / 2 bytes a byte are in the
+/// fraction).
+fn accepting() -> Linear {
+    Linear {
+        num: 2 * JOINING.num + 3 * 25,
+        den: 2,
+        fixed: JOINING.fixed + super::parse_room(0),
+    }
+}
+
+/// A hello is charged what parsing it holds, while the acceptor parses it
+/// and while the [`Accepted`](crate::server::Accepted) keeps it for the
+/// config to be picked: for each hello, the bytes live at once stay
+/// within the most the budget was charged and the deframer's spans,
+/// through accepting and through reading what the client asked for.
+#[test]
+fn a_hello_is_charged_what_parsing_it_holds() {
+    let mut all = Costs::new("hellos");
+    for (name, wire) in large_hellos() {
+        let mut costs = Costs::new(name);
+        let limit = Limit::new(1 << 24);
+        let accepted = costs.step(wire.len(), JOINING_SPANS, accepting(), || {
+            let mut acceptor = Acceptor::with_budget(limit.clone());
+            let mut rest = &wire[..];
+            let accepted = loop {
+                if !rest.is_empty() {
+                    acceptor.read_tls(&mut rest).unwrap();
+                }
+                match acceptor.accept() {
+                    Ok(None) => assert!(!rest.is_empty(), "{name}: the hello stalled"),
+                    Ok(Some(accepted)) => break accepted,
+                    Err((error, _)) => panic!("{name}: {error:?}"),
+                }
+            };
+            Charged {
+                value: accepted,
+                charged: limit.most(),
+            }
+        });
+        // Held while the world picks: what the hello asked for, read.
+        costs.step(
+            0,
+            limit.used() + JOINING_SPANS,
+            Linear {
+                num: 0,
+                den: 1,
+                fixed: 0,
+            },
+            || {
+                let hello = accepted.client_hello();
+                assert!(hello.cipher_suites().len() <= 30_001);
+                Charged {
+                    value: (),
+                    charged: 0,
+                }
+            },
+        );
+        std::println!("cost: {name}: {}", costs.summary());
+        all.absorb(&costs);
+    }
+    std::println!("cost: {}", all.summary());
+}

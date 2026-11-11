@@ -747,7 +747,13 @@ impl<Data> ConnectionCommon<Data> {
     ///
     /// This is a shortcut to the `process_new_packets()` -> `process_msg()` ->
     /// `process_handshake_messages()` path, specialized for the first handshake message.
+    /// The first handshake message, parsed and owned, once it has arrived
+    /// whole and the room for what parsing it allocates is charged: that
+    /// room is kept while the message is ([`CommonState::release_parse`]).
+    /// `None` until then; [`CommonState::wants_budget`] says when the
+    /// room is what it waits for.
     pub(crate) fn first_handshake_message(&mut self) -> Result<Option<Message<'static>>, Error> {
+        self.core.common_state.start_step();
         let mut buffer_progress = self.core.hs_deframer.progress();
 
         let res = self
@@ -1132,11 +1138,18 @@ impl<Data> ConnectionCore<Data> {
         }
     }
 
+    /// Takes the handshake message ready, once the room for what parsing
+    /// it allocates is charged. Without room it stays ready, whole, and
+    /// [`CommonState::wants_budget`] says so.
     fn take_handshake_message<'b>(
         &mut self,
         buffer: &'b mut [u8],
         buffer_progress: &mut BufferProgress,
     ) -> Option<InboundPlainMessage<'b>> {
+        let len = self.hs_deframer.ready_len()?;
+        if !self.common_state.reserve_parse(len) {
+            return None;
+        }
         let message = self
             .hs_deframer
             .iter(buffer)

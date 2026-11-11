@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use pki_types::CertificateDer;
 
 use crate::budget::{
-    chain_bytes, handshake_room, Account, Paid, CONTROL_PAYLOAD, CONTROL_RECORDS,
+    chain_bytes, handshake_room, parse_room, Account, Paid, CONTROL_PAYLOAD, CONTROL_RECORDS,
     HANDSHAKE_RECORDS, HANDSHAKE_ROOM,
 };
 use crate::conn::kernel::KernelState;
@@ -79,6 +79,10 @@ pub struct CommonState {
     /// The room, in bytes and records, charged before each handshake
     /// message for the output it makes.
     pub(crate) handshake_room: (usize, usize),
+    /// Pays for what parsing the handshake message being processed
+    /// allocates ([`parse_room`]), charged before it is taken: a peer's
+    /// message parses into many times its size.
+    parse_room: Paid,
 
     /// Protocol whose key schedule should be used. Unused for TLS < 1.3.
     pub(crate) protocol: Protocol,
@@ -120,6 +124,7 @@ impl CommonState {
             output_unpaid: false,
             final_alert: false,
             handshake_room: (HANDSHAKE_ROOM, HANDSHAKE_RECORDS),
+            parse_room: Paid::default(),
             protocol: Protocol::Tcp,
             quic: quic::Quic::default(),
             enable_secret_extraction: false,
@@ -165,7 +170,26 @@ impl CommonState {
             ChunkVecBuffer::paid_with(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT), Paid::open(&account));
         self.sendable_tls =
             ChunkVecBuffer::paid_with(Some(DEFAULT_BUFFER_LIMIT), Paid::open(&account));
+        self.parse_room = Paid::open(&account);
         self.account = account;
+    }
+
+    /// Charges room for what parsing a handshake message of `len` bytes
+    /// allocates, before the message is taken. `false`, charging nothing
+    /// more, if the budget has no room; [`Self::wants_budget`] then says so,
+    /// and the message waits, whole, until a later call has room. The room
+    /// is kept until [`Self::release_parse`].
+    pub(crate) fn reserve_parse(&mut self, len: usize) -> bool {
+        let more = parse_room(len).saturating_sub(self.parse_room.bytes());
+        let reserved = self.parse_room.grow_by(more);
+        self.wants_budget |= !reserved;
+        reserved
+    }
+
+    /// Gives back the room charged for parsing, once what was parsed is
+    /// gone.
+    pub(crate) fn release_parse(&mut self) {
+        self.parse_room.shrink_by(self.parse_room.bytes());
     }
 
     /// The room, in bytes and records, for the output of `records` control
@@ -241,6 +265,7 @@ impl CommonState {
     pub(crate) fn release_step(&mut self) {
         self.sendable_tls.release_reserve();
         self.received_plaintext.release_reserve();
+        self.release_parse();
     }
 
     /// Fails if output went unpaid, which nothing undoes.

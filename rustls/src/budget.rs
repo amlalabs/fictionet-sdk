@@ -4,6 +4,9 @@
 //! buffers grows: the record arriving (or a handshake message being joined),
 //! the plaintext it has decrypted and not yet handed over, the plaintext
 //! written before the handshake finished, and the records queued to send.
+//! A received handshake message is also charged, before it is parsed, room
+//! for what parsing it allocates, kept while it is
+//! processed; an [`Accepted`] keeps its hello's until it is answered.
 //! Each buffer holds one charge that always covers its allocation, and gives
 //! back what it frees. A record's plaintext stays in the buffer the record
 //! arrived in, which joins the plaintext queue with its charge: the queue's
@@ -294,6 +297,38 @@ pub(crate) fn chain_bytes(chain: &[pki_types::CertificateDer<'_>], ocsp: Option<
         .map(|cert| cert.as_ref().len() + ENTRY)
         .sum::<usize>()
         + ocsp.map_or(0, |ocsp| ocsp.len() + STATUS)
+}
+
+/// The room charged before a received handshake message of `len` bytes is
+/// parsed, for what parsing it allocates while it is processed: the
+/// message parses into lists of elements, each of which can be larger in
+/// memory than on the wire.
+///
+/// - Per byte: an element takes at most a vector and the one byte it
+///   holds for every two bytes on the wire. The smallest such elements
+///   are a protocol name and a PSK binder (a one-byte length and one byte
+///   of name), 25 bytes in memory; every other element of a client's
+///   messages takes less per byte (a key share 33 for 5, a PSK identity
+///   33 for 7, a group or a cipher suite 4 for 2). A list's vector holds
+///   at most twice its elements, and while it grows its old allocation
+///   is held beside the new: three times in all.
+/// - Fixed: each list's first allocation holds four elements whatever
+///   its length, and a hello's extensions are boxed.
+pub(crate) fn parse_room(len: usize) -> usize {
+    /// A vector and the byte it holds, for two bytes on the wire.
+    const ELEMENT: usize = size_of::<Vec<u8>>() + 1;
+    /// The lists a ClientHello parses into, the message with the most:
+    /// cipher suites, compression methods, groups, signature schemes,
+    /// protocols, client and server certificate types, compression
+    /// algorithms, PSK identities and binders, OCSP responder ids, CA
+    /// names, key shares, the extensions kept in order, the outer ECH
+    /// extensions, and the supported versions.
+    const LISTS: usize = 16;
+    /// The largest element of those lists, a key share.
+    const LARGEST: usize = size_of::<crate::msgs::handshake::KeyShareEntry>();
+    const FIXED: usize =
+        LISTS * 4 * LARGEST + size_of::<crate::msgs::handshake::ClientExtensions<'static>>();
+    FIXED + len * 3 * ELEMENT / 2
 }
 
 /// The most records one message received after the handshake makes: a

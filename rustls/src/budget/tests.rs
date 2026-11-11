@@ -541,7 +541,8 @@ fn a_close_notify_goes_out_with_the_budget_full() {
 
 /// A hello that does not parse is answered with decode_error with the
 /// budget full: the room kept for the final alert since the first read
-/// pays for it, and nothing goes out after it.
+/// pays for it, and nothing goes out after it. The budget has room only to
+/// parse the hello, which is charged before it is parsed.
 #[test]
 fn a_fatal_alert_goes_out_with_the_budget_full() {
     let limit = Limit::new(1 << 20);
@@ -551,7 +552,11 @@ fn a_fatal_alert_goes_out_with_the_budget_full() {
     let hello = [0x16, 0x03, 0x03, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00];
     let mut rest = &hello[..];
     assert_eq!(acceptor.read_tls(&mut rest).unwrap(), hello.len());
+    // Without room to parse it, the hello waits.
     limit.set_limit(limit.used());
+    assert!(acceptor.accept().unwrap().is_none());
+    assert!(acceptor.wants_budget());
+    limit.set_limit(limit.used() + super::parse_room(hello.len() - HEADER_SIZE));
     let Err((_, mut alert)) = acceptor.accept() else {
         panic!("the hello was accepted");
     };

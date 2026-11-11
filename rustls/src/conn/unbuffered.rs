@@ -51,6 +51,7 @@ impl<Data> UnbufferedConnectionCommon<Data> {
     ) -> UnbufferedStatus<'c, 'i, Data> {
         let mut buffer = DeframerSliceBuffer::new(incoming_tls);
         let mut buffer_progress = self.core.hs_deframer.progress();
+        self.core.common_state.start_step();
 
         // Output that went unpaid fails the connection: a record after the
         // one lost would leave a gap the peer refuses.
@@ -194,6 +195,11 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                     buffer.pending_discard(),
                     TransmitTlsData { conn: self }.into(),
                 );
+            } else if self.core.hs_deframer.has_message_ready()
+                && self.core.common_state.wants_budget()
+            {
+                // A handshake message waits, whole, for the room to parse it.
+                break (buffer.pending_discard(), ConnectionState::BlockedBudget);
             } else if self.core.common_state.has_received_close_notify
                 && !self.emitted_peer_closed_state
             {

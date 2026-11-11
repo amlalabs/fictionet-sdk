@@ -78,10 +78,15 @@ impl HandshakeDeframer {
 
     /// Do we have a message ready? ie, would `iter().next()` return `Some`?
     pub(crate) fn has_message_ready(&self) -> bool {
-        match self.spans.first() {
-            Some(span) => span.is_complete(),
-            None => false,
-        }
+        self.ready_len().is_some()
+    }
+
+    /// The length of the message ready, header included, if one is.
+    pub(crate) fn ready_len(&self) -> Option<usize> {
+        self.spans
+            .first()
+            .filter(|span| span.is_complete())
+            .map(|span| span.bounds.len())
     }
 
     /// Do we have any message data, partial or otherwise?

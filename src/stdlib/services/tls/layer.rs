@@ -139,7 +139,9 @@ impl Job for Pick {
 ///
 /// The connection's budget pays for every buffer it holds, rustls's own
 /// included: the bytes waiting for the rest of their record, the records
-/// going down, the handshake records rustls queues, and the hello snapshot.
+/// going down, the handshake records rustls queues, what parsing each of
+/// the client's handshake messages holds (the hello's until it is
+/// answered), and the hello snapshot.
 /// A buffer the budget has no room for waits: the layer takes no more input,
 /// keeps the write it could not pay for, and goes on when memory frees. An
 /// idle connection holds no buffer. It is charged the hello and the room
@@ -403,6 +405,36 @@ impl TlsLayer {
         self.ciphertext_completed = self.ciphertext_emitted;
         self.plaintext_completion = None;
         self.completed_plaintext_bytes = 0;
+    }
+
+    /// Asks the acceptor for the client's hello: taken once it is whole and
+    /// the budget pays for what parsing it holds, which the hello keeps
+    /// until it is answered. Until then the acceptor stays, and
+    /// [`Self::hello_waits`] says whether it is the room it waits for.
+    fn accept(&mut self) {
+        let Some(acceptor) = self.acceptor.as_mut() else {
+            return;
+        };
+        match acceptor.accept() {
+            Ok(Some(accepted)) => {
+                self.accepted = Some(accepted);
+                self.acceptor = None;
+            }
+            Ok(None) => {}
+            Err((error, alert)) => {
+                if self.first_byte == Some(22) {
+                    self.alert = Some(alert);
+                }
+                self.acceptor = None;
+                self.fail(Self::protocol_error(error));
+            }
+        }
+    }
+
+    /// The client's hello is whole, and waits for the budget to pay for
+    /// what parsing it holds.
+    fn hello_waits(&self) -> bool {
+        self.acceptor.as_ref().is_some_and(Acceptor::wants_budget)
     }
 
     /// Answers the client's hello with `config`. `false` if the budget had
@@ -814,7 +846,21 @@ impl Layer for TlsLayer {
                         Some(rest) => rest,
                         None => return Ok(Admit::Taken),
                     }
-                } else if let Some(acceptor) = self.acceptor.as_mut() {
+                } else if self.acceptor.is_some() {
+                    // A whole hello waiting for the room to parse it is
+                    // taken first: nothing more is read before it.
+                    if self.hello_waits() {
+                        self.accept();
+                        if self.failed {
+                            return Ok(Admit::Closed(StreamEvent::Data(chunk)));
+                        }
+                        if self.hello_waits() || self.accepted.is_some() {
+                            return Ok(Admit::Blocked(StreamEvent::Data(chunk)));
+                        }
+                    }
+                    let Some(acceptor) = self.acceptor.as_mut() else {
+                        return Ok(Admit::Closed(StreamEvent::Data(chunk)));
+                    };
                     let mut chunk = chunk;
                     self.first_byte.get_or_insert(chunk[0]);
                     let n = match acceptor.read_tls(&mut &chunk[..]) {
@@ -834,20 +880,7 @@ impl Layer for TlsLayer {
                         }
                     };
                     chunk.advance(n);
-                    match acceptor.accept() {
-                        Ok(Some(accepted)) => {
-                            self.accepted = Some(accepted);
-                            self.acceptor = None;
-                        }
-                        Ok(None) => {}
-                        Err((error, alert)) => {
-                            if self.first_byte == Some(22) {
-                                self.alert = Some(alert);
-                            }
-                            self.acceptor = None;
-                            self.fail(Self::protocol_error(error));
-                        }
-                    }
+                    self.accept();
                     chunk
                 } else {
                     return Ok(Admit::Closed(StreamEvent::Data(chunk)));
@@ -956,6 +989,16 @@ impl Layer for TlsLayer {
                 return Ok(true);
             }
             return Ok(false);
+        }
+        // Memory freed since the budget had no room to parse the hello.
+        if self.hello_waits() {
+            self.accept();
+            if self.hello_waits() {
+                return Ok(false);
+            }
+            if self.failed {
+                return Ok(true);
+            }
         }
         if self.hello.is_none()
             && let Some(accepted) = self.accepted.as_ref()
