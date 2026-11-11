@@ -28,6 +28,7 @@ pub enum ProbeEnd {
     PeerClosed,
     Answered,
     WriteFailed,
+    ReadFailed,
     InputLimit,
     Cancelled,
 }
@@ -783,8 +784,13 @@ impl PortServer for Trap {
                                             end = ProbeEnd::Cancelled;
                                             break;
                                         }
-                                        Ok(Ok(0)) | Ok(Err(_)) => {
+                                        Ok(Ok(0))
+                                        | Ok(Err(fictionet::stdlib::network::ConnError::Reset)) => {
                                             end = ProbeEnd::PeerClosed;
+                                            break;
+                                        }
+                                        Ok(Err(_)) => {
+                                            end = ProbeEnd::ReadFailed;
                                             break;
                                         }
                                         Ok(Ok(n)) => {
