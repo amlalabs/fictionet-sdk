@@ -64,6 +64,8 @@ struct Get {
     stream: Option<u64>,
     status: Option<Vec<u8>>,
     alt_svc: Option<Vec<u8>>,
+    /// The SETTINGS the site sent, in wire order.
+    settings: Option<Vec<(u64, u64)>>,
     body: Vec<u8>,
     done: bool,
 }
@@ -92,6 +94,7 @@ impl Get {
             stream: None,
             status: None,
             alt_svc: None,
+            settings: None,
             body: Vec::new(),
             done: false,
         }
@@ -143,7 +146,10 @@ impl Get {
                         self.body.extend_from_slice(&buffer[..n]);
                     }
                 }
-                Ok((_, quiche::h3::Event::Finished)) => self.done = true,
+                Ok((_, quiche::h3::Event::Finished)) => {
+                    self.settings = h3.peer_settings_raw().map(<[_]>::to_vec);
+                    self.done = true;
+                }
                 Ok(_) => {}
                 Err(quiche::h3::Error::Done) => break,
                 Err(error) => panic!("HTTP/3: {error:?}"),
@@ -334,6 +340,67 @@ fn sites_at_one_address_share_udp_443_each_with_its_own_certificate() {
         // No site has the name: the handshake ends without a connection.
         assert!(!gets[3].quic.is_established());
         assert!(gets[3].quic.peer_error().is_some());
+        Ok(())
+    });
+}
+
+#[test]
+fn each_site_shows_its_http3_profile() {
+    use fictionet_extras::http3::{Cloudflare, Nginx};
+    on_the_real_clock(77, |fcx| async move {
+        let edge: IpAddr = "104.18.0.9".parse()?;
+        let origin: IpAddr = "93.184.215.14".parse()?;
+        let (ca, leaf) = issue(&fcx, "Profiles CA", &["edge.test", "origin.test"])?;
+        let edge_key = leaf.certified_key();
+        let origin_key = edge_key.clone();
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(Pools::NONE)
+            .ipv4_only()
+            .add_host(
+                httpd::Server::new(Page("edge"))
+                    .tls_with(move |_| edge_key.clone())
+                    .http3_profile(Cloudflare)
+                    .served_by(Host::new("edge").dns_name("edge.test").at(edge)),
+            )
+            .add_host(
+                httpd::Server::new(Page("origin"))
+                    .tls_with(move |_| origin_key.clone())
+                    .http3_profile(Nginx)
+                    .served_by(Host::new("origin").dns_name("origin.test").at(origin)),
+            )
+            .start(&fcx, attachments)?;
+        let client: SocketAddr = CLIENT.parse()?;
+        let machine = machine(&fcx, attacher.attach("client")?, client.ip());
+        let mut socket = machine.udp.bind(client.port())?;
+        let mut config = trusting(&[&ca]);
+        let mut gets = vec![
+            Get::new(
+                &mut config,
+                1,
+                client,
+                SocketAddr::new(edge, 443),
+                "edge.test",
+                "edge.test",
+                "/a",
+            ),
+            Get::new(
+                &mut config,
+                2,
+                client,
+                SocketAddr::new(origin, 443),
+                "origin.test",
+                "origin.test",
+                "/b",
+            ),
+        ];
+        fetch(&fcx, &mut socket, &mut gets).await?;
+        let profiles: [&dyn httpd::Http3Profile; 2] = [&Cloudflare, &Nginx];
+        for ((get, body), profile) in gets.iter().zip(["edge /a", "origin /b"]).zip(profiles) {
+            assert!(get.done, "{}: {:?}", get.authority, get.quic.peer_error());
+            assert_eq!(get.status.as_deref(), Some(b"200".as_slice()));
+            assert_eq!(get.body, body.as_bytes());
+            super::http3::sees_settings(profile, get.settings.as_deref().unwrap());
+        }
         Ok(())
     });
 }

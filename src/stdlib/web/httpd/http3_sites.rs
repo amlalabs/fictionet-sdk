@@ -21,7 +21,7 @@ use fictionet::stdlib::services::tls::{self, CertifiedKey};
 use fictionet::stdlib::world::net::{DatagramServer, PreparedShare};
 
 use super::sites::HTTP3_CONNECTIONS;
-use super::{Handler, Limits, Observe, Responder, VHost, VirtualHosts};
+use super::{Handler, Http3Profile, Limits, Observe, Responder, VHost, VirtualHosts};
 
 /// Picks a site's certificate for one handshake, at once.
 pub(super) type PickNow = Arc<dyn Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync>;
@@ -56,6 +56,7 @@ pub(super) struct Http3Sites {
     limits: Limits,
     observe: Option<Observe>,
     date: Option<SystemTime>,
+    profile: Arc<dyn Http3Profile>,
     sites: Arc<RwLock<HashMap<SocketAddr, Sites>>>,
 }
 
@@ -67,6 +68,7 @@ impl Http3Sites {
         limits: Limits,
         observe: Option<Observe>,
         date: Option<SystemTime>,
+        profile: Arc<dyn Http3Profile>,
     ) -> Http3Sites {
         Http3Sites {
             vhost,
@@ -75,6 +77,7 @@ impl Http3Sites {
             limits,
             observe,
             date,
+            profile,
             sites: Arc::default(),
         }
     }
@@ -133,8 +136,8 @@ impl Http3Sites {
             endpoint: Arc::new(endpoint),
             server: Arc::new(server),
             connections: HTTP3_CONNECTIONS,
-            // Requests, and three streams of each side's own.
-            streams: self.limits.streams as usize + 6,
+            // Requests, the client's three streams and the profile's own.
+            streams: self.limits.streams as usize + self.profile.unidirectional(),
             connection_budget: connection_budget(&self.limits),
             validation: AddressValidation::Accept,
             cancel: |closing| {
@@ -177,6 +180,7 @@ impl DatagramServer for Http3Sites {
             .limits(self.limits)
             .maybe_observe(self.observe.clone())
             .maybe_date(self.date)
+            .shared_http3_profile(self.profile.clone())
             .http3_listener(listener);
         (Boxed::new(stack), budget)
     }

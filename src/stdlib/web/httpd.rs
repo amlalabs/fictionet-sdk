@@ -81,9 +81,28 @@
 //! serves the same handlers, body streams, virtual hosts and observations,
 //! with HTTP/3 request metadata. [`Server::served_by`] puts it on UDP port
 //! 443 next to HTTP/1 and HTTP/2 on TCP, and advertises it in their
-//! responses with `Alt-Svc`, as real sites do. Its QPACK profile advertises
-//! zero dynamic capacity; static references, literals and Huffman coding
-//! are supported.
+//! responses with `Alt-Svc`, as real sites do.
+//!
+//! What a connection shows its peer besides its responses is an
+//! [`Http3Profile`]: the SETTINGS it sends and their order, the
+//! unidirectional streams it opens, reserved frames, and a
+//! [`qpack::Policy`](fictionet::stdlib::protocols::qpack::Policy) for how
+//! it compresses fields. [`Server::http3_profile`] chooses one for a site
+//! served by [`Server::served_by`], and [`Responder::http3_profile`] for
+//! every connection a responder serves. The default, [`Http3Standard`], advertises a 4096-byte QPACK
+//! table with 16 blocked streams and inserts fields that repeat;
+//! `fictionet_extras::http3` has profiles for Cloudflare and nginx. Each
+//! connection enforces what its profile advertises. Responses reference
+//! only dynamic entries the peer has acknowledged, so they never wait for
+//! QPACK.
+//!
+//! ```
+//! use fictionet::stdlib::web::httpd::{Http3Standard, Responder};
+//! # fn handler(responder: Responder) {
+//! let server = responder.http3_profile(Http3Standard).http3();
+//! # let _ = server;
+//! # }
+//! ```
 //!
 //! HTTP/2 uses the same [`Handler`], [`Limits`] and seeded randomness.
 //! The connection charges its frame buffer, HPACK state, stream state and
@@ -170,7 +189,10 @@ pub use http2::{
     HttpExchange, Opening, Report as Http2Report, RequestHead as Http2RequestHead, RequestTrailers,
     Respond, RespondWork, Responder, ResponseHead, Timer as Http2Timer,
 };
-pub use http3::Http3;
+pub use http3::{
+    Http3, Local as Http3Stream, Profile as Http3Profile, Setting as Http3Setting,
+    Standard as Http3Standard,
+};
 /// HTTP/3 with the SDK handler on each exchange.
 pub type Http3Server = fictionet::stdlib::layer::Chain<
     Http3,

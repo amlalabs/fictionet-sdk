@@ -40,6 +40,7 @@ pub struct Responder {
     date: Option<SystemTime>,
     conn: ConnInfo,
     site: crate::stdlib::web::Site,
+    http3: Arc<dyn super::super::Http3Profile>,
 }
 
 impl Responder {
@@ -57,6 +58,7 @@ impl Responder {
             date: None,
             conn: ConnInfo::default(),
             site: crate::stdlib::web::Site::connection(&ConnInfo::default()),
+            http3: Arc::new(super::super::Http3Standard),
         }
     }
 
@@ -102,9 +104,24 @@ impl Responder {
         self.server(Http2::new(self.limits))
     }
 
+    /// What each HTTP/3 connection advertises and how it encodes fields.
+    /// The default is [`Http3Standard`](super::super::Http3Standard).
+    pub fn http3_profile(mut self, profile: impl super::super::Http3Profile + 'static) -> Self {
+        self.http3 = Arc::new(profile);
+        self
+    }
+
+    pub(in super::super) fn shared_http3_profile(
+        mut self,
+        profile: Arc<dyn super::super::Http3Profile>,
+    ) -> Self {
+        self.http3 = profile;
+        self
+    }
+
     /// HTTP/3 over an established QUIC stream carrier, with a handler on each request.
     pub fn http3(&self) -> super::super::Http3Server {
-        let mut connection = super::super::Http3::new(self.limits);
+        let mut connection = super::super::Http3::new(self.limits).profile(self.http3.clone());
         if let Some(start) = self.date {
             connection = connection.date(start);
         }

@@ -20,7 +20,8 @@ use fictionet::stdlib::world::net::{
 
 use super::http3_sites::{Http3Sites, PickNow};
 use super::{
-    AltSvc, Exchange, Handler, HttpOptions, Limits, Reply, http_for, serve_connection, text,
+    AltSvc, Exchange, Handler, Http3Profile, Http3Standard, HttpOptions, Limits, Reply, http_for,
+    serve_connection, text,
 };
 
 /// How [`VirtualHosts`] selected a request's handler.
@@ -279,6 +280,7 @@ pub struct Server {
     vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
     tls: Option<Certificates>,
     http3: bool,
+    http3_profile: Arc<dyn Http3Profile>,
     tls_layer: tls::Factory,
     application: ApplicationFor,
     protocols: Vec<Vec<u8>>,
@@ -334,6 +336,7 @@ impl Server {
             vhosts: Arc::default(),
             tls: None,
             http3: true,
+            http3_profile: Arc::new(Http3Standard),
             tls_layer: tls::Factory::default(),
             application: Arc::new(|cx, opening, handler, opts| {
                 Boxed::new(http_for(handler, opts, &opening.info, cx.now()))
@@ -447,6 +450,16 @@ impl Server {
         self
     }
 
+    /// What its HTTP/3 connections advertise and how they encode fields,
+    /// so the site looks like the server it stands for. The default is
+    /// [`Http3Standard`]; `fictionet_extras::http3` has Cloudflare and
+    /// nginx. Sites that share a UDP port use the first one's, as they do
+    /// its limits.
+    pub fn http3_profile(mut self, profile: impl Http3Profile + 'static) -> Server {
+        self.http3_profile = Arc::new(profile);
+        self
+    }
+
     /// [`tls_with`](Self::tls_with) with a certificate that may take time to
     /// select: each handshake waits for its own, up to its deadline, while
     /// the world goes on. This serves no HTTP/3, whose handshake cannot
@@ -494,6 +507,7 @@ impl Server {
                     server.limits,
                     server.observe.clone(),
                     server.date,
+                    server.http3_profile.clone(),
                 ),
             ),
             _ => host,

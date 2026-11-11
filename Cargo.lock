@@ -1766,6 +1766,7 @@ name = "fictionet-quic-interop"
 version = "0.0.0"
 dependencies = [
  "fictionet",
+ "fictionet-extras",
  "fictionet-quinn-proto",
  "fictionet-rustls",
  "fictionet-test-support",
@@ -1781,6 +1782,7 @@ version = "0.0.0"
 dependencies = [
  "cc",
  "fictionet",
+ "fictionet-extras",
  "fictionet-quinn-proto",
  "fictionet-rustls",
  "pkg-config",

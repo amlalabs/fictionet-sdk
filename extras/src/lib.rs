@@ -3,6 +3,9 @@
 //! [`ssh`] supplies an OpenSSH profile, a typed honeypot observer and a
 //! terminal line editor over the standard library SSH server.
 //!
+//! [`http3`] supplies HTTP/3 server profiles for Cloudflare and nginx: the
+//! SETTINGS, streams and QPACK encoding each server shows its clients.
+//!
 //! [`search`] renders search engines; [`sites`] supplies reusable site skins and
 //! their local assets. Neither module performs network requests.
 //! [`models`] serves provider APIs through the standard library's host client.
@@ -36,6 +39,7 @@
 #![warn(missing_docs)]
 
 pub mod args;
+pub mod http3;
 pub mod hyper_io;
 pub mod linux;
 pub mod log;

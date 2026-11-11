@@ -26,6 +26,14 @@
 //! with [`Wire::write`] and apply peer acknowledgments between decoded items.
 //! The encoder only references entries the peer has acknowledged.
 //!
+//! What the encoder inserts, how much table it uses, and how it writes
+//! strings is a [`Policy`], given as code. [`Encoder::warm`] asks it about
+//! each field, and [`FieldSection::write_styled`] and
+//! [`EncoderInstruction::write_styled`] write in its [`Style`]: when to use
+//! Huffman code, and whether sensitive fields carry the never-indexed bit.
+//! [`Selective`] is the default. HTTP/3 servers pick a policy as part of a
+//! profile (`stdlib::web::httpd::Http3Profile`).
+//!
 //! ```
 //! use fictionet::stdlib::{codec::Wire, protocols::qpack::{self, Encoder, Field, Table, SectionResult}};
 //!
@@ -103,6 +111,165 @@ pub const MAX_INTEGER_BYTES: usize = 10;
 /// The most field sections an encoder tracks while it waits for their
 /// acknowledgments. Past it, the encoder stops using the dynamic table.
 pub const MAX_OUTSTANDING: usize = 1024;
+
+/// The decoder limits a connection advertises in HTTP/3 SETTINGS.
+/// Construction refuses limits this implementation cannot honor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settings {
+    table_capacity: u64,
+    blocked_streams: usize,
+}
+
+impl Settings {
+    /// Advertise a static-only decoder, with no streams waiting for inserts.
+    /// The peer's settings independently govern the local encoder.
+    pub const STATIC: Self = Self {
+        table_capacity: 0,
+        blocked_streams: 0,
+    };
+
+    /// Limits within the codec's table and blocked-stream bounds.
+    pub const fn new(table_capacity: u64, blocked_streams: usize) -> Option<Self> {
+        if table_capacity > MAX_TABLE_CAPACITY || blocked_streams > MAX_BLOCKED_STREAMS {
+            return None;
+        }
+        Some(Self {
+            table_capacity,
+            blocked_streams,
+        })
+    }
+
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY, in RFC entry octets.
+    pub const fn table_capacity(self) -> u64 {
+        self.table_capacity
+    }
+
+    /// SETTINGS_QPACK_BLOCKED_STREAMS, counting distinct streams.
+    pub const fn blocked_streams(self) -> usize {
+        self.blocked_streams
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            table_capacity: 4096,
+            blocked_streams: 16,
+        }
+    }
+}
+
+/// When a writer codes a string in Huffman code. A decoder reads every
+/// choice; the choice only changes the bytes on the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Huffman {
+    /// Only when the code is shorter than the string.
+    #[default]
+    Shorter,
+    /// Whenever the code is no longer than the string, so a tie is coded.
+    NotLonger,
+    /// Never: every string is written as it is.
+    Never,
+}
+
+/// How an encoder writes strings and sensitive fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Style {
+    /// When strings are Huffman coded.
+    pub huffman: Huffman,
+    /// Whether a sensitive field carries the never-indexed bit, which tells
+    /// intermediaries not to index it. Sensitive fields are never inserted
+    /// into the dynamic table either way.
+    pub never_index: bool,
+}
+
+impl Style {
+    /// Huffman code when shorter, and the never-indexed bit on sensitive
+    /// fields. [`Wire::write`] writes in this style.
+    pub const DEFAULT: Self = Self {
+        huffman: Huffman::Shorter,
+        never_index: true,
+    };
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// How an encoder uses the dynamic table and writes its output.
+///
+/// The [`Encoder`] keeps the rules every policy shares: it never inserts a
+/// sensitive field, an exact static match or an entry the table already
+/// holds; it never evicts an entry still in use; and field sections only
+/// reference entries the peer has acknowledged. A policy chooses within
+/// those rules. [`Selective`] is the default.
+///
+/// ```
+/// use fictionet::stdlib::protocols::qpack::{self, Field, Policy, Style, Table};
+///
+/// /// Never uses the dynamic table, and writes Huffman code on ties.
+/// struct StaticOnly;
+/// impl Policy for StaticOnly {
+///     fn capacity(&self, _peer: u64) -> u64 { 0 }
+///     fn insert(&self, _: &Field, _: &Table) -> bool { false }
+///     fn style(&self) -> Style {
+///         Style { huffman: qpack::Huffman::NotLonger, never_index: false }
+///     }
+/// }
+/// assert_eq!(StaticOnly.capacity(4096), 0);
+/// ```
+pub trait Policy: Send + Sync {
+    /// The dynamic table capacity the encoder sets when the peer allows
+    /// `peer_max` bytes. The encoder lowers a larger answer to `peer_max`.
+    /// Zero leaves the table unused: no Set Dynamic Table Capacity
+    /// instruction and no inserts.
+    fn capacity(&self, peer_max: u64) -> u64;
+
+    /// Whether to insert `field`, given the table as the encoder has built
+    /// it. Asked only for fields the shared rules allow.
+    fn insert(&self, field: &Field, table: &Table) -> bool;
+
+    /// How strings and sensitive fields are written.
+    fn style(&self) -> Style;
+}
+
+/// The default encoder policy. It uses as much table as the peer allows,
+/// and inserts fields that tend to repeat across a connection's messages
+/// (`:authority`, `user-agent`, `accept-language`, `content-type`,
+/// `cache-control`, `server`, `vary`, `strict-transport-security` and
+/// `content-security-policy`) when one takes at most half the table.
+/// Dates, lengths, entity tags, cookies and request identifiers change
+/// from message to message and are never inserted. It writes in
+/// [`Style::DEFAULT`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Selective;
+
+impl Policy for Selective {
+    fn capacity(&self, peer_max: u64) -> u64 {
+        peer_max
+    }
+
+    fn insert(&self, field: &Field, table: &Table) -> bool {
+        matches!(
+            field.name.as_slice(),
+            b":authority"
+                | b"user-agent"
+                | b"accept-language"
+                | b"content-type"
+                | b"cache-control"
+                | b"server"
+                | b"vary"
+                | b"strict-transport-security"
+                | b"content-security-policy"
+        ) && field.size() <= table.capacity() / 2
+    }
+
+    fn style(&self) -> Style {
+        Style::DEFAULT
+    }
+}
 
 /// The HTTP/3 error codes for QPACK failures (RFC 9204 section 6).
 pub mod error_code {
@@ -411,11 +578,22 @@ fn exact<T>(result: Result<(T, usize), Error>, len: usize) -> Result<T, Error> {
     Ok(value)
 }
 
-/// Appends `s` as a string with a `prefix`-bit length, Huffman-coded if
-/// that is shorter. Callers check [`MAX_STRING`] first.
-fn put_string(out: &mut Vec<u8>, prefix: u8, flags: u8, s: &[u8]) -> Result<(), Error> {
+/// Appends `s` as a string with a `prefix`-bit length, Huffman-coded when
+/// `huffman` says so. Callers check [`MAX_STRING`] first.
+fn put_string(
+    out: &mut Vec<u8>,
+    prefix: u8,
+    flags: u8,
+    s: &[u8],
+    huffman: Huffman,
+) -> Result<(), Error> {
     let h = huffman::encoded_len(s).map_err(|_| Error::Unwritable)?;
-    if h < s.len() {
+    let coded = match huffman {
+        Huffman::Shorter => h < s.len(),
+        Huffman::NotLonger => h <= s.len(),
+        Huffman::Never => false,
+    };
+    if coded {
         put_integer(out, prefix, flags | (1 << prefix), h as u64)?;
         huffman::encode(s, out).map_err(|_| Error::Unwritable)?;
     } else {
@@ -465,6 +643,8 @@ fn entry_size(name: &[u8], value: &[u8]) -> u64 {
         .saturating_add(ENTRY_OVERHEAD)
 }
 
+type TableEntry = (Box<[u8]>, Box<[u8]>);
+
 /// The dynamic table: entries inserted in order, each with an absolute
 /// index counting from 0, the oldest evicted first when room is needed.
 /// Both sides of a connection keep one, and keep it the same.
@@ -481,7 +661,7 @@ fn entry_size(name: &[u8], value: &[u8]) -> u64 {
 /// Send acknowledgments in return order before taking an increment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
-    entries: VecDeque<(Vec<u8>, Vec<u8>)>,
+    entries: VecDeque<TableEntry>,
     size: u64,
     capacity: u64,
     max_capacity: u64,
@@ -522,6 +702,27 @@ impl Table {
     /// What the entries' sizes add up to.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Retained heap, including spare slots after eviction or a capacity fall.
+    pub fn held(&self) -> usize {
+        self.entries.capacity() * size_of::<TableEntry>()
+            + self
+                .entries
+                .iter()
+                .map(|(n, v)| n.len() + v.len())
+                .sum::<usize>()
+    }
+
+    /// A lifetime reservation for retained entries and moving deque slots.
+    /// Instruction parsing and copies made by `apply` need caller scratch too.
+    pub fn most_held(&self) -> usize {
+        let entries = self.max_capacity as usize / ENTRY_OVERHEAD as usize;
+        if entries == 0 {
+            return 0;
+        }
+        self.max_capacity as usize
+            + 3 * entries.max(4).next_power_of_two() * size_of::<TableEntry>()
     }
 
     /// How many entries the table holds.
@@ -570,13 +771,13 @@ impl Table {
         let i = self
             .entries
             .iter()
-            .rposition(|(n, v)| n == name && v == value)?;
+            .rposition(|(n, v)| n.as_ref() == name && v.as_ref() == value)?;
         Some(self.first_index() + i as u64)
     }
 
     /// The absolute index of the newest entry with this name.
     pub fn find_name(&self, name: &[u8]) -> Option<u64> {
-        let i = self.entries.iter().rposition(|(n, _)| n == name)?;
+        let i = self.entries.iter().rposition(|(n, _)| n.as_ref() == name)?;
         Some(self.first_index() + i as u64)
     }
 
@@ -595,7 +796,7 @@ impl Table {
     /// returns its absolute index. An entry larger than the capacity is
     /// [`Error::EntryTooLarge`]. Strings above [`MAX_STRING`] and an exhausted
     /// insert-count range are refused. Errors leave the table unchanged.
-    pub fn insert(&mut self, mut name: Vec<u8>, mut value: Vec<u8>) -> Result<u64, Error> {
+    pub fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) -> Result<u64, Error> {
         check_strings(&name, &value)?;
         let size = entry_size(&name, &value);
         if size > self.capacity {
@@ -608,9 +809,11 @@ impl Table {
             .ok_or(Error::IntegerOverflow)?;
         self.evict_to(self.capacity - size);
         self.size += size;
-        name.shrink_to_fit();
-        value.shrink_to_fit();
-        self.entries.push_back((name, value));
+        let entry = (name.into_boxed_slice(), value.into_boxed_slice());
+        if self.entries.len() == self.entries.capacity() {
+            self.entries.reserve_exact(self.entries.capacity().max(4));
+        }
+        self.entries.push_back(entry);
         Ok(index)
     }
 
@@ -1004,15 +1207,22 @@ impl Wire for FieldSection {
         })
     }
 
-    /// Writes a complete section. Refuses invalid lines and excessive encoded size or field count.
+    /// Writes a complete section in [`Style::DEFAULT`]. Refuses invalid lines and excessive encoded size or field count.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.write_styled(Style::DEFAULT, out)
+    }
+}
+
+impl FieldSection {
+    /// Writes a complete section in `style`, as [`Wire::write`] does otherwise.
+    pub fn write_styled(&self, style: Style, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.representations.len() > MAX_FIELDS {
             return Err(Error::Unwritable);
         }
         let mut bytes = Vec::new();
         self.prefix.write(&mut bytes)?;
         for rep in &self.representations {
-            rep.write(&mut bytes)?;
+            rep.write_styled(style, &mut bytes)?;
             if bytes.len() > MAX_SECTION_BYTES {
                 return Err(Error::Unwritable);
             }
@@ -1276,6 +1486,42 @@ impl Encoder {
         self.known_received
     }
 
+    /// Retained table and outstanding section records.
+    pub fn held(&self) -> usize {
+        self.table.held() + self.outstanding.capacity() * size_of::<Outstanding>()
+    }
+
+    /// A lifetime reservation, including moving outstanding-section slots.
+    pub fn most_held(&self) -> usize {
+        if self.table.max_capacity() == 0 {
+            return 0;
+        }
+        self.table.most_held() + 3 * MAX_OUTSTANDING * size_of::<Outstanding>()
+    }
+
+    /// Inserts `field` when `policy` wants it and the table has room.
+    /// Sensitive fields, exact static matches and existing entries never
+    /// cause an insertion, whatever the policy. This avoids speculative
+    /// references: `section` still waits for feedback before using the
+    /// inserted entry.
+    pub fn warm(
+        &mut self,
+        field: &Field,
+        policy: &(impl Policy + ?Sized),
+    ) -> Option<EncoderInstruction> {
+        if field.never_index
+            || field.size() > self.table.capacity()
+            || static_find(&field.name, &field.value).is_some()
+            || self.table.find(&field.name, &field.value).is_some()
+            || !policy.insert(field, &self.table)
+        {
+            return None;
+        }
+        self.insert(&field.name, &field.value)
+            .ok()
+            .map(|(_, instruction)| instruction)
+    }
+
     /// The oldest absolute index that may not be evicted (RFC 9204 section
     /// 2.1.1): the oldest entry a section still waiting for its
     /// acknowledgment uses, or the oldest insert the decoder has not yet
@@ -1406,7 +1652,24 @@ impl Encoder {
             Literal,
         }
         let use_dynamic = self.outstanding.len() < MAX_OUTSTANDING;
-        let acked = |abs: Option<u64>| abs.filter(|&a| use_dynamic && a < self.known_received);
+        // A pending duplicate must not hide an older acknowledged match.
+        let acked = |name: &[u8], value: Option<&[u8]>| {
+            if !use_dynamic {
+                return None;
+            }
+            self.table
+                .entries
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, (n, v))| {
+                    let absolute = self.table.first_index() + i as u64;
+                    (absolute < self.known_received
+                        && n.as_ref() == name
+                        && value.is_none_or(|value| v.as_ref() == value))
+                    .then_some(absolute)
+                })
+        };
         let lines: Vec<Line> = fields
             .iter()
             .map(|f| {
@@ -1414,13 +1677,13 @@ impl Encoder {
                     if let Some(i) = static_find(&f.name, &f.value) {
                         return Line::Static(i);
                     }
-                    if let Some(a) = acked(self.table.find(&f.name, &f.value)) {
+                    if let Some(a) = acked(&f.name, Some(&f.value)) {
                         return Line::Dynamic(a);
                     }
                 }
                 if let Some(i) = static_find_name(&f.name) {
                     Line::StaticName(i)
-                } else if let Some(a) = acked(self.table.find_name(&f.name)) {
+                } else if let Some(a) = acked(&f.name, None) {
                     Line::DynamicName(a)
                 } else {
                     Line::Literal
@@ -1661,7 +1924,16 @@ impl Wire for EncoderInstruction {
     /// Writes one instruction, using Huffman strings when shorter. Refuses oversized strings,
     /// integer overflow, capacity above MAX_TABLE_CAPACITY, and invalid static name indexes.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.write_styled(Style::DEFAULT, out)
+    }
+}
+
+impl EncoderInstruction {
+    /// Writes one instruction with strings Huffman-coded as `style` says,
+    /// and refuses what [`Wire::write`] refuses.
+    pub fn write_styled(&self, style: Style, out: &mut Vec<u8>) -> Result<(), Error> {
         check_encoder_instruction(self).map_err(|_| Error::Unwritable)?;
+        let huffman = style.huffman;
         match self {
             EncoderInstruction::SetCapacity(c) => put_integer(out, 5, 0x20, *c)?,
             EncoderInstruction::InsertWithNameRef {
@@ -1670,11 +1942,11 @@ impl Wire for EncoderInstruction {
                 value,
             } => {
                 put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)?;
-                put_string(out, 7, 0, value)?;
+                put_string(out, 7, 0, value, huffman)?;
             }
             EncoderInstruction::InsertWithLiteralName { name, value } => {
-                put_string(out, 5, 0x40, name)?;
-                put_string(out, 7, 0, value)?;
+                put_string(out, 5, 0x40, name, huffman)?;
+                put_string(out, 7, 0, value, huffman)?;
             }
             EncoderInstruction::Duplicate(i) => put_integer(out, 5, 0, *i)?,
         }
@@ -1733,9 +2005,20 @@ impl Wire for Representation {
         exact(parsed, bytes.len())
     }
 
-    /// Writes one field line, using Huffman strings when shorter. Refuses integers above
+    /// Writes one field line in [`Style::DEFAULT`]. Refuses integers above
     /// MAX_VARINT and strings longer than MAX_STRING.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        self.write_styled(Style::DEFAULT, out)
+    }
+}
+
+impl Representation {
+    /// Writes one field line in `style`, and refuses what [`Wire::write`]
+    /// refuses. Without [`Style::never_index`], no line carries the
+    /// never-indexed bit.
+    pub fn write_styled(&self, style: Style, out: &mut Vec<u8>) -> Result<(), Error> {
+        let huffman = style.huffman;
+        let n = |never_index: &bool| *never_index && style.never_index;
         let (index, name, value): (u64, &[u8], &[u8]) = match self {
             Self::Indexed { index, .. } | Self::IndexedPostBase(index) => (*index, &[], &[]),
             Self::LiteralNameRef { index, value, .. }
@@ -1759,26 +2042,32 @@ impl Wire for Representation {
                 value,
             } => {
                 let flags = 0x40
-                    | if *never_index { 0x20 } else { 0 }
+                    | if n(never_index) { 0x20 } else { 0 }
                     | if *static_table { 0x10 } else { 0 };
                 put_integer(out, 4, flags, *index)?;
-                put_string(out, 7, 0, value)?;
+                put_string(out, 7, 0, value, huffman)?;
             }
             Representation::LiteralPostBaseNameRef {
                 never_index,
                 index,
                 value,
             } => {
-                put_integer(out, 3, if *never_index { 0x08 } else { 0 }, *index)?;
-                put_string(out, 7, 0, value)?;
+                put_integer(out, 3, if n(never_index) { 0x08 } else { 0 }, *index)?;
+                put_string(out, 7, 0, value, huffman)?;
             }
             Representation::LiteralName {
                 never_index,
                 name,
                 value,
             } => {
-                put_string(out, 3, if *never_index { 0x30 } else { 0x20 }, name)?;
-                put_string(out, 7, 0, value)?;
+                put_string(
+                    out,
+                    3,
+                    if n(never_index) { 0x30 } else { 0x20 },
+                    name,
+                    huffman,
+                )?;
+                put_string(out, 7, 0, value, huffman)?;
             }
         }
         Ok(())
@@ -1824,6 +2113,10 @@ impl BlockedSection {
     /// The encoded field bytes retained, excluding the already read prefix.
     pub fn buffered(&self) -> usize {
         self.body.len()
+    }
+    /// Heap retained while this section waits, excluding its inline record.
+    pub fn held(&self) -> usize {
+        self.body.capacity()
     }
     /// Retries using the original prefix. If still blocked, returns this
     /// value unchanged. Successful decoding returns its acknowledgment.
