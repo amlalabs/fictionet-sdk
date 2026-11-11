@@ -429,11 +429,11 @@ pub fn infer(trace: &Trace, enrollment: Option<&Enrollment>) -> Result<Inference
             target,
             ..
         } = gate
+            && *host_checks > 0
+            && target.contains("check")
         {
-            if *host_checks > 0 && target.contains("check") {
-                distinct_checks.insert(target.split('?').next().unwrap_or(target).to_owned());
-                overlapped |= *host_checks > 1;
-            }
+            distinct_checks.insert(target.split('?').next().unwrap_or(target).to_owned());
+            overlapped |= *host_checks > 1;
         }
         if let TrapEvent::Probe {
             probe,
@@ -453,26 +453,27 @@ pub fn infer(trace: &Trace, enrollment: Option<&Enrollment>) -> Result<Inference
                 harness.candidates.retain(|name| name == "opencode");
                 harness.readings.push(RuleReading::HoldKilled);
             }
-            if *probe == ProbeKind::Hold && *end == ProbeEnd::Answered {
-                if let Some(end_at) = trace.provenance.get(index).and_then(|p| p.at_us) {
-                    let start_at = end_at.saturating_sub(elapsed_ms.saturating_mul(1000));
-                    let handed_back =
-                        trace
-                            .gates
-                            .iter()
-                            .zip(&trace.provenance)
-                            .any(|(gate, provenance)| {
-                                matches!(gate, TrapEvent::Request { .. })
-                                    && provenance.at_us.is_some_and(|at| {
-                                        at > start_at
-                                            && at < end_at
-                                            && near_timeout((at - start_at) / 1000)
-                                    })
-                            });
-                    if handed_back {
-                        harness.candidates.retain(|name| name == "claude-code");
-                        harness.readings.push(RuleReading::HoldHandBack);
-                    }
+            if *probe == ProbeKind::Hold
+                && *end == ProbeEnd::Answered
+                && let Some(end_at) = trace.provenance.get(index).and_then(|p| p.at_us)
+            {
+                let start_at = end_at.saturating_sub(elapsed_ms.saturating_mul(1000));
+                let handed_back =
+                    trace
+                        .gates
+                        .iter()
+                        .zip(&trace.provenance)
+                        .any(|(gate, provenance)| {
+                            matches!(gate, TrapEvent::Request { .. })
+                                && provenance.at_us.is_some_and(|at| {
+                                    at > start_at
+                                        && at < end_at
+                                        && near_timeout((at - start_at) / 1000)
+                                })
+                        });
+                if handed_back {
+                    harness.candidates.retain(|name| name == "claude-code");
+                    harness.readings.push(RuleReading::HoldHandBack);
                 }
             }
         }
