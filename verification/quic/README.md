@@ -13,8 +13,10 @@ socket, tested with several independent quiche connections at once. See
 [Shared datagram listener](#shared-datagram-listener) for the latest boundaries.
 Wire input now retains reservations through packet and frame ownership;
 see [Reserved reassembly storage](#reserved-reassembly-storage) for the latest
-resource evidence and the acknowledgment admission fix. Earlier sections record the state at each step. Remaining priorities
-are whole-engine budgeting, the remaining version-two work and unresolved proofs.
+resource evidence and the acknowledgment admission fix. Earlier sections record the state at each step. QUIC version two and
+version negotiation are implemented; see [QUIC version two](#quic-version-two).
+Remaining priorities are whole-engine budgeting, proofs of the version-two
+code and unresolved proofs.
 
 The intended boundary is a layer over the world's datagram carrier, with
 typed multiplexed streams and application datagrams above it. The engine
@@ -1352,3 +1354,205 @@ the existing redundant-link warning in `network/packet.rs`. The existing
 it measures wire copying, not reassembly throughput. All Cargo, Kani and
 TLC commands ran under the required memory-limited scope with Cargo targets
 outside the worktree.
+
+## QUIC version two
+
+The engine now runs [RFC 9369](https://www.rfc-editor.org/rfc/rfc9369.html)
+and the compatible and incompatible negotiation of
+[RFC 9368](https://www.rfc-editor.org/rfc/rfc9368.html). This step adds the
+implementation and its tests; it adds no proofs or models.
+
+`quinn-proto/src/version.rs` names versions 1 (`0x00000001`) and 2
+(`0x6b3343cf`), the drafts the engine already ran, and which versions are
+compatible: 1 and 2 in both directions, every version with itself. Lists of
+versions are `VersionList`, an inline set of known versions, so a peer's
+list is reduced to the versions the engine knows without allocating.
+
+Long header type bits follow the packet's version: `LongHeaderType::from_byte`
+and `to_byte` in `packet.rs` map version 2's Initial 1, 0-RTT 2, Handshake
+3 and Retry 0. The rustls adapter maps `0x6b3343cf` to the fork's version 2
+key schedule, whose Initial salt and `quicv2` labels were already present.
+Retry tags use the version 2 key and nonce in `retry_integrity`, and Retry
+validation takes the Retry packet's own version.
+
+Every connection sends Version Information, which `TransportParameters`
+now keeps as a `VersionInformation`: the Chosen Version, the known
+Available Versions in order, and whether others were listed. The decoder's
+existing checks are unchanged. A server compares the client's Chosen
+Version with the version of the client's first flight; a client compares
+the server's with the negotiated version.
+
+A client's `ClientConfig::version` is its Original Version and
+`preferred_versions` its preference, versions 2 then 1 by default. Its
+first flight offers the preferred versions that the first flight converts
+to and its endpoint accepts. Endpoints accept versions 1 and 2 by default,
+in that order of preference.
+
+A server chooses before its TLS session reads the ClientHello, since its
+own Version Information names the chosen version.
+`version::client_version_information` reads the client's offer from the
+decrypted first Initial: its CRYPTO frames, the ClientHello, the transport
+parameter extension and Version Information, in place and without copying.
+`select_compatible` takes the first version of the server's preference
+that the first flight converts to and the client offered. When the
+ClientHello does not fit the first packet, or anything is unexpected, the
+server keeps the client's version, as RFC 9368 allows.
+
+`Endpoint::compatible_upgrade` then charges the original version's Initial
+keys to the connection's budget, derives them and the negotiated version's
+keys, and starts the TLS session with `set_negotiated_version`. The server
+keeps the original Initial receive keys until a Handshake packet in the
+negotiated version is processed, then drops them and their charge. If the
+budget refuses them, the server keeps the original version.
+
+The client accepts Initial packets in the versions it offered until its
+version is settled. `connection/negotiation.rs` decides each long header:
+`Negotiation::admit` returns the current keys, the other version's keys, a
+trial of an offered version, or a drop. A trial charges the offered
+version's Initial keys before deriving them. The client adopts the version
+only after a packet authenticates under those keys, and before its CRYPTO
+data reaches TLS, in `Connection::adopt_tried_version`. CRYPTO data in the
+original version settles the original version. Handshake packets must use
+the negotiated version, 0-RTT stays in the original version, and a client
+follows a Retry only in its original version before settling.
+
+After a Version Negotiation packet, `Negotiation::react` ignores it when it
+lists the Original Version or when the client already reacted once.
+Otherwise the client starts again in its most preferred listed version that
+its endpoint accepts, through `Connection::restart_in_version`. That
+replaces the TLS session and Initial keys and abandons any 0-RTT.
+`Negotiation::check_server` then requires the server's Version Information
+and applies RFC 9368 section 4's downgrade check,
+`version::negotiation_was_genuine`. Servers ignore Version Negotiation.
+
+The rustls fork changed in two separate commits. A QUIC connection can
+switch to a negotiated version until its handshake secrets exist; 0-RTT
+keys keep the original version. Session tickets record the QUIC version of
+the connection that issued or received them. A server resumes only a
+ticket of its connection's version, and a client offers only one of its
+first flight's version. The client constructor now sets the version before
+the ClientHello chooses a ticket, which the first commit missed. Address
+tokens were already bound to versions.
+
+`QuicLayer::version` reports the settled version, and
+`with_address_validation(AddressValidation::Retry)` makes a server layer
+answer unvalidated clients with a Retry. HTTP/3 above the layer needs no
+change; callers offer and accept version 2 through the configurations
+they already pass.
+
+### Tests
+
+The RFC 9369 Appendix A client Initial, server Initial and Retry run
+through the engine's encoder, protection and decoder as known answers in
+`packet/rfc9369_vectors.rs`; changing the version 2 type bits fails all
+four tests. The fork adds the Appendix A.5 key update vector beside its
+existing version 2 key vectors, and a ticket encoding round trip.
+
+Unit tests cover version lists, compatibility, server selection, the
+downgrade check, the first-flight reader on shuffled CRYPTO frames and the
+RFC's sample ClientHello, and each negotiation decision. Two engines in
+`tests/version.rs` complete version 2 handshakes, an upgrade from version
+1, a version 2 Retry, a Retry before an upgrade, Version Negotiation into
+version 2, and a refusal without a common version. They check the version
+of every long header on the wire and a stream exchange. A forged Version
+Negotiation packet ends in `VERSION_NEGOTIATION_ERROR`, and one listing the
+Original Version is ignored. A version 1 ticket is not offered to a version
+2 connection, a version 2 ticket gives 0-RTT, and a server refuses a version
+1 ticket presented as version 2.
+
+The `versions` module of `services/quic/tests.rs`, which the
+interoperability crate also includes, runs two `QuicLayer`s on the simulated
+datagram carrier: a version 2 handshake, an upgrade, a client offering only
+version 1, a version 2 Retry, a Retry before an upgrade and Version
+Negotiation into version 2. Each checks the versions on the carrier and a
+stream exchange.
+
+Scratch mutations, all reverted: removing the server's ticket check fails
+the relabelled-ticket test; offering tickets of any version fails the
+ticket offer check; skipping the downgrade check fails the forged Version
+Negotiation test and its unit test; never upgrading fails both upgrade
+layer tests.
+
+All 386 engine library tests, 287 fork library tests, 31 SDK QUIC tests and
+37 tests of the independent interoperability crate pass. Clippy with warnings denied
+passes for the engine, the fork and the SDK library and tests. quiche 0.30
+speaks only version 1, so independent version 2 interoperability is not
+tested.
+
+### Resources
+
+New storage is the other version's Initial keys: on a server after an
+upgrade, and on a client trying an offered version. Both are charged to the
+connection's reassembly budget before derivation, using
+`Keys::heap_size`, and released with the keys. `heap_size` counts each key
+box and the rustls key behind it; ring keys hold no further heap, which an
+allocation replay should confirm. Version lists, Version Information and
+the first-flight reader are inline and allocate nothing.
+
+A restart after Version Negotiation replaces the TLS session and Initial
+keys; like the session it replaces, the new session is not charged. A
+layer Retry reaches the engine's existing token encoding and Retry tag
+code, which allocate uncharged buffers. Tickets taken from the client store
+in the wrong version are dropped, not returned.
+
+### Limits
+
+A server upgrades only when the whole ClientHello is in the first Initial
+packet, at most eight CRYPTO frames. A ticket from an upgraded connection
+belongs to the negotiated version, so a client starting in version 1 does
+not resume it; a client resumes by starting in that version. With the
+default preference for version 1, endpoints that both prefer version 2 must
+say so. The server's Available Versions are its known accepted versions.
+
+### Proof targets
+
+Version rules: `version::compatible`, `select_compatible`,
+`negotiation_was_genuine`, `VersionList::{new, known, push,
+compatible_with, first_offered}` and `TypeBits::of`.
+
+Packet types: `LongHeaderType::from_byte` and `to_byte` in `packet.rs`, a
+bijection per version, and `ProtectedHeader::decode` and `Header::encode`.
+
+First-flight reading: `version/first_flight.rs`,
+`client_version_information`, `CryptoData::{read, byte}` and the `Cursor`
+reads. Bounds, no allocation, and agreement with the transport parameter
+decoder on the offer.
+
+Negotiation decisions in `connection/negotiation.rs`:
+`Negotiation::{client, server, decodable, admit, react, check_server}`,
+for example that Handshake packets are only admitted in the current
+version, 0-RTT only in the original, that a client reacts at most once and
+never to a list with its Original Version, and that `check_server` rejects
+every forged downgrade.
+
+Connection integration in `connection/mod.rs`: `handle_decode`,
+`prepare_other_initial`, `adopt_tried_version`, `restart_in_version`, the
+Retry and Version Negotiation arms of `process_decrypted_packet`, the
+Handshake arm that drops the server's other keys, `read_crypto` settling a
+client, and the 0-RTT header version in `packet_builder.rs`.
+`packet_crypto::{unprotect_header, decrypt_packet_body}` with other keys.
+
+Endpoint: `Endpoint::compatible_upgrade`, `accept` and `connect`.
+
+Transport parameters: `read_version_information` and the
+`VersionInformation` arm of `TransportParameters::write` and `read_inner`;
+the existing Kani harnesses in `kani/version_information.rs` were adjusted
+to the returned structure only.
+
+Retry integrity: `crypto/rustls.rs` `retry_integrity`, `retry_tag`,
+`is_valid_retry` and `interpret_version`.
+
+Resources: the charge-before-derivation in `prepare_other_initial` and
+`compatible_upgrade`, `Keys::heap_size` against measured allocation, and
+the release of the other keys.
+
+rustls fork: `ConnectionCommon::set_negotiated_version` and the
+`handshake_secrets_derived` flag set in `tls13/key_schedule.rs`,
+`zero_rtt_keys` using `early_version`, ticket binding in
+`server/tls13.rs` (`get_server_session_value` and the resumption filter),
+`client/hs.rs` (`ClientSessionValue::retrieve`), `client/tls13.rs` and
+the `ServerSessionValue` codec in `msgs/persist.rs`, and
+`ConnectionCore::for_client` setting the version before the ClientHello.
+
+Layer: `QuicLayer::version`, `with_address_validation` and the Retry
+branch of the layer's datagram handling.
