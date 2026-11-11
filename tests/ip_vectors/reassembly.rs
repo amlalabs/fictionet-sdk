@@ -178,10 +178,7 @@ fn reassembly_matches_the_lean_model() {
                     }
                 });
                 if let Some(got) = got {
-                    problems.push(format!(
-                        "got {got}, the model says {}",
-                        brief_want(&want)
-                    ));
+                    problems.push(format!("got {got}, the model says {}", brief_want(&want)));
                 }
             }
             let mut firsts = Vec::new();
