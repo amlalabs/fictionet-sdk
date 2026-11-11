@@ -385,6 +385,7 @@ fn served(
         Charged {
             value: taken,
             charged: 0,
+            moved: 0,
         }
     })
 }
