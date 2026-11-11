@@ -83,7 +83,7 @@ fn a_hello_joined_from_one_byte_records_is_moved_a_few_times() {
             moved: 0,
         }
     });
-    std::println!("cost: {}", costs.summary());
+    costs.print();
 }
 
 /// A TLS 1.3 ClientHello with `suites` cipher suites, and `big`, an
@@ -217,10 +217,10 @@ fn a_hello_is_charged_what_parsing_it_holds() {
                 }
             },
         );
-        std::println!("cost: {name}: {}", costs.summary());
+        costs.print();
         all.absorb(&costs);
     }
-    std::println!("cost: {}", all.summary());
+    all.print();
 }
 
 /// A record holding a hello and then 4,000 empty handshake messages, four
@@ -253,7 +253,7 @@ fn a_record_of_many_messages_is_cut_a_message_at_a_time() {
             moved: 0,
         }
     });
-    std::println!("cost: {}", costs.summary());
+    costs.print();
 }
 
 /// The session slots a config keeps: made and paid for once, for a size
@@ -324,5 +324,5 @@ fn session_slots_are_paid_once_and_a_session_costs_at_most_its_copy() {
         alloc::unmeasured(|| drop(held));
         assert_eq!(limit.used(), paid, "the store was charged again");
     }
-    std::println!("cost: {}", costs.summary());
+    costs.print();
 }

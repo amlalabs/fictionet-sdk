@@ -105,5 +105,5 @@ fn message_fragments_stay_within_their_charge_and_copy_linearly() {
         }
         all.absorb(&costs);
     }
-    println!("cost: {}", all.summary());
+    all.print();
 }

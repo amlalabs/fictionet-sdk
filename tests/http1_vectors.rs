@@ -430,7 +430,7 @@ fn heads_a_byte_a_delivery() {
         }
         total.absorb(&costs);
     }
-    println!("heads cost: {}", total.summary());
+    total.print();
 }
 
 #[test]
@@ -477,7 +477,7 @@ fn requests() {
             )
         })
     });
-    println!("requests cost: {}", served_costs.summary());
+    served_costs.print();
 }
 
 #[test]

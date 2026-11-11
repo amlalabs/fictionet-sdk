@@ -21,6 +21,9 @@
 //! inequality. Build what a session replays inside its steps (the table,
 //! the connection): the running count of live bytes starts at zero with
 //! the session, and only allocations made inside a step are counted.
+//! When a session ends, [`Costs::print`] prints what its steps came to as
+//! a [`CostLine`] (line.rs beside this file), which the verify commands
+//! read back.
 //!
 //! Include beside the allocator, in a test binary:
 //!
@@ -37,6 +40,10 @@
 use std::string::String;
 
 use super::alloc::measuring_left;
+
+#[path = "line.rs"]
+mod line;
+use line::{Closest, CostLine};
 
 /// `per * input + fixed` bytes, with `per` a fraction `num / den`.
 #[derive(Clone, Copy, Debug)]
@@ -202,16 +209,25 @@ impl Costs {
         }
     }
 
-    /// One line: the steps checked, and the closest each bound came.
-    pub(crate) fn summary(&self) -> String {
-        std::format!(
-            "{} steps within their charge and linear bound; closest: {} of {} bytes \
-             charged, {} of {} bytes allowed",
-            self.steps,
-            self.closest_charge.0,
-            self.closest_charge.1,
-            self.closest_linear.0,
-            self.closest_linear.1,
-        )
+    /// What the session's steps came to: the steps checked, and the
+    /// closest each bound came.
+    pub(crate) fn line(&self) -> CostLine {
+        CostLine {
+            session: self.session.clone(),
+            steps: self.steps,
+            charge: Closest {
+                used: self.closest_charge.0,
+                allowed: self.closest_charge.1,
+            },
+            linear: Closest {
+                used: self.closest_linear.0,
+                allowed: self.closest_linear.1,
+            },
+        }
+    }
+
+    /// Prints [`line`](Self::line), for the verify commands to report.
+    pub(crate) fn print(&self) {
+        std::println!("{}", self.line());
     }
 }

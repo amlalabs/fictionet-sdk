@@ -226,7 +226,7 @@ fn reassembly_matches_the_lean_model() {
         all.absorb(&costs);
     });
     println!("reassembly: {kept} first fragments kept for answers");
-    println!("cost: reassembly: {}", all.summary());
+    all.print();
     assert!(
         disagree.is_empty(),
         "{} cases disagree:\n{}",

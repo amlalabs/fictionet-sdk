@@ -930,7 +930,7 @@ mod test {
                 moved: 0,
             }
         });
-        eprintln!("cost: version information: {}", costs.summary());
+        costs.print();
     }
 
     #[test]

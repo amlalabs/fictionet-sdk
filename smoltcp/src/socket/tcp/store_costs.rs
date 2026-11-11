@@ -222,7 +222,7 @@ fn receiving_random_segments_stays_within_its_charge() {
                 _ => rx.read(&mut costs, rng.gen_range(0..4 * MSS)),
             }
         }
-        eprintln!("cost: rx random, seed {seed}: {}", costs.summary());
+        costs.print();
     }
 }
 
@@ -238,7 +238,7 @@ fn many_one_byte_segments_out_of_order_stay_within_their_charge() {
         for k in (1..2000).rev() {
             rx.segment(&mut costs, 2 * k, 1, source);
         }
-        eprintln!("cost: rx one-byte, out of order: {}", costs.summary());
+        costs.print();
     }
 }
 
@@ -255,7 +255,7 @@ fn many_one_byte_segments_in_order_stay_within_their_charge() {
         }
         assert_eq!(rx.store.as_ref().unwrap().window(), 0);
         rx.read(&mut costs, usize::MAX);
-        eprintln!("cost: rx one-byte, in order: {}", costs.summary());
+        costs.print();
     }
 }
 
@@ -271,7 +271,7 @@ fn a_slow_readers_window_joined_stays_within_its_charge() {
             rx.segment(&mut costs, 0, MSS, source);
         }
         rx.read(&mut costs, usize::MAX);
-        eprintln!("cost: rx joins: {}", costs.summary());
+        costs.print();
     }
 }
 
@@ -291,7 +291,7 @@ fn contiguous_pieces_out_of_order_join_within_their_charge() {
     }
     rx.segment(&mut costs, 0, 64, Source::Unpaid);
     rx.read(&mut costs, usize::MAX);
-    eprintln!("cost: rx waiting joins: {}", costs.summary());
+    costs.print();
 }
 
 /// Sending: writes of a byte to two MSS, from the application's own
@@ -342,6 +342,6 @@ fn sending_small_writes_stays_within_its_charge() {
                 });
             }
         }
-        eprintln!("cost: tx, seed {seed}: {}", costs.summary());
+        costs.print();
     }
 }

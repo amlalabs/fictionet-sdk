@@ -243,10 +243,10 @@ fn records_in_seeded_chunks_cost_at_most_a_record() {
                 }
             }
             assert_eq!(got, sent, "{version:?}: the plaintext did not all come up");
-            println!("cost: {version:?}: {}", costs.summary());
+            costs.print();
             all.absorb(&costs);
         }
-        println!("cost: {}", all.summary());
+        all.print();
         Ok(())
     }))
     .unwrap();
@@ -315,7 +315,7 @@ fn a_message_joined_from_one_byte_records_is_moved_a_few_times() {
             });
         }
         assert!(server.layer().failure().is_none());
-        println!("cost: {}", each.summary());
+        each.print();
 
         let budget = Budget::new(1 << 20);
         let (mut server, records) = joining(&fcx, &budget);
@@ -334,7 +334,7 @@ fn a_message_joined_from_one_byte_records_is_moved_a_few_times() {
         });
         assert!(server.layer().failure().is_none());
         assert!(server.layer().is_handshaking());
-        println!("cost: {}", whole.summary());
+        whole.print();
         Ok(())
     }))
     .unwrap();
@@ -421,11 +421,11 @@ fn a_hello_is_parsed_only_with_room_for_what_parsing_holds() {
             });
             assert_eq!(server.layer().hello().is_some(), parsed, "budget {limit}");
             assert!(server.layer().failure().is_none(), "budget {limit}");
-            println!("cost: budget {limit}: {}", costs.summary());
+            costs.print();
             all.absorb(&costs);
             unmeasured(|| drop(server));
         }
-        println!("cost: {}", all.summary());
+        all.print();
         Ok(())
     }))
     .unwrap();
