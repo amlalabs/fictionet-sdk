@@ -9,9 +9,24 @@ subsystem requests also disconnect.
 ## Packet path
 
 The world runs behind `start_raw`, which takes whole Ethernet frames from a
-`fictionet_host::raw::RawAttachment`. A network card's driver holds the other
-side. This build has no driver yet: `honeypot run` checks its options, then
-refuses to start before it opens its state directory. `--help` says so.
+`fictionet_host::raw::RawAttachment`. On EC2, `honeypot run --interface ens6`
+takes over the instance's second ENA through native XDP and an AF_XDP socket
+in copy mode (`fictionet_host::xdp`, described in the
+[host README](../../host/README.md#af_xdp)). The startup checks run before
+the state directory is opened. The binary refuses an interface that carries
+the default route, any route, an address or a TCP connection such as the SSH
+session, that is not an ENA, or that is down. It sets the interface to MTU
+1500 and one combined channel and refuses to start if they read back
+differently. The `backend_attached` record names the interface, driver and
+driver version, MTU and queue, with native attach and copy mode.
+
+`--address` is the data ENA's private IPv4 address, which NAT puts in inbound
+packets. `--public-address` is recorded in the configuration record and goes
+no further. When the process exits, crashes included, its XDP program comes
+off the interface. The interface has no kernel address, so it goes silent
+until the service restarts. Under a systemd unit with `Type=notify` and
+`WatchdogSec=`, the binary reports ready once the world is up, and a world
+task sends the watchdog ping, so a stalled world is restarted.
 
 The Ethernet host in `start_raw` handles ARP, IPv6 discovery and duplicate
 address detection. IPv6 gateway discovery uses router advertisements when
@@ -20,7 +35,10 @@ are dropped while it is unresolved. Untagged IP reaches the simulated host;
 VLAN, malformed and unknown-EtherType frames stay in the original Ethernet
 capture. The adapter supports a 1500-byte IP MTU and does not fragment larger
 replies. The attachment's queues hold at most 64 frames per direction and
-count the frames a full queue discards; device-level loss is unknown.
+count the frames a full queue discards. Each frame record's `nic_rx_dropped`
+counts the AF_XDP socket's receive losses since the last record (its
+`rx_dropped` and `rx_ring_full`, read once a second); losses inside the ENA
+itself are not counted.
 
 ## Northbank deployment services
 
@@ -100,8 +118,8 @@ The executable needs no Rust toolchain, `fictionet` CLI or helper process
 where it runs. Dynamic system library dependencies still follow the chosen
 build target. `--version` prints the build version.
 
-The primary command is `honeypot run`, configured on the command line only.
-`--help` lists options; unknown options fail. `--address`, `--address-v6`,
+The primary command is `honeypot run --interface NAME`, configured on the
+command line only. `--help` lists options; unknown options fail. `--address`, `--address-v6`,
 `--gateway` and `--gateway-v6` set the server's addresses and the link's
 gateways. One protected `--state-dir` owns a persistent sensor identity, a
 private Ed25519 SSH host key, a process lock and separate evidence files for
