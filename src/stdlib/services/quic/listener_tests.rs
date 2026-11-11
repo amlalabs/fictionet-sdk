@@ -35,6 +35,8 @@ impl Lab {
                 server: Arc::new(server),
                 connections: limit,
                 streams: 16,
+                connection_budget: 1 << 20,
+                validation: AddressValidation::Accept,
                 cancel: |_| 0u32.into(),
             },
             epoch,
@@ -204,11 +206,14 @@ fn recycled_engine_handle_routes_only_to_the_new_generation() {
         |_| 0u32.into(),
     );
     layer.connection = Some(connection);
+    let budget = Budget::new(1 << 20);
     let child = lab
         .listener
         .sessions
         .insert(Session {
             layer,
+            budget,
+            reservation: lab.budget.charge(1 << 20).unwrap(),
             announced: false,
             opening: None,
             closing: false,
@@ -248,7 +253,7 @@ fn refused_listener_storage_keeps_input_before_endpoint_creation() {
 }
 
 #[test]
-fn full_listener_ignores_new_initials_and_keeps_the_existing_connection() {
+fn full_listener_refuses_new_initials_and_keeps_the_existing_connection() {
     let mut lab = Lab::new(1);
     let existing = lab.initial();
     let mut observe = Observations::new(0);
@@ -296,6 +301,40 @@ fn full_listener_ignores_new_initials_and_keeps_the_existing_connection() {
         lab.listener.endpoint.as_ref().unwrap().open_connections(),
         1
     );
+    // The newcomer hears CONNECTION_REFUSED at once instead of waiting
+    // out its handshake timer.
+    let Some(DatagramCommand::Send(refusal)) = lab.listener.take_command(&mut env) else {
+        panic!("refusal")
+    };
+    assert_eq!(
+        *refusal.meta(),
+        "127.0.0.1:4445".parse::<SocketAddr>().unwrap()
+    );
+    assert!(matches!(
+        client
+            .on_event(
+                &mut env,
+                DatagramEvent::Datagram(Datagram::new(
+                    refusal.into_parts().0,
+                    "127.0.0.1:4433".parse().unwrap(),
+                )),
+            )
+            .unwrap(),
+        Admit::Taken
+    ));
+    assert!(matches!(
+        lab.listener
+            .on_event(&mut env, DatagramEvent::Sent(1))
+            .unwrap(),
+        Admit::Taken
+    ));
+    client.advance(&mut env).unwrap();
+    assert!(matches!(
+        client.take_event(),
+        Some(MuxEvent::Control(ControlEvent::Lost(
+            quinn_proto::ConnectionError::ConnectionClosed(close)
+        ))) if close.error_code == quinn_proto::TransportErrorCode::CONNECTION_REFUSED
+    ));
     let Some(DatagramCommand::Send(response)) = lab.listener.take_command(&mut env) else {
         panic!("existing connection progresses")
     };

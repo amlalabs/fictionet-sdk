@@ -5,6 +5,11 @@ use std::time::Instant as EngineInstant;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use web_time::Instant as EngineInstant;
 
+/// The engine's monotonic clock. Any reading of it serves as the epoch a
+/// layer or listener takes: the run's zero, from which the run's clock
+/// counts. The engine reads no clock of its own.
+pub type Epoch = EngineInstant;
+
 use quinn_proto::{Connection, ConnectionHandle, Dir, Endpoint, StreamId, VarInt};
 
 use crate::stdlib::layer::{
@@ -680,7 +685,7 @@ impl Layer for QuicLayer {
                                         self.endpoint
                                             .as_mut()
                                             .expect("standalone endpoint")
-                                            .accept(incoming, now, buf, None),
+                                            .accept(incoming, now, buf, None, None),
                                     )
                                 })
                                 .expect("accept response fits a UDP payload")
@@ -1112,4 +1117,4 @@ impl Layer for QuicLayer {
 
 #[path = "listener.rs"]
 mod listener;
-pub use listener::{Connections, Listener, ListenerConfig};
+pub use listener::{Accepted, Connections, Listener, ListenerConfig};

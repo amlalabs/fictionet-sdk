@@ -427,13 +427,15 @@ impl TestEndpoint {
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
+            // Each connection's own timers: with several connections, one
+            // shared deadline would fire on the wrong one.
+            let mut timeout = None;
             for (ch, conn) in self.connections.iter_mut() {
-                if self.timeout.is_some_and(|x| x <= now) {
-                    self.timeout = None;
+                if conn.poll_timeout().is_some_and(|x| x <= now) {
                     conn.handle_timeout(now);
                 }
 
-                for (_, mut events) in self.conn_events.drain() {
+                if let Some(events) = self.conn_events.get_mut(ch) {
                     for event in events.drain(..) {
                         conn.handle_event(event);
                     }
@@ -447,8 +449,9 @@ impl TestEndpoint {
                     self.outbound.extend(split_transmit(transmit, &buf[..size]));
                     buf.clear();
                 }
-                self.timeout = conn.poll_timeout();
+                timeout = min_opt(timeout, conn.poll_timeout());
             }
+            self.timeout = timeout;
 
             if endpoint_events.is_empty() {
                 break;
@@ -488,7 +491,7 @@ impl TestEndpoint {
         now: Instant,
     ) -> Result<ConnectionHandle, ConnectionError> {
         let mut buf = Vec::new();
-        match self.endpoint.accept(incoming, now, &mut buf, None) {
+        match self.endpoint.accept(incoming, now, &mut buf, None, None) {
             Ok((ch, conn)) => {
                 self.connections.insert(ch, conn);
                 self.accepted = Some(Ok(ch));
