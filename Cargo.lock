@@ -1776,6 +1776,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fictionet-quic-ngtcp2"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "fictionet",
+ "fictionet-quinn-proto",
+ "fictionet-rustls",
+ "pkg-config",
+ "ring",
+]
+
+[[package]]
 name = "fictionet-quinn-proto"
 version = "0.11.19"
 dependencies = [
