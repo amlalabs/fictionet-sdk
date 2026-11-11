@@ -775,10 +775,11 @@ mod tests {
                         fixed: suite.charge + expander,
                     };
                     let mut costs = Costs::new("QUIC Initial keys");
-                    let keys = costs.step(cid.len(), suite.charge, linear, || Charged {
-                        value: initial_keys(version, ConnectionId::new(cid), side, &suite.suite),
-                        charged: 0,
-                        moved: 0,
+                    let keys = costs.step(cid.len(), suite.charge, linear, || {
+                        Charged::new(
+                            initial_keys(version, ConnectionId::new(cid), side, &suite.suite),
+                            0,
+                        )
                     });
                     assert!(keys.heap_size() <= suite.charge);
                     all.absorb(&costs);

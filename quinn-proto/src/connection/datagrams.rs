@@ -521,11 +521,7 @@ mod tests {
                 },
                 || {
                     incoming.push(&data, window);
-                    Charged {
-                        value: (),
-                        charged: 0,
-                        moved: 0,
-                    }
+                    Charged::new((), 0)
                 },
             );
             assert_eq!(budget.used(), window);
@@ -558,11 +554,10 @@ mod tests {
             den: 1,
             fixed: 0,
         };
-        assert!(!costs.step(4, 0, zero, || Charged {
-            value: incoming.push(b"kept", window),
-            charged: 0,
-            moved: 0,
-        }));
+        assert!(!costs.step(4, 0, zero, || Charged::new(
+            incoming.push(b"kept", window),
+            0
+        )));
         assert!(incoming.is_empty());
         assert_eq!(incoming.bytes.capacity(), 0);
         drop(held);
@@ -597,11 +592,7 @@ mod tests {
                 },
                 || {
                     incoming.push(b"held", window);
-                    Charged {
-                        value: (),
-                        charged: 0,
-                        moved: 0,
-                    }
+                    Charged::new((), 0)
                 },
             );
             assert_eq!(budget.used(), window);
@@ -663,10 +654,8 @@ mod tests {
             let pointer = source.as_ptr();
             let mut state = DatagramState::default();
             let mut wire = Vec::with_capacity(32);
-            let accepted = costs.step(size, 0, linear, || Charged {
-                value: state.chunk.admit(&mut source, &budget),
-                charged: 0,
-                moved: 0,
+            let accepted = costs.step(size, 0, linear, || {
+                Charged::new(state.chunk.admit(&mut source, &budget), 0)
             });
             assert!(accepted);
             assert!(source.is_empty());
@@ -692,10 +681,8 @@ mod tests {
         let mut source = Chunk::copy_of(&budget, b"held").unwrap();
         let pointer = source.as_ptr();
         let mut slot = DatagramSlot::default();
-        let accepted = costs.step(4, 0, linear, || Charged {
-            value: slot.admit(&mut source, &unavailable),
-            charged: 0,
-            moved: 0,
+        let accepted = costs.step(4, 0, linear, || {
+            Charged::new(slot.admit(&mut source, &unavailable), 0)
         });
         assert!(!accepted);
         assert_eq!(source.as_ptr(), pointer);

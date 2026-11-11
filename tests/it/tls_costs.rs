@@ -234,10 +234,8 @@ fn records_in_seeded_chunks_cost_at_most_a_record() {
                 while at < wire.len() {
                     let end = (at + 1 + rng.random_below(2000) as usize).min(wire.len());
                     let bytes = chunk(&wire[at..end]);
-                    got += costs.step(end - at, charge, CHUNKS, || Charged {
-                        value: deliver(&mut server, bytes).unwrap(),
-                        charged: 0,
-                        moved: 0,
+                    got += costs.step(end - at, charge, CHUNKS, || {
+                        Charged::new(deliver(&mut server, bytes).unwrap(), 0)
                     });
                     at = end;
                 }
@@ -308,10 +306,8 @@ fn a_message_joined_from_one_byte_records_is_moved_a_few_times() {
         let mut each = Costs::new("a message a byte a record, a step a record");
         let charge = room(&budget) + HEADERS;
         for record in records {
-            each.step(6, charge, JOINING_STEP, || Charged {
-                value: deliver(&mut server, record).unwrap(),
-                charged: 0,
-                moved: 0,
+            each.step(6, charge, JOINING_STEP, || {
+                Charged::new(deliver(&mut server, record).unwrap(), 0)
             });
         }
         assert!(server.layer().failure().is_none());
@@ -326,11 +322,7 @@ fn a_message_joined_from_one_byte_records_is_moved_a_few_times() {
             for record in records {
                 deliver(&mut server, record).unwrap();
             }
-            Charged {
-                value: (),
-                charged: 0,
-                moved: 0,
-            }
+            Charged::new((), 0)
         });
         assert!(server.layer().failure().is_none());
         assert!(server.layer().is_handshaking());
@@ -413,11 +405,7 @@ fn a_hello_is_parsed_only_with_room_for_what_parsing_holds() {
                     budget.clone(),
                 );
                 deliver(&mut server, bytes).unwrap();
-                Charged {
-                    value: server,
-                    charged: 0,
-                    moved: 0,
-                }
+                Charged::new(server, 0)
             });
             assert_eq!(server.layer().hello().is_some(), parsed, "budget {limit}");
             assert!(server.layer().failure().is_none(), "budget {limit}");

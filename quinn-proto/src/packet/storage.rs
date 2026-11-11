@@ -154,11 +154,7 @@ mod tests {
                 },
                 || {
                     let packet = PacketBuffer::copy_from(&budget, &input).unwrap();
-                    Charged {
-                        value: packet,
-                        charged: budget.used(),
-                        moved: 0,
-                    }
+                    Charged::new(packet, budget.used())
                 },
             );
             let before = budget.used();
@@ -172,11 +168,7 @@ mod tests {
                 },
                 || {
                     let tail = packet.split_off(len / 2).unwrap();
-                    Charged {
-                        value: tail,
-                        charged: budget.used() - before,
-                        moved: 0,
-                    }
+                    Charged::new(tail, budget.used() - before)
                 },
             );
             let (head, tail) = costs.step(
@@ -187,11 +179,7 @@ mod tests {
                     den: 1,
                     fixed: 2 * OWNER_OVERHEAD,
                 },
-                || Charged {
-                    value: (packet.freeze(), tail.freeze()),
-                    charged: 0,
-                    moved: 0,
-                },
+                || Charged::new((packet.freeze(), tail.freeze()), 0),
             );
             assert_eq!(&head[..], &input[..len / 2]);
             assert_eq!(&tail[..], &input[len / 2..]);
@@ -204,11 +192,7 @@ mod tests {
                     den: 1,
                     fixed: 0,
                 },
-                || Charged {
-                    value: (tail.clone(), tail.slice(..)),
-                    charged: 0,
-                    moved: 0,
-                },
+                || Charged::new((tail.clone(), tail.slice(..)), 0),
             );
             drop(head);
             drop(tail);
@@ -237,11 +221,7 @@ mod tests {
                     den: 1,
                     fixed: 0,
                 },
-                || Charged {
-                    value: PacketBuffer::copy_from(&budget, &input),
-                    charged: budget.used(),
-                    moved: 0,
-                },
+                || Charged::new(PacketBuffer::copy_from(&budget, &input), budget.used()),
             );
             assert!(packet.is_none());
             assert_eq!(budget.used(), 0);
@@ -271,11 +251,7 @@ mod tests {
                         packet.split_off(4)
                     };
                     assert!(split.is_err());
-                    Charged {
-                        value: (),
-                        charged: 0,
-                        moved: 0,
-                    }
+                    Charged::new((), 0)
                 },
             );
             assert_eq!(&packet[..], b"abcdefgh");

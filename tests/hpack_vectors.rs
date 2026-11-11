@@ -134,11 +134,7 @@ fn decode_costed(table: &mut Table, block: &[u8], costs: &mut Costs) -> Result<D
     let (charge, linear, before) = (table.most_held(), decoding(table), out.charged());
     let result = costs.step(block.len(), charge, linear, || {
         let value = table.decode_block(block, &mut out, &budget, MAX_DECODED);
-        Charged {
-            value,
-            charged: out.charged().saturating_sub(before),
-            moved: 0,
-        }
+        Charged::new(value, out.charged().saturating_sub(before))
     });
     result.map(|()| read(&out))
 }
@@ -343,18 +339,14 @@ fn encoder() {
                 // The SETTINGS acknowledgment goes out before the next block,
                 // so the decoder applies the limit before reading it.
                 let charge = encoder.most_held();
-                costs.step(0, charge, NOTHING, || Charged {
-                    value: encoder.set_settings_limit(size(limit)),
-                    charged: 0,
-                    moved: 0,
+                costs.step(0, charge, NOTHING, || {
+                    Charged::new(encoder.set_settings_limit(size(limit)), 0)
                 });
                 table.set_settings_limit(size(limit));
             } else if let Some(capacity) = step.get("capacity") {
                 let charge = encoder.most_held();
-                let got = costs.step(0, charge, NOTHING, || Charged {
-                    value: encoder.set_capacity(size(capacity)),
-                    charged: 0,
-                    moved: 0,
+                let got = costs.step(0, charge, NOTHING, || {
+                    Charged::new(encoder.set_capacity(size(capacity)), 0)
                 });
                 assert_eq!(got.is_ok(), step["ok"].as_bool().unwrap(), "{step}");
             } else if let Some(huffman) = step.get("huffman") {
@@ -366,10 +358,8 @@ fn encoder() {
                 let mut out = Vec::with_capacity(encoder.block_bound(&given).unwrap_or(0));
                 let input = given.iter().map(|f| f.name.len() + f.value.len() + 1).sum();
                 let (charge, linear) = (encoder.most_held(), encoding(&encoder));
-                let got = costs.step(input, charge, linear, || Charged {
-                    value: encoder.encode_block(&given, &mut out),
-                    charged: 0,
-                    moved: 0,
+                let got = costs.step(input, charge, linear, || {
+                    Charged::new(encoder.encode_block(&given, &mut out), 0)
                 });
                 if step.get("error").is_some() {
                     assert_eq!(got, Err(Error::Unwritable), "{step}");

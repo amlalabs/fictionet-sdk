@@ -80,17 +80,36 @@ pub(crate) struct Costs {
     total_allowed: usize,
 }
 
-/// The step's work, and what it charged to a budget besides.
+/// The step's work, and what it charged to a budget besides. Made with
+/// [`new`](Self::new), and [`moved`](Self::moved) for a step that grows
+/// charged storage by reallocating.
 pub(crate) struct Charged<T> {
     /// What the step returns.
-    pub value: T,
+    value: T,
     /// Bytes the step itself charged to a budget, such as a block it grew.
-    pub charged: usize,
+    charged: usize,
     /// Bytes a reallocation moved into storage the step charged: growing
     /// a container asks the allocator for its old contents again. Allowed
     /// in the linear bound, not in the charge. A container that at least
     /// doubles moves no more than it charged.
-    pub moved: usize,
+    moved: usize,
+}
+
+impl<T> Charged<T> {
+    /// A step that returns `value`, charged `charged` bytes to a budget,
+    /// and moved nothing.
+    pub(crate) fn new(value: T, charged: usize) -> Self {
+        Self {
+            value,
+            charged,
+            moved: 0,
+        }
+    }
+
+    /// The same step, having moved `moved` bytes into storage it charged.
+    pub(crate) fn moved(self, moved: usize) -> Self {
+        Self { moved, ..self }
+    }
 }
 
 impl Costs {

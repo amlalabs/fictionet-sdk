@@ -538,7 +538,7 @@ out of 16 GiB.
 | `decoding_a_static_name_stays_within_its_charge` | the same, the name `:method` | 83.3 s |
 | `encoding_into_an_empty_table_stays_within_its_charge` and `_a_table_of_one` to `_four` | the same against `Encoder::most_held()`; one harness a count, as all five in one ran out of 16 GiB | 79.6 s, 121.8 s, 140.9 s, 159.6 s, 197.6 s |
 | `the_longest_static_name_is_counted` | `name_copy()`'s constant is at least every static name's length | 1.2 s |
-| `the_counter_sees_every_allocation` | the counter sees `Box`, `Vec` (grown, then shrunk to a boxed slice), `VecDeque` and `Arc` at their layouts' sizes, and all of it freed | 10.7 s |
+| `the_counter_sees_every_allocation` | the counter sees `Box`, `Vec` (grown, then shrunk to a boxed slice), `VecDeque`, `Arc` and zeroed `vec![0; n]` at their layouts' sizes, and all of it freed | 10.7 s |
 
 `name_copy()` is a shared name's header (two `usize` counts, padded to
 their alignment) and the longest static name. The slot term covers the

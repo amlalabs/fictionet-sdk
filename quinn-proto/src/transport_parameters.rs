@@ -938,11 +938,7 @@ mod test {
                 assert!(
                     TransportParameters::read_for_version(side, 1, &mut bytes.as_slice()).is_ok()
                 );
-                Charged {
-                    value: (),
-                    charged: 0,
-                    moved: 0,
-                }
+                Charged::new((), 0)
             });
         }
         bytes.extend_from_slice(&[0x11, 0]);
@@ -951,11 +947,7 @@ mod test {
                 TransportParameters::read(Side::Client, &mut bytes.as_slice()),
                 Err(Error::Malformed)
             );
-            Charged {
-                value: (),
-                charged: 0,
-                moved: 0,
-            }
+            Charged::new((), 0)
         });
         eprintln!("cost: version information: {}", costs.summary());
     }

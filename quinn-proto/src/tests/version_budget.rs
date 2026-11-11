@@ -183,10 +183,11 @@ fn a_server_retry_allocates_nothing_beyond_its_buffer() {
             den: 1,
             fixed: 0,
         };
-        let size = costs.step(input, 0, nothing, || Charged {
-            value: pair.server.endpoint.retry(incoming, &mut buf).unwrap().size,
-            charged: 0,
-            moved: 0,
+        let size = costs.step(input, 0, nothing, || {
+            Charged::new(
+                pair.server.endpoint.retry(incoming, &mut buf).unwrap().size,
+                0,
+            )
         });
         assert!(size > 0 && size <= buf.capacity());
     }

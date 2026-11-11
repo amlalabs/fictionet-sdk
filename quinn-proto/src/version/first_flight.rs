@@ -413,10 +413,8 @@ mod tests {
         let mut costs = Costs::new("QUIC first flight");
         let mut offers = 0;
         for stream in &streams {
-            let offer = costs.step(stream.prefix() as usize, 0, nothing, || Charged {
-                value: client_offer(stream),
-                charged: 0,
-                moved: 0,
+            let offer = costs.step(stream.prefix() as usize, 0, nothing, || {
+                Charged::new(client_offer(stream), 0)
             });
             offers += usize::from(matches!(offer, Offer::Found(_)));
         }

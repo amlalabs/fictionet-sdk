@@ -389,15 +389,16 @@ mod tests {
             let mut bytes = Vec::with_capacity(capacity);
             bytes.extend_from_slice(b"abcd");
             let mut chunk = Chunk::paid(bytes, charge).unwrap();
-            let taken = costs.step(limit, 0, linear, || Charged {
-                value: ChunkSource {
-                    data: &mut chunk,
-                    budget: &budget,
-                }
-                .pop_chunk(limit)
-                .unwrap(),
-                charged: 0,
-                moved: 0,
+            let taken = costs.step(limit, 0, linear, || {
+                Charged::new(
+                    ChunkSource {
+                        data: &mut chunk,
+                        budget: &budget,
+                    }
+                    .pop_chunk(limit)
+                    .unwrap(),
+                    0,
+                )
             });
             assert_eq!(taken.0.len(), limit);
             assert_eq!(budget.used(), capacity);
@@ -405,14 +406,15 @@ mod tests {
         let budget = Budget::new(4);
         let full = Budget::new(0);
         let mut chunk = Chunk::copy_of(&budget, b"abcd").unwrap();
-        let taken = costs.step(4, 0, linear, || Charged {
-            value: ChunkSource {
-                data: &mut chunk,
-                budget: &full,
-            }
-            .pop_chunk(4),
-            charged: 0,
-            moved: 0,
+        let taken = costs.step(4, 0, linear, || {
+            Charged::new(
+                ChunkSource {
+                    data: &mut chunk,
+                    budget: &full,
+                }
+                .pop_chunk(4),
+                0,
+            )
         });
         assert!(matches!(taken, Err(WriteError::Budget)));
         assert_eq!(&chunk[..], b"abcd");

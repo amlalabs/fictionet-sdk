@@ -280,11 +280,7 @@ fn http3_connection_storage_is_reserved_before_growth() {
                     .on_event(&mut env, MuxEvent::Control(ControlEvent::Connected))
                     .unwrap();
                 assert_eq!(matches!(result, Admit::Taken), limit != 0);
-                Charged {
-                    value: h3,
-                    charged: budget.used(),
-                    moved: 0,
-                }
+                Charged::new(h3, budget.used())
             },
         );
         drop(h3);
