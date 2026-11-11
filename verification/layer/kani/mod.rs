@@ -479,13 +479,28 @@ fn a_charge_becomes_bounded_vector_places() {
 /// within it, and trimmed, over every `u8` limit and byte. A growth the
 /// budget has no room for is refused, and everything is given back when the
 /// bytes are dropped. Sizes are run one by one: a symbolic allocation size
-/// took the solver past the memory cap.
+/// took the solver past the memory cap. Each pair of sizes is a harness of
+/// its own: the three in one ran past 14 GiB after the buffers round.
 #[kani::proof]
 #[kani::unwind(7)]
-fn charged_bytes_capacity_is_its_charge() {
-    for (start, grown) in [(0, 2), (2, 4), (4, 3)] {
-        bytes_keep_their_cover(start, grown);
-    }
+fn charged_bytes_capacity_is_its_charge_from_none_to_two() {
+    bytes_keep_their_cover(0, 2);
+}
+
+/// [`charged_bytes_capacity_is_its_charge_from_none_to_two`], from two
+/// bytes grown to four.
+#[kani::proof]
+#[kani::unwind(7)]
+fn charged_bytes_capacity_is_its_charge_from_two_to_four() {
+    bytes_keep_their_cover(2, 4);
+}
+
+/// [`charged_bytes_capacity_is_its_charge_from_none_to_two`], from four
+/// bytes asked to grow to three, which they already cover.
+#[kani::proof]
+#[kani::unwind(7)]
+fn charged_bytes_capacity_is_its_charge_from_four_to_three() {
+    bytes_keep_their_cover(4, 3);
 }
 
 fn bytes_keep_their_cover(start: usize, grown: usize) {
