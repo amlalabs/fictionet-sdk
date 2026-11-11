@@ -104,6 +104,53 @@ pub const MAX_INTEGER_BYTES: usize = 10;
 /// acknowledgments. Past it, the encoder stops using the dynamic table.
 pub const MAX_OUTSTANDING: usize = 1024;
 
+/// The decoder limits a connection advertises in HTTP/3 SETTINGS.
+/// Construction refuses limits this implementation cannot honor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settings {
+    table_capacity: u64,
+    blocked_streams: usize,
+}
+
+impl Settings {
+    /// Advertise a static-only decoder, with no streams waiting for inserts.
+    /// The peer's settings independently govern the local encoder.
+    pub const STATIC: Self = Self {
+        table_capacity: 0,
+        blocked_streams: 0,
+    };
+
+    /// Limits within the codec's table and blocked-stream bounds.
+    pub const fn new(table_capacity: u64, blocked_streams: usize) -> Option<Self> {
+        if table_capacity > MAX_TABLE_CAPACITY || blocked_streams > MAX_BLOCKED_STREAMS {
+            return None;
+        }
+        Some(Self {
+            table_capacity,
+            blocked_streams,
+        })
+    }
+
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY, in RFC entry octets.
+    pub const fn table_capacity(self) -> u64 {
+        self.table_capacity
+    }
+
+    /// SETTINGS_QPACK_BLOCKED_STREAMS, counting distinct streams.
+    pub const fn blocked_streams(self) -> usize {
+        self.blocked_streams
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            table_capacity: 4096,
+            blocked_streams: 16,
+        }
+    }
+}
+
 /// The HTTP/3 error codes for QPACK failures (RFC 9204 section 6).
 pub mod error_code {
     /// A field section could not be decoded.
@@ -481,7 +528,7 @@ fn entry_size(name: &[u8], value: &[u8]) -> u64 {
 /// Send acknowledgments in return order before taking an increment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
-    entries: VecDeque<(Vec<u8>, Vec<u8>)>,
+    entries: VecDeque<(Box<[u8]>, Box<[u8]>)>,
     size: u64,
     capacity: u64,
     max_capacity: u64,
@@ -522,6 +569,27 @@ impl Table {
     /// What the entries' sizes add up to.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Retained heap, including spare slots after eviction or a capacity fall.
+    pub fn held(&self) -> usize {
+        self.entries.capacity() * size_of::<(Box<[u8]>, Box<[u8]>)>()
+            + self
+                .entries
+                .iter()
+                .map(|(n, v)| n.len() + v.len())
+                .sum::<usize>()
+    }
+
+    /// A lifetime reservation for retained entries and moving deque slots.
+    /// Instruction parsing and copies made by `apply` need caller scratch too.
+    pub fn most_held(&self) -> usize {
+        let entries = self.max_capacity as usize / ENTRY_OVERHEAD as usize;
+        if entries == 0 {
+            return 0;
+        }
+        self.max_capacity as usize
+            + 3 * entries.max(4).next_power_of_two() * size_of::<(Box<[u8]>, Box<[u8]>)>()
     }
 
     /// How many entries the table holds.
@@ -570,13 +638,13 @@ impl Table {
         let i = self
             .entries
             .iter()
-            .rposition(|(n, v)| n == name && v == value)?;
+            .rposition(|(n, v)| n.as_ref() == name && v.as_ref() == value)?;
         Some(self.first_index() + i as u64)
     }
 
     /// The absolute index of the newest entry with this name.
     pub fn find_name(&self, name: &[u8]) -> Option<u64> {
-        let i = self.entries.iter().rposition(|(n, _)| n == name)?;
+        let i = self.entries.iter().rposition(|(n, _)| n.as_ref() == name)?;
         Some(self.first_index() + i as u64)
     }
 
@@ -595,7 +663,7 @@ impl Table {
     /// returns its absolute index. An entry larger than the capacity is
     /// [`Error::EntryTooLarge`]. Strings above [`MAX_STRING`] and an exhausted
     /// insert-count range are refused. Errors leave the table unchanged.
-    pub fn insert(&mut self, mut name: Vec<u8>, mut value: Vec<u8>) -> Result<u64, Error> {
+    pub fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) -> Result<u64, Error> {
         check_strings(&name, &value)?;
         let size = entry_size(&name, &value);
         if size > self.capacity {
@@ -608,9 +676,11 @@ impl Table {
             .ok_or(Error::IntegerOverflow)?;
         self.evict_to(self.capacity - size);
         self.size += size;
-        name.shrink_to_fit();
-        value.shrink_to_fit();
-        self.entries.push_back((name, value));
+        let entry = (name.into_boxed_slice(), value.into_boxed_slice());
+        if self.entries.len() == self.entries.capacity() {
+            self.entries.reserve_exact(self.entries.capacity().max(4));
+        }
+        self.entries.push_back(entry);
         Ok(index)
     }
 
@@ -1276,6 +1346,48 @@ impl Encoder {
         self.known_received
     }
 
+    /// Retained table and outstanding section records.
+    pub fn held(&self) -> usize {
+        self.table.held() + self.outstanding.capacity() * size_of::<Outstanding>()
+    }
+
+    /// A lifetime reservation, including moving outstanding-section slots.
+    pub fn most_held(&self) -> usize {
+        if self.table.max_capacity() == 0 {
+            return 0;
+        }
+        self.table.most_held() + 3 * MAX_OUTSTANDING * size_of::<Outstanding>()
+    }
+
+    /// Inserts a stable, reusable field when space permits. Sensitive fields,
+    /// exact static matches and existing entries never cause an insertion.
+    /// This deliberately avoids speculative references: `section` still waits
+    /// for feedback before using the inserted entry.
+    pub fn warm(&mut self, field: &Field) -> Option<EncoderInstruction> {
+        if field.never_index
+            || !matches!(
+                field.name.as_slice(),
+                b":authority"
+                    | b"user-agent"
+                    | b"accept-language"
+                    | b"content-type"
+                    | b"cache-control"
+                    | b"server"
+                    | b"vary"
+                    | b"strict-transport-security"
+                    | b"content-security-policy"
+            )
+            || field.size() > self.table.capacity() / 2
+            || static_find(&field.name, &field.value).is_some()
+            || self.table.find(&field.name, &field.value).is_some()
+        {
+            return None;
+        }
+        self.insert(&field.name, &field.value)
+            .ok()
+            .map(|(_, instruction)| instruction)
+    }
+
     /// The oldest absolute index that may not be evicted (RFC 9204 section
     /// 2.1.1): the oldest entry a section still waiting for its
     /// acknowledgment uses, or the oldest insert the decoder has not yet
@@ -1406,7 +1518,24 @@ impl Encoder {
             Literal,
         }
         let use_dynamic = self.outstanding.len() < MAX_OUTSTANDING;
-        let acked = |abs: Option<u64>| abs.filter(|&a| use_dynamic && a < self.known_received);
+        // A pending duplicate must not hide an older acknowledged match.
+        let acked = |name: &[u8], value: Option<&[u8]>| {
+            if !use_dynamic {
+                return None;
+            }
+            self.table
+                .entries
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, (n, v))| {
+                    let absolute = self.table.first_index() + i as u64;
+                    (absolute < self.known_received
+                        && n.as_ref() == name
+                        && value.is_none_or(|value| v.as_ref() == value))
+                    .then_some(absolute)
+                })
+        };
         let lines: Vec<Line> = fields
             .iter()
             .map(|f| {
@@ -1414,13 +1543,13 @@ impl Encoder {
                     if let Some(i) = static_find(&f.name, &f.value) {
                         return Line::Static(i);
                     }
-                    if let Some(a) = acked(self.table.find(&f.name, &f.value)) {
+                    if let Some(a) = acked(&f.name, Some(&f.value)) {
                         return Line::Dynamic(a);
                     }
                 }
                 if let Some(i) = static_find_name(&f.name) {
                     Line::StaticName(i)
-                } else if let Some(a) = acked(self.table.find_name(&f.name)) {
+                } else if let Some(a) = acked(&f.name, None) {
                     Line::DynamicName(a)
                 } else {
                     Line::Literal
@@ -1824,6 +1953,10 @@ impl BlockedSection {
     /// The encoded field bytes retained, excluding the already read prefix.
     pub fn buffered(&self) -> usize {
         self.body.len()
+    }
+    /// Heap retained while this section waits, excluding its inline record.
+    pub fn held(&self) -> usize {
+        self.body.capacity()
     }
     /// Retries using the original prefix. If still blocked, returns this
     /// value unchanged. Successful decoding returns its acknowledgment.
