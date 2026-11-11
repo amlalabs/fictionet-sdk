@@ -1237,21 +1237,26 @@ impl Observer {
         event: &fictionet::stdlib::services::ssh::Event,
     ) {
         #[derive(Serialize)]
-        struct Ssh<'a> {
+        struct Ssh {
             event: &'static str,
             at_us: u64,
-            ssh: fictionet_extras::ssh::honeypot::Record<'a>,
+            ssh: fictionet_extras::ssh::honeypot::Record,
         }
         let at_us = self.clock.micros(context.now);
         self.write_observations(at_us, Vec::new());
+        let ssh = if self.restricted_evidence {
+            fictionet_extras::ssh::honeypot::Record::new(context, event, Instant::ZERO)
+        } else {
+            fictionet_extras::ssh::honeypot::Record::redacted(context, event, Instant::ZERO)
+        };
+        let Ok(ssh) = ssh else {
+            self.lost.observations += 1;
+            return;
+        };
         let record = Ssh {
             event: "ssh",
             at_us,
-            ssh: if self.restricted_evidence {
-                fictionet_extras::ssh::honeypot::Record::new(context, event, Instant::ZERO)
-            } else {
-                fictionet_extras::ssh::honeypot::Record::redacted(context, event, Instant::ZERO)
-            },
+            ssh,
         };
         match serde_json::to_vec(&record) {
             Ok(mut line) => {
