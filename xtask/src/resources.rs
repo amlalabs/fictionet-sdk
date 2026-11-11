@@ -21,7 +21,7 @@ use crate::lean_vectors::{Report, logged, scoped};
 pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Result<Report> {
     let mut report = Report::new("kani");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = scoped(cargo, "16G");
+    let mut command = scoped(cargo, "14G");
     command.args([
         "kani",
         "-p",

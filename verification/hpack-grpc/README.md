@@ -256,7 +256,7 @@ directory and are never committed (nor is `.lake/`).
 
 ### Theorems
 
-`Hpack/Axioms.lean` prints the axioms of the 34 headline theorems; each
+`Hpack/Axioms.lean` prints the axioms of the 35 headline theorems; each
 rests on `propext`, `Quot.sound` and `Classical.choice` at most, and none
 on `sorryAx`. The three tree facts are decided by the kernel
 (`decide +kernel`), which adds no axiom.
@@ -282,6 +282,7 @@ on `sorryAx`. The three tree facts are decided by the kernel
 | `Table` | `lookup_some`, `lookup_insert` | section 2.3.3: index 0 and every index past both tables name nothing, every index from 1 to the end of the dynamic table names an entry; after an insertion, 62 is the new entry and each kept older entry moves up one |
 | `Rules` | `parse_write` | section 6: any well-formed representations (both string codings, all five kinds), size updates first, written one after another, read back as themselves |
 | `Rules` | `parse_updates_first` | section 4.2: whatever the bytes, every size update read comes before every field; an update after a field ends the block with `SizeUpdateOrder` |
+| `Block` | `decodeBlock_ok_iff` | `decodeBlock`, which checks a block in Rust's order, accepts exactly the blocks its decoded view `decodeParsed` accepts, with the same fields and decoder after: the theorems below that name `decodeBlock` are proved through it |
 | `Rules` | `decode_reduced` | section 4.2: with a reduction owed, a block is accepted only if it starts with a size update at or below it |
 | `Rules` | `acks_then_block` | after acknowledged SETTINGS limits below the table's maximum, the next accepted block starts with a size update at or below each of them, so at or below the least |
 | `Rules` | `decode_updates` | section 6.3: each size update is at or below the acknowledged settings limit; and Rust's rule: at most two, the second at least the first |
@@ -321,11 +322,30 @@ Which model function stands for which Rust function:
 | `decodeInt`, `encodeInt` | `prefix_int::read`, `prefix_int::write` |
 | `Huffman.decode`, `encode` | `huffman::decode_limited`, `huffman::encode` (the code is `HUFFMAN_LENGTHS` with `build_huffman`) |
 | `Dyn.evict`, `Dyn.insert`, `lookup`, `resolveName` | `DynamicTable::evict`, `insert`, `get`, `name` |
-| `readInt`, `readStr`, `readRep`, `parseBlock` | `ReadFields::integer`, `ReadFields::string`, `Representations` |
-| `Decoder.new`, `Decoder.ack`, `applyRep`, `decodeBlock` | `Table::new`, `Table::set_settings_limit`, `Table::read_block`, `Table::decode_block` |
+| `readInt`, `readRaw`, `readRawRep`, `parseRaw` | `ReadFields::integer`, `Reader::text`, `Representations` |
+| `Raw.decoded`, `RawRep.decoded` | `Text::decoded_len`, `Text::decode_into` |
+| `Decoder.new`, `Decoder.ack`, `St.precheck` then `applyRep` (together `applyRaw`), `decodeBlock` | `Table::new`, `Table::set_settings_limit`, `Table::read_block`, `Table::decode_block` |
 | `retain` | `Block::keep` |
 | `Encoder.new`, `setSettings`, `setCapacity`, `resize` | `Encoder::new`, `set_settings_limit`, `set_capacity`, `resize` |
 | `Encoder.updates`, `chooseRep` with `rustPolicy`, `writeStr`, `writable` | `Encoder::write_block`, `put_string`, `checked` |
+
+**The order of errors.** A block with two faults reports the first one
+Rust meets. `Representations` reads each string's length and checks that
+its octets are there, and leaves its Huffman code to whoever uses it;
+`Table::read_block` then checks the reduction owed and a name's index
+before it decodes the name, and the name before the value. So of a
+truncated value, an owed reduction or a bad index and an invalid Huffman
+name in one literal, the first three come first. RFC 7541 orders no
+decoding error before another (each ends the connection with
+`COMPRESSION_ERROR`), so the order is the code's documented contract, and
+the model takes it: `parseRaw` reads as `Representations` does and
+`applyRaw` checks as `read_block` does. Until November 10 the model
+decoded each string as it read it, and seeds 4, 6, 7 and 8 stopped on
+such a block (seed 4: `00 81 03 01 61`, a one-byte Huffman name that is
+not a code, with a reduction owed: `MissingSizeUpdate` in Rust, `Huffman`
+in the model). The theorems are stated over `parseBlock` and `applyAll`,
+which decode as they read; `decodeBlock_ok_iff` shows the two orders
+accept the same blocks with the same results.
 
 The blocks kind runs sessions: a settings limit from 0 to past
 `MAX_TABLE`, then up to 12 steps, each an acknowledged limit or a block.
@@ -371,6 +391,15 @@ on the first session that sends three updates.
 | `huffman_decode` | 8,294 to 8,323 | 66,444 | 0 |
 | `blocks` | 618 sessions | 4,944 sessions: 10,906 accepted blocks, 2,430 acknowledged limits, every error kind `decode_block` returns | 0 |
 | `encoder` | 400 sessions | 3,200 sessions (seed 1 alone: 2,581 blocks, 413 settings limits, 252 capacities, 103 refused blocks) | 0 |
+
+After the buffers round, seeds 4, 6, 7 and 8 stopped on a block's error
+kind ("The order of errors" above). With the model in Rust's order, all
+eight pass again (November 10, 2026, `comp/fv-fixup`): per seed 27,231
+`int_decode`, 5,200 `int_encode`, 514 `huffman_encode`, 8,294 to 8,323
+`huffman_decode` cases, 619 `blocks` and 400 `encoder` sessions, none
+disagreeing. With the generator switched back to the old order
+(`decodeParsed`) in a scratch copy, seed 4 fails again on `00 81 03 01
+61`.
 
 A seed's vectors take about two minutes to write and the Rust test under
 a second to read.
@@ -443,9 +472,13 @@ cargo xtask hpack-verify resources   # the Kani harnesses and the TLC configs be
 cargo xtask hpack-verify diff        # the vectors, each block costed
 ```
 
-`resources` fails at its Kani step until four other areas' harnesses
-compile again (`verification/README.md`, "Known gaps"). The Kani runs
-below were made in a scratch copy with those four switched off.
+`cargo xtask hpack-verify resources` passed in full on November 10, 2026
+(`comp/fv-fixup`, with `most_held_at`), nothing switched off: the ten
+Kani harnesses in one `cargo kani` under a 14 GiB scope, in 1.4 to 716 s
+each (`encoding_into_a_table_of_four_stays_within_its_charge` the
+longest), and the five configs below with their stated results. The
+tables of times below are from the first runs, in a scratch copy with
+four other areas' modules switched off, before those compiled again.
 
 **What is charged.** The HTTP/2 server charges a connection's decoder
 table at `Table::most_held()` when the connection opens (`Input::open`,
@@ -524,8 +557,9 @@ fixed").
 `tests/hpack_vectors.rs` costs each step of every `blocks` and `encoder`
 session with `resources/cost.rs`. Steps are blocks decoded or encoded, and
 the encoder's settings and capacity changes, which free entries. The
-charge is the table's `most_held()`, held as the server holds it: taken
-when the session opens, raised when the bound rises, never given back.
+charge is the table's `most_held()` as it is before the step, which
+counts the slots it grew before a fall. The server holds a looser one:
+`most_held()` when the connection opens, never given back.
 The head block a block decodes into is made before the step, as the
 server does, at `most_block`'s size. The linear bounds, with their
 constants in the test:
@@ -538,24 +572,29 @@ constants in the test:
 - **Encoding fields** asks for at most 23 bytes for each of their name
   and value octets and one per field, plus twice `most_held()`.
 
-`cargo xtask hpack-verify diff` over seeds 1 to 8, at the commit that adds
-this section:
+`cargo xtask hpack-verify diff` over seeds 1 to 8 on November 10, 2026
+(`comp/fv-fixup`), every step charged `most_held()` afresh; every seed
+passes, 619 `blocks` and 400 `encoder` sessions each, none disagreeing:
 
 | Seed | `blocks` steps, closest to the charge, closest to the linear bound | `encoder` steps, closest to the charge, closest to the linear bound |
 | --- | --- | --- |
-| 1 | 1,816; 4,380 of 12,288; 184 of 469 | 5,930; 182 of 192; 313 of 1,237 |
-| 2 | 1,796; 4,165 of 12,288; 171 of 624 | 5,611; 182 of 192; 144 of 336 |
-| 3 | 1,737; 4,427 of 12,288; 155 of 762 | 5,814; 182 of 192; 195 of 844 |
-| 4 | stops at a disagreeing error kind | 5,599; 182 of 192; 145 of 430 |
-| 5 | 1,850; 4,214 of 12,288; 294 of 2,461 | 5,733; 183 of 192; 152 of 336 |
-| 6 | stops at a disagreeing error kind | 5,696; 182 of 192; 155 of 496 |
-| 7 | stops at a disagreeing error kind | 5,674; 182 of 192; 299 of 1,344 |
-| 8 | stops at a disagreeing error kind | 5,878; 183 of 192; 153 of 591 |
+| 1 | 1,816; 256 of 257; 184 of 469 | 5,930; 128 of 128; 313 of 1,237 |
+| 2 | 1,796; 179 of 192; 171 of 624 | 5,611; 128 of 128; 144 of 336 |
+| 3 | 1,737; 128 of 128; 155 of 762 | 5,814; 128 of 128; 195 of 844 |
+| 4 | 1,768; 128 of 128; 157 of 469 | 5,599; 128 of 128; 145 of 430 |
+| 5 | 1,850; 128 of 129; 294 of 2,461 | 5,733; 256 of 256; 152 of 336 |
+| 6 | 1,783; 256 of 256; 167 of 597 | 5,696; 256 of 256; 155 of 496 |
+| 7 | 1,784; 128 of 128; 162 of 704 | 5,674; 256 of 256; 299 of 1,344 |
+| 8 | 1,778; 128 of 128; 162 of 757 | 5,878; 1,024 of 1,024; 153 of 591 |
 
 "Closest" is the step whose bytes came nearest its bound, as a share of
-the bound. The encoder's sessions come within 9 bytes of their charge
-because a capacity of 64 leaves little slack. Every encoder session
-decodes its blocks too, and those steps are counted in its column.
+the bound. A step that reaches its charge exactly is a table whose slots
+are all it holds: at a capacity of 0, or 1 to 31, no entry fits, and the
+slots it grew before are the whole of `most_held_at`. Every encoder
+session decodes its blocks too, and those steps are counted in its
+column. Charged as the server holds it (the highest `most_held()` so
+far), the closest were 4,152 to 4,458 of 12,288 for `blocks` and 182 or
+183 of 192 for `encoder`, seeds 1 to 8, before this change.
 
 A fixed session at the server's settings decodes an entry as large as a
 string may be, after one that fits. On the decoder from before d914d14e9
@@ -563,11 +602,6 @@ that block held 65,713 bytes against a charge of 12,288 (seed 1). Without
 that session, no vector had an entry large enough to pass the charge. The
 encoder from before its fix held 230 bytes against 192 in seed 1's first
 encoder session.
-
-Seeds 4, 6, 7 and 8 stop at a `blocks` session whose error kind
-disagrees with the model. The cause is not resources (see "The bugs,
-fixed"). Their encoder sessions run in full; their `blocks` sessions are
-costed up to the one that disagrees.
 
 ## The bugs, fixed
 
@@ -603,19 +637,37 @@ d914d14e9. A search over the same tables (every count, both shapes, every
 capacity and settings limit up to 200, a reallocation counted as moving)
 gave those cases and no others. After both fixes it gave none.
 
-Reported, not fixed:
+Three more, fixed after them:
 
-- `Table::most_held()` understates a table's storage once its limit has
-  fallen, because the slots it grew stay allocated. In seed 1's `blocks`
-  session 350, charged at `most_held()` afresh each block, the table held
-  256 bytes against 129. The server charges once at open and never lowers
-  its own limit.
-- A block with two faults reports a different `hpack::Error` from the
-  Lean model's. Since the buffers round, `Representations` borrows strings
-  without decoding them. So a truncated value, a bad index or an owed size
-  reduction comes before an invalid Huffman name, which the model reports
-  first. Both end the connection with `COMPRESSION_ERROR`. Seeds 4, 6, 7
-  and 8 of `hpack-verify diff` fail on it.
+- **`most_held()` left out the slots a table grew before its limit
+  fell.** Slots are never given back, so after a fall they stayed beside
+  a bound computed for the smaller capacity. In seed 1's `blocks` session
+  350, charged at `most_held()` afresh each block, the table held 256
+  bytes against 129. `DynamicTable::most_held_at` now takes the larger of
+  `most_held(capacity)` and the slots held with `capacity`; `Table` and
+  `Encoder::most_held` use it. The server charges once at open and never
+  lowers its own limit, so it was not affected. Tests:
+  `a_decoder_table_lowered_stays_within_most_held` and
+  `an_encoder_table_lowered_stays_within_most_held` (`hpack_codec.rs`):
+  64 slots grown at 4096, then a capacity of 64, held 2,073 bytes against
+  a `most_held()` of 192. The replay now charges every step `most_held()`
+  afresh.
+- **`held()` left out each name's allocation header.** A name lives in a
+  shared allocation with two counts before its octets; `DynamicTable::held`
+  counted only the octets, up to 23 bytes an entry short. It now counts
+  the header and padding, which fit the 32 octets each entry is counted
+  with (a const assertion), so `most_held` still bounds it. The same tests
+  failed on it first: 2,073 bytes allocated against a `held()` of 2,053.
+- **The capture dissector's `held()` reported RFC sizes.**
+  `PartialBlocks::held` summed the table's RFC 7541 size and the length
+  of a block waiting for its CONTINUATION. It now reports the table's
+  `held()` and the buffer's capacity. Test:
+  `a_captured_table_and_open_block_are_within_held` (`hpack_codec.rs`):
+  3,335 bytes allocated against 1,757 before.
+
+A block with two faults reported a different `hpack::Error` from the Lean
+model's. That is a difference of order, not a bug on either side: see
+"The order of errors" above. The model now takes Rust's order.
 
 The earlier one:
 
@@ -642,12 +694,12 @@ the fix. Model: `GrpcCall_without_checkearly`.
   by their RFC sizes and leaves the slots and a name's copy to Kani. The
   replay's allocator counts a reallocation as made in place, so the
   slots' doubling shows only in Kani.
-- The capture dissector's `PartialTable` is not costed. It decodes every
-  name and value into vectors of its own for display before its table
-  sees them, then inserts and evicts. So the entry is allocated whichever
-  order the table goes in, and the table's order changes no peak. Its
-  `held()` reports the table's RFC size, not its slots. Read from the
-  code, not checked.
+- The capture dissector's `PartialTable` has no costed steps. It decodes
+  every name and value into vectors of its own for display before its
+  table sees them, then inserts and evicts. So the entry is allocated
+  whichever order the table goes in, and the table's order changes no
+  peak. What it keeps is counted: `held()` is checked against the
+  counting allocator (`a_captured_table_and_open_block_are_within_held`).
 
 - `HpackSync.tla` has one direction, scaled sizes, a one-entry static
   table, two blocks of one or two fields, and two SETTINGS frames. Block

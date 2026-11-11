@@ -775,6 +775,11 @@ systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=10G -p M
 `--harness smuggling_proofs:: -j 1` runs all of them one at a time; the
 controls fail by design, so that command exits non-zero.
 
+On November 10, 2026 (`comp/fv-fixup`, after the buffers round gave
+`Reader::body` its `partial` argument, passed as `false`), each of the 45
+ran alone under a 14 GiB scope: the 32 proofs pass and the 13 controls
+fail, each on the assertion its row above names.
+
 ### The server test
 
 `ambiguous_framing_never_dispatches_a_pipelined_request` in

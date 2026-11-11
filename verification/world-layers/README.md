@@ -103,8 +103,11 @@ that verifies. The header's other fields are fixed, since with every
 header byte symbolic the proof ran past 25 minutes. Eight payload bytes
 sort TCP, UDP and a plain ICMP message; an ICMP error that quotes a
 transport needs more and is not reached. The harness was rewritten for
-`CheckedIpPacket` and has not been run since; the run recorded for its
-earlier form also covered a network label the endpoint no longer has.
+`CheckedIpPacket`, and after the buffers round takes its packet as a
+`Packet` (2aafab0c8). It has not passed since: on November 10, 2026,
+under a 14 GiB scope with `-Z restrict-vtable`, it did not finish in 25
+minutes. The run recorded for its earlier form also covered a network
+label the endpoint no longer has.
 
 **Application stacks attach directly to transport children, and counts
 outlive them.** `tcp::Listener::attach` and `udp::Socket::attach` hand the

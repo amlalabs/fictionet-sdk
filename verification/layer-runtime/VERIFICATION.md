@@ -851,3 +851,25 @@ under 8 GiB, TLC under 3 GiB with two workers and a 2 GiB heap):
 | `StreamRunner_without_restartidleonwait.cfg` | 949,474 | 13,287 | 8 | `IdleNeedsQuiet` violated |
 | `StreamRunner_without_childwaittold.cfg` | 1,242,266 | 14,784 | 8 | `IdleNeedsQuiet` violated |
 | `StreamRunner_without_memorystopsidle.cfg` | 1,280,202 | 15,499 | 7 | `IdleNeedsQuiet` violated |
+
+## Kani after the buffers round (November 10, 2026, `comp/fv-fixup`)
+
+`kani/framed.rs` compiles again at 2aafab0c8 (`network::packet::Framed`
+sends a `Packet`, made with `Packet::from_chunk`). Run alone under a
+14 GiB scope with swap off and a 25-minute limit:
+
+| Harness | Result |
+| --- | --- |
+| `a_bounded_writer_refuses_every_encoding_past_its_capacity` | all pass, 0.3 s |
+| `a_decoded_allocation_keeps_its_charge_outside_the_layer` | out of memory at 14 GiB; with `-Z restrict-vtable`, not finished in 25 minutes (1 to 3 s before the buffers round) |
+| `a_decoder_failure_comes_up_once_then_ended_first_input_then_input` | with `-Z restrict-vtable`, not finished in 25 minutes |
+
+Both that did not finish drive a `Driver`, which keeps a `Waiter` made
+from a `std::task::Waker`; CBMC lets the waker's plain function pointers
+call every function of their type, the likely reason
+(`verification/layer/VERIFICATION.md`, "Kani after the buffers round").
+The rest drive a `Driver` too and were not run: the `charged!`,
+`charges!` and `in_order!` families, the other six `a_decoder_failure_*`,
+`encoding_is_not_called_without_its_reservation` and the two
+`a_refused_*_after_release`. `admission.rs`, `lifetime.rs`, `ntp.rs`,
+`ntp_reply.rs` and `plc.rs` compiled throughout and were not rerun.

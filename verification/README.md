@@ -223,21 +223,29 @@ all now fixed:
   that can double there are 64, and three times 64 is within the 256
   already counted.
 
-Two are reported, not fixed. `Table::most_held()` understates a table's
-storage once its limit has fallen, because the entry slots it grew stay
-allocated. The server charges once at open and never lowers its own limit,
-so it is not affected.
+Three more were fixed after them, each with a test on the counting
+allocator that fails before its fix (`tests/it/hpack_codec.rs`):
 
-The other one came from porting `tests/hpack_vectors.rs` to the current
-`decode_block`. The test had not built since the buffers round
-(3d5e185a5). A block with two faults now reports a
-different one than the Lean model does. Since that round,
-`Representations` borrows strings without decoding them, so a truncated
-value, a bad index or an owed size reduction is reported before an
-invalid Huffman name. The model decodes as it parses and reports the
-Huffman error first. Both end the connection with `COMPRESSION_ERROR`;
-only `hpack::Error`'s kind differs. Seeds 4, 6, 7 and 8 of `hpack-verify
-diff` fail on it until the model or the code takes the other's order.
+- `Table::most_held()` understated a table's storage once its limit had
+  fallen, because the entry slots it grew stay allocated: 2,073 bytes
+  held against 192. `DynamicTable::most_held_at` counts the slots held.
+  The server charges once at open and never lowers its own limit, so it
+  was not affected.
+- `DynamicTable::held()` left out each shared name's allocation header,
+  up to 23 bytes an entry.
+- The capture dissector's `PartialBlocks::held()` reported the table's
+  RFC 7541 size and the length of a waiting block, not their storage:
+  1,757 bytes against 3,335 allocated.
+
+And one difference of order. Since the buffers round, `Representations`
+borrows strings without decoding them, so of two faults in one literal a
+truncated value, a bad index or an owed size reduction is reported before
+an invalid Huffman name, where the Lean model decoded as it parsed and
+reported the Huffman error first. RFC 7541 orders no decoding error
+before another (each is `COMPRESSION_ERROR`), so the code's documented
+order stands and the model now takes it; `decodeBlock_ok_iff` proves the
+model's two readings accept the same blocks. All eight seeds of
+`hpack-verify diff` pass.
 
 ## Known gaps
 
@@ -256,24 +264,25 @@ diff` fail on it until the model or the code takes the other's order.
   (`ssh-layer`); `native.rs`'s `after` buffer is dead code. (HEADERS on a
   stream the client itself reset ends the connection; RFC 9113 allows that,
   and the stream error once listed here is RFC 7540's rule, `http2-layer`.)
-- **`cargo kani -p fictionet` does not compile** at 3db7a847e:
-  `verification/tls/kani/LayerProof.rs` and `verification/layer/kani/mod.rs`
-  no longer match the code. The HTTP/2 harnesses were run with those two
-  modules switched off locally. At d56ff61aa, after the buffers round,
-  four modules fail to compile: `layer/kani/mod.rs`,
-  `layer-runtime/kani/mod.rs` (`framed.rs`),
-  `world-layers/kani/dispatch.rs` and `http/kani/smuggling.rs`. The HPACK
-  resource harnesses were run in a scratch copy with those four switched
-  off. Until they are brought up to date, `cargo xtask hpack-verify
-  resources` fails at its Kani step.
+- **Harnesses that drive a `Driver` or wake a `Waiter` do not finish.**
+  `cargo kani -p fictionet` compiles again at 2aafab0c8 (the buffers round
+  had broken `layer/kani/mod.rs`, `layer-runtime/kani/framed.rs`,
+  `world-layers/kani/dispatch.rs` and `http/kani/smuggling.rs`), and
+  `cargo xtask hpack-verify resources` passes with nothing switched off.
+  Of the four areas' harnesses run on November 10: all 45 in
+  `smuggling.rs` do as they must (32 proofs pass, 13 controls fail); in
+  `layer/kani/mod.rs` 21 of 24 pass, nine of them with Kani's
+  `-Z restrict-vtable`, which limits a trait object's calls to the types
+  that make one. Not finished: `a_release_after_a_refusal_wakes_once` and
+  `starved_is_a_need_over_the_limit_and_never_wakes` (out of memory at
+  14 GiB), `stream_credit_splits_keep_the_allocation_owned`, the
+  `Framed` harnesses that drive a `Driver` (two tried, the rest not run)
+  and `a_host_packet_goes_only_to_its_transport` (25 minutes each). A
+  `std::task::Waker`'s vtable is plain function pointers, which CBMC lets
+  call every function of their type; `Driver` and those two harnesses
+  hold one (`layer/VERIFICATION.md`, "Kani after the buffers round").
 - **Kani in the audited areas was read, not rerun**, except where an
   area's README gives a date for its last run.
-- **`cargo kani` on the library does not compile at `3db7a847e`.** Two
-  areas' harnesses no longer match their code:
-  `layer/kani/mod.rs` compares `Refusals`, which has no `PartialEq`, and
-  `tls/kani/LayerProof.rs` uses `TlsLayer` fields that are gone. The
-  packet-udp reruns of 2026-11-10 switched those two modules off in a
-  scratch copy; nothing in the tree was changed for it.
 - **The trace check covers data only.** `RouteTrace.tla` replays bytes
   through `Chain`, `Switch` and `Driver`; the urgent path (`Written`,
   `Reset`), ends of input, timers and work are checked by `Route_urgent`

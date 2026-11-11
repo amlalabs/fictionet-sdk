@@ -898,7 +898,7 @@ sequences over symbolic `u8` sizes, and have not been run:
 | `charge_within_takes_what_fits_or_nothing` | a charge within a range takes its end if it fits, else all the room left if that covers its start, else nothing, changing nothing but the count of refusals |
 | `transfer_within_one_budget_never_raises_used` | moving a charge within one budget changes nothing even when the budget is full; across budgets the target is charged first, a refusal changes neither count, and a move takes exactly the charge from one count to the other |
 | `a_release_after_a_refusal_wakes_once` | a runner that asks after a refusal is woken once by the first release that leaves room for the refused charge, a release that leaves less wakes nothing, a charge past the limit is never woken for, asking again adds nothing, and asking when nothing was refused wakes nothing |
-| `charged_bytes_capacity_is_its_charge` | for three fixed sizes, bytes are charged their capacity after being made, grown, overrun by a writer that is undone, written and trimmed; a growth without room is refused and everything comes back on drop |
+| `charged_bytes_capacity_is_its_charge_from_none_to_two`, `_from_two_to_four`, `_from_four_to_three` | for three fixed sizes, one harness each, bytes are charged their capacity after being made, grown, overrun by a writer that is undone, written and trimmed; a growth without room is refused and everything comes back on drop |
 | `a_refused_growth_changes_nothing` | a refused growth leaves a charge, bytes (their allocation included) and a queue as they were, with the count unchanged |
 
 Each asker now charges through its own view of a budget (`Budget::view`),
@@ -1201,3 +1201,51 @@ single-threaded harnesses, or the budget's own update loop on
 is covered meanwhile by the model test
 `random_calls_keep_cover_sum_order_return_move_and_wake` (`charged.rs`),
 the unit tests in `budget.rs`, and `BudgetWake.tla` for the wake.
+
+## Kani after the buffers round (November 10, 2026, `comp/fv-fixup`)
+
+The buffers round broke this module's compile again (`Charge::into_vec`
+became `ChargedVec::from_charge`); it compiles at 2aafab0c8. Then each
+harness alone, under a 14 GiB scope with swap off, a 25-minute limit,
+Kani 0.68 and CBMC 6.11, unwinding assertions on.
+
+The budget harnesses that ran out of memory above did so in CBMC's
+function pointer removal, not in the update loops: a release that leaves
+room for a refused charge takes the waiter list and drops its
+`Arc<dyn Waits>`, and CBMC let that drop reach every function of its
+type (`drop_glue::<std::io::Error>` among them). With the wake path cut
+off in a scratch copy, `charges_split_and_drop_within_the_limit` passed
+at 8 GiB; a strong compare-exchange in the update loops, also tried,
+changed nothing. Kani's `-Z restrict-vtable` limits a trait object's
+calls to the types that make one, which is what the code can do, so it
+proves no less; with it most of them pass:
+
+| Harness | Flags | Result |
+| --- | --- | --- |
+| `slots_refuse_past_the_limit` | | all pass, 2.1 s |
+| `slots_never_answer_a_stale_id` | | all pass, 19.8 s |
+| `slots_never_answer_another_connections_id` | | all pass, 1.0 s |
+| `charge_within_takes_what_fits_or_nothing` | | all pass, 86.5 s |
+| `timers_*` (the six arming harnesses) | | all pass, under 1 s each |
+| `timers_cancel_fire_and_retain_touch_one_name` | | all pass, 206.5 s |
+| `work_cancellation_stays_with_its_owner` | | all pass, 0.2 s |
+| `charges_split_and_drop_within_the_limit` | `-Z restrict-vtable` | all pass, 562.0 s (out of memory without) |
+| `charges_sum_to_the_budget_and_never_pass_its_limit` | `-Z restrict-vtable` | all pass, 55.5 s (out of memory without) |
+| `transfer_within_one_budget_never_raises_used` | `-Z restrict-vtable` | all pass, 78.8 s (out of memory without) |
+| `a_view_records_only_its_own_refusals` | `-Z restrict-vtable` | all pass, 40.4 s (out of memory without) |
+| `a_charge_becomes_bounded_vector_places` | `-Z restrict-vtable` | all pass, 120.1 s (out of memory without) |
+| `a_refused_growth_changes_nothing` | `-Z restrict-vtable` | all pass, 127.7 s (out of memory without) |
+| `charged_bytes_capacity_is_its_charge_from_none_to_two`, `_from_two_to_four`, `_from_four_to_three` | `-Z restrict-vtable` | all pass, 37.4, 39.7 and 31.6 s; the three in one harness ran out of memory with the flag too, so each pair of sizes is now its own |
+| `a_release_after_a_refusal_wakes_once` | `-Z restrict-vtable` | out of memory at 14 GiB |
+| `starved_is_a_need_over_the_limit_and_never_wakes` | `-Z restrict-vtable` | out of memory at 14 GiB |
+| `stream_credit_splits_keep_the_allocation_owned` | `-Z restrict-vtable` | not finished in 25 minutes (out of memory without) |
+
+The two wake harnesses hold a `Waiter` made from a `std::task::Waker`,
+whose wake and drop go through the `RawWakerVTable`'s plain function
+pointers; `-Z restrict-vtable` does not reach those, and CBMC again
+lets them call every function of their type. `Driver` keeps such a
+`Waiter`, which is the likely reason the `Framed` harnesses that drive
+one no longer finish (`verification/layer-runtime/VERIFICATION.md`).
+The way through is a waker whose calls CBMC can resolve: a stub of the
+waker's vtable calls for the harness's own waker type, or a `Waiter`
+built without a `std` waker in these harnesses. Not done here.
