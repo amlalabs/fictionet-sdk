@@ -497,6 +497,62 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_pressure_preserves_the_next_source_and_partial_progress() {
+        let descriptor = size_of::<Segment>();
+        let budget = Budget::new(12 * descriptor);
+        let held = budget.charge(8 * descriptor).unwrap();
+        let mut stream = Send::new(8u32.into());
+        stream.pending.set_budget(Some(&budget));
+        let mut chunks = [
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+            Bytes::from_static(b"d"),
+            Bytes::from_static(b"e"),
+        ];
+        let mut source = BytesArray::from_chunks(&mut chunks);
+        assert_eq!(
+            stream.write(&mut source, 8),
+            Ok(Written {
+                bytes: 4,
+                chunks: 4
+            })
+        );
+        assert_eq!(stream.offset(), 4);
+        assert_eq!(source.consumed, 4);
+        assert_eq!(&source.chunks[4][..], b"e");
+        assert_eq!(stream.write(&mut source, 8), Err(WriteError::Budget));
+        assert_eq!(source.consumed, 4);
+        assert_eq!(stream.offset(), 4);
+        drop(held);
+        assert_eq!(
+            stream.write(&mut source, 8),
+            Ok(Written {
+                bytes: 1,
+                chunks: 1
+            })
+        );
+        assert_eq!(stream.offset(), 5);
+        assert!(source.is_empty());
+        stream.reset();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn empty_writes_do_not_reserve_descriptors() {
+        let budget = Budget::new(0);
+        let mut stream = Send::new(8u32.into());
+        stream.pending.set_budget(Some(&budget));
+        let before = budget.refusals();
+        assert_eq!(
+            stream.write(&mut ByteSlice::from_slice(&[]), 8),
+            Ok(Written::default())
+        );
+        assert_eq!(budget.used(), 0);
+        assert!(!budget.refused_since(before));
+    }
+
+    #[test]
     fn bytes_array() {
         let full = b"Hello World 123456789 ABCDEFGHJIJKLMNOPQRSTUVWXYZ".to_owned();
         for limit in 0..full.len() {

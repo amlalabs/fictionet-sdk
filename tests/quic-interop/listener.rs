@@ -67,12 +67,13 @@ impl Client {
         }
         let Some(h3) = &mut self.http else { return };
         if self.sent.is_none() {
+            let length = self.payload.len().to_string();
             let headers = [
                 quiche::h3::Header::new(b":method", b"POST"),
                 quiche::h3::Header::new(b":scheme", b"https"),
                 quiche::h3::Header::new(b":authority", b"localhost"),
                 quiche::h3::Header::new(b":path", b"/echo"),
-                quiche::h3::Header::new(b"content-length", b"20000"),
+                quiche::h3::Header::new(b"content-length", length.as_bytes()),
                 quiche::h3::Header::new(b"cookie", b"a=1; b=2"),
             ];
             self.sent = Some((h3.send_request(&mut self.quic, &headers, false).unwrap(), 0));
@@ -116,7 +117,23 @@ fn listener_stack(
     connections: usize,
     seen: Arc<std::sync::Mutex<Vec<stdlib::network::ConnInfo>>>,
 ) -> Chain<Listener, Children<httpd::Http3Server, Top, stdlib::network::ConnInfo>> {
-    let (_, server, endpoint) = configs_with_protocol(entropy, false, b"h3");
+    listener_stack_with_controller(
+        entropy,
+        local,
+        connections,
+        seen,
+        Arc::new(quinn_proto::congestion::CubicConfig::default()),
+    )
+}
+
+fn listener_stack_with_controller(
+    entropy: Arc<dyn Entropy>,
+    local: SocketAddr,
+    connections: usize,
+    seen: Arc<std::sync::Mutex<Vec<stdlib::network::ConnInfo>>>,
+    controller: Arc<dyn quinn_proto::congestion::ControllerFactory + Send + Sync>,
+) -> Chain<Listener, Children<httpd::Http3Server, Top, stdlib::network::ConnInfo>> {
+    let (_, server, endpoint) = configs_with_controller(entropy, false, b"h3", controller);
     let listener = Listener::new(
         ListenerConfig {
             endpoint,
@@ -279,6 +296,125 @@ fn world_udp_host_serves_several_http3_connections_on_one_socket() {
         assert_eq!(observed.len(), 3);
         assert!(observed.iter().all(|info| info.peer == Some(remote)));
         Ok(())
+    });
+}
+
+#[test]
+fn world_http3_transfers_recover_from_bidirectional_handshake_and_packet_loss() {
+    use fictionet_test_support::{Done, ended_with_done, sandbox::machine, within};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use stdlib::network::{Direction, delay, filter};
+    use stdlib::world::net::{Net, Pools};
+
+    within(Duration::from_secs(60), || {
+        ended_with_done(fictionet::block_on(fictionet::run(
+            Seed::from_u64(74),
+            |fcx| async move {
+                let local: SocketAddr = "104.18.0.7:443".parse().unwrap();
+                let remote: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+                let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(74)));
+                let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let observed = seen.clone();
+                let (attacher, attachments) = fictionet::attachments();
+                Net::new(Pools::NONE)
+                    .ipv4_only()
+                    .host("http3", move |host| {
+                        host.at(local.ip())
+                            .udp_stack(443, Budget::new(64 << 20), move |info| {
+                                listener_stack_with_controller(
+                                    entropy.clone(),
+                                    info.local.unwrap(),
+                                    3,
+                                    observed.clone(),
+                                    Arc::new(quinn_proto::congestion::BbrConfig::default()),
+                                )
+                            })
+                    })
+                    .start(&fcx, attachments)?;
+                let dropped = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+                let losses = dropped.clone();
+                let mut packets = [0usize; 2];
+                let lossy = filter(&fcx, attacher.attach("client")?, move |_, direction, _| {
+                    let side = usize::from(direction == Direction::ToInner);
+                    packets[side] += 1;
+                    // Lose the first flight in both directions, then recurring packets
+                    // throughout the transfer, including retransmissions and ACKs.
+                    let keep = packets[side] != 1 && packets[side] % 17 != 0;
+                    if !keep {
+                        losses[side].fetch_add(1, Ordering::Relaxed);
+                    }
+                    keep
+                });
+                let client = machine(
+                    &fcx,
+                    delay(&fcx, Duration::from_millis(1), lossy),
+                    remote.ip(),
+                );
+                let mut socket = client.udp.bind(remote.port())?;
+                let mut peers: Vec<_> = (0..3)
+                    .map(|n| {
+                        let mut peer = Client::new(51 + n, remote, local);
+                        peer.payload = (0..(1 << 20)).map(|i| (i as u8).wrapping_add(n)).collect();
+                        peer
+                    })
+                    .collect();
+                let mut buffer = [0; 65535];
+                let finish_by = fcx.now() + Duration::from_secs(45);
+                loop {
+                    assert!(fcx.now() < finish_by, "HTTP/3 transfer did not complete");
+                    for peer in &mut peers {
+                        peer.progress();
+                        loop {
+                            match peer.quic.send(&mut buffer) {
+                                Ok((n, info)) => socket.send_to(&buffer[..n], info.to),
+                                Err(quiche::Error::Done) => break,
+                                Err(error) => panic!("independent send: {error:?}"),
+                            }
+                        }
+                    }
+                    if peers.iter().all(|peer| peer.finished) {
+                        break;
+                    }
+                    let timeout = peers
+                        .iter()
+                        .filter_map(|peer| peer.quic.timeout())
+                        .min()
+                        .unwrap();
+                    match fcx
+                        .race(
+                            Some((fcx.now() + timeout).min(finish_by)),
+                            socket.recv(&fcx),
+                        )
+                        .await
+                    {
+                        Ok(packet) => {
+                            let (mut bytes, source) = packet?;
+                            assert_eq!(source, local);
+                            let header = quiche::Header::from_slice(&mut bytes, 16).unwrap();
+                            let peer = peers
+                                .iter_mut()
+                                .find(|peer| peer.quic.source_ids().any(|id| *id == header.dcid))
+                                .unwrap();
+                            peer.receive(&mut bytes);
+                        }
+                        Err(fictionet::RaceError::Deadline) => {
+                            for peer in &mut peers {
+                                peer.quic.on_timeout();
+                            }
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                assert!(
+                    dropped
+                        .iter()
+                        .all(|count| count.load(Ordering::Relaxed) > 10)
+                );
+                assert_eq!(seen.lock().unwrap().len(), 3);
+                Err(fictionet::Error::from(Done))
+            },
+        )))
+        .unwrap();
     });
 }
 

@@ -37,6 +37,20 @@ fn configs_with_protocol(
     datagrams: bool,
     protocol: &[u8],
 ) -> (ClientConfig, ServerConfig, Arc<EndpointConfig>) {
+    configs_with_controller(
+        entropy,
+        datagrams,
+        protocol,
+        Arc::new(quinn_proto::congestion::CubicConfig::default()),
+    )
+}
+
+fn configs_with_controller(
+    entropy: Arc<dyn Entropy>,
+    datagrams: bool,
+    protocol: &[u8],
+    controller: Arc<dyn quinn_proto::congestion::ControllerFactory + Send + Sync>,
+) -> (ClientConfig, ServerConfig, Arc<EndpointConfig>) {
     let cert = rustls::pki_types::CertificateDer::from(
         include_bytes!("../../../../tests/it/fixtures/tls/p256.cert.der").to_vec(),
     );
@@ -63,6 +77,7 @@ fn configs_with_protocol(
     server.alpn_protocols = client.alpn_protocols.clone();
     let mut transport = quinn_proto::TransportConfig::default();
     transport
+        .congestion_controller_factory(controller)
         .max_concurrent_bidi_streams(8u32.into())
         .max_concurrent_uni_streams(8u32.into())
         .stream_receive_window(4096u32.into())

@@ -46,11 +46,11 @@ fn bbr_uses_supplied_entropy() {
 fn bbr_startup_respects_its_target_window() {
     let mut rng = Pcg32::from_seed([0; 16]);
     let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200, &mut rng);
-    let window = u64::from(kani::any::<u32>());
+    let window: u64 = kani::any();
     kani::assume(window >= bbr.init_cwnd);
     bbr.cwnd = window;
     bbr.acked_bytes = bbr.init_cwnd;
-    bbr.calculate_cwnd(u64::from(kani::any::<u16>()), 0);
+    bbr.calculate_cwnd(kani::any(), 0);
     assert_eq!(bbr.cwnd, window);
     std::mem::forget(bbr);
 }

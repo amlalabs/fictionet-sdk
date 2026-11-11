@@ -13,8 +13,12 @@ socket, tested with several independent quiche connections at once. See
 [Shared datagram listener](#shared-datagram-listener) for the latest boundaries.
 Wire input now retains reservations through packet and frame ownership;
 see [Reserved reassembly storage](#reserved-reassembly-storage) for the latest
-resource evidence and the acknowledgment admission fix. Earlier sections record the state at each step. Remaining priorities
-are whole-engine budgeting, the remaining version-two work and unresolved proofs.
+resource evidence and the acknowledgment admission fix. Application send
+descriptors now also reserve storage before consuming writes. The latest
+sections cover that reservation, corrected BBR sampling and startup growth,
+and independent HTTP/3 transfers over a lossy world network. Earlier sections
+record the state at each step. Whole-engine budgeting, version two, the
+complete standard test matrix and unresolved proofs remain incomplete.
 
 The intended boundary is a layer over the world's datagram carrier, with
 typed multiplexed streams and application datagrams above it. The engine
@@ -1377,8 +1381,8 @@ production sampler and filter run under the shared counting allocator;
 peak and requested allocations are both bounded by zero. Kani also passes
 `bbr_bandwidth_conversion_saturates_unrepresentable_rates` over every byte
 count at a one-nanosecond interval, and
-`bbr_startup_respects_its_target_window` over arbitrary valid windows in the
-32-bit range and 16-bit acknowledged byte counts, after the initial window
+`bbr_startup_respects_its_target_window` over arbitrary valid full-width
+windows and acknowledged byte counts, after the initial window
 has been acknowledged and with no bandwidth estimate yet. There are no
 production stubs in these proofs. They do not prove the complete controller,
 packet sampling accuracy, recovery state machine or pacing cycle.
@@ -1435,3 +1439,89 @@ records, CRYPTO send queues, TLS, endpoint routing, and control progress
 under budget exhaustion remain outside it. Legacy byte payload APIs are
 still uncharged. All 364 engine tests and the existing 31 layer/independent
 peer tests pass with these changes.
+
+A scratch commit removed descriptor reservation. The refusal replay failed
+with 128 live bytes against zero paid, and the empty-capacity Kani harness
+failed `cost.peak <= budget.used()`. The refusal harness also rejected the
+unexpected successful admission. The scratch commit was removed; both
+focused resource proofs and all 364 engine tests passed again unchanged.
+A repeat of the broader insertion harness with a smaller sufficient unwind
+bound also terminated during conversion without a verdict. Neither run is
+reported as proved.
+
+## Independent HTTP/3 through a lossy world network
+
+The additional world test starts three quiche connections on a shared UDP
+socket. Each uploads a one-mebibyte body and receives an identical response
+through the existing HTTP/3 handlers. Stream windows begin at four kibibytes
+and connection windows at thirty-two kibibytes. Fictionet's `filter` drops
+the first packet in each direction and every seventeenth subsequent packet;
+`delay` adds one millisecond each way. The test requires more than ten drops
+in each direction, complete byte equality, and three separate accepted
+connections. It passed first with Cubic and then with BBR on the server;
+the committed test uses BBR. No host networking devices are involved.
+
+This runs Fictionet's simulated network in its real-time world mode.
+quiche's public receive, send and timeout APIs use the host monotonic clock,
+so the client waits on its actual earliest timeout alongside socket input.
+It does not add sleeps to make a test pass, force premature timeouts, or
+claim virtual-time determinism for the external peer. The existing pure
+Fictionet adversarial-transfer test still uses injected virtual time.
+
+The [Interop Runner definitions](https://github.com/quic-interop/quic-interop-runner/blob/master/quic.md)
+require more than similarly named local tests. In particular, most transfer
+cases use HTTP/0.9 and the v2 case requires compatible negotiation from v1.
+The following distinguishes available evidence from actual runner verdicts:
+
+| Requested case | Evidence at this tip | Standard runner verdict |
+| --- | --- | --- |
+| Handshake | Protected quiche exchange with Fictionet in both roles | Not run |
+| Transfer | Sustained local transport tests; independent HTTP/3 uploads and responses | Not run; HTTP/0.9 concurrent-file case remains |
+| Retry, resumption, zero RTT | Vendored engine tests only | Not run against an independent peer |
+| HTTP/3 | Parallel quiche requests, streamed responses, trailers and shared listeners pass | Native integration passes; external runner not run |
+| Multiconnect | Three concurrent independent connections under loss pass | Runner workload not run |
+| Version two | Version-information validation and version-bound tokens only | Not implemented end to end; compatible negotiation remains |
+| ChaCha20, key update | Vendored engine coverage only | Not run against an independent peer |
+| ECN | Engine metadata exists; datagram carrier still lacks ECN propagation | Not run |
+| Amplification limit | Engine regression and allowance proofs | Independent runner case not run |
+| Handshake loss, transfer loss | Bidirectional recurring loss in the new independent HTTP/3 world test passes | Runner workloads not run |
+| Blackhole, corruption | No independent world scenario yet | Not run |
+| Rebinding, migration | Engine tests; listener connection-ID rotation | Independent path-validation scenarios not run |
+| h3spec | Executable not installed in this environment | Not run |
+
+There is no standard-suite certification claim. Adding compatible v2 also
+still requires emitted version information, packet mappings and protection,
+version-bound TLS tickets and authenticated negotiation. HTTP/3 client
+service integration and the full RFC correctness/resource proofs remain
+unfinished.
+
+The original paid-source allocation harness was retried with a ten-minute
+timeout and unchanged assertions. It timed out during path expansion;
+there is still no solver verdict. The full receive-path harness still
+triggers Kani's internal intrinsic-signature assertion, including runs
+without default features, requesting `tracing/max_level_off`, and with the fixture left
+undropped. None of those diagnostic variants changed the committed harness.
+The new full-width BBR rate harness also timed out under Kissat after five
+minutes. Its successful focused proofs do not replace that open assertion.
+The unchanged BBR entropy assertions were also tried with a diagnostic
+constructor spelling out seed acquisition before `Pcg32::from_seed`.
+That reached the solver but timed out after three minutes. The constructor
+was restored; no proof or production behavior change is claimed from it.
+
+Final validation for this step: 366 engine library tests, 4,374 SDK library
+tests, 1,413 SDK integration tests, 32 isolated layer/interoperability tests,
+303 SDK doctests and three engine doctests pass. The send tests additionally
+cover empty writes requiring no reservation and a multi-chunk write that
+returns its accepted prefix while preserving the next chunk under descriptor
+pressure, then resumes after budget release. Clippy with warnings denied,
+workspace formatting and rustdoc pass; rustdoc retains the existing redundant
+link warning in `network/packet.rs`. The existing `quic_wire_admission`
+benchmark ran at 1,200 and 65,527 bytes with ten samples.
+
+Run SDK and independent-peer packages separately. Combining their tests in
+one Cargo invocation made six SDK doctests fail to link BoringSSL's C++
+exception symbol. All 303 pass when run separately, with no source or test
+changes. This is why the quiche suite has its own crate. The full receive
+compiler failure and solver timeouts above remain open despite these test
+results. No rustls source changed, and all Cargo, Kani and TLC commands used
+the required memory-limited scope and external target directory.
