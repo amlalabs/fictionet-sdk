@@ -1097,3 +1097,36 @@ fn application_completion_passes_blocked_application_input() {
     assert_eq!(datagram_payloads(&pair.client), [b"pending".to_vec()]);
     assert!(pair.client.driver.layer_mut().take_urgent().is_none());
 }
+
+#[test]
+fn required_stream_exhaustion_closes_with_the_callers_error() {
+    let mut pair = Pair::new();
+    pair.handshake();
+    for _ in 0..8 {
+        pair.client
+            .command(MuxCommand::control(ControlCommand::Open(Dir::Uni)));
+        pair.drive();
+        let _ = pair.client.opened();
+    }
+    assert!(matches!(
+        pair.client
+            .driver
+            .command(MuxCommand::control(ControlCommand::Open(Dir::Uni)))
+            .unwrap(),
+        Admit::Blocked(_)
+    ));
+    let code = VarInt::from_u32(0xabc);
+    pair.client
+        .command(MuxCommand::control(ControlCommand::OpenOrClose {
+            direction: Dir::Uni,
+            error: code,
+        }));
+    pair.client.driver.run().unwrap();
+    assert!(Pair::transfer(&mut pair.client, &mut pair.server, false));
+    pair.server.driver.run().unwrap();
+    while let Some(event) = pair.server.driver.layer_mut().take_event() {
+        pair.server.events.push(event);
+    }
+    assert!(pair.server.events.iter().any(|event| matches!(event,
+        MuxEvent::Control(ControlEvent::Lost(quinn_proto::ConnectionError::ApplicationClosed(error))) if error.error_code == code)));
+}

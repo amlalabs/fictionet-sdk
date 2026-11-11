@@ -37,6 +37,15 @@ impl Port for Control {
 pub enum ControlCommand {
     /// Open a locally initiated stream after handshake completion.
     Open(Dir),
+    /// Open a required stream, or close with this application error if
+    /// the peer's stream limit or the adapter's slots cannot admit it.
+    /// Unlike `Open`, exhaustion does not hold the command path blocked.
+    OpenOrClose {
+        /// Direction of the required stream.
+        direction: Dir,
+        /// The application's error when that stream cannot be opened.
+        error: VarInt,
+    },
     /// Start graceful connection closure with an application error code.
     Close(VarInt),
     /// A command on the connection's application datagram carrier. `End`
@@ -688,17 +697,29 @@ impl Layer for QuicLayer {
                 self.ending = true;
                 self.datagram_send = DatagramSend::Idle;
             }
-            MuxOp::Control(ControlCommand::Open(dir)) => {
-                if !self.connected
-                    || self.up.is_some()
-                    || self.channels.len() == self.channels.limit()
-                {
-                    return Ok(refused(MuxOp::Control(ControlCommand::Open(dir))));
-                }
-                let Some(stream) = connection.streams().open(dir) else {
-                    return Ok(refused(MuxOp::Control(ControlCommand::Open(dir))));
+            MuxOp::Control(
+                command @ (ControlCommand::Open(_) | ControlCommand::OpenOrClose { .. }),
+            ) => {
+                let (direction, error) = match command {
+                    ControlCommand::Open(direction) => (direction, None),
+                    ControlCommand::OpenOrClose { direction, error } => (direction, Some(error)),
+                    _ => unreachable!(),
                 };
-                self.opened(stream, true, env.budget());
+                if !self.connected || self.up.is_some() {
+                    return Ok(refused(MuxOp::Control(command)));
+                }
+                let stream = (self.channels.len() < self.channels.limit())
+                    .then(|| connection.streams().open(direction))
+                    .flatten();
+                if let Some(stream) = stream {
+                    self.opened(stream, true, env.budget());
+                } else if let Some(code) = error {
+                    connection.close(now, code, bytes::Bytes::new());
+                    self.ending = true;
+                    self.datagram_send = DatagramSend::Idle;
+                } else {
+                    return Ok(refused(MuxOp::Control(command)));
+                }
             }
             MuxOp::Control(ControlCommand::Close(code)) => {
                 connection.close(now, code, bytes::Bytes::new());
