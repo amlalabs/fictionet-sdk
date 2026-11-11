@@ -229,7 +229,7 @@ it stops and says to run `aws login`.
 
 | Command | What it does |
 | --- | --- |
-| `launch` | Creates an m8i.large on Amazon Linux 2023 with two network interfaces. The management interface gets its own Elastic IP and a security group that admits SSH only from the address this workstation has when it launches. The data interface gets no public address and a security group with no rules. The SSH key pair is made here, kept under `~/.ssh`, and its public half imported. |
+| `launch` | Creates an m8i.large on Amazon Linux 2023 with two network interfaces. The management interface gets its own Elastic IP and a security group that admits SSH from any address. The instance accepts only the launch's key: password and keyboard-interactive login are turned off. The data interface gets no public address and a security group with no rules. The SSH key pair is made here, kept under `~/.ssh`, and its public half imported. |
 | `deploy` | Builds `honeypot` as a static `x86_64-unknown-linux-musl` executable, copies it over SSH, writes its systemd unit and restarts the service. The unit restarts the honeypot whenever it exits and limits its memory to 4 GiB. The commit it was built from is kept on the instance. |
 | `status` | The instance's state and addresses, the data interface as Linux sees it, the service state, the deployed commit and the service's last log lines. |
 | `dashboard` | Forwards `127.0.0.1:8700` here to the same port on the instance over SSH, until Ctrl-C. |

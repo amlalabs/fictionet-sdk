@@ -3,7 +3,8 @@
 //!
 //! `launch` creates one instance in eu-west-2 with two network interfaces.
 //! The management interface has its own Elastic IP and a security group that
-//! admits SSH from the launching workstation's address only. The data
+//! admits SSH from any address; the instance accepts only the launch's key.
+//! The data
 //! interface has no public address and a security group with no rules. The
 //! IDs of everything `launch` creates go to a state file outside the
 //! repository, and every resource carries a tag with that launch's ID. Later
@@ -286,22 +287,6 @@ fn checked(command: &mut Command) -> Result {
     Ok(())
 }
 
-/// The workstation's public IPv4 address, as AWS sees it.
-fn workstation_address() -> Result<Ipv4Addr> {
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "https://checkip.amazonaws.com",
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err("cannot read this workstation's public address".into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().parse()?)
-}
-
 fn launch(aws: &Aws, files: &Files) -> Result {
     if files.state.exists() {
         return Err(format!(
@@ -310,7 +295,6 @@ fn launch(aws: &Aws, files: &Files) -> Result {
         )
         .into());
     }
-    let workstation = workstation_address()?;
     let subnets: aws::Subnets = aws.read(&[
         "ec2",
         "describe-subnets",
@@ -387,11 +371,14 @@ fn launch(aws: &Aws, files: &Files) -> Result {
         "--ip-permissions",
         &serde_json::json!([{
             "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
-            "IpRanges": [{"CidrIp": format!("{workstation}/32"), "Description": "SSH from the launching workstation"}],
+            "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH from anywhere; key authentication only"}],
+            "Ipv6Ranges": [{"CidrIpv6": "::/0", "Description": "SSH from anywhere; key authentication only"}],
         }])
         .to_string(),
     ])?;
-    println!("Management security group {management_group}: SSH from {workstation} only");
+    println!(
+        "Management security group {management_group}: SSH from anywhere, key authentication only"
+    );
 
     // The data group starts with AWS's allow-all egress rule; removing it
     // leaves the group with no rules in either direction.
