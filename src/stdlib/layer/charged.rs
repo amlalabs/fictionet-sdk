@@ -5,7 +5,11 @@
 //! and a refusal allocates nothing and changes nothing. Giving memory back
 //! cannot fail, so it returns nothing. At every moment outside their own
 //! methods, a container's charge is what its allocation holds: the
-//! capacity, counted in bytes, never its length. Items that own heap of
+//! capacity, counted in bytes, never its length. Inside them it is at
+//! least that: a container that reallocates to grow or shrink keeps its
+//! old allocation live beside the new one until what it holds is moved,
+//! and charges the old one too for that moment. A shrink with no room for
+//! it now does not happen. Items that own heap of
 //! their own, such as a [`Chunk`], carry their own charge; a queue pays
 //! only for its places.
 
@@ -98,24 +102,36 @@ impl ChargedBytes {
     }
 
     /// Grows the capacity to `capacity`, charging the growth before
-    /// reallocating. Refuses, changing nothing, if the budget has no room.
-    /// A capacity already reached is kept.
+    /// reallocating, and the old allocation too while the bytes move out
+    /// of it. Refuses, changing nothing, if the budget has no room for
+    /// both. A capacity already reached is kept.
     #[must_use = "a refused growth leaves no room for what was to be written"]
     pub fn grow_to(&mut self, capacity: usize) -> bool {
         if capacity <= self.bytes.capacity() {
             return true;
         }
-        if !self.charge.grow_to(capacity) {
+        let Some(moving) = self.charge.grow_to_moving(capacity, self.bytes.capacity()) else {
             return false;
-        }
+        };
         self.bytes.reserve_exact(capacity - self.bytes.len());
+        drop(moving);
         true
     }
 
-    /// Gives back the capacity past the length.
+    /// Gives back the capacity past the length. The bytes move to a
+    /// smaller allocation, charged while both are live, so with no room
+    /// for that now the capacity stays.
     pub fn trim(&mut self) {
+        let len = self.bytes.len();
+        if len == self.bytes.capacity() {
+            return;
+        }
+        let Some(moving) = moving_out(&self.charge, len) else {
+            return;
+        };
         self.bytes.shrink_to_fit();
         self.charge.shrink_to(self.bytes.capacity());
+        drop(moving);
     }
 
     /// Keeps the first `len` bytes. The capacity stays.
@@ -195,13 +211,15 @@ impl fictionet::stdlib::codec::Storage for ChargedBytes {
         }
         // The capacity is at least what is paid for, so `least` is more.
         let paid = self.charge.bytes();
-        let Some(more) = self
-            .charge
-            .grow_by_units(least - paid..=most.max(least) - paid, 1)
-        else {
+        let Some((more, moving)) = self.charge.grow_by_units_moving(
+            least - paid..=most.max(least) - paid,
+            1,
+            self.bytes.capacity(),
+        ) else {
             return false;
         };
         self.bytes.reserve_exact(paid + more - self.bytes.len());
+        drop(moving);
         true
     }
 
@@ -221,8 +239,14 @@ impl fictionet::stdlib::codec::Storage for ChargedBytes {
     fn clear_to(&mut self, keep: usize) {
         self.bytes.clear();
         if self.bytes.capacity() > keep {
-            self.bytes.shrink_to(keep);
-            self.charge.shrink_to(self.bytes.capacity());
+            // Nothing is left to move, so nothing is live beside the new
+            // allocation: the old one goes first.
+            self.bytes = Vec::new();
+            self.charge.shrink_to(0);
+            if let Some(room) = self.charge.budget().try_charge(keep) {
+                self.bytes = Vec::with_capacity(keep);
+                let _ = self.charge.absorb(room);
+            }
         }
     }
 }
@@ -307,21 +331,35 @@ fn more_places(places: usize, most: usize) -> usize {
 /// Charges the places a container of `places` places grows by to hold
 /// `wanted` items of `size` bytes, at most `most`: up to
 /// [`more_places`] or `wanted` if that is more, and as few as `wanted`
-/// when the budget has room for no more. Returns the places to add, or
-/// `None`, changing nothing, when not even `wanted` fits or `wanted`
-/// passes `most`.
+/// when the budget has room for no more. The container grows by
+/// reallocating, so its old allocation, `moving` bytes, is live beside
+/// the new one until its items are moved: those bytes are charged with
+/// the growth ([`Charge::grow_by_units_moving`]). Returns the places to
+/// add and the charge of the `moving` bytes, which the caller drops once
+/// the move is done, or `None`, changing nothing, when not even `wanted`
+/// fits with them or `wanted` passes `most`.
 pub(super) fn charge_places(
     charge: &mut Charge,
     places: usize,
     wanted: usize,
     most: usize,
     size: usize,
-) -> Option<usize> {
+    moving: usize,
+) -> Option<(usize, Charge)> {
     if wanted <= places || wanted > most {
         return None;
     }
     let up_to = more_places(places, most).max(wanted);
-    charge.grow_by_units(wanted - places..=up_to - places, size)
+    charge.grow_by_units_moving(wanted - places..=up_to - places, size, moving)
+}
+
+/// The charge for the moment a container moves what it keeps, `keep`
+/// bytes of allocation, into a smaller allocation: the old one is live
+/// beside the new until the move is done. Taken only if there is room now
+/// ([`Budget::try_charge`]): a container with no room for it keeps its
+/// allocation as it is.
+fn moving_out(charge: &Charge, keep: usize) -> Option<Charge> {
+    charge.budget().try_charge(keep)
 }
 
 /// A queue whose places are paid for: what it is charged is its places
@@ -402,11 +440,19 @@ impl<T> ChargedDeque<T> {
         if wanted <= places {
             return true;
         }
-        let Some(more) = charge_places(&mut self.charge, places, wanted, self.most, size_of::<T>())
-        else {
+        let size = size_of::<T>();
+        let Some((more, moving)) = charge_places(
+            &mut self.charge,
+            places,
+            wanted,
+            self.most,
+            size,
+            places * size,
+        ) else {
             return false;
         };
         self.items.reserve_exact(places + more - len);
+        drop(moving);
         true
     }
 
@@ -524,11 +570,22 @@ impl<T> ChargedDeque<T> {
     }
 
     /// Gives back places down to `keep`, or to the items held if there are
-    /// more. How many to keep is the owner's choice.
+    /// more, when the budget has room for the move. How many to keep is
+    /// the owner's choice.
     pub fn shrink_to(&mut self, keep: usize) {
-        self.items.shrink_to(keep.max(self.items.len()));
+        let keep = keep.max(self.items.len());
+        if keep >= self.items.capacity() {
+            return;
+        }
+        // The items move to a smaller allocation, paid for while both are
+        // live; with no room for that now, the places stay.
+        let Some(moving) = moving_out(&self.charge, keep * size_of::<T>()) else {
+            return;
+        };
+        self.items.shrink_to(keep);
         self.charge
             .shrink_to(self.items.capacity() * size_of::<T>());
+        drop(moving);
     }
 
     /// The places allocated, filled or not.
@@ -621,11 +678,19 @@ impl<T> ChargedVec<T> {
         if wanted <= places {
             return true;
         }
-        let Some(more) = charge_places(&mut self.charge, places, wanted, self.most, size_of::<T>())
-        else {
+        let size = size_of::<T>();
+        let Some((more, moving)) = charge_places(
+            &mut self.charge,
+            places,
+            wanted,
+            self.most,
+            size,
+            places * size,
+        ) else {
             return false;
         };
         self.items.reserve_exact(places + more - len);
+        drop(moving);
         true
     }
 
@@ -659,9 +724,19 @@ impl<T> ChargedVec<T> {
     /// Gives back places down to `keep`, or to the items held if there are
     /// more.
     pub fn shrink_to(&mut self, keep: usize) {
-        self.items.shrink_to(keep.max(self.items.len()));
+        let keep = keep.max(self.items.len());
+        if keep >= self.items.capacity() {
+            return;
+        }
+        // The items move to a smaller allocation, paid for while both are
+        // live; with no room for that now, the places stay.
+        let Some(moving) = moving_out(&self.charge, keep * size_of::<T>()) else {
+            return;
+        };
+        self.items.shrink_to(keep);
         self.charge
             .shrink_to(self.items.capacity() * size_of::<T>());
+        drop(moving);
     }
 
     /// The places allocated, filled or not.
@@ -1201,13 +1276,20 @@ mod tests {
                         unreachable!()
                     };
                     let more = to.saturating_sub(bytes.capacity());
-                    let fits = more <= room;
+                    // A growth charges the old allocation too while the
+                    // bytes move out of it.
+                    let need = if more == 0 {
+                        0
+                    } else {
+                        more + bytes.capacity()
+                    };
+                    let fits = need <= room;
                     let grew = bytes.grow_to(to);
                     assert_eq!(grew, fits);
                     if grew {
                         assert!(bytes.capacity() >= to);
                     }
-                    charging(grew, payer, view, more)
+                    charging(grew, payer, view, need)
                 }
                 4 | 5 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Bytes(_))) else {
@@ -1257,6 +1339,7 @@ mod tests {
                         return refused(false);
                     };
                     let keep = self.below(64);
+                    let room = self.room(self.held[at].payer);
                     let Item::Bytes(bytes) = &mut self.held[at].item else {
                         unreachable!()
                     };
@@ -1264,8 +1347,12 @@ mod tests {
                     if keep.is_multiple_of(2) {
                         bytes.truncate(keep);
                     } else {
+                        // The bytes move to a smaller allocation, charged
+                        // while both are live: with no room, nothing moves.
+                        let (len, capacity) = (bytes.len(), bytes.capacity());
+                        let moves = len < capacity && len <= room;
                         bytes.trim();
-                        assert_eq!(bytes.capacity(), bytes.len());
+                        assert_eq!(bytes.capacity(), if moves { len } else { capacity });
                     }
                     assert!(bytes.charged() <= charged);
                     refused(true)
@@ -1293,11 +1380,19 @@ mod tests {
                     };
                     let (len, places) = (deque.len(), deque.places());
                     let full = len == places;
-                    let fits = len < deque.most && (!full || size_of::<u64>() <= room);
+                    // A full queue's growth charges its old places too,
+                    // live while its items move.
+                    let moving = places * size_of::<u64>();
+                    let need = if full {
+                        size_of::<u64>() + moving
+                    } else {
+                        size_of::<u64>()
+                    };
+                    let fits = len < deque.most && (!full || need <= room);
                     // A full queue doubles if there is room, else takes
                     // the places there is room for.
-                    let grown =
-                        more_places(places, deque.most).min(places + room / size_of::<u64>());
+                    let grown = more_places(places, deque.most)
+                        .min(places + room.saturating_sub(moving) / size_of::<u64>());
                     let pushed = if front {
                         deque.push_front(item)
                     } else {
@@ -1317,13 +1412,14 @@ mod tests {
                         }
                         Err(back) => assert_eq!(back, item),
                     }
-                    charging(pushed.is_ok(), payer, view, size_of::<u64>())
+                    charging(pushed.is_ok(), payer, view, need)
                 }
                 10 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Deque(_))) else {
                         return refused(false);
                     };
                     let keep = self.below(16);
+                    let room = self.room(self.held[at].payer);
                     let Item::Deque(deque) = &mut self.held[at].item else {
                         unreachable!()
                     };
@@ -1343,8 +1439,12 @@ mod tests {
                         }
                         _ => {
                             let places = deque.places();
+                            let kept = keep.max(deque.len());
+                            // The move to fewer places is charged while
+                            // both are live: with no room, nothing moves.
+                            let moves = kept < places && kept * size_of::<u64>() <= room;
                             deque.shrink_to(keep);
-                            assert_eq!(deque.places(), keep.max(deque.len()).min(places));
+                            assert_eq!(deque.places(), if moves { kept } else { places });
                         }
                     }
                     refused(true)
@@ -1374,22 +1474,31 @@ mod tests {
                         }
                         let places = list.places();
                         assert_eq!(list.charged(), places * size_of::<u32>(), "still paid for");
+                        // The items move to fewer places, charged while
+                        // both are live: with no room, nothing moves.
+                        let moves = list.len() < places && list.len() * size_of::<u32>() <= room;
                         list.shrink_to(0);
-                        assert_eq!(list.places(), list.len());
+                        assert_eq!(list.places(), if moves { list.len() } else { places });
                         return refused(true);
                     }
                     let (len, places) = (list.len(), list.places());
                     let full = len == places;
-                    let fits = len < list.most && (!full || size_of::<u32>() <= room);
-                    let grown =
-                        more_places(places, list.most).min(places + room / size_of::<u32>());
+                    let moving = places * size_of::<u32>();
+                    let need = if full {
+                        size_of::<u32>() + moving
+                    } else {
+                        size_of::<u32>()
+                    };
+                    let fits = len < list.most && (!full || need <= room);
+                    let grown = more_places(places, list.most)
+                        .min(places + room.saturating_sub(moving) / size_of::<u32>());
                     let pushed = list.push(item);
                     assert_eq!(pushed.is_ok(), fits);
                     if pushed.is_ok() {
                         assert_eq!(list.places(), if full { grown } else { places });
                         assert_eq!(list.last(), Some(&item));
                     }
-                    charging(pushed.is_ok(), payer, view, size_of::<u32>())
+                    charging(pushed.is_ok(), payer, view, need)
                 }
                 12 => {
                     let Some(at) = self.pick(|item| matches!(item, Item::Map(_))) else {
@@ -1507,14 +1616,18 @@ mod tests {
                     };
                     let (len, places) = (deque.len(), deque.places());
                     let wanted = len + additional;
+                    // A growth charges the old places too, live while the
+                    // items move.
+                    let moving = places * size_of::<u64>();
                     let fits = wanted <= deque.most
-                        && (wanted <= places || (wanted - places) * size_of::<u64>() <= room);
+                        && (wanted <= places
+                            || (wanted - places) * size_of::<u64>() + moving <= room);
                     // Growth doubles, or goes to what is asked if that is
                     // more, when there is room, else takes the places
                     // there is room for, never fewer than asked.
                     let grown = more_places(places, deque.most)
                         .max(wanted)
-                        .min(places + room / size_of::<u64>());
+                        .min(places + room.saturating_sub(moving) / size_of::<u64>());
                     let reserved = deque.reserve(additional);
                     assert_eq!(reserved, fits);
                     if reserved {
@@ -1527,7 +1640,7 @@ mod tests {
                         }
                         assert_eq!(deque.len(), wanted);
                     }
-                    let need = wanted.saturating_sub(places) * size_of::<u64>();
+                    let need = wanted.saturating_sub(places) * size_of::<u64>() + moving;
                     charging(reserved, payer, view, need)
                 }
                 17 => {
@@ -1948,7 +2061,9 @@ mod tests {
         // Full, and doubling does not fit: no place more fits either.
         assert_eq!(deque.push_back(4), Err(4));
         assert!(budget.refused_since(mark));
-        let other = Budget::new(6 * size);
+        // Room for the four places, the old four again while the items
+        // move, and two more: not for eight.
+        let other = Budget::new(10 * size);
         let mut deque = ChargedDeque::<u64>::new(&other, 64);
         for i in 0..4 {
             assert!(deque.push_back(i).is_ok());
@@ -1963,10 +2078,56 @@ mod tests {
         assert_eq!(budget.used(), 4 * size);
     }
 
+    /// A growth reallocates: the old places stay allocated beside the new
+    /// until the items have moved, so the budget must have room for both
+    /// at once, and a queue whose growth fits only without its old places
+    /// refuses. Before the move was charged, this push grew the queue to
+    /// eight places while its old four were live: twelve against a limit
+    /// of eleven.
+    #[test]
+    fn a_growth_is_paid_for_while_the_old_places_are_live() {
+        let size = size_of::<u64>();
+        let budget = Budget::new(11 * size);
+        let mut deque = ChargedDeque::<u64>::new(&budget, 64);
+        for i in 0..4 {
+            assert!(deque.push_back(i).is_ok());
+        }
+        assert_eq!(budget.used(), 4 * size);
+        let mark = budget.refusals();
+        assert!(deque.push_back(4).is_ok());
+        assert!(
+            deque.places() + 4 <= 11,
+            "{} places and the old four live at once, past eleven",
+            deque.places()
+        );
+        assert!(!budget.refused_since(mark));
+        assert_eq!(
+            budget.used(),
+            deque.charged(),
+            "the move's charge went back"
+        );
+        // Shrinking moves the items too: with no room for the smaller
+        // allocation beside the old one, the places stay.
+        for _ in 0..4 {
+            deque.pop_front();
+        }
+        let filler = budget.charge(budget.limit() - budget.used()).unwrap();
+        let places = deque.places();
+        deque.shrink_to(0);
+        assert_eq!(deque.places(), places, "no room to move, so no move");
+        drop(filler);
+        deque.shrink_to(0);
+        assert_eq!(deque.places(), deque.len());
+        assert_eq!(budget.used(), deque.charged());
+    }
+
     #[test]
     fn a_place_is_paid_for_before_its_item_exists() {
         let size = size_of::<u64>();
-        let budget = Budget::new(2 * size);
+        // Two places for the deque, and one held elsewhere until the deque
+        // shrinks below, which moves its item into a new allocation.
+        let budget = Budget::new(3 * size);
+        let elsewhere = budget.charge(size).unwrap();
         let mut deque = ChargedDeque::<u64>::new(&budget, 8);
         deque.place().expect("room for a place").push_back(1);
         deque.place().expect("room for a place").push_back(2);
@@ -1984,6 +2145,7 @@ mod tests {
         deque.set_most(1);
         assert!(deque.place().is_none(), "more than the most are held");
         deque.pop_front();
+        drop(elsewhere);
         deque.set_most(1);
         assert_eq!(deque.places(), 1);
         assert_eq!(budget.used(), size);

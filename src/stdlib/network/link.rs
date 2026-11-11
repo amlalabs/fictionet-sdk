@@ -4,7 +4,7 @@
 //! delays, rate limits, or caller-selected filtering. They do not parse or
 //! write protocol messages, implement sessions or services, or encrypt traffic.
 
-use std::collections::VecDeque;
+use fictionet::stdlib::layer::{Budget, Charge, ChargedDeque};
 use std::task::Poll;
 
 use fictionet::PACKET_COST;
@@ -38,13 +38,14 @@ use fictionet::{Cx, End, Interface, Packet};
 /// [region](Cx#regions) is cancelled. Packets it still holds are lost.
 ///
 /// A delay holds at most 32 MiB of packets in each direction, counting each
-/// packet's length plus 64 bytes. A packet that arrives while its direction
-/// is full is dropped, as a real link drops what its buffer cannot hold.
-/// That is about 21,000 full-size packets: with a 100 ms delay, a direction
-/// fills only above about 320 MB/s. The returned end also holds at most
-/// 32 MiB each way while it waits to be read, counting each packet's
-/// buffer, its capacity rather than its length, plus 64 bytes, and drops
-/// what is sent past that. Without these limits, a sandbox that sends without pause, or a
+/// packet's buffer, its capacity rather than its length, plus
+/// [`PACKET_COST`](fictionet::PACKET_COST), and the queue's places. A
+/// packet that arrives while its direction is full is dropped, as a real
+/// link drops what its buffer cannot hold. That is about 20,000 full-size
+/// packets: with a 100 ms delay, a direction fills only above about
+/// 300 MB/s. The returned end also holds at most 32 MiB each way while it
+/// waits to be read, counting each packet the same way but for the places,
+/// and drops what is sent past that. Without these limits, a sandbox that sends without pause, or a
 /// world that never reads the returned end, would grow the world's memory
 /// without end.
 ///
@@ -82,7 +83,7 @@ pub fn delay(fcx: &Cx, by: Duration, inner: impl Interface) -> End {
 /// their own.
 ///
 /// Whatever `queue` says, a direction also holds at most 32 MiB, counting
-/// each packet's length plus 64 bytes, as [`delay`] does. The returned end
+/// each packet as [`delay`] does. The returned end
 /// holds at most 32 MiB each way while it waits to be read, and drops what
 /// is sent past that, so packets that have left the queue cannot pile up
 /// in an end that is not read.
@@ -113,12 +114,12 @@ pub fn bottleneck(fcx: &Cx, bits_per_second: u64, queue: usize, inner: impl Inte
         fcx,
         inner,
         move |waiting: &Queue, now: Instant, len: usize| {
-            if waiting.packets.len() >= queue {
+            if waiting.len() >= queue {
                 return None;
             }
             // The link starts on this packet when the one before it has left.
-            let start = match waiting.packets.back() {
-                Some((leaves, _)) if *leaves > now => *leaves,
+            let start = match waiting.last() {
+                Some(leaves) if leaves > now => leaves,
                 _ => now,
             };
             Some(later(start, send_time(len, bits_per_second)))
@@ -218,26 +219,79 @@ fn later(at: Instant, d: Duration) -> Instant {
 }
 
 /// The packets waiting in one direction of a [`shape`]d link, each with the
-/// time it leaves. Always in leaving order.
-#[derive(Default)]
+/// time it leaves. Always in leaving order. A budget of [`LINK_STORE`]
+/// pays for them, each counted as a limited cable counts it, and for the
+/// queue's places, charged as it grows.
 struct Queue {
-    packets: VecDeque<(Instant, Packet)>,
-    /// What `packets` holds, counted as for [`LINK_STORE`].
-    bytes: usize,
+    packets: ChargedDeque<(Instant, Packet, Charge)>,
+    budget: Budget,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        let budget = Budget::new(LINK_STORE);
+        Queue {
+            packets: ChargedDeque::new(&budget, usize::MAX),
+            budget,
+        }
+    }
+}
+
+impl Queue {
+    /// The packets waiting.
+    fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    /// When the first packet leaves.
+    fn first(&self) -> Option<Instant> {
+        self.packets.front().map(|(leaves, _, _)| *leaves)
+    }
+
+    /// When the last packet leaves.
+    fn last(&self) -> Option<Instant> {
+        self.packets.iter().last().map(|(leaves, _, _)| *leaves)
+    }
+
+    /// Queues `packet` to leave at `leaves`, charging it and then a place
+    /// first. False, with nothing charged, past the store.
+    fn push(&mut self, leaves: Instant, packet: Packet) -> bool {
+        let cost = packet.chunk().capacity().checked_add(PACKET_COST);
+        let charge = cost.and_then(|cost| self.budget.charge(cost));
+        let Some(charge) = charge else {
+            return false;
+        };
+        let Some(place) = self.packets.place() else {
+            return false;
+        };
+        place.push_back((leaves, packet, charge));
+        true
+    }
+
+    /// Takes out the first packet. An emptied queue gives back its places.
+    fn pop(&mut self) -> Option<Packet> {
+        let (_, packet, _) = self.packets.pop_front()?;
+        if self.packets.is_empty() {
+            self.packets.shrink_to(0);
+        }
+        Some(packet)
+    }
 }
 
 /// The most a [`delay`] or [`bottleneck`] holds in each direction: packets
-/// waiting to leave, each counted as its length plus 64 bytes. A packet
-/// that would take a direction past this is dropped, as a full queue on a
-/// real link drops it.
+/// waiting to leave, each counted as its buffer's capacity plus
+/// [`PACKET_COST`](fictionet::PACKET_COST), and the queue's places. A
+/// packet that would take a direction past this is dropped, as a full
+/// queue on a real link drops it.
 const LINK_STORE: usize = 32 << 20;
 
 /// The most each direction of the interface returned by [`delay`],
 /// [`bottleneck`] and [`filter`] holds while it waits to be read, each
-/// packet counted as its buffer's capacity plus 64 bytes. Past that,
-/// packets sent into it are dropped. TCP puts up
-/// to a window of packets into it at once, so it is as large as the
-/// windows of a hundred connections with the default buffers.
+/// packet counted as its buffer's capacity plus
+/// [`PACKET_COST`](fictionet::PACKET_COST). Past that, packets sent into
+/// it are dropped. TCP puts up to a window of packets into it at once, so
+/// it is as large as the windows of a hundred connections with the default
+/// buffers.
 const LINK_OUTPUT: usize = 32 << 20;
 
 /// The two ends that [`shape`] and [`filter`] make, with a size limit.
@@ -261,18 +315,13 @@ where
             ports::Ports::new(vec![Box::new(inner) as Box<dyn Interface>, Box::new(mine)]);
         let mut queues = [Queue::default(), Queue::default()];
         loop {
-            let deadline = queues
-                .iter()
-                .filter_map(|q| q.packets.front().map(|(t, _)| *t))
-                .min();
+            let deadline = queues.iter().filter_map(Queue::first).min();
             match ports.next(&fcx, deadline, |_| Poll::Pending).await? {
                 ports::Event::Packet(i, packet) => {
                     let now = fcx.now();
-                    let cost = packet.len() + PACKET_COST;
-                    let fits = queues[i].bytes + cost <= LINK_STORE;
-                    if let Some(leaves) = admit(&queues[i], now, packet.len()).filter(|_| fits) {
-                        queues[i].bytes += cost;
-                        queues[i].packets.push_back((leaves, packet));
+                    if let Some(leaves) = admit(&queues[i], now, packet.len()) {
+                        // Past the store, the packet is dropped.
+                        let _ = queues[i].push(leaves, packet);
                     }
                 }
                 ports::Event::Timer => {
@@ -280,12 +329,11 @@ where
                     let mut sent = 0;
                     for (i, queue) in queues.iter_mut().enumerate() {
                         while sent < ports::BUDGET {
-                            match queue.packets.front() {
-                                Some((t, _)) if *t <= now => {}
+                            match queue.first() {
+                                Some(t) if t <= now => {}
                                 _ => break,
                             }
-                            let (_, packet) = queue.packets.pop_front().unwrap();
-                            queue.bytes -= packet.len() + PACKET_COST;
+                            let packet = queue.pop().expect("a first packet");
                             ports.send(1 - i, packet);
                             sent += 1;
                         }
@@ -305,8 +353,12 @@ mod tests {
     use fictionet::{InterfaceExt, block_on, pair, run};
     use std::future::poll_fn;
 
-    /// How many 1,500-byte packets fit in 32 MiB, at 64 bytes more each.
+    /// How many 1,500-byte packets fit in 32 MiB, at [`PACKET_COST`] more
+    /// each.
     const FIT: usize = (32 << 20) / (1500 + PACKET_COST);
+
+    /// A delay queue's place for one packet.
+    const PLACE: usize = size_of::<(Instant, Packet, Charge)>();
 
     /// Sends `n` 1,500-byte packets into `inner`'s other end, giving the
     /// link's task turns as it goes.
@@ -345,15 +397,22 @@ mod tests {
                     0,
                     "nothing leaves before the delay"
                 );
+                fcx.sleep(Duration::from_secs(1)).await?;
+                // Turns for the link's task to send all that is due.
                 for _ in 0..FIT {
-                    assert_eq!(far.recv(&fcx).await?, Packet::new(vec![0x45; 1500]));
+                    fcx.yield_now().await?;
                 }
-                assert_eq!(fcx.now().since_start(), Duration::from_secs(1));
-                assert_eq!(
-                    drain(&fcx, &mut far).await,
-                    0,
-                    "the delay kept exactly 32 MiB and dropped the rest"
+                let kept = drain(&fcx, &mut far).await;
+                // The store pays for the packets and the queue's places:
+                // never more packets than fit alone, and no fewer than fit
+                // with three places each (twice the places a doubling
+                // leaves, and the old ones while they move).
+                assert!(kept <= FIT, "{kept} packets kept, past 32 MiB");
+                assert!(
+                    kept >= (32 << 20) / (1500 + PACKET_COST + 3 * PLACE),
+                    "{kept} packets kept, far less than 32 MiB"
                 );
+                assert_eq!(fcx.now().since_start(), Duration::from_secs(1));
                 // Room again, once the queue has emptied.
                 sandbox.send(Packet::new(vec![1; 100]));
                 assert_eq!(far.recv(&fcx).await?, Packet::new(vec![1; 100]));

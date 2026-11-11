@@ -1294,6 +1294,10 @@ fn unpad(mut packet: Vec<u8>, at: usize) -> Result<Vec<u8>, TransportError> {
 #[cfg(test)]
 mod replay;
 
+#[cfg(kani)]
+#[path = "../../../../verification/ssh-layer/kani/resources.rs"]
+mod resource_proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

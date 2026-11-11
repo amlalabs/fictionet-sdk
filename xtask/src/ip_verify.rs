@@ -39,11 +39,6 @@ const SEEDS: std::ops::RangeInclusive<u64> = 1..=8;
 
 const COMMAND: &str = "ip-verify";
 
-/// The harnesses reach a `Budget`, whose wakers are trait objects: Kani
-/// limits their calls to the types that make one, as the layer's budget
-/// harnesses do (verification/layer/VERIFICATION.md).
-const RESTRICT_VTABLE: &[&str] = &["-Z", "restrict-vtable"];
-
 /// The counted Kani harnesses in `fictionet`: the counter's own check,
 /// and a UDP socket paying before it keeps. Not listed, because they do not
 /// finish within 14 GiB and 25 minutes (verification/packet-udp/README.md,
@@ -444,14 +439,12 @@ fn resources(paths: &Paths) -> Result<lean_vectors::Report> {
         &paths.root,
         &paths.out.join("fictionet"),
         "fictionet",
-        RESTRICT_VTABLE,
         &KANI_FICTIONET,
     )?);
     report.absorb(resources::kani(
         &paths.root,
         &paths.out.join("smoltcp"),
         "smoltcp",
-        RESTRICT_VTABLE,
         &KANI_SMOLTCP,
     )?);
     report.absorb(resources::tlc(

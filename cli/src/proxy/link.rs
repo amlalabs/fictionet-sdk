@@ -31,8 +31,8 @@ use tokio::sync::Notify;
 use crate::world;
 
 /// Packets waiting for room in the socket may take this many bytes, each
-/// counting its length plus 64, as the world's own queue does. Past it,
-/// packets are dropped.
+/// counting its buffer and its record, with the queue's places, as the
+/// world's own queue does. Past it, packets are dropped.
 const QUEUE_BUDGET: usize = 32 << 20;
 
 /// The world's socket, as the stack's interface.

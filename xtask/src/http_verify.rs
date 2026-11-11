@@ -38,10 +38,6 @@ const KANI_RESOURCES: [&str; 3] = [
     "stdlib::web::httpd::http2::respond::collect_proofs::a_collected_body_copies_linearly",
 ];
 
-/// Dropping a block gives its charge back, through the budget's wakers:
-/// without this, the harnesses run CBMC out of memory.
-const KANI_FLAGS: [&str; 2] = ["-Z", "restrict-vtable"];
-
 /// The configs that check the joins and the send holds, each with the
 /// result its first line names: the code, and the controls.
 const TLC_RESOURCES: [(&str, &[&str]); 2] = [
@@ -395,7 +391,6 @@ fn resource_properties(paths: &Paths) -> Result {
         &paths.root,
         &paths.out,
         "fictionet",
-        &KANI_FLAGS,
         &KANI_RESOURCES,
     )?);
     let tla = paths.root.join("verification").join("http").join("tla");

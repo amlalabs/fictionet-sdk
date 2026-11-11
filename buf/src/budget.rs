@@ -279,6 +279,19 @@ impl Budget {
         self.charge_within(bytes..=bytes)
     }
 
+    /// A charge of exactly `bytes` if they fit now, and `None` if not,
+    /// with no refusal recorded and no wake asked for: for memory a holder
+    /// can do without, such as the moment a shrink moves what it keeps
+    /// into a smaller allocation. A holder that must wait for room uses
+    /// [`charge`](Self::charge).
+    pub fn try_charge(&self, bytes: usize) -> Option<Charge> {
+        let now = self.try_take(&|room| (bytes <= room).then_some(bytes))?;
+        Some(Charge {
+            budget: self.clone(),
+            now,
+        })
+    }
+
     /// A charge of as much of `want` as fits: its end if there is room,
     /// less if not, and `None` if not even its start fits.
     pub fn charge_within(&self, want: RangeInclusive<usize>) -> Option<Charge> {
@@ -547,6 +560,52 @@ impl Charge {
         Some(more)
     }
 
+    /// As [`grow_by_units`](Self::grow_by_units), for a container that
+    /// grows by reallocating: its old allocation, of `moving` bytes, stays
+    /// live beside the new one until what it holds is moved, so those
+    /// bytes are charged too, taken with the growth in one step, and a
+    /// refusal names their sum as its need. Returns the units grown by
+    /// and a charge of the `moving` bytes, which the caller drops once
+    /// the move is done.
+    #[must_use = "a refused growth must not be followed by the growth"]
+    pub fn grow_by_units_moving(
+        &mut self,
+        units: RangeInclusive<usize>,
+        unit: usize,
+        moving: usize,
+    ) -> Option<(usize, Charge)> {
+        let (least, most) = (*units.start(), *units.end());
+        let need = least.checked_mul(unit)?.checked_add(moving)?;
+        let taken = self.budget.take_with(need, |room| {
+            let room = room.checked_sub(moving)?;
+            // Units of no bytes always fit, all of them.
+            let take = room.checked_div(unit).map_or(most, |fit| most.min(fit));
+            (take >= least).then(|| moving + take * unit)
+        })?;
+        let grown = taken - moving;
+        self.now += grown;
+        let more = grown.checked_div(unit).unwrap_or(most);
+        Some((
+            more,
+            Charge {
+                budget: self.budget.clone(),
+                now: moving,
+            },
+        ))
+    }
+
+    /// As [`grow_to`](Self::grow_to), for a container that grows by
+    /// reallocating an allocation of `moving` bytes
+    /// ([`grow_by_units_moving`](Self::grow_by_units_moving)). Returns the
+    /// charge of the `moving` bytes, for the caller to drop once the move
+    /// is done, or `None`, changing nothing.
+    #[must_use = "a refused growth must not be followed by the growth"]
+    pub fn grow_to_moving(&mut self, to: usize, moving: usize) -> Option<Charge> {
+        let more = to.saturating_sub(self.now);
+        self.grow_by_units_moving(more..=more, 1, moving)
+            .map(|(_, moving)| moving)
+    }
+
     /// Charges only `to` bytes, if that is less than now, giving back the
     /// rest. Giving back cannot fail.
     pub fn shrink_to(&mut self, to: usize) {
@@ -709,6 +768,51 @@ mod tests {
         assert!(budget.refused_since(mark), "nothing fitting is a refusal");
         assert_eq!((charge.bytes(), budget.used()), (held, used));
         drop((other, charge));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_growth_that_moves_takes_the_old_allocation_with_it() {
+        let unit = 8;
+        let budget = Budget::new(64);
+        let mut charge = budget.charge(16).unwrap();
+        // 48 bytes of room: the 16 moving and four units, not the six
+        // that fit without them.
+        let (more, moving) = charge.grow_by_units_moving(1..=6, unit, 16).unwrap();
+        assert_eq!((more, moving.bytes()), (4, 16));
+        assert_eq!(budget.used(), budget.limit());
+        drop(moving);
+        assert_eq!(budget.used(), charge.bytes());
+        // A growth that does not fit with its move is refused whole, and
+        // the refusal needs both.
+        let mark = budget.refusals();
+        let used = budget.used();
+        assert!(charge.grow_by_units_moving(1..=1, unit, 48).is_none());
+        assert!(budget.refused_since(mark));
+        assert_eq!((budget.used(), charge.bytes()), (used, 48));
+        assert_eq!(
+            budget.starved_since(mark).map(|s| s.need),
+            None,
+            "56 bytes fit the limit once the rest goes"
+        );
+        assert!(charge.grow_by_units_moving(3..=3, unit, 48).is_none());
+        assert_eq!(budget.starved_since(mark).map(|s| s.need), Some(72));
+        let moving = charge.grow_to_moving(56, 0).unwrap();
+        assert_eq!((charge.bytes(), moving.bytes()), (56, 0));
+        drop((charge, moving));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_charge_tried_without_room_is_no_refusal() {
+        let budget = Budget::new(8);
+        let held = budget.charge(6).unwrap();
+        let mark = budget.refusals();
+        assert!(budget.try_charge(4).is_none());
+        assert!(!budget.refused_since(mark), "no refusal is recorded");
+        let tried = budget.try_charge(2).unwrap();
+        assert_eq!(budget.used(), 8);
+        drop((held, tried));
         assert_eq!(budget.used(), 0);
     }
 

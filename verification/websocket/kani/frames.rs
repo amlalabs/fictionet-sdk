@@ -440,7 +440,7 @@ fn websocket_control_without_close_ranges() {
 
 #[kani::proof]
 #[kani::unwind(8)]
-#[kani::stub(Messages::held, omit_held)]
+#[kani::stub(Messages::assembled, omit_held)]
 fn websocket_control_without_held_charge() {
     message_limit_precedes_payload_copy(1, 1, 1);
 }

@@ -56,9 +56,9 @@
 //! network card queue drops them, and attach counts them and prints the
 //! count when it ends normally. The proxy types queue them instead,
 //! because a packet lost inside attach's own TCP can cost a retransmit
-//! timeout of a second or more. Both queues count each packet's length
-//! plus 64 bytes against their 32 MiB budget, and drop new packets past
-//! it.
+//! timeout of a second or more. Both queues count each packet's buffer
+//! and its record, and their places, against their 32 MiB budget, and drop
+//! new packets past it.
 //!
 //! [`listen`](crate::listen) validates the attach type in `hello`.
 //! World code is never told the type. It

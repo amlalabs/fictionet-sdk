@@ -316,9 +316,62 @@ Both models refine the spec with no change to the code. The two model
 changes above (the 1-byte Close body in `Messages`, the separate return
 step in `Echo`) were gaps in the models, not departures in the code.
 
+## Resource properties
+
+The method is in `verification/README.md`, "Resource properties". The
+message decoder has all three layers, run with
+`cargo xtask layer-verify resources` (the area's command, beside the
+runtime's; see `verification/layer/README.md`). They found one bug, now
+fixed.
+
+**The bug.** `Messages` grew a fragmented message with
+`Vec::extend_from_slice`, which doubles, so the message's allocation
+passed the decoder's limit while its length stayed within it, and
+`held()` reported the length. At a limit of ten, six bytes and then three
+allocated twelve while `held()` said nine. Whoever charged `held()`
+(`codec::Demux` charges `allocated() + held()`) paid for less than the
+decoder kept, by up to the message's length again. `Partial::append` now
+doubles but stops at the limit, and `held()` reports the allocation; a
+copy of the decoder keeps the same allocation, so it reports the same.
+Test: `a_message_in_fragments_holds_no_more_than_its_limit` in
+`websocket.rs`, which fails on the code before.
+
+**What is charged.** The decoder's limit `L` bounds the message it
+assembles, and its driver charges `held()`. A step is one frame through
+`decode`: the frame's payload, `n` bytes, is copied out of the input
+(`Frame::from_header`), and either becomes the message's data or is
+appended.
+
+| Bound | Constant | Why |
+| --- | --- | --- |
+| after a step, the bytes the decoder keeps are at most `held()`, and `held()` at most `L` | `L`, the decoder's limit | `check_header` refuses a frame that would take the message past `L` before its payload is copied; `append` never grows past `L` |
+| the most bytes live at once in a step are at most `held()` before it, plus `n`, plus `L` | `n + L`, the step's scratch | the frame's copy, and the message's new allocation while the old one is live |
+| a step asks for at most `n + L` bytes | per = 1, fixed = `L` | the frame's copy, and one new allocation of at most `L` |
+
+| Layer | Check | Result |
+| --- | --- | --- |
+| Kani (`kani/resources.rs`) | `a_message_of_two_fragments_stays_within_its_limit` (6 then 4 bytes at `L` = 10) and `a_message_of_three_fragments_stays_within_its_limit` (3, 3, 4): `Partial::append` with every allocation counted, the first and third bounds above for the append, and `held()` read through `Messages` | both pass, 0.8 s and 1.5 s. A harness on the whole of `decode` ran CBMC out of 14 GiB |
+| costed vectors (`tests/it/websocket_costs.rs`) | every split of a message into up to four fragments of 0, 1, 3, 7, 16, 33 or 64 bytes within `L` = 64, text and binary, two messages per decoder: every `decode` step held to all three bounds (`resources/cost.rs`) | 11,299 steps pass; the closest held exactly its charge, 128 of 128 bytes |
+| TLA+ (`tla/Assembly.tla`) | the message's storage and each step's scratch as stores: `RetainedPaid`, `StepPaid`, `HeldTracks` | `Assembly_base` passes |
+
+Controls, each run and then dropped:
+
+| Control | Layer | Fails |
+| --- | --- | --- |
+| `Partial::append` as `extend_from_slice` and `held()` as the length (the code before) | Kani, both harnesses | `the message holds more than held() says` |
+| the same | costed vectors | fragments of 7, 16, 1 and 33 bytes, step 4: 125 bytes live at once against 24 held and 97 charged to the step |
+| `Assembly_without_clamp` | TLA+ | `RetainedPaid` |
+| `Assembly_without_checkfirst` (copy the payload before `check_header`) | TLA+ | `StepPaid` |
+| `Assembly_without_heldiscapacity` | TLA+ | `HeldTracks` |
+
+The existing control `websocket_control_without_held_charge` now stubs
+`Messages::assembled`, the length `check_header` compares with the limit,
+since `held()` is the allocation.
+
 ## Bugs found
 
-Both were in the test echo servers, not in the codec.
+The resource properties found one in the codec (above). These two were in
+the test echo servers.
 
 - `EchoSocket` returned on any message other than text. A Ping or Pong
   between fragments ended the session in the middle of a message, and a
@@ -363,9 +416,9 @@ deliberate and left as they are:
 These checks cover inputs up to the sizes in the tables, streams of up to
 three frames in the decoder test, and four-frame histories in the models,
 not every possible session. The UTF-8 checks use Rust's own validator as
-the definition of valid text. Allocation failure, allocator spare capacity
-and total process memory are outside them; the message limit bounds
-payload bytes before each copy.
+the definition of valid text. Allocation failure and total process memory
+are outside them; the message limit bounds payload bytes before each copy,
+and the message's allocation (Resource properties).
 
 Not covered:
 

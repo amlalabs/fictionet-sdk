@@ -33,11 +33,6 @@ const KANI_RUSTLS: [&str; 4] = [
 // here: the three-record one did not finish in 25 minutes, CBMC following
 // the budget's atomics and its lock (verification/tls/README.md, "Kani").
 
-/// A call through a trait object (a budget, a reader, an error's drop) is
-/// resolved to the types that implement it, not every function of its
-/// shape; without it the harnesses did not finish.
-const KANI_FLAGS: [&str; 2] = ["-Z", "restrict-vtable"];
-
 /// `Join.tla`'s configs: the code, and a control for each rule.
 const TLC_RESOURCES: [&str; 5] = [
     "Join_base.cfg",
@@ -82,7 +77,6 @@ fn resources_report(paths: &Paths) -> Result<Report> {
         &paths.root,
         &paths.out,
         "fictionet-rustls",
-        &KANI_FLAGS,
         &KANI_RUSTLS,
     )?);
     report.absorb(resources::tlc(

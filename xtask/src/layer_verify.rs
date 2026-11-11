@@ -1,31 +1,180 @@
 //! `cargo xtask layer-verify`: the layer foundation's routing code checked
-//! against its TLA+ model, `verification/layer/tla/Route.tla`.
+//! against its TLA+ model, `verification/layer/tla/Route.tla`, and the
+//! resource properties of the runtime and layer machinery, SSH and
+//! WebSocket (verification/README.md, "Resource properties").
 //!
 //! | Command | Does |
 //! | --- | --- |
 //! | `layer-verify trace` | runs `route_trace` in the library's tests, which logs every step the real `Chain`, `Switch` and `Driver` take under abstract layers for each seed, then replays each log against the model with `RouteTrace.tla` |
+//! | `layer-verify resources` | the Kani harnesses in [`KANI_RESOURCES`] with every allocation counted, TLC on the configs in [`TLC_RESOURCES`], and the costed replays: the SSH coverage traces and the tests in [`COSTED_TESTS`] |
 //!
 //! Everything is written under a fresh run directory in `layer-verify/`
 //! in Cargo's target directory
 //! (`CARGO_TARGET_DIR`, or `target/`): the logs and the specs in `traces/`,
 //! TLC's output in `tlc/`, and its state files in `states/`.
 //!
-//! TLC runs as `$JAVA -Xmx2g -cp $TLA2TOOLS tlc2.TLC -workers 2`. `TLA2TOOLS`
-//! names `tla2tools.jar`, and `JAVA` a Java 11 or later (`java` when unset).
+//! TLC runs as `$JAVA -Xmx2g -cp $TLA2TOOLS tlc2.TLC -workers 2` (4 GiB for
+//! the resource configs). `TLA2TOOLS` names `tla2tools.jar`, and `JAVA` a
+//! Java 11 or later (`java` when unset).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 use crate::Result;
+use crate::lean_vectors::{Report, scoped};
+use crate::resources;
+
+/// The counted Kani harnesses: the counter itself, the charged containers
+/// growing through a reallocation, the report store, a WebSocket message
+/// assembled in fragments, and an SSH packet decoded before keys.
+const KANI_RESOURCES: [&str; 11] = [
+    "counting::proofs::the_counter_sees_every_allocation",
+    "stdlib::layer::resource_proofs::a_full_charged_deque_grows_within_a_tight_budget",
+    "stdlib::layer::resource_proofs::a_full_charged_vec_grows_within_a_tight_budget",
+    "stdlib::layer::resource_proofs::charged_bytes_grow_within_their_budget_100",
+    "stdlib::layer::resource_proofs::charged_bytes_grow_within_their_budget_160",
+    "stdlib::layer::resource_proofs::kept_reports_are_charged_to_the_store",
+    "stdlib::layer::resource_proofs::reports_past_the_store_are_omitted_with_nothing_kept",
+    "stdlib::protocols::websocket::resource_proofs::a_message_of_two_fragments_stays_within_its_limit",
+    "stdlib::protocols::websocket::resource_proofs::a_message_of_three_fragments_stays_within_its_limit",
+    "stdlib::protocols::ssh::transport::resource_proofs::decoding_a_short_plain_packet_copies_only_the_packet",
+    "stdlib::protocols::ssh::transport::resource_proofs::decoding_a_longer_plain_packet_copies_only_the_packet",
+];
+
+/// The resource models, each with its directory, module and configs: the
+/// code, and a control for each property that the code before its fix, or
+/// with a check removed, must violate.
+const TLC_RESOURCES: [(&str, &str, &[&str]); 4] = [
+    (
+        "verification/layer/tla",
+        "Growth",
+        &[
+            "Growth_base.cfg",
+            "Growth_without_chargemove.cfg",
+            "Growth_places_without_chargemove.cfg",
+        ],
+    ),
+    (
+        "verification/world-net/tla",
+        "Memory",
+        &[
+            "Memory_base.cfg",
+            "Memory_without_countfirst.cfg",
+            "Memory_without_recordcost.cfg",
+            "Memory_agentonpair.cfg",
+            "Memory_without_chargereportfirst.cfg",
+        ],
+    ),
+    (
+        "verification/websocket/tla",
+        "Assembly",
+        &[
+            "Assembly_base.cfg",
+            "Assembly_without_clamp.cfg",
+            "Assembly_without_checkfirst.cfg",
+            "Assembly_without_heldiscapacity.cfg",
+        ],
+    ),
+    (
+        "verification/ssh-layer/tla",
+        "TransportMemory",
+        &[
+            "TransportMemory_base.cfg",
+            "TransportMemory_without_chargecopyfirst.cfg",
+            "TransportMemory_without_chargescratch.cfg",
+        ],
+    ),
+];
+
+/// The costed tests of `tests/it`: queued packets against what their
+/// queues count, and WebSocket messages in fragments, each step costed.
+const COSTED_TESTS: [&str; 2] = ["world_memory::", "websocket_costs::"];
 
 /// Runs `layer-verify` with the arguments after it.
 pub fn run(args: &[String]) -> Result {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["trace"] => trace(),
-        _ => Err("expected layer-verify trace".into()),
+        ["resources"] => resources(),
+        _ => Err("expected layer-verify trace or resources".into()),
     }
+}
+
+/// The counted Kani harnesses, the resource configs, and the costed
+/// replays.
+fn resources() -> Result {
+    let paths = Paths::new()?;
+    let mut report = Report::new("resources");
+    // Each harness in a `cargo kani` of its own, its log in a directory
+    // of its own: run together, one after another, the deque's ran out of
+    // 14 GiB, though alone it fits.
+    for harness in KANI_RESOURCES {
+        let name = harness.rsplit("::").next().unwrap_or(harness);
+        report.absorb(resources::kani(
+            &paths.root,
+            &paths.out.join("kani").join(name),
+            "fictionet",
+            &[harness],
+        )?);
+    }
+    for (dir, module, configs) in TLC_RESOURCES {
+        report.absorb(resources::tlc(
+            &paths.root,
+            &paths.out,
+            &paths.root.join(dir),
+            module,
+            configs,
+        )?);
+    }
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let replays: [(&str, Vec<&str>); 2] = [
+        (
+            "ssh-replay",
+            vec![
+                "--lib",
+                "--",
+                "--nocapture",
+                "--exact",
+                "stdlib::protocols::ssh::transport::replay::transport_traces_replay_on_the_production_transport",
+            ],
+        ),
+        (
+            "costed-tests",
+            [
+                vec!["--test", "it", "--", "--nocapture"],
+                COSTED_TESTS.to_vec(),
+            ]
+            .concat(),
+        ),
+    ];
+    for (name, args) in replays {
+        let (text, ok) = crate::lean_vectors::logged(
+            scoped(&cargo, "14G")
+                .args(["test", "-p", "fictionet", "--features", "tokio"])
+                .args(&args)
+                .current_dir(&paths.root),
+            &paths.out.join(format!("{name}.out")),
+        )?;
+        let costs: Vec<&str> = text.lines().filter(|l| l.starts_with("cost:")).collect();
+        if ok && !costs.is_empty() {
+            for line in costs {
+                report.pass(format!("{name}: {line}"));
+            }
+            if name == "costed-tests" {
+                report.pass(format!(
+                    "{name}: {}",
+                    text.lines()
+                        .find(|l| l.starts_with("test result:"))
+                        .unwrap_or("no result line")
+                ));
+            }
+        } else {
+            report.fail(format!("{name}: failed; see {name}.out"));
+        }
+    }
+    report.print();
+    report.result("layer-verify")
 }
 
 /// Where the sources are and where the results go.

@@ -6,7 +6,7 @@
 //! from `malloc` and count it. Write a counted proof with [`counted_proof`]
 //! in place of `#[kani::proof]`, call the code inside [`measure`], and
 //! state the bound on the [`Cost`] it returns. Run it with
-//! `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+//! `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates -Z restrict-vtable`.
 //!
 //! Include this file once per crate, at the crate root, as `counting`
 //! (the macro names its stubs by `crate::counting`):

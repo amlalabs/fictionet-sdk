@@ -16,18 +16,13 @@ use crate::lean_vectors::{Report, logged, scoped};
 
 /// The Kani harnesses `harnesses` of `package`'s library, with the
 /// allocation functions stubbed by their counting ones (`-Z stubbing`) and
-/// `malloc` under them (`-Z c-ffi`), which tell a live allocation from a dangling pointer (`-Z mem-predicates`), and Kani's
-/// `flags` besides, such as `-Z restrict-vtable` for harnesses that drop
-/// what a budget charged. Each harness must report
-/// `VERIFICATION:- SUCCESSFUL`. What Kani prints goes to
-/// `kani-<package>.out`.
-pub fn kani(
-    root: &Path,
-    out: &Path,
-    package: &str,
-    flags: &[&str],
-    harnesses: &[&str],
-) -> Result<Report> {
+/// `malloc` under them (`-Z c-ffi`), which tell a live allocation from a dangling pointer (`-Z mem-predicates`). A trait object's call
+/// may reach only the implementations whose vtables it can hold
+/// (`-Z restrict-vtable`), which proves no less: without it, a harness
+/// that charges a `Budget` runs CBMC out of 14 GiB on the wake path of
+/// its release. Each harness must report `VERIFICATION:- SUCCESSFUL`.
+/// What Kani prints goes to `kani-<package>.out`.
+pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Result<Report> {
     let mut report = Report::new("kani");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = scoped(cargo, "14G");
@@ -42,8 +37,14 @@ pub fn kani(
         "c-ffi",
         "-Z",
         "mem-predicates",
+        "-Z",
+        "restrict-vtable",
+        "--exact",
+        // One harness at a time: Kani runs several at once otherwise, and
+        // together they pass the scope's memory.
+        "-j",
+        "1",
     ]);
-    command.args(flags).arg("--exact");
     for harness in harnesses {
         command.arg("--harness").arg(harness);
     }

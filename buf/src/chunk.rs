@@ -102,7 +102,9 @@ impl Chunk {
     /// for them, what they hold back and their pool. No charge counts it,
     /// so a holder that keeps many small chunks counts it with each one it
     /// keeps, and a bound on what a layer allocates counts it once for each
-    /// backing the layer makes.
+    /// backing the layer makes. A chunk with storage keeps one alive;
+    /// pieces of one backing share it, and a pooled backing's stays its
+    /// pool's.
     pub const HEADER: usize = 2 * size_of::<usize>() + size_of::<Backing>();
 
     /// Bytes nothing pays for yet: input from the wire, data from the

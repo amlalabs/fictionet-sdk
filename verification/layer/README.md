@@ -153,3 +153,111 @@ kept the mux from delivering its waiting connection control message.
 The November 9 Kani rerun completed all nine selected ownership, cursor,
 charge and slot harnesses, including the new shared-edit property; the
 interrupted TLS accounting harnesses are tracked in the TLS verification area.
+
+## Resource properties
+
+The method is in `verification/README.md`, "Resource properties". This
+area adds all three layers for the runtime and layer machinery: the
+charged containers (`ChargedDeque`, `ChargedVec`, `ChargedBytes`), the
+budget's charges and refunds, `Children`'s places and the spares a closed
+child leaves, and the report store (`Observations`). The cable queues,
+the packet queues and the split of the whole world's memory are in
+`verification/world-net/README.md`, "Resource properties"; SSH and
+WebSocket in their own READMEs. One command runs them all:
+
+```sh
+cargo xtask layer-verify resources   # Kani, TLC and the costed replays of all four
+```
+
+**The bug, fixed (84530d0d5).** A charged container grew by reallocating
+after charging only its new size. `Vec` and `VecDeque` move their items
+into the new allocation before they free the old one, so for that moment
+both were live, past the charge: a deque of four 16-byte places on a
+budget of 130 bytes doubled to eight while its four were live, 192 bytes
+against the limit. `Children`'s places grew every table the same way, and
+gave places back by making each new table before the old one went.
+`Budget`'s own rule says the limit holds at every moment, not only when
+someone checks. Now a growth takes the old allocation's bytes with the new
+ones, in one step (`Charge::grow_by_units_moving`, `Charge::grow_to_moving`),
+so a refusal names their sum as its need, and gives them back once the
+items have moved. A shrink moves the items too: it charges the smaller
+allocation first with `Budget::try_charge`, which records no refusal, and
+does not happen while there is no room. `Places::make_room` charges what
+the places are charged now for the moment its tables move, and
+`Places::release` the new tables. Test:
+`a_growth_is_paid_for_while_the_old_places_are_live` (`charged.rs`), which
+grew to eight places against a limit of eleven before; the budget's own
+tests are `a_growth_that_moves_takes_the_old_allocation_with_it` and
+`a_charge_tried_without_room_is_no_refusal`.
+
+**What is charged.** Each container pays from a `Budget` before it
+allocates; the harnesses give it a budget of its own, so its limit is the
+charge. The report store has a budget of its own (`Observations::bounded`)
+and charges a report's heap, then its place.
+
+| Bound | Constant | Why |
+| --- | --- | --- |
+| no moment of a growth holds more than the budget's limit | the limit | the old allocation is charged while the items move |
+| after a step, a container holds what its budget counts | | its charge is its capacity outside its own methods |
+| a push asks for at most what the container is charged after it | | one new allocation, of the places charged |
+| a refused growth allocates nothing | | the charge comes first |
+| after a report, the store keeps at most what its budget counts, beside the budget's record | the record: what `Budget::new` allocates | the heap and the place are charged before the report is kept |
+| no moment holds more than the record, the store's limit and the report being made | one report | the report exists before the store sees it |
+| `Children`: open children and spares together never pass the places paid for | the places | see the TLA+ model below |
+
+| Layer | Check | Result |
+| --- | --- | --- |
+| Kani (`kani/resources.rs`) | `a_full_charged_deque_grows_within_a_tight_budget` (four 8-byte places on a budget of 65 bytes, one more pushed), the same for `ChargedVec`, `charged_bytes_grow_within_their_budget_100` and `_160` (60 bytes, then 80), `kept_reports_are_charged_to_the_store` and `reports_past_the_store_are_omitted_with_nothing_kept`, with every allocation counted | all pass; times below |
+| TLA+ (`tla/Growth.tla`) | a container's places and `Children`'s two tables of places and their spares as stores, in the code's order: `ContainerPaid`, `PlacesPaid`, `PartsPaid`, `BudgetWithinLimit`, and `Tracks` for each | `Growth_base` passes, 3,686 distinct states |
+| replays | the layer foundation's trace replay (`layer-verify trace`) runs abstract layers that hold nothing of their own, so it is not costed; the costed replays of this command are SSH's and WebSocket's | |
+
+The `Children` cap on spares (`Places::keep` keeps one only while a place
+no child fills has room) turned out to be implied: opening a child takes a
+spare when there is one, and closing turns a child into a spare, so open
+children and spares never pass the places whatever `keep` checks. With
+the cap removed, `PartsPaid` still holds. So the model has no control for
+it; the cap stays as a guard.
+
+`cargo xtask layer-verify resources` passed in full on November 10, 2026
+(`comp/res-ssh-runtime`), each Kani harness in a `cargo kani` of its own
+under a 14 GiB scope, with `-Z restrict-vtable` and one harness at a time
+(`xtask/src/resources.rs`): run in one `cargo kani`, after the others,
+the deque's harness ran out of 14 GiB, though alone it fits. The four
+models' configs and the costed replays ran in the same command
+(`world-net`, `ssh-layer` and `websocket` READMEs).
+
+| Harness | Time |
+| --- | --- |
+| `the_counter_sees_every_allocation` | 12.0 s |
+| `a_full_charged_deque_grows_within_a_tight_budget` | 437.3 s |
+| `a_full_charged_vec_grows_within_a_tight_budget` | 212.0 s |
+| `charged_bytes_grow_within_their_budget_100` | 33.4 s |
+| `charged_bytes_grow_within_their_budget_160` | 10.2 s |
+| `kept_reports_are_charged_to_the_store` | 143.2 s |
+| `reports_past_the_store_are_omitted_with_nothing_kept` | 147.0 s |
+| WebSocket's two and SSH's two | 0.8 to 6.1 s |
+
+Controls, each run and then dropped:
+
+| Control | Layer | Fails |
+| --- | --- | --- |
+| `charge_places` and `grow_to_moving` without the old allocation (the code before 84530d0d5) | Kani: `a_full_charged_deque_grows_within_a_tight_budget`, `a_full_charged_vec_grows_within_a_tight_budget`, `charged_bytes_grow_within_their_budget_100` | `the deque held more than its budget` (179 s), `the vector held more than its budget` (161 s), `the bytes held more than their budget` (13 s) |
+| `Observations::observe` keeping a report without charging its heap | Kani: `kept_reports_are_charged_to_the_store` | `the store keeps more than it is charged` (69 s) |
+| `Growth_without_chargemove` | TLA+ | `ContainerPaid` |
+| `Growth_places_without_chargemove` | TLA+ | `PlacesPaid` |
+
+**Not covered.** `Children`'s places have no Kani harness: one needs a
+router with a mux, a factory and children, and none was attempted. The
+TLA+ model and the unit test
+`full_places_grow_every_table_by_the_places_that_fit` cover them. A
+deque or vector pushed from empty through a doubling ran CBMC out of
+14 GiB, so each harness starts from a full container of the first four
+places, made inside the measurement. A full deque with room for its
+doubling and the move (16-byte items, 200 bytes) did not finish: CBMC
+ran 31 minutes at 11 GiB before it was stopped, and the vector's twin was
+not run. So the growth that fits with its move is proved for
+`ChargedBytes` only (`charged_bytes_grow_within_their_budget_160`); for
+the deque and the vector, the harnesses prove the refusal, and the unit
+test `a_growth_is_paid_for_while_the_old_places_are_live` the growth.
+With 16-byte items, the deque's tight harness passed once (270.7 s) and
+once ran out of 14 GiB, so its items are `u64`s.
