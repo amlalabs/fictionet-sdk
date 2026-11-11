@@ -20,6 +20,8 @@ mod mptcp_verify;
 #[cfg(feature = "host-tools")]
 mod rawnic;
 mod resources;
+#[cfg(feature = "shibboleth")]
+mod shibboleth_infer;
 #[cfg(feature = "host-tools")]
 // This module owns the host syscall boundary.
 #[allow(unsafe_code)]
@@ -43,6 +45,10 @@ fn main() -> Result {
     let task = args.next().ok_or(
         "expected gate, dns-verify, http-verify, mptcp-verify, hpack-verify, layer-verify or a host command",
     )?;
+    #[cfg(feature = "shibboleth")]
+    if task == "shibboleth-infer" {
+        return shibboleth_infer::run(&args.collect::<Vec<_>>());
+    }
     if task == "kani" {
         return gate::kani(&args.collect::<Vec<_>>());
     }
