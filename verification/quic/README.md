@@ -235,7 +235,12 @@ Five Kani harnesses retain these same bounds, arbitrary four-byte input
 and ownership assertions, with whole and partial admissions at each
 capacity and refused admission separated for solver size. They use only the shared allocation stubs. The
 shared counter's own allocation-detection harness passed in this crate;
-the source-admission harnesses have not yet returned completed verdicts.
+the source-admission runs were stopped without verdicts. The last paid
+partial-admission and refused-admission runs each spent more than sixteen
+minutes expanding paths, without reaching the solver. They did not hit the
+memory cap, and no proof failure or success is inferred from stopping them.
+The remaining paid shapes were queued behind the first paid harness and
+did not complete either.
 Run them with `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
 -Z c-ffi -Z mem-predicates -Z restrict-vtable --harness source_proofs` under
 the required scope. The ordinary tests, model and counter check do not
@@ -265,7 +270,11 @@ The Kani harness `bbr_uses_supplied_entropy` checks arbitrary seed bytes,
 entropy consumption and equality of the complete initialized RNG state
 with a generator seeded directly from those bytes. It does not verify the
 BBR congestion algorithm or cryptographic properties. Its verdict remains
-unfinished. Run it under the required scope with `cargo kani
+unfinished: both bundled SAT solvers were tried, and the runs were stopped
+without a verdict. A diagnostic variant supplying the same arbitrary seed
+one byte at a time also did not complete. The earlier comparison of four
+generated samples was replaced by the stronger full-state equality,
+without restricting the seed domain. Run it under the required scope with `cargo kani
 -p fictionet-quinn-proto --lib -Z stubbing --harness bbr_uses_supplied_entropy`.
 The selected harness does not stub production functions; `-Z stubbing`
 permits compiling the separate allocation harnesses in this crate.
