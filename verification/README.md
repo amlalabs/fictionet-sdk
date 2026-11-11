@@ -149,15 +149,19 @@ area's README. A bound that fails on the current code is a finding: report
 it and fix the code. Never loosen the bound until it passes.
 
 Wire the layers into the area's verify command with `xtask/src/resources.rs`.
-`resources::kani` runs the named harnesses with the counting stubs.
-`resources::tlc` runs the named configs and checks each against its first
-line (`\* Must pass` or `\* Must violate <invariant>`). HPACK's is
-`cargo xtask hpack-verify resources`. Its replay costs run in
-`hpack-verify diff`. TLS's, `cargo xtask tls-verify resources`, runs
-its costed replays too, and its harnesses with `-Z restrict-vtable`
-(`resources::kani`'s flags), which resolves a call through a trait
-object to the types that implement it. TCP and below's is `cargo xtask ip-verify
-resources`, with the reassembly vectors costed in `ip-verify diff`.
+`resources::kani` runs the named harnesses with the counting stubs and
+`-Z restrict-vtable`, one at a time (`-j 1`). `resources::tlc` runs the
+named configs and checks each against its first line (`\* Must pass` or
+`\* Must violate <invariant>`). Each area's command runs all three
+layers, except where the table says a replay runs with the area's `diff`.
+
+| Area | Command | Bounds proved | What each layer caught | Open gaps |
+| --- | --- | --- | --- | --- |
+| HPACK ([`hpack-grpc`](hpack-grpc/README.md)) | `hpack-verify resources`; replays in `hpack-verify diff` | neither table holds more than its charge at any moment; copying per block is linear (`HpackSync.tla`, Kani on the production insertion, every replayed block) | TLA+: `_without_evictfirst` and `_without_encevictfirst` violate `DecoderPaid` and `EncoderPaid`; Kani and replay: the allocate-before-evict decoder (d914d14e9) | none open |
+| TLS ([`tls`](tls/README.md)) | `tls-verify resources` | both join buffers and the parse are charged before they grow, within 2 × and `ParsePer` × what was joined; bytes allocated ≤ 4 × bytes delivered (`Join.tla`); rustls's `DeframerVecBuffer::resize` for 1, 3 and 8 records (Kani); every replayed session of rustls and of the layer | TLA+: four controls (no doubling, charging the difference, no 64 KiB cap, no parse room); Kani: no doubling, charging the difference; replays: 600,410,229 bytes for 60,018 read with the old `resize`, 717,760,840 against 299,810 with the old layer join, and the parse and deframer fixes reverted | the layer's own join harness does not fit (Kani); client-auth buffers uncharged between steps (one 64 KiB message each); rustls's QUIC path has no budget, unused by the SDK |
+| HTTP ([`http`](http/README.md)) | `http-verify resources`; replay in `http-verify diff` | HTTP/1 heads, HTTP/2 header blocks and request bodies are paid before they grow and copy at most `CopyPer` × what was received (`Assembly.tla`); the response queue stays within `SEND_CREDIT`, the receive window within its charge, a stalled stream waits at most `WriteTimeout` (`SendHold.tla`); a collected body on a roomy budget copies ≤ 4 × its bytes (Kani); every request vector, costed (replay) | TLA+: the head before 3271cfe52 and at 3271cfe52, `Respond` before bf20d67f4, allocate-before-charge, `ChargedBytes` before 84530d0d5, and three `SendHold` controls; replay: 1,877,416,964 and 260,172,451 bytes against 8,445,148 for the two old heads; Kani: exact-length body growth | the head-assembly harnesses and the tight-budget body harness do not fit (Kani); a budget that frees room in step with the pieces makes a head copy once a piece (`Assembly_head_budgetmoves`) |
+| TCP and below ([`packet-udp`](packet-udp/README.md)) | `ip-verify resources`; reassembly vectors in `ip-verify diff` | reassembly within its 4 MiB, a UDP socket within its budget, a TCP store within its charges plus `PLACES` (`Holding.tla`); a UDP socket holds and asks for no more than it was charged (Kani); reassembly, UDP floods, TCP stores, DNS queries and the resolver cache, costed (sessions) | TLA+: room-first, move-first, charge-first and headers controls; Kani: `Socket::keep` without its header charge; sessions: each of the five fixed bugs' old code, and a store that copies all it holds on each delivery | the reassembly, TCP store and third UDP harnesses do not fit (Kani); the cache's deduplication is quadratic in time; the count of queries the resolver holds at once is unchecked |
+| Runtime, layers, SSH, WebSocket ([`layer`](layer/README.md), [`world-net`](world-net/README.md), [`ssh-layer`](ssh-layer/README.md), [`websocket`](websocket/README.md)) | `layer-verify resources` | a charged container never holds more than its budget while it grows, and a refusal allocates nothing; the report store, a limited cable and `PacketQueue` stay within their charges; the WebSocket decoder keeps ≤ `held()` ≤ its limit; SSH decoding before keys asks for at most the packet; the world's memory splits into charged payload, bounded overhead, topology the world makes and trusted application storage (`Memory.tla`, `Growth.tla`, `Assembly.tla`, `TransportMemory.tla`; 11 Kani harnesses; SSH and WebSocket replays) | TLA+: `Growth_without_chargemove`, `Growth_places_without_chargemove`, three `Memory.tla` store controls and `Memory_agentonpair`, three WebSocket and two SSH controls; Kani: the old container growth, an unpaid report, the old WebSocket growth, an SSH read that copies the packet first; replays: `exchange_scratch` returning 0 (2,784 bytes against 1,460), the old WebSocket code | a full deque with room to double, pushes from empty through a doubling, the whole of WebSocket `decode` (Kani, out of memory); no harness for `Children`'s places, SSH channels or encrypted SSH packets |
 
 ## What the models found in the code
 
@@ -323,10 +327,11 @@ that fails before:
 - `Respond` grew a request body to exactly its length on every DATA
   frame: 202 MB for 20,000 one-byte frames. It now doubles.
 
-They also found two things reported, not fixed: `ChargedBytes` growth
-holds the old allocation and the new one with only the new one charged,
-and a client that frees its budget a little before each piece can still
-make a tight head copy once a piece (known gaps below).
+They also found `ChargedBytes` growth holding the old allocation and the
+new one with only the new one charged, which the layer area's 84530d0d5
+fixed (above), and that a client that frees its budget a little before
+each piece can still make a tight head copy once a piece (known gaps
+below).
 
 The resource properties of TCP and below (November 10,
 `packet-udp/README.md`, "Resource properties") found five more, each
@@ -354,20 +359,6 @@ fixed with a test that fails before its fix:
 
 ## Known gaps
 
-- **`ChargedBytes` grows in place, charging only the growth.**
-  `grow_to` and `grow_within` (`layer/charged.rs`) charge the difference,
-  then reallocate, so for a moment the old allocation and the new one are
-  both live with only the new one charged: up to twice what is charged,
-  for the largest buffers (a 64 MiB HTTP/2 request body growing from
-  32 MiB). HTTP/2 header blocks and request bodies grow this way
-  (`Assembly_block_chargedbytes`, `Assembly_body_chargedbytes` and the
-  Kani harness `a_collected_body_stays_within_its_charge`, in
-  `http/README.md`). Charging the new allocation whole beside the old one
-  changes what every budget must hold while a buffer grows: tried on
-  this branch, it turned three `serve_limits` HTTP/2 tests, whose budgets
-  are sized to the old accounting, from passing to failing. The same
-  holds for `ChargedDeque` and `ChargedVec` places. It is the layer
-  area's call; not changed here.
 - **A budget that frees room in step with the pieces.** A head, header
   block or body that the budget cannot double takes the largest block
   that fits. A client whose other connections free a little of the budget
@@ -397,13 +388,6 @@ fixed with a test that fails before its fix:
   reassembly and five store harnesses run past 25 minutes (the
   `BTreeMap`s' node code, and the 64-piece array `RxStore::insert`
   keeps). The costed sessions check the same bounds on the same code.
-- **A charged container's growth holds its old places uncharged for a
-  moment.** `ChargedDeque` and `ChargedVec` charge the places they grow
-  by, not the old block a reallocation holds while it moves: about
-  160 KiB for a UDP socket's queue growing from 2,048 places to 4,096.
-  Charging the old places again breaks two tests of the layer's
-  randomized model, whose refusals and wakes assume the old rule
-  (`packet-udp/README.md`, "Found, not fixed").
 - **Harnesses that drive a `Driver` or wake a `Waiter` do not finish.**
   `cargo kani -p fictionet` compiles again at 2aafab0c8 (the buffers round
   had broken `layer/kani/mod.rs`, `layer-runtime/kani/framed.rs`,

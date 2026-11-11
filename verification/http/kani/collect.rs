@@ -19,9 +19,11 @@
 //!   once is at most what was live before the body (the budget's own
 //!   state) plus `TIGHT`. While `ChargedBytes` reallocates, the old
 //!   allocation and the new one are both live, and both are charged
-//!   (84530d0d5); before, only the new one was, and a body growing from 4
-//!   to 6 bytes held 10 on a budget of 6
-//!   (`a_collected_body_stays_within_its_charge`).
+//!   (84530d0d5); before, only the new one was, and a body growing from 2
+//!   to 3 bytes held 5 on a budget of 3
+//!   (`a_collected_body_stays_within_its_charge`, which does not fit in
+//!   14 GiB; the layer area's `charged_bytes_grow_within_their_budget_*`
+//!   prove the growth).
 
 use super::*;
 use crate::counting::{counted_proof, measure, so_far};
@@ -29,10 +31,13 @@ use crate::counting::{counted_proof, measure, so_far};
 /// See the module's bounds.
 const JOIN_PER: usize = 4;
 
-/// A budget with room for the body to double to 4 bytes, and for a move
-/// out of 4 bytes only if the move charges no more than the growth: the
+/// A budget with room for the body to double to 2 bytes, and for a move
+/// out of 2 bytes only if the move charges no more than the growth: the
 /// budget that tells the two apart.
-const TIGHT: usize = 6;
+const TIGHT: usize = 3;
+
+/// A budget with room for the whole body at every doubling.
+const ROOMY: usize = 1 << 12;
 
 /// The data of one DATA frame.
 static PIECE: [u8; 1] = *b"a";
@@ -66,8 +71,7 @@ fn collect(limit: usize) -> ((usize, usize, usize, usize), crate::counting::Cost
 counted_proof! {
     #[kani::unwind(3)]
     fn a_collected_body_copies_linearly() {
-        let limit = if kani::any() { 1 << 12 } else { 6 };
-        let ((_, asked, taken, _), _) = collect(limit);
+        let ((_, asked, taken, _), _) = collect(ROOMY);
         assert!(
             asked <= JOIN_PER * taken,
             "collecting the body copied more than its bytes allow"
@@ -75,13 +79,22 @@ counted_proof! {
     }
 }
 
+// The tight budget's run checks both bounds. It does not fit: since the
+// growth charges its move (84530d0d5), CBMC runs out of 14 GiB in the
+// propositional reduction, on a budget of 6 or of 3, as it did with a
+// choice between this budget and the roomy one in one harness. Not in
+// `http-verify resources`.
 counted_proof! {
     #[kani::unwind(3)]
     fn a_collected_body_stays_within_its_charge() {
-        let ((base, _, _, _), cost) = collect(TIGHT);
+        let ((base, asked, taken, _), cost) = collect(TIGHT);
         assert!(
             cost.peak <= base + TIGHT,
             "the body held more than it was charged"
+        );
+        assert!(
+            asked <= JOIN_PER * taken,
+            "collecting the body copied more than its bytes allow"
         );
     }
 }

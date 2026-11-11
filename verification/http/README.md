@@ -877,8 +877,8 @@ what the client may still send at most the window), `QueuesTrack`,
 | `Assembly_head_without_largestwhenrefused` | violates `LinearCopy`: the head assembly at 3271cfe52, a block of exactly the need when doubling does not fit |
 | `Assembly_head_without_chargefirst` | violates `AssemblyPaid`: a block allocated before it is charged |
 | `Assembly_body_without_double` | violates `LinearCopy`: `Respond::collect` before bf20d67f4 |
-| `Assembly_block_chargedbytes` | violates `AssemblyPaid`, reported: `ChargedBytes` growth as it is |
-| `Assembly_body_chargedbytes` | violates `AssemblyPaid`, reported: the same for the body |
+| `Assembly_block_without_chargewhole` | violates `AssemblyPaid`: `ChargedBytes` growth before 84530d0d5 |
+| `Assembly_body_without_chargewhole` | violates `AssemblyPaid`: the same for the body |
 | `Assembly_head_budgetmoves` | violates `LinearCopy`, reported: a budget that frees room before each piece |
 | `SendHold_base`, `SendHold_receive_base` | pass, depth 23 |
 | `SendHold_without_stalldeadline` | violates `HoldBounded`: no reset on the stall timer |
@@ -898,7 +898,8 @@ give their stated results with it, with the state counts of before.
 
 `kani/collect.rs`, compiled into `respond.rs`, runs `collect_into` on a
 body of eight one-byte pieces, with every allocation counted, under a
-roomy budget and one of 6 bytes, where doubling is refused at 5. The
+roomy budget and, in its own harness, one of 3 bytes, where a growth
+that charges its move is refused at the third piece. The
 pieces are written out, not looped, so the unwinding bound stays at 3,
 which the budget's own loops need. `kani/resources.rs`, compiled into
 `http1.rs`, runs the production `RequestStream::push` on a head of ten
@@ -909,14 +910,16 @@ block dropped gives its charge back through the budget's wakers.
 
 | Harness | Bound | Result, November 10, 2026 |
 | --- | --- | --- |
-| `a_collected_body_copies_linearly` | the joins ask for at most `JOIN_PER` (4) times the bytes taken | passes, 105.3 s |
+| `a_collected_body_copies_linearly` | the joins ask for at most `JOIN_PER` (4) times the bytes taken, on a roomy budget | passes, 258.4 s (105.3 s with a choice of two budgets, before 84530d0d5) |
 | `a_backing_is_within_its_constant` | a one-byte chunk asks for at most its byte and `BACKING` (128) | passes, 0.1 s |
 | `the_counter_sees_every_allocation` | the counter's own check | passes, 20.8 s |
-| `a_collected_body_stays_within_its_charge` | the most live at once is at most what was live before and the body's charge at the end | fails, reported: `ChargedBytes` growth (below), 78.3 s |
+| `a_collected_body_stays_within_its_charge` | on a budget of `TIGHT` (3), the most live at once is at most what was live before and `TIGHT`, and the joins ask for at most `JOIN_PER` times the bytes taken | does not fit: out of 14 GiB in CBMC's propositional reduction, on a budget of 3 or 6; before 84530d0d5, with the bound against the charge at the end, it failed on `ChargedBytes` growth in 78.3 s |
 | `a_head_in_pieces_within_a_roomy_budget_copies_linearly` | the most live at once is at most what was live once the stream was made, the budget's limit, three backings and a piece; the pushes ask for at most `JOIN_PER` times the bytes taken, both slots and `HEAD_BLOCKS` (8) backings | not finished: still in CBMC's symbolic execution after an hour, at 9.7 GiB |
 | `a_head_in_pieces_within_a_tight_budget_copies_linearly` | the same | not run: it is the roomy harness with a choice of two budgets |
 
-`cargo xtask http-verify resources` runs the three that pass. The head
+`cargo xtask http-verify resources` runs the three that pass. The
+layer area's `charged_bytes_grow_within_their_budget_100` and `_160`
+prove the growth the tight harness was for. The head
 harnesses stay in the file. Their first version, twenty 3-byte pieces
 looped with an unwinding bound of 22, ran out of 14 GiB; ten pieces
 written out did not finish in an hour. Each push charges and releases the
@@ -998,15 +1001,15 @@ replaced `http1::RequestHead` with `web::Head`; it now uses `Head`.
 
 ### Reported, not fixed
 
-- **`ChargedBytes` growth.** `grow_to` and `grow_within` charge only the
-  growth and then reallocate, so the old and new allocations are live at
-  once with only the new charged. Header blocks and collected bodies grow
-  this way (`Assembly_block_chargedbytes`, `Assembly_body_chargedbytes`,
-  `a_collected_body_stays_within_its_charge`). Charging the new
-  allocation whole made three `serve_limits` HTTP/2 tests fail, their
-  budgets sized to the old accounting; the change belongs to
-  `layer/charged.rs` and every budget that holds a growing buffer
-  (`verification/README.md`, known gaps).
+`ChargedBytes` growth, reported here first, held the old and new
+allocations at once with only the new charged. The layer area fixed it
+at the root (84530d0d5): a growth charges the old allocation with the
+new while the bytes move. `Assembly_block_without_chargewhole` and
+`Assembly_body_without_chargewhole` are now controls of the old growth.
+The Kani harness that would show the body within a tight budget,
+`a_collected_body_stays_within_its_charge`, no longer fits in 14 GiB
+(above); the layer area's harnesses prove the growth itself.
+
 - **A budget that moves with the pieces.** With the largest-that-fits
   rule, a client whose other connections free a little room before each
   piece makes each block one piece larger
