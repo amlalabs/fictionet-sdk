@@ -152,7 +152,7 @@ impl Channel {
 /// Crypto providers and calendar time belong to the supplied configuration;
 /// use the world's TLS provider for deterministic simulation.
 pub struct QuicLayer {
-    endpoint: Endpoint,
+    endpoint: Option<Endpoint>,
     connection: Option<(ConnectionHandle, Connection)>,
     epoch: EngineInstant,
     channels: Slots<Channel>,
@@ -264,7 +264,16 @@ impl QuicLayer {
         env.entropy().fill_random(&mut seed);
         let mut endpoint = Endpoint::new(config, server, false, Some(seed));
         endpoint.set_datagram_receive_budget(env.budget());
-        Ok(Self {
+        Ok(Self::with_channels(Some(endpoint), epoch, channels, cancel))
+    }
+
+    fn with_channels(
+        endpoint: Option<Endpoint>,
+        epoch: EngineInstant,
+        channels: Slots<Channel>,
+        cancel: fn(Closing) -> VarInt,
+    ) -> Self {
+        Self {
             endpoint,
             connection: None,
             epoch,
@@ -288,7 +297,7 @@ impl QuicLayer {
             datagram_limit: None,
             datagram_turn: true,
             datagrams_ended: false,
-        })
+        }
     }
 
     /// Start this layer's client connection. Configuration must disable
@@ -301,9 +310,12 @@ impl QuicLayer {
         server_name: &str,
     ) -> Result<(), Error> {
         assert!(self.connection.is_none() && !self.ending);
+        let now = self.now(env)?;
         self.connection = Some(
             self.endpoint
-                .connect(self.now(env)?, config, remote, server_name)
+                .as_mut()
+                .expect("standalone endpoint")
+                .connect(now, config, remote, server_name)
                 .map_err(Error::Connect)?,
         );
         self.update_deadline();
@@ -572,7 +584,12 @@ impl Layer for QuicLayer {
                     return Ok(Admit::Closed(DatagramEvent::Datagram(datagram)));
                 }
                 if datagram.payload().len() as u64
-                    > self.endpoint.config().get_max_udp_payload_size()
+                    > self
+                        .endpoint
+                        .as_ref()
+                        .expect("standalone endpoint")
+                        .config()
+                        .get_max_udp_payload_size()
                 {
                     return Ok(Admit::Taken);
                 }
@@ -585,7 +602,7 @@ impl Layer for QuicLayer {
                 let now = self.now(env)?;
                 let event = response
                     .fill(|buf| {
-                        Ok::<_, ()>(self.endpoint.handle(
+                        Ok::<_, ()>(self.endpoint.as_mut().expect("standalone endpoint").handle(
                             now,
                             *datagram.meta(),
                             None,
@@ -606,12 +623,20 @@ impl Layer for QuicLayer {
                     }
                     Some(quinn_proto::DatagramEvent::NewConnection(incoming)) => {
                         if self.connection.is_some() || self.ending {
-                            self.endpoint.ignore(incoming);
+                            self.endpoint
+                                .as_mut()
+                                .expect("standalone endpoint")
+                                .ignore(incoming);
                             None
                         } else {
                             match response
                                 .fill(|buf| {
-                                    Ok::<_, ()>(self.endpoint.accept(incoming, now, buf, None))
+                                    Ok::<_, ()>(
+                                        self.endpoint
+                                            .as_mut()
+                                            .expect("standalone endpoint")
+                                            .accept(incoming, now, buf, None),
+                                    )
                                 })
                                 .expect("accept response fits a UDP payload")
                             {
@@ -805,8 +830,10 @@ impl Layer for QuicLayer {
         self.now(env)?;
         let mut moved = false;
         if let Some((handle, connection)) = self.connection.as_mut() {
-            if let Some(event) = connection.poll_endpoint_events() {
-                if let Some(event) = self.endpoint.handle_event(*handle, event) {
+            if let Some(endpoint) = self.endpoint.as_mut()
+                && let Some(event) = connection.poll_endpoint_events()
+            {
+                if let Some(event) = endpoint.handle_event(*handle, event) {
                     connection.handle_event(event);
                 }
                 moved = true;
