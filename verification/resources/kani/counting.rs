@@ -154,7 +154,7 @@ macro_rules! counted_proof {
 pub(crate) use counted_proof;
 
 mod proofs {
-    use super::{counted_proof, measure};
+    use super::{counted_proof, measure, so_far};
     use std::alloc::Layout;
     use std::boxed::Box;
     use std::collections::VecDeque;
@@ -163,13 +163,14 @@ mod proofs {
 
     counted_proof! {
         /// The counter sees what `Box`, `Vec` (grown, so reallocated, and
-        /// shrunk to a boxed slice), `VecDeque` and `Arc` allocate, at their
+        /// shrunk to a boxed slice), `VecDeque`, `Arc` and `vec![0; n]`
+        /// (zeroed, as `Chunk::block` makes its storage) allocate, at their
         /// layouts' sizes, and sees all of it freed.
         #[kani::unwind(20)]
         fn the_counter_sees_every_allocation() {
             let n: usize = kani::any();
             kani::assume(n >= 1 && n <= 4);
-            let ((), cost) = measure(|| {
+            let (zeroed, cost) = measure(|| {
                 let boxed = Box::new(0u64);
                 let mut grown: Vec<u8> = Vec::with_capacity(1);
                 grown.extend(std::iter::repeat_n(1u8, n + 1));
@@ -178,8 +179,18 @@ mod proofs {
                 let name: Arc<[u8]> = std::iter::repeat_n(0u8, n).collect();
                 deque.reserve_exact(4);
                 deque.push_front((name, Vec::new().into_boxed_slice()));
-                drop((boxed, slice, deque));
+                // Costed on its own: the bounds below have room to spare
+                // that a missed zeroed allocation would hide in.
+                let before = so_far();
+                let zeroed = std::vec![0u8; n];
+                let after = so_far();
+                assert!(zeroed.iter().all(|&byte| byte == 0));
+                drop((boxed, slice, deque, zeroed));
+                (before, after)
             });
+            let (before, after) = zeroed;
+            assert!(after.allocations > before.allocations);
+            assert!(after.requested - before.requested >= n);
             let arc = Layout::new::<[usize; 2]>()
                 .extend(Layout::array::<u8>(n).unwrap())
                 .unwrap()
