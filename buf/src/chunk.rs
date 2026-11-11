@@ -97,6 +97,13 @@ fn exact(bytes: &[u8]) -> Vec<u8> {
 }
 
 impl Chunk {
+    /// The bytes of a backing's record, beside the bytes it holds: its two
+    /// reference counts and what it keeps with them (what pays for it,
+    /// what it holds back, the pool it goes back to). A chunk with storage
+    /// keeps one alive. Pieces of one backing share it, and a pooled
+    /// backing's stays its pool's.
+    pub const RECORD_BYTES: usize = 2 * size_of::<usize>() + size_of::<Backing>();
+
     /// Bytes nothing pays for yet: input from the wire, data from the
     /// world. Whoever takes them in pays at admission
     /// ([`repay`](Self::repay)).

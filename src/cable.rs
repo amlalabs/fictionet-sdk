@@ -41,15 +41,22 @@ pub(crate) fn pair_with_guard(guard: Option<Box<dyn Send>>) -> (End, End) {
     make(guard, None)
 }
 
-/// What a queued packet costs against a limit beyond its bytes: its place
-/// in the queue. So a flood of tiny packets is bounded too.
-pub const PACKET_COST: usize = 64;
+/// What a queued packet costs against a limit beyond its bytes: its
+/// backing's record ([`Chunk::RECORD_BYTES`](crate::Chunk::RECORD_BYTES))
+/// and its place in the queue, the packet beside the word that says its
+/// slot is written and its share of the block of slots it sits in, at most
+/// two words. So a flood of tiny packets is bounded by what it keeps alive
+/// too.
+pub const PACKET_COST: usize =
+    crate::Chunk::RECORD_BYTES + size_of::<Packet>() + 2 * size_of::<usize>();
 
 /// Makes a [`pair`] whose queues each hold at most `limit` bytes, counting
-/// each packet's allocated capacity plus 64 bytes. A packet sent past that is dropped,
-/// as on a congested link. Use it for links on the agent's path, where an
-/// unlimited queue would let the agent grow the world's memory without
-/// end.
+/// each packet's allocated capacity plus [`PACKET_COST`]. A packet sent
+/// past that is dropped, as on a congested link. Beside what it counts, a
+/// queue keeps a few blocks of slots allocated whatever it holds: at most
+/// the one it reads from, the one it writes to, and the next. Use it for
+/// links on the agent's path, where an unlimited queue would let the agent
+/// grow the world's memory without end.
 pub fn pair_with_limit(limit: usize) -> (End, End) {
     make(None, Some(limit))
 }

@@ -71,4 +71,5 @@ mod tls_write_cancellation;
 mod web;
 mod wire_codec;
 mod world_layers;
+mod world_memory;
 mod writer_allocation;

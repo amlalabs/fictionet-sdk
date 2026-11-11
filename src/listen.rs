@@ -123,9 +123,10 @@ impl std::error::Error for ParseWorldSocketError {}
 /// as attach makes room, in order. The helper thread writes it out, so
 /// this happens whether or not the world is reading from that attachment.
 ///
-/// The queue has a budget of 32 MiB. Each waiting packet counts its length
-/// plus 64 bytes, so a flood of tiny packets is bounded too. A packet that
-/// would go past the budget is dropped. This is loss in the transport, not
+/// The queue has a budget of 32 MiB. Each waiting packet counts its buffer
+/// and that buffer's record, and the queue its places, so a flood of tiny
+/// packets is bounded too. A packet that would go past the budget is
+/// dropped. This is loss in the transport, not
 /// loss the world adds on purpose, and it makes the sandbox's TCP send data
 /// again, often after a delay. The large budget absorbs bursts, such as
 /// many downloads running side by side, so they are not lost. Enough
@@ -643,8 +644,9 @@ fn handshake_step(
 /// Packets an attachment reads in a row before it gives the thread back.
 const BUDGET: u32 = 64;
 
-/// How many bytes of packets may wait for room in a connection, counting
-/// [`crate::PACKET_COST`] for each. Past that, packets are dropped.
+/// How many bytes of packets may wait for room in a connection, with their
+/// records and the queue's places ([`PacketQueue`]). Past that, packets are
+/// dropped.
 const QUEUE_LIMIT: usize = 32 << 20;
 
 /// The bytes of a block a packet from attach is read into: its tag and an
