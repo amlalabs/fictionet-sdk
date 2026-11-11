@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::time::Instant as EngineInstant;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use web_time::Instant as EngineInstant;
 
 use bytes::BytesMut;
 use quinn_proto::{Connection, ConnectionHandle, Dir, Endpoint, StreamId, VarInt};
@@ -636,6 +639,7 @@ impl Layer for QuicLayer {
     }
 
     fn advance(&mut self, env: &mut Env<'_, ()>) -> Result<bool, Error> {
+        self.now(env)?;
         let mut moved = false;
         if let Some((handle, connection)) = self.connection.as_mut() {
             if let Some(event) = connection.poll_endpoint_events() {

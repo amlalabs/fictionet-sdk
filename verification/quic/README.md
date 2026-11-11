@@ -333,7 +333,32 @@ The adapter is a connection boundary, not a multi-connection listener: a
 server accepts one connection on its lower carrier. ECN and local-address
 metadata are not present in that carrier, and path MTU discovery is disabled.
 Only post-handshake stream data is exposed. Application datagrams, the
-HTTP/3 coordinator and handler integration are still absent. Engine receive
+HTTP/3 coordinator and handler integration are still absent. The vendored
+engine implements QUIC version one, not version two. Engine receive
 storage, recovery records, routing and TLS allocations remain uncharged;
 the complete three-layer resource evidence is therefore still outstanding.
 This is not yet the fully verified QUIC and HTTP/3 build-out.
+
+## Independent peer interoperability
+
+`tests/quic-interop` runs the actual datagram-backed layer against quiche
+0.30.1 in both client and server roles. Each test verifies the certificate,
+negotiates an application protocol, and exchanges a request, response and
+FINs over a bidirectional stream. The peer driver exchanges owned UDP
+payloads directly; it opens no sockets. The peer supplies its own entropy
+and clock, so these tests do not establish deterministic replay or adverse
+network scheduling. They also do not cover HTTP/3 or application datagrams.
+
+The separate test crate keeps its BoringSSL link dependencies out of the
+SDK's OpenSSL-using integration binaries. Its eleven tests pass, including
+the nine shared adapter regressions. Run `cargo test --locked
+-p fictionet-quic-interop` under the scope above. Quiche's libc upper bound
+requires libc 0.2.189 in the lockfile; the peer is a development dependency
+only. The SDK library also builds for `wasm32-unknown-unknown`, using the
+same monotonic-instant type as the engine on that target. Its existing
+unused-variable warning in `attach.rs` remains.
+
+After isolating the peer dependency, all 4,340 SDK library tests, 1,413
+integration tests and the SSH transport integration test pass. The
+`quic_sparse_reassembly` benchmark also runs at 16 KiB and 64 KiB; it still
+measures the legacy codec, not this adapter.

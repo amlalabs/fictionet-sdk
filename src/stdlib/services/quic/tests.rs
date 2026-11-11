@@ -36,17 +36,20 @@ fn configs(entropy: Arc<dyn Entropy>) -> (ClientConfig, ServerConfig, Arc<Endpoi
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).unwrap();
     let provider = Arc::new(tls::crypto_provider(entropy));
-    let client = rustls::ClientConfig::builder_with_details(provider.clone(), Arc::new(Calendar))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let server = rustls::ServerConfig::builder_with_details(provider, Arc::new(Calendar))
+    let mut client =
+        rustls::ClientConfig::builder_with_details(provider.clone(), Arc::new(Calendar))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    let mut server = rustls::ServerConfig::builder_with_details(provider, Arc::new(Calendar))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .unwrap();
+    client.alpn_protocols = vec![b"fictionet-test".to_vec()];
+    server.alpn_protocols = client.alpn_protocols.clone();
     let mut transport = quinn_proto::TransportConfig::default();
     transport
         .max_concurrent_bidi_streams(8u32.into())
