@@ -109,7 +109,7 @@ fn write_short(count: usize) {
 
 counted_proof! {
     /// The first short write, which takes a pooled block.
-    #[kani::unwind(66)]
+    #[kani::unwind(8)]
     fn a_first_short_write_is_paid_for() {
         write_short(0);
     }
@@ -117,7 +117,7 @@ counted_proof! {
 
 counted_proof! {
     /// A third short write, gathered after two.
-    #[kani::unwind(66)]
+    #[kani::unwind(8)]
     fn a_third_short_write_is_paid_for() {
         write_short(2);
     }

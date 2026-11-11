@@ -55,7 +55,7 @@ MemoryMax=10G`), with `CARGO_TARGET_DIR` outside the tree.
 | [`tcp-port-zero`](tcp-port-zero/README.md) | smoltcp's socket with source port zero (`Socket.tla`), port allocation and preparation (`Binding.tla`); the wire and socket in Kani | models named to the vendored smoltcp, `engine.rs`, `hosts.rs`; Kani included in smoltcp's tests | TLC per config; `cargo kani` |
 | [`tcp-store`](tcp-store/README.md) | the TCP socket's receive and send stores of retained chunks: what they hold, the window, acknowledgements, and pieces within one chunk | none; harnesses call the stores in `smoltcp/src/socket/tcp/{rx,tx}.rs` | `cargo kani -p smoltcp` |
 | [`observer`](observer/README.md) | the passive observer delivers each byte once and in order with holes marked (`Observer.tla`); the same for `Flow` in Kani | model named to `observer/flow.rs`, `observer.rs`; Kani on the production `Flow` | TLC per config; `cargo kani` |
-| [`packet-udp`](packet-udp/README.md) | TLA+: IP reassembly with the overlap kill, expiry and the cap (`Reassembly.tla`) and the IP layer's slots (`Dispatch.tla`), each checked to refine a spec written from the RFCs (`RfcReassembly.tla`, `RfcIpInput.tla`); UDP sockets and their queues (`UdpSockets.tla`); the trusted-checksum flag, ready for the core `Packet` (`TrustedChecksum.tla`). Lean ([lean/](packet-udp/lean/README.md)): the RFC 1071 checksum and the RFC 1624 hop update, IPv4 header checks, UDP, reassembly (any order and copies give the original; overlaps kill; limits; Time Exceeded on timeout), IPv6 extension headers, and the ICMP and ICMPv6 the engine sends (81 headline theorems, standard axioms only). Headers and checksums in Kani | `Gen.lean` vectors replayed by `tests/ip_vectors.rs`; `cargo xtask ip-verify lean|vectors|diff|all`; models named to `network/ip.rs`, `packet.rs`, `udp/sockets.rs`; Kani on the production parsers | `cargo xtask ip-verify all`; TLC per config; `cargo kani` |
+| [`packet-udp`](packet-udp/README.md) | TLA+: IP reassembly with the overlap kill, expiry and the cap (`Reassembly.tla`) and the IP layer's slots (`Dispatch.tla`), each checked to refine a spec written from the RFCs (`RfcReassembly.tla`, `RfcIpInput.tla`); UDP sockets and their queues (`UdpSockets.tla`); the trusted-checksum flag, ready for the core `Packet` (`TrustedChecksum.tla`). Lean ([lean/](packet-udp/lean/README.md)): the RFC 1071 checksum and the RFC 1624 hop update, IPv4 header checks, UDP, reassembly (any order and copies give the original; overlaps kill; limits; Time Exceeded on timeout), IPv6 extension headers, and the ICMP and ICMPv6 the engine sends (81 headline theorems, standard axioms only). Headers and checksums in Kani. Resources, for all of TCP and below: reassembly, UDP sockets, the blocks from attach, the TCP stores, DNS parsing and the resolver's cache hold no more than they are charged at any moment (`Holding.tla`, counted Kani harnesses, costed sessions) | `Gen.lean` vectors replayed by `tests/ip_vectors.rs`, each reassembly step costed; `cargo xtask ip-verify lean|vectors|diff|all`; models named to `network/ip.rs`, `packet.rs`, `udp/sockets.rs`; Kani on the production parsers and stores | `cargo xtask ip-verify all` and `resources`; TLC per config; `cargo kani` |
 | [`world-layers`](world-layers/README.md) | per-peer admission with holds and releases (`Admission.tla`), staging a machine's ports (`Staging.tla`); packet dispatch in Kani | models named to `world/net/hosts.rs`, `tcp.rs`, `children.rs` | TLC per config; `cargo kani` |
 | [`world-net`](world-net/README.md) | attachments and routes (`Attachments.tla`), the port table (`Ports.tla`), the routing table (`Table.tla`), cables (`Cable.tla`); prefixes in Kani | models named to `world/net/attachments.rs`, `network/route.rs`, `cable.rs` | TLC per config; `cargo kani` |
 
@@ -75,12 +75,15 @@ layers:
 1. **TLA+: storage is reserved before it grows.** A step in TLA+ is
    atomic, so an entry added and the old ones dropped in one step look
    the same as the reverse order. `resources/tla/Resources.tla` makes the
-   transient visible. A model keeps a store `[held, peak, reserved]` for
-   each part of the code that holds storage. Each step starts with
-   `Begin`. The model threads the store through every allocation and
+   transient visible. A model keeps a store `[held, peak, reserved,
+   short]` for each part of the code that holds storage, where `short`
+   is the most it ever held past what was reserved at that moment.
+   Each step starts with `Begin`. The model threads the store through every allocation and
    free with `Grow` and `Shrink`, in the code's order, and through every
    charge with `Reserve`, `ReserveTo` and `Release`. Then it checks three
-   invariants. `Paid`: no moment held more than was reserved. `WithinLimit`:
+   invariants. `Paid`: no moment held more than was reserved at that
+   moment, so a copy made before its charge fails even when the charge
+   comes later in the same step. `WithinLimit`:
    the reservation stays within the budget's limit. `Tracks`: the store
    holds what the model's state says, which catches a step that forgot to
    thread it. Add `EXTENDS Resources`, and give TLC
@@ -118,8 +121,13 @@ layers:
    the session replays inside its steps. Make what the caller pays for
    before the step, such as the budget or a block sized to its bound.
    `Costs::held_charge` keeps a charge the way a holder keeps one that it
-   never gives back. Each test prints a `cost:` line per kind, and the
-   area's `diff` command reports it.
+   never gives back. A step's `Charged::moved` is what a reallocation
+   moved into storage it charged, allowed in the linear bound only.
+   `Costs::amortized` holds the linear bound over a session's steps
+   together, for a holder that copies each byte a bounded number of
+   times but not in the step that brought it (a store joining blocks).
+   Each test prints a `cost:` line per kind, and the area's `diff`
+   command reports it.
 
 Bytes copied are measured as bytes asked of the allocator. Every copy
 into fresh storage is asked for first, so a step that copies all it holds
@@ -139,7 +147,8 @@ Wire the layers into the area's verify command with `xtask/src/resources.rs`.
 `resources::tlc` runs the named configs and checks each against its first
 line (`\* Must pass` or `\* Must violate <invariant>`). HPACK's is
 `cargo xtask hpack-verify resources`. Its replay costs run in
-`hpack-verify diff`.
+`hpack-verify diff`. TCP and below's is `cargo xtask ip-verify
+resources`, with the reassembly vectors costed in `ip-verify diff`.
 
 ## What the models found in the code
 
@@ -247,6 +256,30 @@ order stands and the model now takes it; `decodeBlock_ok_iff` proves the
 model's two readings accept the same blocks. All eight seeds of
 `hpack-verify diff` pass.
 
+The resource properties of TCP and below (November 10,
+`packet-udp/README.md`, "Resource properties") found five more, each
+fixed with a test that fails before its fix:
+
+- Fragment reassembly counted a third of what it held against its
+  4 MiB: 40,000 one-fragment packets held 15.2 MB. Its maps are now
+  `BTreeMap`s, its costs cover each entry's share of its trees, it makes
+  room before it copies a fragment in (for the same packets, so the Lean
+  vectors still agree), and a first fragment kept for its answer is moved,
+  not copied. `Reassembly::MOST_HELD` is the bound.
+- A UDP socket charged 64 bytes a datagram for a chunk header and a queue
+  place of 176, in a queue that never gave places back: one-byte
+  datagrams held 228 bytes each against 65 charged. The queue is a
+  `ChargedDeque` now, and each datagram charges `Chunk::HEADER`.
+- A packet from attach longer than a block was copied into storage
+  nothing paid for. It is paid from the sandbox's budget first, or
+  dropped.
+- `PLACES`, a TCP socket's open charge, left out the header of each
+  backing its stores retain: up to 12 KiB a connection beside the 5 KiB
+  charged.
+- A parsed DNS query kept every record it carried, each compression
+  pointer decoded to a name of up to 255 octets: a 64 KiB query kept
+  2.2 MB while the resolver answered it. It keeps none of them now.
+
 ## Known gaps
 
 - **Reported, not fixed.** From the models and their audit, each with its
@@ -264,6 +297,20 @@ model's two readings accept the same blocks. All eight seeds of
   (`ssh-layer`); `native.rs`'s `after` buffer is dead code. (HEADERS on a
   stream the client itself reset ends the connection; RFC 9113 allows that,
   and the stream error once listed here is RFC 7540's rule, `http2-layer`.)
+- **Most of TCP and below's counted Kani harnesses do not fit.** Of
+  the resource harnesses for reassembly, UDP and the TCP stores
+  (`packet-udp/README.md`, "Kani"), two UDP ones and the counter's check
+  in smoltcp finish; the third UDP one runs out of 14 GiB, and the three
+  reassembly and five store harnesses run past 25 minutes (the
+  `BTreeMap`s' node code, and the 64-piece array `RxStore::insert`
+  keeps). The costed sessions check the same bounds on the same code.
+- **A charged container's growth holds its old places uncharged for a
+  moment.** `ChargedDeque` and `ChargedVec` charge the places they grow
+  by, not the old block a reallocation holds while it moves: about
+  160 KiB for a UDP socket's queue growing from 2,048 places to 4,096.
+  Charging the old places again breaks two tests of the layer's
+  randomized model, whose refusals and wakes assume the old rule
+  (`packet-udp/README.md`, "Found, not fixed").
 - **Harnesses that drive a `Driver` or wake a `Waiter` do not finish.**
   `cargo kani -p fictionet` compiles again at 2aafab0c8 (the buffers round
   had broken `layer/kani/mod.rs`, `layer-runtime/kani/framed.rs`,

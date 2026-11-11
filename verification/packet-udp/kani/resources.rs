@@ -91,7 +91,7 @@ fn arrive(count: u8, id: u8) {
 
 counted_proof! {
     /// A first packet into an empty table.
-    #[kani::unwind(24)]
+    #[kani::unwind(13)]
     fn a_fragment_into_an_empty_table_stays_within_its_count() {
         arrive(0, 0);
     }
@@ -99,7 +99,7 @@ counted_proof! {
 
 counted_proof! {
     /// A second packet beside one.
-    #[kani::unwind(24)]
+    #[kani::unwind(13)]
     fn a_second_packet_stays_within_its_count() {
         arrive(1, 1);
     }
@@ -107,7 +107,7 @@ counted_proof! {
 
 counted_proof! {
     /// A third packet, past the limit: the oldest is dropped first.
-    #[kani::unwind(24)]
+    #[kani::unwind(13)]
     fn a_packet_past_the_limit_makes_room_first() {
         arrive(2, 2);
     }

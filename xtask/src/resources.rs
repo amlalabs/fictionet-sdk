@@ -19,6 +19,19 @@ use crate::lean_vectors::{Report, logged, scoped};
 /// `malloc` under them (`-Z c-ffi`), which tell a live allocation from a dangling pointer (`-Z mem-predicates`). Each harness must report
 /// `VERIFICATION:- SUCCESSFUL`.
 pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Result<Report> {
+    kani_with(root, out, package, &[], harnesses)
+}
+
+/// [`kani`], with `flags` for Kani besides, such as `-Z restrict-vtable`,
+/// which limits a trait object's calls to the types that make one: for
+/// harnesses that reach a `Budget`'s wakers.
+pub fn kani_with(
+    root: &Path,
+    out: &Path,
+    package: &str,
+    flags: &[&str],
+    harnesses: &[&str],
+) -> Result<Report> {
     let mut report = Report::new("kani");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = scoped(cargo, "14G");
@@ -35,6 +48,7 @@ pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Resul
         "mem-predicates",
         "--exact",
     ]);
+    command.args(flags);
     for harness in harnesses {
         command.arg("--harness").arg(harness);
     }

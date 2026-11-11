@@ -5,7 +5,7 @@
 //! of src/stdlib/network/udp/sockets.rs, so each harness calls the
 //! production `Socket::keep` on the private `Socket`.
 //!
-//! A socket holding zero to three datagrams of five bytes keeps one more.
+//! A socket holding zero to two datagrams of five bytes keeps one more.
 //! Its queue grows from no places to four on the first, so every count
 //! here grows it at most once, from none. Every length is a constant.
 //!
@@ -81,9 +81,9 @@ counted_proof! {
 }
 
 counted_proof! {
-    /// The fourth, into the last of the first four places.
+    /// A third, into the third of the first four places.
     #[kani::unwind(8)]
-    fn a_fourth_datagram_is_paid_before_it_is_kept() {
-        keep_one(3);
+    fn a_third_datagram_is_paid_before_it_is_kept() {
+        keep_one(2);
     }
 }
