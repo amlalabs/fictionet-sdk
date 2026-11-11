@@ -50,6 +50,10 @@ pub enum ControlCommand {
         /// The application's error when that stream cannot be opened.
         error: VarInt,
     },
+    /// Open an optional stream, or answer [`ControlEvent::Unopened`] if
+    /// the peer's stream limit or the adapter's slots cannot admit it.
+    /// Neither outcome holds the command path blocked.
+    OpenIfAllowed(Dir),
     /// Start graceful connection closure with an application error code.
     Close(VarInt),
     /// A command on the connection's application datagram carrier. `End`
@@ -70,6 +74,8 @@ pub enum ControlEvent {
     /// An event on the connection's application datagram carrier. Send
     /// completions retire local attempts, including drops, not peer delivery.
     Datagram(DatagramEvent<()>),
+    /// An [`ControlCommand::OpenIfAllowed`] stream was not opened.
+    Unopened(Dir),
     /// The connection was lost. Child handles will be retired.
     Lost(quinn_proto::ConnectionError),
     /// Connection closure and its draining period finished.
@@ -773,11 +779,16 @@ impl Layer for QuicLayer {
                 self.datagram_send = DatagramSend::Idle;
             }
             MuxOp::Control(
-                command @ (ControlCommand::Open(_) | ControlCommand::OpenOrClose { .. }),
+                command @ (ControlCommand::Open(_)
+                | ControlCommand::OpenOrClose { .. }
+                | ControlCommand::OpenIfAllowed(_)),
             ) => {
-                let (direction, error) = match command {
-                    ControlCommand::Open(direction) => (direction, None),
-                    ControlCommand::OpenOrClose { direction, error } => (direction, Some(error)),
+                let (direction, error, optional) = match command {
+                    ControlCommand::Open(direction) => (direction, None, false),
+                    ControlCommand::OpenOrClose { direction, error } => {
+                        (direction, Some(error), false)
+                    }
+                    ControlCommand::OpenIfAllowed(direction) => (direction, None, true),
                     _ => unreachable!(),
                 };
                 if !self.connected || self.up.is_some() {
@@ -788,6 +799,8 @@ impl Layer for QuicLayer {
                     .flatten();
                 if let Some(stream) = stream {
                     self.opened(stream, true, env.budget());
+                } else if optional {
+                    self.up = Some(MuxEvent::Control(ControlEvent::Unopened(direction)));
                 } else if let Some(code) = error {
                     connection.close(now, code, bytes::Bytes::new());
                     self.ending = true;
