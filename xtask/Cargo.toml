@@ -9,31 +9,19 @@ default-run = "xtask"
 [features]
 host-tools = [
     "dep:fictionet", "dep:fictionet-demo", "dep:fictionet-extras", "dep:fictionet-host",
-    "dep:http", "dep:libc", "dep:web-world", "dep:serde", "dep:serde_json", "dep:url",
+    "dep:http", "dep:web-world", "dep:serde", "dep:serde_json", "dep:url",
     "dep:tokio", "dep:fatfs", "dep:reqwest", "dep:zim", "dep:zip", "dep:mime_guess",
     "dep:tar", "dep:xz2",
 ]
-rawnic = ["host-tools", "fictionet-host/virtio-net", "dep:honeypot-world"]
 shibboleth = ["dep:honeypot-world", "dep:serde_json"]
 
-[[bin]]
-name = "honeypot-vm-guest"
-path = "src/bin/honeypot-vm-guest.rs"
-required-features = ["host-tools"]
-
-[[bin]]
-name = "rawnic-guest"
-path = "src/bin/rawnic-guest.rs"
-required-features = ["rawnic"]
-
 [dependencies]
-honeypot-world = { path = "../demos/honeypot", features = ["raw-virtio"], optional = true }
+honeypot-world = { path = "../demos/honeypot", optional = true }
 fictionet = { path = "..", optional = true }
 fictionet-demo = { path = "../demos/kit", optional = true }
 fictionet-extras = { path = "../extras", optional = true }
 fictionet-host = { path = "../host", features = ["filesystem"], optional = true }
 http = { version = "1", optional = true }
-libc = { version = "0.2", optional = true }
 web-world = { path = "../demos/search/world", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", features = ["raw_value"], optional = true }

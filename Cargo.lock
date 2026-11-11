@@ -6811,7 +6811,6 @@ dependencies = [
  "fictionet-host",
  "honeypot-world",
  "http",
- "libc",
  "mime_guess",
  "reqwest",
  "serde",
