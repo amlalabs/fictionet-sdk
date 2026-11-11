@@ -1045,3 +1045,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+#[path = "../../verification/quic/kani/version_packets.rs"]
+mod version_packets;

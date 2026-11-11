@@ -191,6 +191,42 @@ fn version_negotiation_moves_the_client_to_a_version_the_server_lists() {
     );
 }
 
+/// RFC 9368 section 2.3, Figure 1: incompatible negotiation into a version
+/// the server then upgrades from. The downgrade check judges the version
+/// the client attempted after Version Negotiation, not the one the server
+/// upgraded to, so this genuine negotiation completes.
+#[test]
+fn version_negotiation_followed_by_a_compatible_upgrade_completes() {
+    let _guard = subscribe();
+    const DRAFT: u32 = 0xff00_0020;
+    let mut client_endpoint = EndpointConfig::default();
+    client_endpoint.supported_versions(vec![QUIC_V2, QUIC_V1, DRAFT]);
+    let client = Endpoint::new(Arc::new(client_endpoint), None, true, None);
+    let mut server_endpoint = EndpointConfig::default();
+    server_endpoint.supported_versions(vec![QUIC_V1, QUIC_V2]);
+    let server = Endpoint::new(
+        Arc::new(server_endpoint),
+        Some(Arc::new(server_config())),
+        true,
+        None,
+    );
+    let mut pair = Pair::new_from_endpoint(client, server);
+    // The server cannot read the draft, lists 1 and 2, the client restarts
+    // in its preferred 2 and the server, preferring 1, upgrades to 1.
+    let (client_ch, server_ch) = pair.connect_with(client_in(DRAFT, &[QUIC_V2, QUIC_V1, DRAFT]));
+    assert_versions(&mut pair, client_ch, server_ch, QUIC_V1);
+    exchange(&mut pair, client_ch, server_ch);
+    let client = sent_by(&pair, Side::Client);
+    let server = sent_by(&pair, Side::Server);
+    assert_eq!(client[0], DRAFT);
+    assert_eq!(server[0], 0, "a Version Negotiation packet");
+    assert_eq!(client[1], QUIC_V2, "the restart uses the chosen version");
+    assert!(
+        server[1..].iter().all(|&version| version == QUIC_V1),
+        "{server:x?}"
+    );
+}
+
 #[test]
 fn a_client_without_a_listed_version_gives_up() {
     let _guard = subscribe();
