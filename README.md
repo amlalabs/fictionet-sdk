@@ -136,7 +136,7 @@ bottleneck, a router, a TCP endpoint. The crate docs show each layer.
 
 | Optional crate | Components |
 |---|---|
-| [`fictionet-extras`](extras/src/lib.rs) | Search engine results and reusable site skins with local stylesheets and assets. |
+| [`fictionet-extras`](extras/src/lib.rs) | Search engine results and reusable site skins with local stylesheets and assets. HTTP/3 server profiles for [Cloudflare and nginx](extras/src/http3.rs). |
 
 `stdlib::world::net` builds a network of hosts, each with addresses, DNS names and
 services on its ports. A service is a stack of protocol layers, written with

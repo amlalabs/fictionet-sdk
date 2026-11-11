@@ -12,6 +12,7 @@ doctest = false
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 fictionet = { path = "../.." }
+fictionet-extras = { path = "../../extras" }
 quinn-proto = { package = "fictionet-quinn-proto", path = "../../quinn-proto", default-features = false, features = ["rustls-ring"] }
 rustls = { package = "fictionet-rustls", path = "../../rustls", default-features = false, features = ["std", "ring"] }
 ring = "0.17"

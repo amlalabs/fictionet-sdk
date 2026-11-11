@@ -456,7 +456,8 @@ impl httpd::Handler for Files {
     }
 }
 
-/// The SDK's HTTP/3 listener, serving `files` on every connection
+/// The SDK's HTTP/3 listener, serving `files` on every connection with
+/// an HTTP/3 profile
 pub struct SdkH3 {
     sdk: Sdk<httpd::Http3Listener>,
     worker: Polling<<httpd::Http3Listener as Layer>::Work>,
@@ -471,7 +472,12 @@ const CONNECTIONS: usize = 64;
 const CONNECTION_BUDGET: usize = 16 << 20;
 
 impl SdkH3 {
-    pub fn server(versions: Versions<'_>, files: &BTreeMap<String, Vec<u8>>, seed: u64) -> Self {
+    pub fn server(
+        versions: Versions<'_>,
+        files: &BTreeMap<String, Vec<u8>>,
+        seed: u64,
+        profile: impl httpd::Http3Profile + 'static,
+    ) -> Self {
         let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(seed)));
         let (_, server, endpoint) = configs(entropy.clone(), b"h3", versions);
         let listener = Listener::new(
@@ -489,7 +495,9 @@ impl SdkH3 {
             std::time::Instant::now(),
             Some(SERVER.parse().unwrap()),
         );
-        let stack = httpd::Responder::new(Files(files.clone())).http3_listener(listener);
+        let stack = httpd::Responder::new(Files(files.clone()))
+            .http3_profile(profile)
+            .http3_listener(listener);
         Self {
             sdk: Sdk {
                 driver: Driver::new(

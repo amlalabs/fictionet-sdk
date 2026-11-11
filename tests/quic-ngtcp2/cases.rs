@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use fictionet::stdlib::services::quic::{AddressValidation, QUIC_V1, QUIC_V2};
+use fictionet::stdlib::web::httpd::{Http3Profile, Http3Setting, Http3Standard, Http3Stream};
 
 use crate::network::{Endpoint, Kind, Network, Scenario, Side};
 use crate::ngtcp2::{App, Clients, Closed, Ngtcp2};
@@ -159,7 +160,7 @@ fn connect(case: Case, roles: Roles, seed: u64) -> Run {
             };
             let (versions_seen, close);
             if case.app == App::H3 {
-                let mut server = SdkH3::server(versions, &files, seed);
+                let mut server = SdkH3::server(versions, &files, seed, Http3Standard);
                 net.run(&mut client, &mut server, |client, _, now| {
                     finish(client, now, &mut closed)
                 });
@@ -409,6 +410,7 @@ fn http3_dynamic_qpack_from_nghttp3() {
         },
         &files,
         seed,
+        Http3Standard,
     );
     let mut client = Ngtcp2::client(QUIC_V1, OFFER, App::H3, seed, net.now);
     client.request("/assets/app.js?version=0");
@@ -537,6 +539,185 @@ fn http3_dynamic_qpack_from_nghttp3() {
         100.0 * (static_bytes as f64 - total as f64) / static_bytes as f64
     );
     eprintln!("nghttp3 decoded {dynamic_responses}/20 dynamic response sections");
+}
+
+#[test]
+fn http3_profiles_with_nghttp3() {
+    profile_with_nghttp3(Http3Standard);
+    profile_with_nghttp3(fictionet_extras::http3::Cloudflare);
+    profile_with_nghttp3(fictionet_extras::http3::Nginx);
+}
+
+/// The frames on a stream, as (type, payload) pairs.
+fn frames(mut bytes: &[u8]) -> Vec<(u64, &[u8])> {
+    use fictionet::stdlib::protocols::quic::read_varint;
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let (kind, n) = read_varint(bytes).unwrap();
+        let (length, m) = read_varint(&bytes[n..]).unwrap();
+        let end = n + m + length as usize;
+        out.push((kind, &bytes[n + m..end]));
+        bytes = &bytes[end..];
+    }
+    out
+}
+
+fn is_reserved(id: u64) -> bool {
+    id >= 0x21 && (id - 0x21).is_multiple_of(0x1f)
+}
+
+/// Twenty requests from nghttp3 to a server with `profile`. The client
+/// allows three server unidirectional streams. Everything checked here
+/// comes from the profile's trait methods, so the same checks hold for
+/// every profile.
+fn profile_with_nghttp3<P: Http3Profile + Copy + 'static>(profile: P) {
+    use fictionet::stdlib::codec::{Decode, Frames, Step, Wire};
+    use fictionet::stdlib::protocols::{http3, qpack, quic::read_varint};
+
+    const ALLOWED: usize = 3;
+    let seed = 812;
+    let files = BTreeMap::from([("/assets/app.js".to_owned(), b"profile".to_vec())]);
+    let mut net = Network::new(Scenario::simple(seed));
+    let versions = Versions {
+        first: QUIC_V1,
+        preferred: OFFER,
+    };
+    let mut server = SdkH3::server(versions, &files, seed, profile);
+    let mut client = Ngtcp2::client(QUIC_V1, OFFER, App::H3, seed, net.now);
+
+    // Server streams in the order the profile opens them. A reserved stream
+    // past the client's limit is left out.
+    let mut opened = Vec::new();
+    for kind in profile.streams() {
+        if opened.len() == ALLOWED {
+            assert!(
+                matches!(kind, Http3Stream::Reserved(_)),
+                "{kind:?} needs a stream"
+            );
+            continue;
+        }
+        opened.push((*kind, 3 + 4 * opened.len() as i64));
+    }
+    let decoder = opened
+        .iter()
+        .find(|(kind, _)| *kind == Http3Stream::Decoder)
+        .map(|(_, id)| *id);
+    let acknowledgments = |client: &Ngtcp2| {
+        let Some(id) = decoder else { return 0 };
+        let mut bytes = client.stream_bytes(id, false).get(1..).unwrap_or_default();
+        let mut count = 0;
+        while let Ok(Step::Item(instruction, used)) =
+            Frames::<qpack::DecoderInstruction>::new().decode(bytes, false)
+        {
+            count += usize::from(matches!(
+                instruction.unwrap(),
+                qpack::DecoderInstruction::SectionAck(_)
+            ));
+            bytes = &bytes[used..];
+        }
+        count
+    };
+    let dynamic_requests = |client: &Ngtcp2| {
+        (0..80)
+            .step_by(4)
+            .filter(|&id| {
+                matches!(http3::Frame::parse(client.stream_bytes(id, true)),
+                Ok(http3::Frame::Headers(section)) if section[0] != 0)
+            })
+            .count()
+    };
+
+    client.request("/assets/app.js?version=0");
+    let mut requested = 1;
+    net.run(&mut client, &mut server, |client, _, _| {
+        if client.responses().is_some() && requested < 20 {
+            client.request(&format!("/assets/app.js?version={requested}"));
+            requested += 1;
+        }
+        requested == 20
+            && client.responses().is_some()
+            && acknowledgments(client) == dynamic_requests(client)
+    });
+    assert_eq!(client.failure(), None);
+    let responses = client.responses().expect("every request completes");
+    assert_eq!(responses.len(), 20);
+    for response in responses {
+        assert_eq!(response.status, Some(200));
+        assert_eq!(response.body, b"profile");
+    }
+
+    // The streams and SETTINGS the client received.
+    for (kind, id) in &opened {
+        let bytes = client.stream_bytes(*id, false);
+        let (stream_type, n) = read_varint(bytes).unwrap();
+        match kind {
+            Http3Stream::Control => {
+                assert_eq!(stream_type, 0);
+                let (frame_type, payload) = frames(&bytes[n..])[0];
+                assert_eq!(frame_type, http3::frame_type::SETTINGS);
+                let received = http3::Settings::parse(payload).unwrap().entries;
+                assert_eq!(received.len(), profile.settings().len());
+                for (listed, entry) in profile.settings().iter().zip(&received) {
+                    let (id, value) = (entry.id, entry.value);
+                    match *listed {
+                        Http3Setting::FieldSectionSize(v) => {
+                            assert_eq!(id, http3::setting::MAX_FIELD_SECTION_SIZE);
+                            assert!(value <= v);
+                        }
+                        Http3Setting::QpackTableCapacity(v) => {
+                            assert_eq!((id, value), (http3::setting::QPACK_MAX_TABLE_CAPACITY, v));
+                        }
+                        Http3Setting::QpackBlockedStreams(v) => {
+                            assert_eq!((id, value), (http3::setting::QPACK_BLOCKED_STREAMS, v));
+                        }
+                        Http3Setting::Reserved => {
+                            assert!(is_reserved(id) && is_reserved(value));
+                        }
+                    }
+                }
+            }
+            Http3Stream::Encoder => {
+                assert_eq!(stream_type, 2);
+                // An encoder that never uses the table sends nothing on it.
+                if profile.capacity(4096) == 0 {
+                    assert_eq!(bytes.len(), n);
+                }
+            }
+            Http3Stream::Decoder => assert_eq!(stream_type, 3),
+            Http3Stream::Reserved(payload) => {
+                assert!(is_reserved(stream_type));
+                assert_eq!(&bytes[n..], *payload);
+            }
+        }
+    }
+
+    // Reserved frames go before the first response's HEADERS only, and the
+    // encoder uses the dynamic table only if its policy does.
+    let mut dynamic_responses = 0;
+    for id in (0..80).step_by(4) {
+        let frames = frames(client.stream_bytes(id, false));
+        let reserved = if id == 0 {
+            profile.reserved_frames()
+        } else {
+            &[]
+        };
+        for ((kind, payload), expected) in frames.iter().zip(reserved) {
+            assert!(is_reserved(*kind));
+            assert_eq!(payload, expected);
+        }
+        let (kind, section) = frames[reserved.len()];
+        assert_eq!(kind, http3::frame_type::HEADERS);
+        dynamic_responses += usize::from(section[0] != 0);
+    }
+    assert_eq!(dynamic_responses > 0, profile.capacity(4096) > 0);
+
+    // nghttp3 uses the server's table only when the profile advertises one.
+    let advertised = profile
+        .settings()
+        .iter()
+        .any(|s| matches!(s, Http3Setting::QpackTableCapacity(v) if *v > 0));
+    assert_eq!(dynamic_requests(&client) > 0, advertised);
+    assert_eq!(acknowledgments(&client), dynamic_requests(&client));
 }
 
 /// Loss and corruption cases also check that the link impaired packets
@@ -671,7 +852,7 @@ fn http3_clients_at_once_share_one_listener() {
         first: case.first,
         preferred: case.server,
     };
-    let mut server = SdkH3::server(versions, &files, seed);
+    let mut server = SdkH3::server(versions, &files, seed, Http3Standard);
     net.run(&mut clients, &mut server, |clients, _, _| {
         clients.0.iter().all(|client| client.responses().is_some())
     });
@@ -698,7 +879,7 @@ fn http3_multiconnect_through_one_listener() {
         first: case.first,
         preferred: case.server,
     };
-    let mut server = SdkH3::server(versions, &files, seed);
+    let mut server = SdkH3::server(versions, &files, seed, Http3Standard);
     for i in 0..50 {
         let mut client = Ngtcp2::client(case.first, case.client, App::H3, seed + i, net.now);
         for path in files.keys() {

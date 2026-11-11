@@ -60,20 +60,59 @@ impl httpd::BodyStream for Streamed {
 
 #[test]
 fn quiche_http3_reaches_sdk_handlers_and_reuses_stream_slots() {
-    exchange(false, 8);
+    exchange(false, 8, httpd::Http3Standard);
 }
 
 #[test]
 fn quiche_http3_streams_responses_and_trailers_with_pending_polls() {
-    exchange(true, 8);
+    exchange(true, 8, httpd::Http3Standard);
 }
 
 #[test]
 fn insufficient_critical_stream_credit_closes_instead_of_stalling() {
-    exchange(false, 2);
+    exchange(false, 2, httpd::Http3Standard);
 }
 
-fn exchange(streamed: bool, uni: u64) {
+#[test]
+fn quiche_http3_sees_the_cloudflare_profile() {
+    exchange(false, 8, fictionet_extras::http3::Cloudflare);
+    exchange(true, 3, fictionet_extras::http3::Cloudflare);
+}
+
+#[test]
+fn quiche_http3_sees_the_nginx_profile() {
+    exchange(false, 8, fictionet_extras::http3::Nginx);
+    exchange(true, 2, fictionet_extras::http3::Nginx);
+}
+
+fn is_reserved(id: u64) -> bool {
+    id >= 0x21 && (id - 0x21).is_multiple_of(0x1f)
+}
+
+/// The SETTINGS quiche received, in wire order, match what `profile` lists.
+fn sees_settings(profile: &dyn httpd::Http3Profile, received: &[(u64, u64)]) {
+    use stdlib::protocols::http3::setting;
+    assert_eq!(received.len(), profile.settings().len(), "{received:?}");
+    for (listed, &(id, value)) in profile.settings().iter().zip(received) {
+        match *listed {
+            httpd::Http3Setting::FieldSectionSize(v) => {
+                assert_eq!(id, setting::MAX_FIELD_SECTION_SIZE);
+                assert!(value <= v);
+            }
+            httpd::Http3Setting::QpackTableCapacity(v) => {
+                assert_eq!((id, value), (setting::QPACK_MAX_TABLE_CAPACITY, v));
+            }
+            httpd::Http3Setting::QpackBlockedStreams(v) => {
+                assert_eq!((id, value), (setting::QPACK_BLOCKED_STREAMS, v));
+            }
+            httpd::Http3Setting::Reserved => assert!(is_reserved(id) && is_reserved(value)),
+        }
+    }
+}
+
+/// Forty echo exchanges between quiche's HTTP/3 client and a server with
+/// `profile`, whose peer allows `uni` server unidirectional streams.
+fn exchange<P: httpd::Http3Profile + Copy + 'static>(streamed: bool, uni: u64, profile: P) {
     let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(71)));
     let (_, server, endpoint) = configs_with_protocol(entropy.clone(), false, b"h3");
     let budget = Budget::new(32 << 20);
@@ -91,7 +130,14 @@ fn exchange(streamed: bool, uni: u64) {
     let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = observations.clone();
     let responder = httpd::Responder::new(Echo { streamed })
-        .observe(Arc::new(move |event| seen.lock().unwrap().push(event)));
+        .observe(Arc::new(move |event| seen.lock().unwrap().push(event)))
+        .http3_profile(profile);
+    // The streams the server needs; a reserved stream is optional.
+    let needed = profile
+        .streams()
+        .iter()
+        .filter(|s| !matches!(s, httpd::Http3Stream::Reserved(_)))
+        .count() as u64;
     let mut sdk = Driver::new(
         Chain::new(transport, responder.http3()),
         entropy,
@@ -138,7 +184,7 @@ fn exchange(streamed: bool, uni: u64) {
             ));
         }
         if let Some(error) = peer.peer_error() {
-            assert!(uni < 3);
+            assert!(uni < needed);
             assert!(error.is_app);
             assert_eq!(error.error_code, 0x103);
             return;
@@ -148,7 +194,7 @@ fn exchange(streamed: bool, uni: u64) {
             http3 = Some(quiche::h3::Connection::with_transport(&mut peer, &h3_config).unwrap());
         }
         if let Some(h3) = &mut http3 {
-            while uni >= 3 && sent < 40 && sent - finished < 4 {
+            while uni >= needed && sent < 40 && sent - finished < 4 {
                 let headers = [
                     quiche::h3::Header::new(b":method", b"POST"),
                     quiche::h3::Header::new(b":scheme", b"https"),
@@ -218,6 +264,7 @@ fn exchange(streamed: bool, uni: u64) {
             }
         }
         if finished == 40 {
+            sees_settings(&profile, http3.as_ref().unwrap().peer_settings_raw().unwrap());
             sdk.run().unwrap();
             let seen = observations.lock().unwrap();
             assert_eq!(seen.len(), 40);
