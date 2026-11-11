@@ -950,9 +950,28 @@ fn shared_len(len: usize) -> usize {
     (2 * size_of::<usize>() + len).next_multiple_of(align_of::<usize>())
 }
 
+/// The most a shared name allocates beyond its octets: its two counts and
+/// the padding after its octets.
+pub const NAME_HEADER: usize = 2 * size_of::<usize>() + align_of::<usize>() - 1;
+
 // A name's header and padding fit within the overhead each entry is
 // counted with, so the entries' storage stays within their size.
-const _: () = assert!(2 * size_of::<usize>() + align_of::<usize>() - 1 <= ENTRY_OVERHEAD);
+const _: () = assert!(NAME_HEADER <= ENTRY_OVERHEAD);
+
+/// The octets of the longest name in [`STATIC_TABLE`], the most a name
+/// given by a static index copies into a table entry.
+pub const LONGEST_STATIC_NAME: usize = {
+    let mut longest = 0;
+    let mut index = 0;
+    while index < STATIC_TABLE.len() {
+        let len = STATIC_TABLE[index].0.len();
+        if len > longest {
+            longest = len;
+        }
+        index += 1;
+    }
+    longest
+};
 
 /// A name for a table entry, decoded into an allocation of its own that
 /// entries can share.
