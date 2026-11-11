@@ -12,8 +12,8 @@ The shared listener also serves these handlers through a world host UDP
 socket, tested with several independent quiche connections at once. See
 [Shared datagram listener](#shared-datagram-listener) for the latest boundaries.
 Wire input now retains reservations through packet and frame ownership;
-see [Reserved wire backings](#reserved-wire-backings) for the latest resource
-evidence. Earlier sections record the state at each step. Remaining priorities
+see [Reserved reassembly storage](#reserved-reassembly-storage) for the latest
+resource evidence and the acknowledgment admission fix. Earlier sections record the state at each step. Remaining priorities
 are whole-engine budgeting, the remaining version-two work and unresolved proofs.
 
 The intended boundary is a layer over the world's datagram carrier, with
@@ -1229,3 +1229,97 @@ All 4,373 pre-existing SDK library tests, the new listener regression,
 1,413 integration tests and 303 SDK doctests pass. Rustfmt and clippy with
 warnings denied pass. All Cargo, Kani and TLC invocations use the required
 memory-limited scope and the separate target directory.
+
+
+## Reserved reassembly storage
+
+`Endpoint::set_reassembly_budget` installs a budget on future connections
+before either STREAM or CRYPTO frames are processed. The assembler reserves
+its descriptor growth before allocating. It retains the geometric growth
+history as its charge, less than twice the current descriptor capacity;
+that covers old and replacement allocations together and each replacement's
+copying cost. Clearing or recycling a receive stream retains both capacity
+and its reservation. Dropping it releases both.
+
+Compaction now sorts, deduplicates and rebuilds in the same descriptor
+allocation. It reserves one new payload and its shared owner before copying,
+while original wire owners remain live. Every contiguous output run shares
+that new backing. Application slices keep its payment after the connection
+and other slices are gone. A refused compaction still removes duplicate
+ranges in place and preserves every useful byte; it allocates nothing.
+An insertion that cannot reserve another descriptor, or that leaves more
+than the existing gap limit after compaction, ends the connection with an
+internal transport error. It does not silently discard reliable data.
+
+The pressure regression exposed an acknowledgment error in the previous
+receive path. Authentication inserted the packet number into pending ACKs
+before frame processing. When storage admission then failed, the closing
+packet ACKed the rejected bytes and the sender reported its stream finished.
+ACK admission now follows successful processing, including the first Initial
+packet. Closing packets can still acknowledge earlier successfully processed
+packets. This enforces the enqueue-before-ACK rule in
+[RFC 9000 section 13.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-13.1).
+The unchanged pressure regression now receives a connection error without
+stream success or application acceptance. No rollback of earlier frames in
+that rejected packet is claimed; the connection closes.
+
+The resource replays measure descriptor growth and reuse, successful copies
+from charged wire input at one, sixty-four, twelve hundred and sixteen
+thousand bytes per fragment, and allocation-free descriptor/copy refusal.
+Compaction makes at most one copy of its retained useful input plus one owner;
+it creates no new descriptor allocation. These are individual compaction
+costs, not an amortized bound over arbitrary packet delivery. A seeded
+regression mixes small copied spans, large retained spans, overlaps, gaps and
+partial reads, checking every byte and final budget release. A protected-peer
+regression checks CRYPTO admission from the endpoint's budget, then exhausts
+that budget and checks STREAM refusal and close behavior.
+
+Four Kani harnesses pass with the shared counting stubs and no production
+stubs: copy refusal, arbitrary four-byte copying with two shared slices,
+descriptor refusal and two empty descriptor-capacity growth steps. Each
+checks actual peak allocation against its reservation and requested bytes
+against a linear bound. The copy coefficient is one, with one owner as its
+fixed term. Descriptor growth has no input-byte term and a fixed term for
+four initial and eight replacement descriptors. The allocator sanity
+harness also passes. Run under the required scope:
+
+```sh
+cargo kani -p fictionet-quinn-proto --lib -Z stubbing -Z c-ffi \
+  -Z mem-predicates -Z restrict-vtable --harness reassembly_copy_ \
+  --harness reassembly_empty_descriptor --harness reassembly_descriptors_refuse \
+  --harness the_counter_sees_every_allocation
+```
+
+The broader `reassembly_descriptor_growth_fits_its_reservation` harness
+inserts five descriptors with an arbitrary offset and checks their contents
+as well as both allocation bounds. Its first run exhausted the fourteen
+GiB scope during propositional conversion. The focused empty-capacity proof
+does not prove heap ordering, payload preservation or the full insertion
+path. The existing five-insertion assertions remain in the broader harness.
+
+`ReassemblyStorage.tla` models descriptor growth, shared compacted backings,
+retained source owners and application slices. Its base passes with 473
+generated states, 173 distinct states and depth twenty-one. Removing
+descriptor admission, removing copy admission, or releasing payment while
+a slice remains each violates `StoragePaid`. The model checks the combined
+budget and tracked storage in abstract descriptor/backing units; it is not
+a byte bound or a production trace replay.
+
+`ReceiveAdmission.tla` separately models two protected packets with two
+reliable frames each, partial processing, storage refusal, malformed frames
+and normal or closing ACK output. Its base passes with 61 generated states,
+41 distinct states and depth eight. Restoring ACK admission at authentication
+violates `AckAfterProcessing`. The reachability control violates
+`NoCompletedPacket`. This model abstracts cryptography, frame parsing and
+application consumption; it does not prove the production packet loop.
+Run both modules' configurations with the scoped TLC command and shared
+resource library described above.
+
+Whole-engine budgeting remains incomplete. Wire backings must still enter
+through `PacketBuffer`; the legacy byte APIs cannot acquire a retrospective
+charge. Unordered-read interval sets, stream records and maps, sent-packet
+and retransmission metadata, TLS queues and endpoint routing are outside
+these bounds. A dedicated control-input reserve and progress under sustained
+budget pressure also remain unresolved. No rustls files changed. The next
+priority remains those engine allocations, followed by version two and the
+older unresolved proofs.

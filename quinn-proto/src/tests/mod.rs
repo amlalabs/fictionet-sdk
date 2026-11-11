@@ -136,6 +136,31 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 #[test]
+fn receive_reassembly_uses_the_endpoint_budget_and_refuses_stream_growth() {
+    let budget = fictionet_buf::Budget::new(64 << 10);
+    let mut pair = Pair::default();
+    pair.server.endpoint.set_reassembly_budget(&budget);
+    let (client, server) = pair.connect();
+    // The handshake's CRYPTO descriptors were admitted against the same budget.
+    assert!(budget.used() > 0);
+    let retained = budget.used();
+    let held = budget.charge(budget.limit() - retained).unwrap();
+    let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+    pair.client_send(client, stream).write(b"unpaid").unwrap();
+    pair.client_send(client, stream).finish().unwrap();
+    pair.drive();
+    assert!(pair.server_conn_mut(server).is_closed());
+    assert_matches!(
+        pair.client_conn_mut(client).poll(),
+        Some(Event::ConnectionLost { reason: ConnectionError::ConnectionClosed(ref close) })
+            if close.error_code == TransportErrorCode::INTERNAL_ERROR
+    );
+    assert_eq!(pair.server_streams(server).accept(Dir::Uni), None);
+    drop((pair, held));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn charged_wire_storage_survives_decryption_and_partial_stream_reads() {
     let mut pair = Pair::default();
     let (client, server) = pair.connect();

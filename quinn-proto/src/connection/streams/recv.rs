@@ -77,7 +77,7 @@ impl Recv {
         if !self.stopped {
             self.assembler
                 .insert(frame.offset, frame.data, payload_len)
-                .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in stream buffer"))?;
+                .map_err(|_| TransportError::INTERNAL_ERROR("stream receive storage exhausted"))?;
         }
 
         Ok((new_bytes, frame.fin && self.stopped))
