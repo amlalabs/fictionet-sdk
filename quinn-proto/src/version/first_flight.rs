@@ -368,4 +368,46 @@ mod tests {
         assert!(CryptoData::read(&payload).is_some());
         assert!(client_version_information(&payload).is_none());
     }
+
+    /// The reader allocates nothing on any first flight: a whole offer,
+    /// shuffled frames, every truncation of it and every byte of it
+    /// flipped, each read as a step with nothing allowed
+    #[test]
+    fn the_reader_allocates_nothing_on_any_first_flight() {
+        use crate::cost::{Charged, Costs, Linear};
+        let hello = client_hello(&params(QUIC_V1, &[QUIC_V2, QUIC_V1]));
+        let whole = crypto_frame(0, &hello);
+        let (a, b) = hello.split_at(40);
+        let mut shuffled = crypto_frame(40, b);
+        shuffled.extend([0x02, 0x05, 0x00, 0x01, 0x00, 0x01, 0x01]);
+        shuffled.extend(crypto_frame(0, a));
+        let mut payloads = vec![whole.clone(), shuffled];
+        payloads.extend((0..whole.len()).map(|len| whole[..len].to_vec()));
+        payloads.extend((0..whole.len()).map(|at| {
+            let mut flipped = whole.clone();
+            flipped[at] ^= 0xff;
+            flipped
+        }));
+        let nothing = Linear {
+            num: 0,
+            den: 1,
+            fixed: 0,
+        };
+        let mut costs = Costs::new("QUIC first flight");
+        let mut offers = 0;
+        for payload in &payloads {
+            let offer = costs.step(payload.len(), 0, nothing, || Charged {
+                value: client_version_information(payload),
+                charged: 0,
+            });
+            offers += usize::from(offer.is_some());
+        }
+        // The whole offer and the shuffled one are read.
+        assert!(offers >= 2);
+        eprintln!("cost: QUIC first flight: {}", costs.summary());
+    }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/quic/kani/first_flight_storage.rs"]
+mod first_flight_storage_proofs;

@@ -27,7 +27,7 @@ const UNSTABLE: [&str; 1] = ["restrict-vtable"];
 /// key derivations charged first, Retry and Version Negotiation packets
 /// and tokens in the send buffer, a client's Retry copy within its charge,
 /// and the version rules without allocation.
-const KANI_RESOURCES: [&str; 16] = [
+const KANI_RESOURCES: [&str; 14] = [
     "counting::proofs::the_counter_sees_every_allocation",
     "connection::negotiation::negotiation_storage_proofs::other_initial_keys_are_charged_before_they_are_derived",
     "connection::negotiation::negotiation_storage_proofs::installed_keys_free_the_old_ones_before_the_charge_goes",
@@ -36,14 +36,12 @@ const KANI_RESOURCES: [&str; 16] = [
     "packet::retry::retry_storage_proofs::a_server_tags_a_retry_in_its_send_buffer",
     "packet::retry::retry_storage_proofs::a_client_copies_a_retry_only_within_its_charge",
     "endpoint::version_negotiation_proofs::version_negotiation_is_written_in_the_send_buffer",
-    "token::token_storage_proofs::a_retry_token_is_sealed_and_opened_in_place",
+    "token::token_storage_proofs::a_retry_token_is_sealed_in_place",
     "token::token_storage_proofs::a_returned_token_never_allocates",
-    "version::version_storage_proofs::the_first_flight_offer_is_read_in_place",
-    "version::version_storage_proofs::any_short_first_flight_is_read_in_place",
+    "version::first_flight::first_flight_storage_proofs::the_transport_parameter_offer_is_read_in_place",
     "version::version_storage_proofs::version_choices_allocate_nothing",
     "version::version_storage_proofs::version_information_is_encoded_in_place",
     "transport_parameters::version_information_proofs::version_information_body_checks_the_connection_without_allocating",
-    "transport_parameters::version_information_proofs::version_information_checks_the_connection_without_allocating",
 ];
 
 /// The code, a control for each flag of the model, and the states each

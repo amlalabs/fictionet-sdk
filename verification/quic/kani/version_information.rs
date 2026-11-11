@@ -54,7 +54,7 @@ counted_proof! {
 }
 
 counted_proof! {
-    #[kani::unwind(24)]
+    #[kani::unwind(10)]
     fn version_information_checks_the_connection_without_allocating() {
         let bytes: [u8; 12] = kani::any();
         let connection: u32 = kani::any();

@@ -376,7 +376,7 @@ fn encode_unix_secs(buf: &mut Vec<u8>, time: SystemTime) {
 }
 
 fn decode_unix_secs<B: Buf>(buf: &mut B) -> Option<SystemTime> {
-    Some(UNIX_EPOCH + Duration::from_secs(buf.get::<u64>().ok()?))
+    UNIX_EPOCH.checked_add(Duration::from_secs(buf.get::<u64>().ok()?))
 }
 
 /// Stateless reset token
@@ -539,6 +539,22 @@ mod test {
 
         assert_eq!(ip_1, ip_2);
         assert_eq!(issued_1, issued_2);
+    }
+
+    #[test]
+    fn a_token_issued_past_the_end_of_time_is_refused() {
+        let key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&[5; 64]);
+        let nonce = 7u128.to_le_bytes();
+        let version = 1u32;
+        // A validation token for 127.0.0.1 issued u64::MAX seconds after the epoch.
+        let mut token = vec![TokenType::Validation as u8, 0, 127, 0, 0, 1];
+        token.extend_from_slice(&u64::MAX.to_be_bytes());
+        let tag = key
+            .seal(&nonce, &mut token, &version.to_be_bytes())
+            .unwrap();
+        token.extend_from_slice(&tag);
+        token.extend_from_slice(&nonce);
+        assert!(Token::decode(&key, version, &token).is_none());
     }
 
     #[test]
