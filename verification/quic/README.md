@@ -1,15 +1,17 @@
 # QUIC
 
 The vendored `quinn-proto` engine uses the workspace rustls fork. It is
-now wired into a single-connection Fictionet layer. Owned stream writes retain charged
-payloads, but engine metadata and the legacy byte APIs are not budgeted. This directory records evidence as that work grows;
+wired into both a single-connection layer and a shared datagram listener.
+Owned stream writes retain charged payloads, but engine metadata and the
+legacy byte APIs are not budgeted. This directory records evidence as that work grows;
 it does not claim verification of the whole transport or HTTP/3.
 
 The current server composes HTTP/3 and static QPACK over `QuicLayer` into
 the SDK's existing web handlers, with independent quiche interoperability.
-See [HTTP/3 handlers over QUIC streams](#http3-handlers-over-quic-streams)
-for the latest implementation and proof boundaries. Earlier sections record
-the state at each step. Remaining priorities are shared listener routing,
+The shared listener also serves these handlers through a world host UDP
+socket, tested with several independent quiche connections at once. See
+[Shared datagram listener](#shared-datagram-listener) for the latest boundaries.
+Earlier sections record the state at each step. Remaining priorities are
 whole-engine budgeting, the remaining version-two work and unresolved proofs.
 
 The intended boundary is a layer over the world's datagram carrier, with
@@ -995,3 +997,134 @@ No rustls files changed. Remaining build-out priority is listener
 routing, whole-engine budgeting, version two, then the previously
 unfinished proofs. A full HTTP/3 client/proxy and optional dynamic QPACK
 profile are separate from this working server profile.
+
+## Shared datagram listener
+
+`services::quic::Listener` owns one vendored endpoint over
+`Datagrams<SocketAddr>` and exposes `Mux<Quic, Top, ConnInfo>`. Its children
+reuse the stream and application-datagram adapter from `QuicLayer`.
+`Children` can therefore put `Responder::http3()` on each connection. This
+stack attaches directly to `Host::udp_stack`; no second UDP socket or async
+transport task is created per connection. The constructor's documentation
+has the composition example. TLS configuration must negotiate `h3`.
+
+The listener initializes on its first environment step, reserving the
+connection slots before constructing the endpoint or drawing entropy.
+Before accepting a new connection it reserves that connection's stream
+slots. Handshakes and draining connections count against the configured
+connection limit. When full it ignores new Initials and cleans up their
+incoming handles; existing connections continue. One shared socket budget
+pays for adapter storage. This is not per-sandbox admission or a bound on
+all engine allocations.
+
+The endpoint routes packets by connection ID, and the adapter processes
+its identifier issuance, retirement and draining events even while an
+application cannot read. A connection is exposed only after handshake
+completion, with local and peer addresses, TLS, SNI and ALPN metadata.
+The application factory may choose a different application for each
+negotiated protocol. Metadata reflects acceptance, not later migration.
+Connection events add no second credit window around the independently
+credited streams and application datagrams; the existing children router
+bounds their queued descriptors and repays their payload storage.
+
+Sends and application events rotate among live connections. Engine and
+stream work is scanned in bounded slot order, including when upper output
+is blocked; this is not a new constant-time scheduler claim. At most one
+tracked send is outstanding on the lower carrier. Its owner is either the
+endpoint or a generation-bearing connection child. Completion reaches only
+that owner, and excess completion counts leave the ownership unchanged.
+A connection is retained until its final endpoint event, its application
+events and its local send have retired. Closing one connection never ends
+the shared datagram carrier. Closing that carrier cancels pending completions
+and retires all children.
+
+The distinction between engine handles and child generations matters: an
+engine handle can be reused after `Drained` while its old adapter still
+owns an outstanding UDP send. The listener disables routing to the old
+adapter before returning `Drained` to the endpoint. A regression forces
+that reuse, checks that incoming events select the new adapter, and checks
+that send completion still retires the old one's send. Other regressions
+cover a close while a send is outstanding, invalid completion refusal,
+full-listener admission, zero-budget input preservation and lower-carrier
+closure with a pending application-datagram completion.
+
+Independent HTTP/3 tests run three quiche clients concurrently from the
+same socket address, with different connection IDs and different
+20,000-byte POST bodies. Exact echoed responses establish separation of
+request state. Every client retires its first destination connection ID
+and continues through a replacement issued by the shared endpoint. Three
+rounds serve nine connections through three slots, exercising drain
+deadlines and reuse. Another test leaves one entire QUIC application
+unread while its sibling completes an HTTP/3 request.
+
+The world-host test attaches the listener stack to `Host::udp_stack`,
+connects three quiche clients through one native UDP socket on a sandbox
+machine, and checks all three HTTP/3 responses and accepted metadata.
+Packets traverse the world's native IP and UDP layers. This is a world
+host test, not a live OS UDP test. Certificate verification remains on.
+The earlier single-connection tests still cover collected and streamed
+responses and trailers. No new listener-specific lossy or migration replay
+is claimed.
+
+`Listener.tla` models three distinct child lifetimes, two recycled engine
+handles, two admitted connections and one outstanding send. The base passes:
+2,827 generated states, 955 distinct states, depth eleven. Its controls
+violate `Bounded`, `RoutesCurrent`, `CompletionOwned` and `PaidStorage` when
+admission, route retirement, send retention or reservation is removed.
+The resource store models per-connection stream-slot storage as one abstract
+unit, with freeing and releasing its reservation in separate steps. It
+checks payment, the limit and tracked storage; it does not measure bytes,
+model the fixed listener table or account for endpoint allocations.
+The model does not replay production traces or prove cryptography,
+connection-ID authentication, packet recovery or scheduler progress.
+Run its five configurations using the scoped TLC invocation and shared
+resource library described earlier, with `Listener.tla` as the module.
+
+The Kani harness
+`listener_completion_preserves_its_owner_without_allocating` passes with
+arbitrary owner values, arbitrary sixty-four-bit completion counts and all
+three ownership states. It calls the production generic completion method,
+proving exact ownership, no mutation on refusal or zero completion, and
+zero peak and requested allocations with the shared counting stubs. The
+counter sanity harness also passes. No production function is stubbed.
+A temporary mutation discarding the connection owner fails the owner
+assertion; it was removed and the original harness passes again. Run:
+
+```sh
+cargo kani -p fictionet --lib -Z stubbing -Z c-ffi -Z mem-predicates \
+  -Z restrict-vtable --harness listener_completion_preserves_its_owner_without_allocating \
+  --harness the_counter_sees_every_allocation
+```
+
+The allocation replay constructs the listener and offers caller-owned input
+against a zero-byte budget. Both peak allocation and requested bytes must
+be zero: per-input and fixed costs are both zero for refusal. Constructing
+slots against an unrelated unlimited budget makes this replay fail with
+22,572 live bytes against zero charged. That mutation was removed. This
+replay proves refusal before allocation; successful endpoint admission,
+wire copies, handshake metadata and engine routing still lack complete
+resource bounds. The earlier unfinished Kani harnesses remain unfinished.
+
+No rustls files changed. The next build-out priority is whole-engine
+budgeting, followed by the remaining version-two work and unresolved
+proofs. The HTTP/3 server retains its static QPACK profile; an HTTP/3
+client/proxy and optional dynamic compression remain separate work.
+
+Validation for this step: all 4,373 SDK library tests, 1,413 integration
+tests and 303 doctests pass. The isolated QUIC/HTTP/3 suite passes all 31
+tests. Clippy with warnings denied passes for both crates and all their
+targets; rustfmt passes, including the included listener test source.
+Cargo doc succeeds with the existing redundant-link warning in
+`network/packet.rs`. The QPACK long-instruction decoder benchmark ran both
+7,500-byte and 30,000-byte cases with ten samples; this is not a listener
+throughput measurement. All Cargo, Kani and TLC commands ran in the required
+memory-limited scope with artifacts in the separate target directory.
+
+For the next budgeting step, both datagram adapters still copy incoming
+payloads into `BytesMut` before `Endpoint::handle`. Those backings can be
+split and retained through packet and frame processing, so a temporary
+reservation around the call alone would not cover their lifetime. Endpoint
+routing and incoming queues, stream receive state, packet recovery and TLS
+allocations likewise remain in scope for whole-engine admission. The new
+listener's connection and stream limits must not be presented as that
+missing heap bound.

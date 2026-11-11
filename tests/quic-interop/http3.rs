@@ -290,3 +290,7 @@ fn http3_connection_storage_is_reserved_before_growth() {
         assert_eq!(budget.used(), 0);
     }
 }
+
+mod listener {
+    include!("listener.rs");
+}
