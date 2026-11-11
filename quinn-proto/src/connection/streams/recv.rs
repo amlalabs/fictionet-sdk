@@ -57,11 +57,8 @@ impl Recv {
             ));
         }
 
-        if let Some(final_offset) = self.final_offset() {
-            if end > final_offset || (frame.fin && end != final_offset) {
-                debug!(end, final_offset, "final size error");
-                return Err(TransportError::FINAL_SIZE_ERROR(""));
-            }
+        if !valid_final_size(self.final_offset(), self.end, end, frame.fin) {
+            return Err(TransportError::FINAL_SIZE_ERROR(""));
         }
 
         let new_bytes = self.credit_consumed_by(end, received, max_data)?;
@@ -174,14 +171,13 @@ impl Recv {
         max_data: u64,
     ) -> Result<bool, TransportError> {
         // Validate final_offset
-        if let Some(offset) = self.final_offset() {
-            if offset != final_offset.into_inner() {
-                return Err(TransportError::FINAL_SIZE_ERROR("inconsistent value"));
-            }
-        } else if self.end > u64::from(final_offset) {
-            return Err(TransportError::FINAL_SIZE_ERROR(
-                "lower than high water mark",
-            ));
+        if !valid_final_size(
+            self.final_offset(),
+            self.end,
+            final_offset.into_inner(),
+            true,
+        ) {
+            return Err(TransportError::FINAL_SIZE_ERROR("inconsistent final size"));
         }
         self.credit_consumed_by(final_offset.into(), received, max_data)?;
 
@@ -232,6 +228,22 @@ impl Recv {
         Ok(new_bytes)
     }
 }
+
+/// A final size cannot omit bytes already accounted for or change a size
+/// already declared. Data, including reordered frames, must fit that size.
+fn valid_final_size(known: Option<u64>, received_end: u64, end: u64, fin: bool) -> bool {
+    if fin && end < received_end {
+        return false;
+    }
+    match known {
+        Some(size) => end <= size && (!fin || end == size),
+        None => true,
+    }
+}
+
+#[cfg(kani)]
+#[path = "../../../../verification/quic/kani/final_size.rs"]
+mod final_size_proofs;
 
 /// Chunks returned from [`RecvStream::read()`][crate::RecvStream::read].
 ///
@@ -449,6 +461,60 @@ mod tests {
     use crate::{Dir, Side};
 
     use super::*;
+
+    #[test]
+    fn a_fin_cannot_end_before_previously_received_data() {
+        for stopped in [false, true] {
+            let mut recv = Recv::new(1024);
+            let id = StreamId::new(Side::Client, Dir::Uni, 0);
+            recv.ingest(
+                frame::Stream {
+                    id,
+                    offset: 3,
+                    fin: false,
+                    data: Bytes::from_static(b"abc"),
+                },
+                1200,
+                0,
+                1024,
+            )
+            .unwrap();
+            if stopped {
+                let _ = recv.stop().unwrap();
+            }
+            for end in 0..6 {
+                let error = recv
+                    .ingest(
+                        frame::Stream {
+                            id,
+                            offset: end,
+                            fin: true,
+                            data: Bytes::new(),
+                        },
+                        1200,
+                        6,
+                        1024,
+                    )
+                    .expect_err("FIN cannot shrink the stream's final size");
+                assert_eq!(error.code, TransportError::FINAL_SIZE_ERROR("").code);
+                assert_eq!(recv.end, 6);
+                assert_eq!(recv.final_offset(), None);
+            }
+            assert!(recv
+                .ingest(
+                    frame::Stream {
+                        id,
+                        offset: 6,
+                        fin: true,
+                        data: Bytes::new(),
+                    },
+                    1200,
+                    6,
+                    1024
+                )
+                .is_ok());
+        }
+    }
 
     #[test]
     fn reordered_frames_while_stopped() {

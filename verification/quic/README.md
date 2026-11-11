@@ -362,3 +362,43 @@ After isolating the peer dependency, all 4,340 SDK library tests, 1,413
 integration tests and the SSH transport integration test pass. The
 `quic_sparse_reassembly` benchmark also runs at 16 KiB and 64 KiB; it still
 measures the legacy codec, not this adapter.
+
+## Stream final sizes
+
+The engine accepted a first FIN ending before data it had already received.
+The regression first supplies bytes at offsets three through six, then
+tries FINs ending at zero through five, both with and without a local
+STOP_SENDING. It failed before the fix: the first FIN returned success.
+`Recv::ingest` now checks the existing high-water mark before touching
+credit, state or reassembly. `Recv::reset` shares the same validation. The
+test checks rejection without changing the high-water mark or declaring
+a final size, then verifies that a FIN at six is accepted. All 324 engine
+library tests pass, as do the adapter and independent-peer tests above.
+
+`RfcFinalSize.tla` states RFC 9000 sections 4.5 and 20.1 independently:
+the final size cannot omit accounted data, change once known, or permit
+data beyond it. `FinalSize.tla` refines that specification through the
+production guard. Its high-water value projects the flow-accounted end,
+including the final size declared by reset; it is not always `Recv::end`.
+The base passes with 91 generated states, ten distinct states and depth
+three. Removing the high-water check violates `WithinFinal`. Ignoring an
+already known final size violates `Refines`. The reachability control
+violates `NoFinal`, so the base does not pass by preventing final sizes.
+Run the four configs as above, with `FinalSize.tla`.
+
+`final_sizes_preserve_received_bytes_and_known_end` passes Kani over
+arbitrary 64-bit ends, known final sizes and the FIN bit, without stubs.
+It proves both the acceptance conditions and that a rejection has a
+conflict. Run `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
+--harness final_sizes_preserve_received_bytes_and_known_end` under the
+required scope. The separate
+`a_short_final_frame_leaves_receive_state_unchanged` harness calls the
+full production receive path. Kani 0.68.0 fails while compiling it with
+an internal assertion in `kani-compiler/src/intrinsics.rs`; it has no
+proof verdict. It remains present and is not replaced by a stub.
+
+The model does not cover data delivery, flow-control limits, allocation,
+or forgetting closed streams, and has no production trace replay yet.
+The successful Kani proof is of the guard, not those caller properties.
+Clippy with warnings denied passes for the SDK, engine and interop crate,
+including their tests.
