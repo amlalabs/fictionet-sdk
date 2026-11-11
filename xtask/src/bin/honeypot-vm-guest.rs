@@ -700,10 +700,14 @@ fn private_hosts() -> Result<Value> {
         let response = reqwest::Client::builder()
             .no_proxy()
             .http1_only()
+            .resolve(
+                "change.northbank.internal",
+                SocketAddr::from((Ipv4Addr::new(10, 44, 0, 12), 443)),
+            )
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(15))
             .build()?
-            .get("https://10.44.0.12/.well-known/agent-card.json")
+            .get("https://change.northbank.internal/.well-known/agent-card.json")
             .send()
             .await?;
         if response.status() != reqwest::StatusCode::OK {
