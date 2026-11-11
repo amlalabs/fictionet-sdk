@@ -287,6 +287,9 @@ pub enum Error {
     /// Catch-all error for problems while decoding transport parameters
     #[error("parameters were malformed")]
     Malformed,
+    /// The authenticated version differs from the connection's version
+    #[error("chosen version does not match the connection")]
+    VersionMismatch,
 }
 
 impl From<Error> for TransportError {
@@ -294,6 +297,9 @@ impl From<Error> for TransportError {
         match e {
             Error::IllegalValue => Self::TRANSPORT_PARAMETER_ERROR("illegal value"),
             Error::Malformed => Self::TRANSPORT_PARAMETER_ERROR("malformed"),
+            Error::VersionMismatch => {
+                Self::VERSION_NEGOTIATION_ERROR("chosen version does not match the connection")
+            }
         }
     }
 }
@@ -405,8 +411,26 @@ impl TransportParameters {
 
     /// Decode `TransportParameters` from buffer
     pub fn read<R: Buf>(side: Side, r: &mut R) -> Result<Self, Error> {
+        Self::read_inner(side, None, r)
+    }
+
+    /// Decode peer parameters for a connection that does not switch versions.
+    ///
+    /// Version Information is checked in place, without retaining the peer's
+    /// list. Compatible negotiation and fallback after a Version Negotiation
+    /// packet need additional selection and downgrade checks before use.
+    pub(crate) fn read_for_version<R: Buf>(
+        side: Side,
+        version: u32,
+        r: &mut R,
+    ) -> Result<Self, Error> {
+        Self::read_inner(side, Some(version), r)
+    }
+
+    fn read_inner<R: Buf>(side: Side, version: Option<u32>, r: &mut R) -> Result<Self, Error> {
         // Initialize to protocol-specified defaults
         let mut params = Self::default();
+        let mut got_version_information = false;
 
         // State to check for duplicate transport parameters.
         macro_rules! param_state {
@@ -429,6 +453,16 @@ impl TransportParameters {
                 return Err(Error::Malformed);
             }
             let len = len as usize;
+            // Version Information is receive-only until version negotiation is
+            // implemented. Its list is validated without allocating storage.
+            if id == 0x11 {
+                if got_version_information {
+                    return Err(Error::Malformed);
+                }
+                got_version_information = true;
+                read_version_information(side, len, version, r)?;
+                continue;
+            }
             let Ok(id) = TransportParameterId::try_from(id) else {
                 // unknown transport parameters are ignored
                 r.advance(len);
@@ -535,6 +569,43 @@ impl TransportParameters {
         Ok(params)
     }
 }
+
+/// Validate the wire structure and role-specific list requirements before
+/// comparing the chosen version with the connection. All entries are visited,
+/// even after the chosen version occurs, so a later zero is still rejected.
+fn read_version_information(
+    side: Side,
+    len: usize,
+    version: Option<u32>,
+    r: &mut impl Buf,
+) -> Result<u32, Error> {
+    if len < 4 || len % 4 != 0 || len > r.remaining() {
+        return Err(Error::Malformed);
+    }
+    let chosen = r.get::<u32>()?;
+    if chosen == 0 {
+        return Err(Error::IllegalValue);
+    }
+    let mut includes_chosen = false;
+    for _ in 1..len / 4 {
+        let available = r.get::<u32>()?;
+        if available == 0 {
+            return Err(Error::IllegalValue);
+        }
+        includes_chosen |= available == chosen;
+    }
+    if side.is_server() && !includes_chosen {
+        return Err(Error::IllegalValue);
+    }
+    if version.is_some_and(|version| version != chosen) {
+        return Err(Error::VersionMismatch);
+    }
+    Ok(chosen)
+}
+
+#[cfg(kani)]
+#[path = "../../verification/quic/kani/version_information.rs"]
+mod version_information_proofs;
 
 /// A reserved transport parameter.
 ///
@@ -731,6 +802,134 @@ mod test {
     use rand::TryRng;
 
     use super::*;
+
+    #[test]
+    fn version_information_checks_every_entry_and_the_peer_role() {
+        for side in [Side::Client, Side::Server] {
+            for words in [&[][..], &[0][..], &[0, 1][..], &[1, 0][..], &[1, 1, 0][..]] {
+                let bytes: Vec<_> = words.iter().flat_map(|x: &u32| x.to_be_bytes()).collect();
+                assert!(
+                    read_version_information(side, bytes.len(), None, &mut bytes.as_slice())
+                        .is_err()
+                );
+            }
+            for trailing in 1..4 {
+                let mut bytes = vec![0, 0, 0, 1, 0, 0, 0, 1];
+                bytes.extend_from_slice(&[0; 3][..trailing]);
+                assert_eq!(
+                    read_version_information(side, bytes.len(), None, &mut bytes.as_slice()),
+                    Err(Error::Malformed)
+                );
+            }
+        }
+        for words in [&[1][..], &[1, 2][..]] {
+            let bytes: Vec<_> = words.iter().flat_map(|x: &u32| x.to_be_bytes()).collect();
+            assert_eq!(
+                read_version_information(Side::Client, bytes.len(), None, &mut bytes.as_slice()),
+                Ok(1)
+            );
+            assert_eq!(
+                read_version_information(Side::Server, bytes.len(), None, &mut bytes.as_slice()),
+                Err(Error::IllegalValue)
+            );
+        }
+        // Unknown and repeated nonzero versions are legal, in either order.
+        for words in [[1u32, 2, 1], [1, 1, 2], [1, 1, 1], [1, 0x1a2a3a4a, 1]] {
+            let bytes: Vec<_> = words.iter().flat_map(|x| x.to_be_bytes()).collect();
+            for side in [Side::Client, Side::Server] {
+                for split in 0..=bytes.len() {
+                    let mut fragmented = bytes[..split].chain(&bytes[split..]);
+                    assert_eq!(
+                        read_version_information(side, bytes.len(), None, &mut fragmented),
+                        Ok(1)
+                    );
+                    assert_eq!(fragmented.remaining(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn version_information_is_bounded_by_its_parameter_and_not_repeated() {
+        let valid = [0x11, 8, 0, 0, 0, 1, 0, 0, 0, 1];
+        for side in [Side::Client, Side::Server] {
+            assert!(TransportParameters::read_for_version(side, 1, &mut &valid[..]).is_ok());
+            assert_eq!(
+                TransportParameters::read_for_version(side, 2, &mut &valid[..]),
+                Err(Error::VersionMismatch)
+            );
+            let mut repeated = valid.to_vec();
+            repeated.extend_from_slice(&valid);
+            assert_eq!(
+                TransportParameters::read(side, &mut repeated.as_slice()),
+                Err(Error::Malformed)
+            );
+            for end in 0..8 {
+                let mut truncated = valid[..2 + end].to_vec();
+                truncated[1] = end as u8;
+                assert!(
+                    TransportParameters::read(Side::Server, &mut truncated.as_slice()).is_err()
+                );
+            }
+            // A following parameter cannot supply the missing list entry.
+            let followed = [0x11, 4, 0, 0, 0, 1, 0x04, 1, 17];
+            assert_eq!(
+                TransportParameters::read(Side::Server, &mut &followed[..]),
+                Err(Error::IllegalValue)
+            );
+            let params = TransportParameters::read(Side::Client, &mut &followed[..]).unwrap();
+            assert_eq!(params.initial_max_data, VarInt::from_u32(17));
+        }
+        assert_eq!(
+            u64::from(TransportError::from(Error::VersionMismatch).code),
+            0x11
+        );
+        assert_eq!(u64::from(TransportError::from(Error::Malformed).code), 0x08);
+        assert_eq!(
+            u64::from(TransportError::from(Error::IllegalValue).code),
+            0x08
+        );
+    }
+
+    #[test]
+    fn version_information_does_not_allocate_for_the_available_list() {
+        use crate::cost::{Charged, Costs, Linear};
+        let mut bytes = vec![0x11];
+        bytes.write_var(4 * 1025);
+        bytes.write(1u32);
+        for version in 1u32..=1024 {
+            bytes.write(version);
+        }
+        let mut costs = Costs::new("version information");
+        let linear = Linear {
+            num: 0,
+            den: 1,
+            fixed: 0,
+        };
+        for side in [Side::Client, Side::Server] {
+            costs.step(bytes.len(), 0, linear, || {
+                assert!(
+                    TransportParameters::read_for_version(side, 1, &mut bytes.as_slice()).is_ok()
+                );
+                Charged {
+                    value: (),
+                    charged: 0,
+                }
+            });
+        }
+        bytes.extend_from_slice(&[0x11, 0]);
+        costs.step(bytes.len(), 0, linear, || {
+            assert_eq!(
+                TransportParameters::read(Side::Client, &mut bytes.as_slice()),
+                Err(Error::Malformed)
+            );
+            Charged {
+                value: (),
+                charged: 0,
+            }
+        });
+        eprintln!("cost: version information: {}", costs.summary());
+    }
 
     #[test]
     fn coding() {

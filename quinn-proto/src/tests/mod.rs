@@ -33,6 +33,100 @@ use util::*;
 
 mod token;
 
+#[test]
+fn tls_checks_authenticated_version_information_in_both_roles() {
+    use crate::coding::BufMutExt;
+
+    for wire_version in [1, 0xff00_001d, 0xff00_0021] {
+        let tls_version = if wire_version == 0xff00_001d {
+            rustls::quic::Version::V1Draft
+        } else {
+            rustls::quic::Version::V1
+        };
+        for side in [Side::Client, Side::Server] {
+            for chosen in [wire_version, wire_version ^ 2, 0] {
+                let mut encoded = vec![0x11, 8];
+                encoded.write(chosen);
+                encoded.write(chosen);
+                let client = client_crypto();
+                let server = Arc::new(
+                    QuicServerConfig::inner(
+                        vec![CERTIFIED_KEY.cert.der().clone()],
+                        PrivateKeyDer::Pkcs8(CERTIFIED_KEY.signing_key.serialize_der().into()),
+                    )
+                    .unwrap(),
+                );
+                let params = TransportParameters::default();
+                let (mut session, mut peer) = if side.is_server() {
+                    (
+                        crypto::ServerConfig::start_session(
+                            Arc::new(QuicServerConfig::try_from(server.clone()).unwrap()),
+                            wire_version,
+                            &params,
+                        ),
+                        rustls::quic::Connection::Client(
+                            rustls::quic::ClientConnection::new(
+                                client.inner,
+                                tls_version,
+                                "localhost".try_into().unwrap(),
+                                encoded,
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                } else {
+                    (
+                        crypto::ClientConfig::start_session(
+                            Arc::new(client),
+                            wire_version,
+                            "localhost",
+                            &params,
+                        )
+                        .unwrap(),
+                        rustls::quic::Connection::Server(
+                            rustls::quic::ServerConnection::new(server, tls_version, encoded)
+                                .unwrap(),
+                        ),
+                    )
+                };
+                let mut result = None;
+                for _ in 0..8 {
+                    let mut flight = Vec::new();
+                    session.write_handshake(&mut flight);
+                    if !flight.is_empty() {
+                        peer.read_hs(&flight).unwrap();
+                    }
+                    flight.clear();
+                    peer.write_hs(&mut flight);
+                    if !flight.is_empty() {
+                        session.read_handshake(&flight).unwrap();
+                    }
+                    match session.transport_parameters() {
+                        Ok(None) => {}
+                        done => {
+                            result = Some(done);
+                            break;
+                        }
+                    }
+                }
+                let result = result.expect("peer transport parameters were received");
+                if chosen == wire_version {
+                    assert!(result.unwrap().is_some());
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        if chosen == 0 {
+                            TransportErrorCode::TRANSPORT_PARAMETER_ERROR
+                        } else {
+                            TransportErrorCode::VERSION_NEGOTIATION_ERROR
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 

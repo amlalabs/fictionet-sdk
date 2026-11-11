@@ -34,6 +34,7 @@ impl From<Side> for rustls::Side {
 /// A rustls TLS session
 pub struct TlsSession {
     version: Version,
+    wire_version: u32,
     got_handshake_data: bool,
     next_secrets: Option<Secrets>,
     inner: Connection,
@@ -131,7 +132,11 @@ impl crypto::Session for TlsSession {
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
         match self.inner.quic_transport_parameters() {
             None => Ok(None),
-            Some(buf) => match TransportParameters::read(self.side(), &mut io::Cursor::new(buf)) {
+            Some(buf) => match TransportParameters::read_for_version(
+                self.side(),
+                self.wire_version,
+                &mut io::Cursor::new(buf),
+            ) {
                 Ok(params) => Ok(Some(params)),
                 Err(e) => Err(e.into()),
             },
@@ -337,9 +342,11 @@ impl crypto::ClientConfig for QuicClientConfig {
         server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn crypto::Session>, ConnectError> {
+        let wire_version = version;
         let version = interpret_version(version)?;
         Ok(Box::new(TlsSession {
             version,
+            wire_version,
             got_handshake_data: false,
             next_secrets: None,
             inner: rustls::quic::Connection::Client(
@@ -493,9 +500,11 @@ impl crypto::ServerConfig for QuicServerConfig {
         params: &TransportParameters,
     ) -> Box<dyn crypto::Session> {
         // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
+        let wire_version = version;
         let version = interpret_version(version).unwrap();
         Box::new(TlsSession {
             version,
+            wire_version,
             got_handshake_data: false,
             next_secrets: None,
             inner: rustls::quic::Connection::Server(

@@ -663,3 +663,74 @@ tests, the SSH transport test and 302 doctests pass. Clippy with warnings denied
 workspace formatting check pass. The existing `quic_sparse_reassembly`
 benchmark runs at sixteen and sixty-four kibibytes; it still measures the
 legacy codec, not the new receive ring or transport throughput.
+
+## Authenticated version information
+
+The rustls adapter now validates received Version Information against the
+connection's exact wire version. The parameter decoder checks its length,
+rejects zero in either field and duplicate parameters, and requires a
+client's Available Versions to include its Chosen Version. A server's list
+can be empty or omit the chosen version. Every entry is checked, including
+entries after the chosen version. Unknown nonzero versions and repeated
+versions within a list remain legal. Malformed input becomes
+`TRANSPORT_PARAMETER_ERROR`; disagreement with the connection becomes
+`VERSION_NEGOTIATION_ERROR`. Draft wire aliases remain distinct even when
+they use the same rustls key schedule.
+
+This is the receive side of RFC 9368 section four for the existing profile,
+which never switches versions or retries a failed connection after a
+Version Negotiation packet. Missing Version Information is still permitted.
+The parameter is not emitted yet, and its list is not retained. The generic
+decoder validates its structure; the rustls session also checks the chosen
+version. This does not implement compatible negotiation or authenticated
+fallback and does not enable QUIC version two. Version-bound session
+tickets and tokens, packet mappings and protection, and interoperability
+remain prerequisites for enabling that version.
+
+The new unit tests cover list validation, both peer roles, every split of
+a three-word list across two input buffers, parameter boundaries and
+duplicate parameters. A TLS handshake test feeds peer-supplied parameter
+bytes through the production rustls adapter in both roles for version one
+and two draft aliases. It checks matching versions, mismatches and zero
+versions without changing certificate verification. This is a TLS adapter
+test, not independent QUIC version-two interoperability.
+
+The allocation replay parses a list with a thousand and twenty-four
+available versions and then a repeated parameter. Its inputs are caller
+fixtures. The parser borrows them and keeps only inline state, so every
+step has a zero-byte reservation and a linear bound with both coefficients
+zero. The conversion of a decoding error into an allocated diagnostic
+string is outside that measurement, as are TLS and packet processing.
+
+Two Kani harnesses in `kani/version_information.rs` pass over arbitrary
+values for a chosen version, two available versions, the connection version
+and the receiving role. The first checks list validation and consumption.
+The second checks the body's error classification and zero-allocation bound
+with the shared allocation stubs. The shared allocator's sanity harness
+also passes. No production functions are stubbed. Run these under the
+required scope with `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
+-Z c-ffi -Z mem-predicates -Z restrict-vtable --harness
+version_information_validates --harness version_information_body --harness
+the_counter_sees_every_allocation`.
+
+The separate `version_information_checks_the_connection_without_allocating`
+harness calls the entire transport-parameter decoder. It retains its
+classification and allocation assertions, but has no verdict. Runs were
+stopped while expanding paths through unrelated parameters, before the
+solver. A contiguous fixed-shape input and a smaller sufficient unwind
+bound did not resolve that expansion. This unfinished harness is separate
+from the successful body proofs and the whole-decoder allocation replay.
+
+`VersionInformation.tla` models length checks, scanning all entries,
+role-specific validation, the connection comparison and duplicate
+detection. Its configurations include controls for each guard, an
+uncharged list copy using the shared resource store, and reachability of
+acceptance. The model uses two abstract nonzero versions, zero and lists
+of up to two entries. It does not model cryptography or replay production
+traces. Run its configurations with the shared resource library and the
+scoped TLC command described above.
+
+The base passes with 1,760 generated and distinct states, depth six. The
+five guard controls violate `Decision`, the copy control violates
+`PaidStorage`, and the reachability control violates `NoAcceptance`.
+Production mutation checks and final Cargo checks are still in progress.
