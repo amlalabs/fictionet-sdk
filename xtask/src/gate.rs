@@ -174,6 +174,7 @@ pub fn kani(args: &[String]) -> Result {
     for harness in harnesses {
         command.arg("--harness").arg(harness);
     }
+    let _slot = crate::kani_slot::take(root, "12G")?;
     let status = command
         .current_dir(root)
         .env("CARGO_BUILD_JOBS", "8")

@@ -59,6 +59,7 @@ pub fn kani(
     for harness in harnesses {
         command.arg("--harness").arg(harness);
     }
+    let _slot = crate::kani_slot::take(root, memory)?;
     let (text, ran) = logged(
         command.env("CARGO_BUILD_JOBS", "8").current_dir(root),
         &out.join(format!("kani-{package}.out")),
