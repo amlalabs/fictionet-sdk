@@ -2331,6 +2331,7 @@ dependencies = [
  "fictionet",
  "fictionet-extras",
  "fictionet-host",
+ "fictionet-test-support",
  "libc",
  "serde",
  "serde_json",
