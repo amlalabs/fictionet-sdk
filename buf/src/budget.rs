@@ -578,16 +578,13 @@ impl Charge {
         let need = least.checked_mul(unit)?.checked_add(moving)?;
         let taken = self.budget.take_with(need, |room| {
             let room = room.checked_sub(moving)?;
-            let take = if unit == 0 {
-                most
-            } else {
-                most.min(room / unit)
-            };
+            // Units of no bytes always fit, all of them.
+            let take = room.checked_div(unit).map_or(most, |fit| most.min(fit));
             (take >= least).then(|| moving + take * unit)
         })?;
         let grown = taken - moving;
         self.now += grown;
-        let more = if unit == 0 { most } else { grown / unit };
+        let more = grown.checked_div(unit).unwrap_or(most);
         Some((
             more,
             Charge {
