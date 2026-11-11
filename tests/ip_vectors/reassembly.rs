@@ -10,15 +10,44 @@
 //! the code keeps them by deadline, the model by its table's order. The
 //! answer built for each (`reassembly_time_exceeded`) must be ICMP Time
 //! Exceeded, code 1, from the fragment's destination, quoting its start.
+//!
+//! Every step is also costed (verification/resources/cost.rs): the
+//! reassembly holds no more than `Reassembly::MOST_HELD` at any moment,
+//! besides what a step hands out, and a step asks the allocator for no
+//! more than [`PUSH`] or [`EXPIRE`] allows. The constants are in
+//! verification/packet-udp/README.md, "Resource properties".
 
-use fictionet::Packet;
+use fictionet::Chunk;
 use fictionet::stdlib::network::ip::{
     Header, Intake, Reassembly, destination, reassembly_time_exceeded, source,
 };
 use fictionet::time::{Duration, Instant};
 use serde_json::Value;
 
+use crate::alloc::unmeasured;
+use crate::cost::{Charged, Costs, Linear};
 use crate::support::cases;
+
+/// A push's linear bound. The packet is built inside the step from its
+/// hex digits, one allocation of its bytes and a chunk's header, so that
+/// freeing it is the step's; then its data and first fragment's headers
+/// are copied once each, at most its bytes again. An entry added to a
+/// `BTreeMap` may split a node at every level: three trees, at most 8
+/// levels, at most 2 KiB a node.
+const PUSH: Linear = Linear {
+    num: 2,
+    den: 1,
+    fixed: 3 * 8 * 2048 + Chunk::HEADER,
+};
+
+/// An expiry's bound, on the bytes counted before it: it copies nothing
+/// and asks only for the nodes that keep the first fragments, which their
+/// count covers, never more than their packets counted.
+const EXPIRE: Linear = Linear {
+    num: 1,
+    den: 1,
+    fixed: 0,
+};
 
 /// Bytes from a string of hex digits.
 fn hex(s: &str) -> Vec<u8> {
@@ -47,30 +76,57 @@ fn expected(value: &Value) -> Expect {
     }
 }
 
-fn got(intake: Intake) -> Expect {
-    match intake {
-        Intake::Whole(Packet(bytes)) => Expect::Whole(bytes),
-        Intake::Waiting => Expect::Waiting,
-        Intake::Discarded => Expect::Discarded,
-        Intake::Refused { .. } => Expect::Refused,
+/// Whether `intake` is what `want` says, compared in place.
+fn agrees(intake: &Intake, want: &Expect) -> bool {
+    match (intake, want) {
+        (Intake::Whole(whole), Expect::Whole(bytes)) => whole[..] == bytes[..],
+        (Intake::Waiting, Expect::Waiting)
+        | (Intake::Discarded, Expect::Discarded)
+        | (Intake::Refused { .. }, Expect::Refused) => true,
+        _ => false,
     }
 }
 
 /// A short form of a result for a failure message.
-fn brief(e: &Expect) -> String {
+fn brief(intake: &Intake) -> String {
+    match intake {
+        Intake::Whole(b) => format!("Whole({} bytes)", b.len()),
+        Intake::Waiting => "Waiting".into(),
+        Intake::Discarded => "Discarded".into(),
+        Intake::Refused { .. } => "Refused".into(),
+    }
+}
+
+fn brief_want(e: &Expect) -> String {
     match e {
         Expect::Whole(b) => format!("Whole({} bytes)", b.len()),
         other => format!("{other:?}"),
     }
 }
 
+/// What a step hands out for its taker to pay for: a whole packet, which
+/// for IPv6 is built and then copied without its extension headers (two
+/// packets at most), or a refused packet and its answer, each in a chunk
+/// of its own.
+fn handed_out(intake: &Intake) -> usize {
+    match intake {
+        Intake::Whole(whole) => 2 * (whole.len() + Chunk::HEADER),
+        Intake::Waiting | Intake::Discarded => 0,
+        Intake::Refused { packet, answer } => {
+            2 * (packet.len() + Chunk::HEADER)
+                + answer.as_ref().map_or(0, |a| a.len() + Chunk::HEADER)
+        }
+    }
+}
+
 /// Checks the answer to a kept first fragment, if one is sent.
-fn check_answer(first: &Packet) -> Result<(), String> {
-    let Some(Packet(answer)) = reassembly_time_exceeded(first) else {
+fn check_answer(first: &[u8]) -> Result<(), String> {
+    let Some(answer) = reassembly_time_exceeded(first) else {
         return Ok(());
     };
+    let answer = answer.to_vec();
     let h = Header::parse_whole(&answer).ok_or("an answer that does not read")?;
-    let (Some(from), Some(to)) = (destination(&first.0), source(&first.0)) else {
+    let (Some(from), Some(to)) = (destination(first), source(first)) else {
         return Err("an answer to a fragment with no addresses".into());
     };
     if (h.src, h.dst) != (from, to) {
@@ -81,7 +137,7 @@ fn check_answer(first: &Packet) -> Result<(), String> {
     if icmp.len() < 8 || (icmp[0], icmp[1]) != (kind, 1) {
         return Err("not Time Exceeded, code 1".into());
     }
-    if !first.0.starts_with(&icmp[8..]) {
+    if !first.starts_with(&icmp[8..]) {
         return Err("a quote that is not the fragment's start".into());
     }
     Ok(())
@@ -91,33 +147,63 @@ fn check_answer(first: &Packet) -> Result<(), String> {
 fn reassembly_matches_the_lean_model() {
     let mut disagree = Vec::new();
     let mut kept = 0;
+    let mut all = Costs::new("reassembly");
     cases("reassembly", |case| {
         let name = case["name"].as_str().unwrap();
+        let mut costs = Costs::new(name);
         let mut r = Reassembly::default();
         for (i, step) in case["steps"].as_array().unwrap().iter().enumerate() {
             let now =
                 Instant::from_since_start(Duration::from_millis(step["at_ms"].as_u64().unwrap()));
-            let packet = hex(step["packet"].as_str().unwrap());
+            let digits = step["packet"].as_str().unwrap();
             let mut problems = Vec::new();
-            if packet.is_empty() {
-                r.expire(now);
+            if digits.is_empty() {
+                costs.step(r.counted(), Reassembly::MOST_HELD, EXPIRE, || {
+                    r.expire(now);
+                    Charged {
+                        value: (),
+                        charged: 0,
+                        moved: 0,
+                    }
+                });
             } else {
-                let result = got(r.push(Packet(packet), now));
                 let want = expected(&step["expect"]);
-                if result != want {
+                let got = costs.step(digits.len() / 2, Reassembly::MOST_HELD, PUSH, || {
+                    let intake = r.push(Chunk::unpaid(hex(digits)), now);
+                    let value = (!agrees(&intake, &want)).then(|| brief(&intake));
+                    Charged {
+                        value,
+                        charged: handed_out(&intake),
+                        moved: 0,
+                    }
+                });
+                if let Some(got) = got {
                     problems.push(format!(
-                        "got {}, the model says {}",
-                        brief(&result),
-                        brief(&want)
+                        "got {got}, the model says {}",
+                        brief_want(&want)
                     ));
                 }
             }
             let mut firsts = Vec::new();
-            while let Some(first) = r.take_expired() {
+            loop {
+                let first = costs.step(0, Reassembly::MOST_HELD, EXPIRE, || {
+                    let first = r.take_expired();
+                    let charged = first.as_ref().map_or(0, |f| f.len() + Chunk::HEADER);
+                    // Kept for the comparison outside the count, so that
+                    // only the reassembly's own bytes stay counted.
+                    let copy = first.as_deref().map(|f| unmeasured(|| f.to_vec()));
+                    drop(first);
+                    Charged {
+                        value: copy,
+                        charged,
+                        moved: 0,
+                    }
+                });
+                let Some(first) = first else { break };
                 if let Err(e) = check_answer(&first) {
                     problems.push(e);
                 }
-                firsts.push(first.0);
+                firsts.push(first);
             }
             let mut want: Vec<Vec<u8>> = step["expired"]
                 .as_array()
@@ -140,8 +226,10 @@ fn reassembly_matches_the_lean_model() {
                 break;
             }
         }
+        all.absorb(&costs);
     });
     println!("reassembly: {kept} first fragments kept for answers");
+    println!("cost: reassembly: {}", all.summary());
     assert!(
         disagree.is_empty(),
         "{} cases disagree:\n{}",

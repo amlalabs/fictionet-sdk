@@ -35,9 +35,12 @@ namespace Ip.Reassembly
 /-- `MAX_WAITING`: 4 MiB. -/
 def MAX_WAITING : Nat := 4194304
 /-- `PIECE_COST`: what one waiting fragment costs beyond its data. -/
-def PIECE_COST : Nat := 64
+def PIECE_COST : Nat := 96
 /-- `PARTIAL_COST`: what one unfinished packet costs beyond its fragments. -/
-def PARTIAL_COST : Nat := 192
+def PARTIAL_COST : Nat := 1536
+/-- `EXPIRED_COST`: what a first fragment kept for its answer costs beyond
+its bytes. -/
+def EXPIRED_COST : Nat := 384
 /-- `V4_TIMEOUT`: 30 s. -/
 def V4_TIMEOUT : Nat := 30000
 /-- `V6_TIMEOUT`: 60 s (RFC 8200 section 4.5). -/
@@ -239,8 +242,9 @@ def firstPacket (p : Partial) : Option (List Nat) :=
   | some h, some q => some (rebuild h p.frag6 q.data)
   | _, _ => none
 
-/-- The bytes the waiting first fragments count. -/
-def osize (out : List (List Nat)) : Nat := (out.map List.length).sum
+/-- The bytes the waiting first fragments count: each one's bytes and
+`EXPIRED_COST`. -/
+def osize (out : List (List Nat)) : Nat := (out.map fun b => b.length + EXPIRED_COST).sum
 
 /-- `Reassembly::expire`: drops every packet whose deadline is at or
 before `now`, and keeps the first fragment of each one that had it, for
@@ -889,7 +893,7 @@ theorem pieceCost_mem {ps : List Piece} {q : Piece} (hq : q ∈ ps) :
 
 /-- A kept first fragment is no bigger than what its packet counted. -/
 theorem firstPacket_le {p : Partial} {b : List Nat} (hp : PartialOk p)
-    (h : firstPacket p = some b) : b.length ≤ p.size := by
+    (h : firstPacket p = some b) : b.length + EXPIRED_COST ≤ p.size := by
   unfold firstPacket at h
   split at h
   · next hd q hh hq =>
@@ -898,7 +902,7 @@ theorem firstPacket_le {p : Partial} {b : List Nat} (hp : PartialOk p)
     have h2 : hdrCost p.header = hd.length := by simp [hdrCost, hh]
     have h3 := hp.size
     have h8 : 8 ≤ PIECE_COST := by decide
-    have hpc : 8 ≤ PARTIAL_COST := by decide
+    have hpc : EXPIRED_COST + 8 ≤ PARTIAL_COST + PIECE_COST := by decide
     injection h with h; subst h
     unfold rebuild
     split
