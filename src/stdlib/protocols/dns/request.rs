@@ -22,7 +22,9 @@ use fictionet::stdlib::network::Transport;
 /// one question a server can answer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
-    /// The whole message as parsed.
+    /// The message as parsed: its header, question, EDNS and signature,
+    /// without the answer, authority and additional records, which a query
+    /// does not use.
     pub message: Message,
     /// The one question.
     pub question: Query,
@@ -158,6 +160,14 @@ impl Request {
             dnssec_ok: edns.flags().dnssec_ok,
             nsid: edns.option(EdnsCode::NSID).is_some(),
         });
+        // A query's answer, authority and additional records are not kept:
+        // nothing answers from them, and each two-octet compression pointer
+        // among them stands for a name of up to 255 octets, so a query of
+        // 64 KiB of them would keep 2 MB while it is answered.
+        let mut message = message;
+        message.answers = Vec::new();
+        message.authorities = Vec::new();
+        message.additionals = Vec::new();
         Parsed::Request(Request {
             question_bytes: question_bytes(bytes).expect("a parsed message's question reads again"),
             question,

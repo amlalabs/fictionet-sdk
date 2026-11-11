@@ -330,6 +330,212 @@ behavior (all but `a_checked_packet_is_what_the_ip_layer_hands_up`, which
 tests the new constructor) fail with the fixes taken out and pass with
 them. `cargo clippy -p fictionet --lib --tests -- -D warnings` passed.
 
+## Resource properties
+
+The method is in `verification/README.md`, "Resource properties". This
+section covers TCP and below: fragment reassembly, UDP sockets, the
+blocks a sandbox's packets arrive in, the TCP socket's stores (whose
+own README is `../tcp-store/README.md`), and DNS request parsing and the
+resolver's cache. All three layers run from one command:
+
+```sh
+cargo xtask ip-verify resources   # the Kani harnesses, Holding.tla's configs, the costed sessions
+cargo xtask ip-verify diff        # the Lean vectors, each reassembly step costed
+```
+
+The checks found five bugs, each now fixed with a test that fails
+before its fix ("The bugs, fixed" below).
+
+### What is charged, and the bounds
+
+| Holder | What pays | The bound, at every moment of every step |
+| --- | --- | --- |
+| `Reassembly` | its cap, `MAX_WAITING` (4 MiB), counted with `PIECE_COST` (96), `PARTIAL_COST` (1,536) and `EXPIRED_COST` (384) | held ≤ `Reassembly::MOST_HELD`, the cap and the roots of its three maps (a leaf and an inner node each), besides a packet the step hands out; and held ≤ `counted()` and those roots after each step |
+| a UDP socket (`Socket::keep`) | the layer's budget | held ≤ what the budget was charged: a datagram's bytes and `Chunk::HEADER` before they are allocated, the queue's places before they grow |
+| a link from attach (`SocketLink::poll_recv`) | the sandbox's budget | a packet longer than a block is copied only into a block that budget paid for first |
+| the TCP stores (`RxStore`, `TxStore`) | the store's budget for the blocks it makes, the budget that paid a packet's slot for what it keeps of it, and `PLACES` | held ≤ those charges and `PLACES`, the stores' places and a header for each backing they retain, with one more each way for a join |
+| `Request::parse` | nothing: it is transient, and the request it makes is kept while the query is answered | held ≤ the records the message can carry decoded (twice a `Record` and a 383-octet name for every 12 octets) and the question; the request keeps at most the question and its octets |
+| the resolver's `Cache` | its budget, at `Cache::storage` when made and by its estimate for each entry | held ≤ what the budget was charged |
+
+The constants and why each covers what it counts:
+
+- **`tree_leaf(kv)` = 16 + 11 kv, `tree_inner(kv)` = `tree_leaf` + 96.**
+  A node of std's `BTreeMap`: a parent pointer, two `u16`s and room for
+  eleven entries; an inner node adds twelve edges. Every node but the
+  root holds at least five entries, so a map of n entries has at most
+  n/5 leaves and (n/5 + 3)/5 inner nodes: at most a leaf and an inner
+  node (`tree_root`) and n times `tree_entry(kv)` = leaf/5 + inner/25 + 2.
+- **`PIECE_COST` (96)** ≥ `tree_entry` of a piece's entry (32 bytes).
+  **`PARTIAL_COST` (1,536)** ≥ the entries of the map of packets and of
+  the deadlines, and `tree_root` of the packet's map of pieces.
+  **`EXPIRED_COST` (384)** ≥ `tree_entry` of a kept first fragment, and
+  with 8 bytes of fragment header at most `PIECE_COST + PARTIAL_COST`, so
+  a kept fragment never counts more than its packet did. Const
+  assertions in `ip.rs` check each against `size_of` of the entries.
+- **`DATAGRAM_COST` (256)**, what each datagram counts against a socket's
+  1 MiB: ≥ `Chunk::HEADER` and a place in the queue (a const assertion).
+- **`Chunk::HEADER`**: two reference counts and the `Backing` they share
+  (96 bytes on 64-bit targets). No charge counts it, so a holder of many small chunks
+  counts it with each.
+- **`PLACES`**: `SEGMENTS` places each way and a `Chunk::HEADER` for each
+  chunk a store retains, `SEGMENTS` each way, and one more each way for
+  the block a join makes while the two it joins are held.
+
+### TLA+
+
+`tla/Holding.tla` threads three stores through `Resources.tla`: the
+reassembly against its cap, a socket against its budget, and a receive
+store against its charges and `PLACES`. Each holder's code order is a
+flag, and each control turns one off.
+
+| Config | Result |
+| --- | --- |
+| `Holding_base` | passes, with every `Paid`, `Tracks` and the cap and budget limits: 80,696 states generated, 15,580 distinct, depth 8 |
+| `Holding_without_roomfirst` | a fragment copied in, then the soonest dropped while past the cap (the code before a2750ef02): violates `ReassemblyPaid` |
+| `Holding_without_movefirst` | a first fragment copied while its packet is held: violates `ReassemblyPaid` |
+| `Holding_without_chargefirst` | a datagram copied before it is charged: violates `SocketPaid` |
+| `Holding_without_headers` | `PLACES` without the backings' headers (the code before e141c7cb3): violates `StorePaid` |
+
+`Resources.tla` now checks each moment against the reservation it had:
+a store records the most it ever held past what was reserved at that
+moment (`short`), and `Paid` asks that it be zero. Before, `Paid`
+compared the step's peak with the reservation at the step's end, so a
+copy made before its charge in the same step, and a free followed by a
+release, were judged against the wrong reservation. HPACK's five resource
+configs give the same results and state counts on it.
+
+### Kani
+
+Three files of counted harnesses (`resources/kani/counting.rs`), each
+compiled into its production module: `kani/resources.rs` into `ip.rs`
+(`Reassembly::push`), `kani/udp_resources.rs` into `udp/sockets.rs`
+(`Socket::keep`), and `../tcp-store/kani/resources.rs` into smoltcp's
+`tcp.rs` (`RxStore::insert`, `TxStore::push`), with `counting.rs` now
+compiled into smoltcp too. Kani 0.68 with `-Z stubbing -Z c-ffi -Z
+mem-predicates -Z restrict-vtable`, the last because each harness reaches
+a `Budget`, whose wakers are trait objects, as the layer's budget
+harnesses do. One harness at a time, under a 14 GiB scope, on November
+10, 2026.
+
+| Harness | Bound | Result |
+| --- | --- | --- |
+| `the_counter_sees_every_allocation`, in `fictionet` and in smoltcp | the stubs see every allocation | successful (13.4 s in smoltcp) |
+| `the_first_datagram_is_paid_before_it_is_kept` | the most live at once is at most what the budget was charged after the step and the budget's own state; the step asks for no more than it charged | successful, 36.1 s |
+| `a_second_datagram_is_paid_before_it_is_kept` | the same, into a place already paid for | successful, 90.0 s |
+| `a_third_datagram_is_paid_before_it_is_kept` | the same | **does not fit**: out of memory at 14 GiB (51,913 VCCs) |
+| `a_fragment_into_an_empty_table_stays_within_its_count`, `a_second_packet_stays_within_its_count`, `a_packet_past_the_limit_makes_room_first` | the most live at once is at most the limit, the maps' roots and the packet built; after the step, at most the count and the roots; the step asks for at most twice its packet and a leaf of each map | **do not fit**: the second ran 27 minutes to 11 GiB at unwind 24 and was stopped; the first ran past 25 minutes at unwind 13; the third, larger, was not run. CBMC unrolls the `BTreeMap`s' node code |
+| `a_segment_into_an_empty_store_is_paid_for` and the two across waiting pieces | the most live at once is at most what the budget was charged and `PLACES`, besides the budget's and pool's state | **do not fit**: the first ran past 25 minutes; `insert` keeps 64 pieces in an array, so it unwinds 66; the other two, larger, were not run |
+| `a_first_short_write_is_paid_for`, `a_third_short_write_is_paid_for` | the same, for the send store | **do not fit**: the first ran past 25 minutes at unwind 8; the third was not run |
+
+`ip-verify resources` runs the two UDP harnesses that finish and the
+counter's own check in both crates; on November 10 it passed in full, with
+`Holding.tla`'s five configs and every costed session. The harnesses that do not fit stay in their files,
+so a lighter shape can take their place; the costed sessions check the
+same bounds on the same code.
+
+### The costed sessions
+
+`tests/it/net_resources.rs`, `smoltcp/src/socket/tcp/store_costs.rs`,
+`listen.rs`'s `a_packet_longer_than_a_block_is_paid_from_the_sandboxs_budget`,
+and the reassembly vectors in `tests/ip_vectors/reassembly.rs` (every
+step of `ip-verify diff`). Each step is costed with
+`verification/resources/cost.rs` and the counting allocator. A step
+builds the input it takes, so that freeing it is the step's.
+
+| Session | Steps | The linear bound, and why |
+| --- | --- | --- |
+| reassembly: 40,000 one-fragment packets; 80,000 eight-byte pieces ascending, descending and interleaved; first fragments kept with no one taking them; packets completed from 1,000 shuffled pieces | 40,002; 3 × 80,000; 86,933; 20,000 | twice the packet (built, then its data and headers copied once) and a node split at each of 8 levels in three trees, 2 KiB a node; an expiry copies nothing and asks at most what was counted before it |
+| UDP: floods of empty, one-byte and mixed datagrams past a socket's queue, drained and refilled; a flood past a 256 KiB budget | 24,002; 5,000 | twice the packet (built, then the datagram copied), two chunk headers, the layers' own queues (4 KiB), and what the step charged; a queue that doubles moves no more than it charged |
+| TCP stores: random segments (both sources, 12 seeds), one-byte segments in and out of order, a slow reader's window joined, contiguous pieces out of order, small writes partly acknowledged (6 seeds) | 182 to 16,386 a session | over each session's steps together: each segment's or write's bytes once, what was charged, and a header for each piece and join |
+| DNS queries of 0 to 4,000 compression-pointer records in each section | 18 | twice a `Record` asked over a section's growth and a 383-octet name for every 12 octets, and the question |
+| the resolver's cache: 3,000 RRsets of 1, 4 and 32 addresses | 3 × 3,001 | over the session: the offer built, three times that for the normalized copy, what was charged, and the maps' room charged when made, once more for their doublings |
+
+Every session passes (November 10, 2026, `comp/res-net`). "Closest" is
+the step that came nearest its charge: bytes live at once against bytes
+paid for.
+
+| Session | Closest to the charge |
+| --- | --- |
+| 40,000 tiny packets | 2,033,876 of 4,202,432 |
+| pieces in each of three orders | 2,867,444 of 4,202,432 |
+| first fragments kept, no one taking them | 2,442,832 of 4,202,432 |
+| packets completed from small pieces | 72,172 of 4,210,548 (with the packet handed out) |
+| `ip-verify diff`, seeds 1 to 8, every reassembly step | 23,047 to 28,444 steps a seed; 140,342 of 4,333,758; 0 cases disagree |
+| UDP floods | 724,821 of 725,603 |
+| UDP flood past a 256 KiB budget | 263,175 of 266,157 |
+| TCP stores, `rx joins` (both sources) | 382,260 of 394,720; 518,884 of 525,392 |
+| TCP stores, random segments, 12 seeds | 35,413 to 63,123 of 53,140 to 78,464 |
+| TCP stores, sending, 6 seeds | 21,846 to 53,631 of 37,480 to 70,668 |
+| DNS queries, 4,000 records | 2,155,472 of 5,116,511 while parsing; the request then keeps no more than `keeps`, its question and the octets it echoes |
+| cache, 32 addresses a set | 30,103,784 of 38,203,510 |
+
+### The bugs, fixed
+
+- **Reassembly counted a third of what it held** (a2750ef02). An
+  unfinished packet counted 192 bytes besides its fragments; its entry in
+  a `HashMap`, its deadline and its map of pieces held about 830, and the
+  `HashMap` kept its grown table after its packets left. Forty thousand
+  one-fragment packets held 15.2 MB against the cap of 4 MiB; the session
+  `many_tiny_packets_stay_within_most_held` passed `MOST_HELD` at step
+  5,826 with 4,202,556 bytes live, and before that one step that grew the
+  `HashMap` asked for 86,920 bytes on 28 bytes of input. A fragment was
+  copied in before the cap made room, a first fragment kept for its
+  answer was copied while its packet was held, and `finish` gathered every
+  piece's slice in a vector first. The maps are now `BTreeMap`s, the
+  costs cover each entry's share of its trees, room is made first for the
+  same packets, and a kept first fragment is moved, not copied. The Lean
+  model takes the new constants and counts `EXPIRED_COST` with each kept
+  fragment; `ip-verify diff` passes.
+- **A UDP socket charged a third of what each datagram held**
+  (b9252b397). 64 bytes for "its sender's address and its place", where a
+  datagram held a chunk header (96) and a place (80) in a queue that
+  doubled and never gave places back: one-byte datagrams held 228 bytes
+  each against 65 charged. On the old code both UDP sessions fail at step
+  32, 8,412 bytes live against 6,144 paid.
+- **A packet longer than a block from attach was unpaid** (45ebd3386):
+  copied into a `Vec` of its own and handed on as `Chunk::unpaid`, after
+  72158929e made the blocks a sandbox's packets arrive in its budget's.
+  Test `a_packet_longer_than_a_block_is_paid_from_the_sandboxs_budget`.
+- **A TCP socket's open charge left out its backings' headers**
+  (e141c7cb3), up to 12 KiB a connection beside the 5 KiB charged. With
+  the old `PLACES` the joins sessions fail: 110,700 bytes live against
+  106,300 paid.
+- **A parsed DNS query kept every record it carried** (a75b820a4). Each
+  two-octet compression pointer decodes to a name of up to 255 octets, and
+  the `Request` kept the whole message while the resolver answered it: a
+  64 KiB query kept 2,155,729 bytes. It now keeps none of the answer,
+  authority and additional records. On the old code the session fails at
+  ten records: 7,849 bytes kept against 1,963.
+
+### Controls and mutations
+
+| Layer | Mutation, in a scratch copy or a control config | What failed |
+| --- | --- | --- |
+| TLA+ | the four `Holding_without_*` controls above | the `Paid` each names |
+| Kani | `Socket::keep` without its header charge, as datagrams were charged before b9252b397 | `the_first_datagram_is_paid_before_it_is_kept`: "the socket held more than its budget paid" (35.8 s) |
+| sessions | each bug's old code, above | the step and bytes given above |
+| sessions | `RxStore::commit` copying everything ready on each delivery | four of the six store sessions: `rx joins` asked 95,728 bytes in all against 89,008 by step 7; `rx one-byte, in order` 34,343,140 against 34,338,340 |
+
+### Found, not fixed
+
+- **A charged container's growth holds its old and new places for a
+  moment.** `ChargedDeque` and `ChargedVec` (`layer/charged.rs`) charge
+  the places they grow by, not the old block a reallocation holds while it
+  moves. A UDP socket's queue growing from 2,048 places to 4,096 holds
+  about 160 KiB more than charged until the old block is freed. Charging
+  the old places again for the move breaks two tests of the layer's
+  randomized model, whose wakes and refusals assume the old rule; it is
+  left for the layer's owner. The UDP Kani harnesses stay within the
+  first four places, and the replay's allocator counts a reallocation as
+  its change in size, so neither sees it.
+- **The cache's normalized copy deduplicates in quadratic time**
+  (`normalized` in `resolver/cache.rs` compares each record with every
+  one kept). Its memory is linear; its time for an RRset of n records is
+  n². Not a memory bound, so not checked here.
+- The resolver keeps each client's query (`Asker`) for its resolution,
+  with no budget and no count of its own. Whether what feeds it bounds
+  the queries in flight was not checked in this pass.
+
 ## What is left out
 
 - Reassembly's overlap rules beyond one place per fragment (partial
@@ -349,8 +555,9 @@ them. `cargo clippy -p fictionet --lib --tests -- -D warnings` passed.
   slot properties see only whether a packet waits, so this hides nothing
   they check. A reassembled packet that `checked` then refuses is not
   modeled apart from a whole one refused.
-- The Kani harnesses do not reach `Reassembly` itself (its `HashMap`) or
-  the UDP layer's state; TLA+ and the unit tests cover those.
+- The protocol Kani harnesses do not reach `Reassembly` itself or the
+  UDP layer's state; TLA+ and the unit tests cover those. The counted
+  resource harnesses do (see "Resource properties").
 - The UDP send side, ICMP port-unreachable answers and the `udp::endpoint`
   facade are not modeled. Nor are the multicast groups as state
   (`UdpControl::Join`; the `groups` check is one of the reasons an

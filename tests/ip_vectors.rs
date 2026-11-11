@@ -5,6 +5,11 @@
 #[path = "ip_vectors/support.rs"]
 mod support;
 
+#[path = "../verification/resources/alloc.rs"]
+mod alloc;
+#[path = "../verification/resources/cost.rs"]
+mod cost;
+
 #[path = "ip_vectors/checksum.rs"]
 mod checksum;
 #[path = "ip_vectors/ext6.rs"]

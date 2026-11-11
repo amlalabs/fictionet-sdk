@@ -121,6 +121,7 @@ fn decode_costed(table: &mut Table, block: &[u8], costs: &mut Costs) -> Result<D
         Charged {
             value,
             charged: out.charged().saturating_sub(before),
+            moved: 0,
         }
     });
     result.map(|()| read(&out))
@@ -321,6 +322,7 @@ fn encoder() {
                 costs.step(0, charge, NOTHING, || Charged {
                     value: encoder.set_settings_limit(size(limit)),
                     charged: 0,
+                    moved: 0,
                 });
                 table.set_settings_limit(size(limit));
             } else if let Some(capacity) = step.get("capacity") {
@@ -328,6 +330,7 @@ fn encoder() {
                 let got = costs.step(0, charge, NOTHING, || Charged {
                     value: encoder.set_capacity(size(capacity)),
                     charged: 0,
+                    moved: 0,
                 });
                 assert_eq!(got.is_ok(), step["ok"].as_bool().unwrap(), "{step}");
             } else if let Some(huffman) = step.get("huffman") {
@@ -342,6 +345,7 @@ fn encoder() {
                 let got = costs.step(input, charge, linear, || Charged {
                     value: encoder.encode_block(&given, &mut out),
                     charged: 0,
+                    moved: 0,
                 });
                 if step.get("error").is_some() {
                     assert_eq!(got, Err(Error::Unwritable), "{step}");

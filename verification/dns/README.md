@@ -146,3 +146,14 @@ since a validator already finds that parent Insecure; and `Request::parse`
 took a query whose MD, MF, MB, MG, MR, or MINFO record held RDATA that is no
 name, which hickory reads as octets for these types; it now checks every
 record's layout as RFC 3597 §4 asks (`respond.json`, seed 2).
+
+## Resource properties
+
+DNS request parsing and the resolver's cache are part of TCP and below's
+resource properties, run by `cargo xtask ip-verify resources` and
+described with their bounds in `../packet-udp/README.md`, "Resource
+properties". Two costed sessions in `tests/it/net_resources.rs` cover them:
+queries full of compression-pointer records, which found that a parsed
+`Request` kept every record its query carried (fixed in a75b820a4), and
+RRsets offered to the cache, which stays within what it charges. They
+have no TLA+ model or Kani harness of their own.

@@ -3,6 +3,12 @@
 
 mod common;
 
+/// The replays' cost recorder (verification/README.md, "Resource
+/// properties"), which reads the allocator as `crate::alloc`.
+#[path = "../../verification/resources/cost.rs"]
+mod cost;
+use common::alloc;
+
 mod allocations;
 mod asn1_codec;
 mod bodies_codec;
@@ -45,6 +51,7 @@ mod listen;
 mod mail_codec;
 mod media_codec;
 mod messaging_codec;
+mod net_resources;
 mod open_allocations;
 mod packet_composition;
 mod packets;

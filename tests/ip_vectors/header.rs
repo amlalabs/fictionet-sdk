@@ -86,12 +86,12 @@ fn build(case: &Value) {
     let expected = bytes(&case["expected"]);
     if options.is_empty() {
         let p = ip::packet_with(src, dst, protocol, fields, &payload);
-        assert_eq!(p.0, expected, "packet_with {case}");
+        assert_eq!(p.to_vec(), expected, "packet_with {case}");
     }
     if let (IpAddr::V4(s), IpAddr::V4(d)) = (src, dst) {
         let p = ip::packet_with_ipv4_options(s, d, protocol, fields, &options, &payload)
             .expect("options that fit");
-        assert_eq!(p.0, expected, "packet_with_ipv4_options {case}");
+        assert_eq!(p.to_vec(), expected, "packet_with_ipv4_options {case}");
     }
 }
 

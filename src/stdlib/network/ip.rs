@@ -79,7 +79,7 @@
 //! assert!(ip::udp_checksum_ok(src, dst, header.payload(&packet)));
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
@@ -527,14 +527,63 @@ const V4_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long an unfinished IPv6 packet waits (RFC 8200, section 4.5).
 const V6_TIMEOUT: Duration = Duration::from_secs(60);
 /// At most this many bytes of fragments wait at any one time, counting
-/// [`PIECE_COST`] and [`PARTIAL_COST`] for the bookkeeping.
+/// [`PIECE_COST`], [`PARTIAL_COST`] and [`EXPIRED_COST`] for the
+/// bookkeeping.
 const MAX_WAITING: usize = 4 << 20;
-/// What one waiting fragment costs beyond its data: its map entry and
-/// vector. Counted so that a flood of tiny fragments hits the cap as soon
-/// as large ones would.
-const PIECE_COST: usize = 64;
-/// What one unfinished packet costs beyond its fragments.
-const PARTIAL_COST: usize = 192;
+/// What one waiting fragment costs beyond its data: its share of its
+/// packet's `BTreeMap` of pieces ([`tree_entry`]). Counted so that a flood
+/// of tiny fragments hits the cap as soon as large ones would.
+const PIECE_COST: usize = 96;
+/// What one unfinished packet costs beyond its fragments: its share of the
+/// map of packets and of the deadlines, and the first two nodes of its
+/// map of pieces ([`tree_root`]).
+const PARTIAL_COST: usize = 1536;
+/// What a first fragment kept for its answer costs beyond its bytes: its
+/// share of the map that keeps them.
+const EXPIRED_COST: usize = 384;
+
+// Each cost covers what it counts, at most. A kept first fragment counts
+// its bytes as it came, the fragment header included: never more than its
+// packet counted, the fragment's data, PIECE_COST and PARTIAL_COST.
+const _: () = {
+    assert!(PIECE_COST >= tree_entry(size_of::<(usize, Vec<u8>)>()));
+    assert!(
+        PARTIAL_COST
+            >= tree_entry(size_of::<(Key, Partial)>())
+                + tree_entry(size_of::<(Instant, Key)>())
+                + tree_root(size_of::<(usize, Vec<u8>)>())
+    );
+    assert!(EXPIRED_COST >= tree_entry(size_of::<((Instant, Key), First)>()));
+    assert!(EXPIRED_COST + 8 <= PARTIAL_COST + PIECE_COST);
+};
+
+/// The most bytes a node of std's `BTreeMap` with entries of `kv` bytes
+/// takes: a parent pointer, two `u16`s and room for eleven entries (its
+/// `CAPACITY`), padded.
+const fn tree_leaf(kv: usize) -> usize {
+    16 + 11 * kv
+}
+
+/// The same for an inner node, with its twelve edges.
+const fn tree_inner(kv: usize) -> usize {
+    tree_leaf(kv) + 12 * size_of::<usize>()
+}
+
+/// What a `BTreeMap` takes besides its entries' shares: a leaf and an
+/// inner node. A tree of up to eleven entries is one leaf; past that the
+/// root is an inner node.
+const fn tree_root(kv: usize) -> usize {
+    tree_leaf(kv) + tree_inner(kv)
+}
+
+/// Each entry's share of the rest of a `BTreeMap`, rounded up. Every node
+/// but the root holds at least five entries (`MIN_LEN`), so a tree of `n`
+/// entries has at most `n / 5` leaves, and every inner node but the root
+/// at least six children, so at most `(n / 5 + 3) / 5` inner nodes: at
+/// most `tree_root(kv)` and `n` times this in all.
+const fn tree_entry(kv: usize) -> usize {
+    tree_leaf(kv) / 5 + tree_inner(kv) / 25 + 2
+}
 
 /// Which packet a fragment belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -594,14 +643,78 @@ struct Partial {
 /// [`take_expired`](Reassembly::take_expired) for the caller to answer
 /// ([`reassembly_time_exceeded`]). It counts against the 4 MiB until
 /// taken; it is never bigger than what its packet counted.
-#[derive(Default)]
+///
+/// What is counted is what is held: every fragment's bytes, every map's
+/// nodes and every kept first fragment, at most, so that the memory held
+/// at any moment, a step's included, stays within
+/// [`MOST_HELD`](Reassembly::MOST_HELD). Room is made before a fragment is
+/// copied in, and the maps are `BTreeMap`s, whose nodes come and go with
+/// their entries, so nothing grows past what is counted, not even for a
+/// moment.
 pub struct Reassembly {
-    partial: HashMap<Key, Partial>,
+    partial: BTreeMap<Key, Partial>,
     /// Every unfinished packet by when it expires, soonest first.
     by_expiry: BTreeSet<(Instant, Key)>,
-    /// The first fragments of the packets that timed out, oldest first.
-    expired: VecDeque<Chunk>,
+    /// The first fragments of the packets that timed out, by when they
+    /// timed out, oldest first.
+    expired: BTreeMap<(Instant, Key), First>,
+    /// The bytes counted against `limit`.
     size: usize,
+    /// [`MAX_WAITING`], or less in a proof.
+    limit: usize,
+}
+
+impl Default for Reassembly {
+    fn default() -> Reassembly {
+        Reassembly {
+            partial: BTreeMap::new(),
+            by_expiry: BTreeSet::new(),
+            expired: BTreeMap::new(),
+            size: 0,
+            limit: MAX_WAITING,
+        }
+    }
+}
+
+/// The first fragment of a packet that timed out, kept in the parts its
+/// packet kept, with nothing copied: its headers (for IPv6, with the
+/// "next header" byte that named the fragment header naming what it
+/// named), the fragment header of an IPv6 one and where the byte that
+/// named it is, and its data.
+struct First {
+    header: Vec<u8>,
+    frag6: Option<(usize, [u8; 8])>,
+    data: Vec<u8>,
+}
+
+impl First {
+    /// Its bytes as it came.
+    fn len(&self) -> usize {
+        self.header.len() + self.frag6.map_or(0, |_| 8) + self.data.len()
+    }
+
+    /// The fragment as it came, in one allocation of its length.
+    fn rebuild(&self) -> Vec<u8> {
+        let mut first = Vec::with_capacity(self.len());
+        first.extend_from_slice(&self.header);
+        if let Some((next_at, frag)) = self.frag6 {
+            first[next_at] = protocol::FRAGMENT;
+            first.extend_from_slice(&frag);
+        }
+        first.extend_from_slice(&self.data);
+        first
+    }
+}
+
+impl Reassembly {
+    /// The most bytes a reassembly holds at any moment: the 4 MiB it
+    /// counts, and the root nodes of its three maps, which no packet
+    /// counts. A step that hands a packet out holds that packet besides,
+    /// which its taker pays for.
+    pub const MOST_HELD: usize = MAX_WAITING
+        + tree_root(size_of::<(Key, Partial)>())
+        + tree_root(size_of::<(Instant, Key)>())
+        + tree_root(size_of::<((Instant, Key), First)>());
 }
 
 /// What [`Reassembly::push`] made of a packet.
@@ -631,12 +744,37 @@ struct Arrived<'a> {
     offset: usize,
     more: bool,
     data: &'a [u8],
-    /// The headers in front of the data, ready to use, if this is the first
-    /// fragment.
-    header: Option<Vec<u8>>,
+    /// The headers in front of the data, if this is the first fragment.
+    header: Option<Head<'a>>,
     /// See [`Partial::frag6`].
     frag6: Option<(usize, [u8; 8])>,
     timeout: Duration,
+}
+
+/// A first fragment's headers in the packet, read but not copied: copied
+/// only where they are kept, after room is made for them.
+#[derive(Clone, Copy)]
+struct Head<'a> {
+    bytes: &'a [u8],
+    /// For IPv6: where the "next header" byte that named the fragment
+    /// header is, and what the fragment header named, which it names in
+    /// the headers kept.
+    next: Option<(usize, u8)>,
+}
+
+impl Head<'_> {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// The headers as they are kept.
+    fn to_vec(self) -> Vec<u8> {
+        let mut header = self.bytes.to_vec();
+        if let Some((at, next)) = self.next {
+            header[at] = next;
+        }
+        header
+    }
 }
 
 impl Reassembly {
@@ -682,21 +820,19 @@ impl Reassembly {
     /// Packets whose time is up are dropped first, so a fragment that comes
     /// after its packet expired never completes it, even when the caller
     /// has not called [`expire`](Reassembly::expire) yet.
+    ///
+    /// The cap holds after each packet: a fragment that would pass it first
+    /// makes room ([`make_room`](Reassembly::make_room)), dropping the
+    /// packets that expire soonest, as many as dropping them after it went
+    /// in would, so the outcome is the same.
     fn reassemble(&mut self, packet: Chunk, now: Instant) -> Result<Option<Chunk>, ()> {
         self.expire(now);
         let whole = self.push_fragment(packet, now);
-        // Every path that may have added bookkeeping ends here, so the cap
-        // holds after each packet.
-        while self.size > MAX_WAITING {
-            match self.by_expiry.first() {
-                Some(&(_, k)) => self.remove(&k),
-                None => break,
-            }
-        }
+        debug_assert!(self.size <= self.limit, "{} bytes wait", self.size);
         whole
     }
 
-    /// [`reassemble`](Reassembly::reassemble), without the cap.
+    /// [`reassemble`](Reassembly::reassemble), after the expiry.
     fn push_fragment(&mut self, packet: Chunk, now: Instant) -> Result<Option<Chunk>, ()> {
         let Some(frag) = arrived(&packet) else {
             return Ok(Some(packet));
@@ -704,7 +840,7 @@ impl Reassembly {
         // A packet in one fragment needs no waiting (RFC 6946).
         if frag.offset == 0 && !frag.more {
             let header = frag.header.ok_or(())?;
-            return finish(header, &[(0, frag.data)], frag.data.len())
+            return finish(header, [frag.data], frag.data.len())
                 .map(|bytes| Some(Chunk::unpaid(bytes)))
                 .ok_or(());
         }
@@ -719,104 +855,172 @@ impl Reassembly {
             self.kill(&key);
             return Err(());
         }
+        // The checks read the packet as it is, adding nothing yet: a
+        // packet with no fragments here yet passes every one.
+        if let Some(partial) = self.partial.get_mut(&key) {
+            if partial.dead {
+                return Err(());
+            }
+            // An exact copy of a fragment that is already here, with the
+            // same bytes and the same "more fragments" flag, is ignored.
+            // Fragments never overlap and carry data, so the one that ends
+            // at the length is the last fragment.
+            if let Some((o, d)) = partial.pieces.range(..=frag.offset).next_back()
+                && *o == frag.offset
+                && d.as_slice() == frag.data
+            {
+                let was_last = partial.total == Some(end);
+                if was_last != frag.more {
+                    return Ok(None);
+                }
+                self.kill(&key);
+                return Err(());
+            }
+            let mut ok = true;
+            // The last fragment sets the length. It must agree with the
+            // data.
+            if !frag.more {
+                match partial.total {
+                    Some(t) if t != end => ok = false,
+                    _ => {}
+                }
+                if partial
+                    .pieces
+                    .iter()
+                    .next_back()
+                    .is_some_and(|(o, d)| o + d.len() > end)
+                {
+                    ok = false;
+                }
+                partial.total = Some(end);
+            } else if partial.total.is_some_and(|t| end >= t) {
+                ok = false;
+            }
+            // Any other overlap drops the whole packet, including the same
+            // place with other bytes (RFC 5722).
+            if ok {
+                if let Some((o, d)) = partial.pieces.range(..=frag.offset).next_back()
+                    && o + d.len() > frag.offset
+                {
+                    ok = false;
+                }
+                if let Some((o, _)) = partial.pieces.range(frag.offset + 1..).next()
+                    && *o < end
+                {
+                    ok = false;
+                }
+            }
+            if !ok {
+                self.kill(&key);
+                return Err(());
+            }
+            // Complete when the pieces cover the data. They never overlap
+            // and never pass the end, so counting their bytes is enough.
+            // The last piece is never copied in: the whole packet is built
+            // from the pieces and it, and the packet goes.
+            let header = partial
+                .header
+                .as_deref()
+                .map(|bytes| Head { bytes, next: None });
+            if let Some(header) = header.or(frag.header)
+                && partial.total == Some(partial.have + frag.data.len())
+            {
+                let pieces = partial.pieces.iter().map(|(o, d)| (*o, d.as_slice()));
+                let data = with_piece(pieces, frag.offset, frag.data);
+                let whole = finish(header, data, partial.have + frag.data.len());
+                self.take(&key);
+                return whole.map(|bytes| Some(Chunk::unpaid(bytes))).ok_or(());
+            }
+        }
+        // The fragment waits. What it adds is counted, and room made for it,
+        // before anything is copied.
+        let fresh = !self.partial.contains_key(&key);
+        let header_new = self
+            .partial
+            .get(&key)
+            .is_none_or(|partial| partial.header.is_none());
+        let header = frag.header.filter(|_| header_new);
+        let mut added = frag.data.len() + PIECE_COST + header.map_or(0, |h| h.len());
+        if fresh {
+            added += PARTIAL_COST;
+        }
+        let expires = match self.partial.get(&key) {
+            Some(partial) => partial.expires,
+            None => now + frag.timeout,
+        };
+        if !self.make_room(key, expires, fresh, added) {
+            // Its own packet went to make room: the fragment goes with it,
+            // as when it was dropped after going in.
+            return Ok(None);
+        }
         let by_expiry = &mut self.by_expiry;
-        let size = &mut self.size;
         let partial = self.partial.entry(key).or_insert_with(|| {
-            let expires = now + frag.timeout;
             by_expiry.insert((expires, key));
-            *size += PARTIAL_COST;
             Partial {
                 dead: false,
                 header: None,
                 frag6: None,
                 pieces: BTreeMap::new(),
-                total: None,
+                total: (!frag.more).then_some(end),
                 have: 0,
-                size: PARTIAL_COST,
+                size: 0,
                 expires,
             }
         });
-        if partial.dead {
-            return Err(());
-        }
-        // An exact copy of a fragment that is already here, with the same
-        // bytes and the same "more fragments" flag, is ignored. Fragments
-        // never overlap and carry data, so the one that ends at the length
-        // is the last fragment.
-        if let Some((o, d)) = partial.pieces.range(..=frag.offset).next_back()
-            && *o == frag.offset
-            && d.as_slice() == frag.data
-        {
-            let was_last = partial.total == Some(end);
-            if was_last != frag.more {
-                return Ok(None);
-            }
-            self.kill(&key);
-            return Err(());
-        }
-        let mut ok = true;
-        // The last fragment sets the length. It must agree with the data.
-        if !frag.more {
-            match partial.total {
-                Some(t) if t != end => ok = false,
-                _ => {}
-            }
-            if partial
-                .pieces
-                .iter()
-                .next_back()
-                .is_some_and(|(o, d)| o + d.len() > end)
-            {
-                ok = false;
-            }
-            partial.total = Some(end);
-        } else if partial.total.is_some_and(|t| end >= t) {
-            ok = false;
-        }
-        // Any other overlap drops the whole packet, including the same
-        // place with other bytes (RFC 5722).
-        if ok {
-            if let Some((o, d)) = partial.pieces.range(..=frag.offset).next_back()
-                && o + d.len() > frag.offset
-            {
-                ok = false;
-            }
-            if let Some((o, _)) = partial.pieces.range(frag.offset + 1..).next()
-                && *o < end
-            {
-                ok = false;
-            }
-        }
-        if !ok {
-            self.kill(&key);
-            return Err(());
-        }
-        let mut added = frag.data.len() + PIECE_COST;
-        if let Some(h) = frag.header
-            && partial.header.is_none()
-        {
-            added += h.len();
-            partial.header = Some(h);
+        if let Some(h) = header {
+            partial.header = Some(h.to_vec());
             partial.frag6 = frag.frag6;
         }
         partial.pieces.insert(frag.offset, frag.data.to_vec());
         partial.have += frag.data.len();
         partial.size += added;
         self.size += added;
-        // Complete when the pieces cover the data. They never overlap and
-        // never pass the end, so counting their bytes is enough.
-        if partial.header.is_some() && partial.total == Some(partial.have) {
-            let partial = self.take(&key).unwrap();
-            let pieces: Vec<(usize, &[u8])> = partial
-                .pieces
-                .iter()
-                .map(|(o, d)| (*o, d.as_slice()))
-                .collect();
-            return finish(partial.header.unwrap(), &pieces, partial.have)
-                .map(|bytes| Some(Chunk::unpaid(bytes)))
-                .ok_or(());
-        }
         Ok(None)
+    }
+
+    /// Makes room for `added` more bytes of the packet `key`, which expires
+    /// at `expires` and is `fresh` when it is not here yet: drops the
+    /// packets that expire soonest, its own by its place among them, until
+    /// the count with `added` is within the limit. These are the packets
+    /// that dropping after the fragment went in would drop, and in the same
+    /// order. Returns whether the packet `key` is still to have the bytes:
+    /// `false` when it was dropped, or would have been.
+    fn make_room(&mut self, key: Key, expires: Instant, fresh: bool, added: usize) -> bool {
+        let own = (expires, key);
+        // How many of the soonest go, counting a fresh packet in its place,
+        // and whether its own packet is among them.
+        let mut left = self.size + added;
+        let mut drop = 0;
+        let mut own_goes = false;
+        let mut waiting = self.by_expiry.iter().peekable();
+        while left > self.limit {
+            let next = waiting.peek().copied();
+            let (at, k) = match next {
+                Some(&first) if !fresh || first < own || own_goes => first,
+                _ if fresh && !own_goes => own,
+                _ => break,
+            };
+            if (at, k) == own {
+                own_goes = true;
+                left -= added;
+                if !fresh {
+                    left -= self.partial[&k].size;
+                    waiting.next();
+                    drop += 1;
+                }
+            } else {
+                left -= self.partial[&k].size;
+                waiting.next();
+                drop += 1;
+            }
+        }
+        for _ in 0..drop {
+            let Some(&(_, k)) = self.by_expiry.first() else {
+                break;
+            };
+            self.remove(&k);
+        }
+        !own_goes
     }
 
     /// Takes an unfinished packet out, with its bookkeeping.
@@ -846,6 +1050,13 @@ impl Reassembly {
         p.have = 0;
     }
 
+    /// The bytes counted against the 4 MiB now: at least what the waiting
+    /// fragments and kept first fragments hold, besides the roots of the
+    /// maps ([`MOST_HELD`](Reassembly::MOST_HELD)).
+    pub fn counted(&self) -> usize {
+        self.size
+    }
+
     /// When the next unfinished packet times out.
     pub fn next_expiry(&self) -> Option<Instant> {
         self.by_expiry.first().map(|(t, _)| *t)
@@ -856,7 +1067,7 @@ impl Reassembly {
     /// overlap. For tests and fuzzing.
     #[cfg(any(test, fuzzing))]
     pub fn check(&self) {
-        assert!(self.size <= MAX_WAITING, "{} bytes wait", self.size);
+        assert!(self.size <= self.limit, "{} bytes wait", self.size);
         assert_eq!(self.partial.len(), self.by_expiry.len());
         let mut size = 0;
         for (key, p) in &self.partial {
@@ -870,28 +1081,47 @@ impl Reassembly {
             }
             assert_eq!(have, p.have);
             assert!(p.total.is_none_or(|t| end <= t));
+            let header = p.header.as_ref().map_or(0, Vec::len);
+            assert_eq!(
+                p.size,
+                PARTIAL_COST + header + have + p.pieces.len() * PIECE_COST
+            );
             size += p.size;
         }
-        size += self.expired.iter().map(|p| p.len()).sum::<usize>();
+        size += self
+            .expired
+            .values()
+            .map(|first| first.len() + EXPIRED_COST)
+            .sum::<usize>();
         assert_eq!(size, self.size);
     }
 
     /// Drops every unfinished packet whose time is up. Each one whose first
     /// fragment came keeps that fragment for
     /// [`take_expired`](Reassembly::take_expired) (RFC 1122 section 3.3.2,
-    /// RFC 8200 section 4.5). This also runs before every packet
+    /// RFC 8200 section 4.5), in the parts its packet kept, copying
+    /// nothing. This also runs before every packet
     /// [`push`](Reassembly::push) takes.
     pub fn expire(&mut self, now: Instant) {
         while let Some(&(t, k)) = self.by_expiry.first() {
             if t > now {
                 break;
             }
-            let Some(p) = self.take(&k) else { break };
-            if let Some(first) = first_fragment(&p) {
-                // Never more than the packet counted: the fragment's
-                // headers and data, and 8 bytes of fragment header.
-                self.size += first.len();
-                self.expired.push_back(Chunk::unpaid(first));
+            let Some(mut p) = self.take(&k) else { break };
+            let data = p.pieces.remove(&0);
+            if let (Some(header), Some(data)) = (p.header.take(), data) {
+                let first = First {
+                    header,
+                    frag6: p.frag6,
+                    data,
+                };
+                // Its other pieces go before the first fragment's entry is
+                // made. Never more than the packet counted: the fragment's
+                // headers and data, 8 bytes of fragment header, and
+                // EXPIRED_COST, which PIECE_COST and PARTIAL_COST cover.
+                drop(p);
+                self.size += first.len() + EXPIRED_COST;
+                self.expired.insert((t, k), first);
             }
         }
     }
@@ -899,26 +1129,28 @@ impl Reassembly {
     /// The first fragment, as it came, of a packet whose reassembly timed
     /// out, oldest first. Answer it with [`reassembly_time_exceeded`].
     pub fn take_expired(&mut self) -> Option<Chunk> {
-        let first = self.expired.pop_front()?;
-        self.size -= first.len();
-        Some(first)
+        let (_, first) = self.expired.pop_first()?;
+        self.size -= first.len() + EXPIRED_COST;
+        Some(Chunk::unpaid(first.rebuild()))
     }
 }
 
-/// The first fragment of a packet, as it came, if it arrived: its headers
-/// and the data at offset 0. For IPv6, the "next header" byte that named the
-/// fragment header names it again, and the fragment header goes back in
-/// front of the data.
-fn first_fragment(p: &Partial) -> Option<Vec<u8>> {
-    let header = p.header.as_ref()?;
-    let data = p.pieces.get(&0)?;
-    let mut first = header.clone();
-    if let Some((next_at, frag)) = p.frag6 {
-        first[next_at] = protocol::FRAGMENT;
-        first.extend_from_slice(&frag);
-    }
-    first.extend_from_slice(data);
-    Some(first)
+/// The data `pieces` hold by offset, with `data` at `offset` in its place
+/// among them.
+fn with_piece<'a>(
+    pieces: impl Iterator<Item = (usize, &'a [u8])>,
+    offset: usize,
+    data: &'a [u8],
+) -> impl Iterator<Item = &'a [u8]> {
+    let mut pieces = pieces.peekable();
+    let mut placed = false;
+    core::iter::from_fn(move || {
+        if !placed && pieces.peek().is_none_or(|(o, _)| *o > offset) {
+            placed = true;
+            return Some(data);
+        }
+        pieces.next().map(|(_, d)| d)
+    })
 }
 
 /// The ICMP or ICMPv6 Time Exceeded answer, code 1 ("fragment reassembly
@@ -954,7 +1186,10 @@ fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
                 offset: f.offset,
                 more: f.more,
                 data: h.payload(packet),
-                header: (f.offset == 0).then(|| packet[..h.payload.start].to_vec()),
+                header: (f.offset == 0).then(|| Head {
+                    bytes: &packet[..h.payload.start],
+                    next: None,
+                }),
                 frag6: None,
                 timeout: V4_TIMEOUT,
             })
@@ -969,10 +1204,9 @@ fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
             };
             // The headers in front of the fragment header, with the "next
             // header" byte that named it naming what it named.
-            let header = (f.offset == 0).then(|| {
-                let mut header = packet[..at].to_vec();
-                header[next_at] = packet[at];
-                header
+            let header = (f.offset == 0).then(|| Head {
+                bytes: &packet[..at],
+                next: Some((next_at, packet[at])),
             });
             Some(Arrived {
                 key: Key::V6 { src, dst, id: f.id },
@@ -995,18 +1229,29 @@ fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
 /// `None` if it would be longer than its header's length field can say:
 /// 65,535 bytes for IPv4, and 65,535 bytes after the fixed header for
 /// IPv6. The data alone stays within 65,535 bytes, but headers come on top.
-fn finish(mut header: Vec<u8>, pieces: &[(usize, &[u8])], total: usize) -> Option<Vec<u8>> {
-    let head = header.len();
-    let len = if header[0] >> 4 == 4 {
-        head + total
+/// The packet is made in one allocation of its length.
+fn finish<'a>(
+    head: Head<'_>,
+    pieces: impl IntoIterator<Item = &'a [u8]>,
+    total: usize,
+) -> Option<Vec<u8>> {
+    let first = *head.bytes.first()?;
+    let at = head.len();
+    let len = if first >> 4 == 4 {
+        at + total
     } else {
-        head - 40 + total
+        at - 40 + total
     };
     let len = u16::try_from(len).ok()?;
-    header.reserve(total);
-    for (_, d) in pieces {
+    let mut header = Vec::with_capacity(at + total);
+    header.extend_from_slice(head.bytes);
+    if let Some((next_at, next)) = head.next {
+        header[next_at] = next;
+    }
+    for d in pieces {
         header.extend_from_slice(d);
     }
+    let head = at;
     if header[0] >> 4 == 4 {
         header[2..4].copy_from_slice(&len.to_be_bytes());
         // No more fragments, offset 0. Keep "don't fragment".
@@ -1886,6 +2131,12 @@ pub fn hop(packet: &mut [u8]) -> Hop {
 #[path = "../../../verification/packet-udp/kani/ip_header.rs"]
 mod proofs;
 
+/// Bounded proofs that reassembly holds no more than it counts, with every
+/// allocation counted, run with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../verification/packet-udp/kani/resources.rs"]
+mod resource_proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2032,7 +2283,7 @@ mod tests {
         assert!(r.partial.is_empty());
         // What is left counted is the first fragment, kept for the Time
         // Exceeded answer until taken.
-        assert_eq!(r.size, first.len());
+        assert_eq!(r.size, first.len() + EXPIRED_COST);
         assert_eq!(r.take_expired(), Some(first));
         assert_eq!(r.size, 0);
         // The rest alone does not make a packet: the first fragment is gone.
@@ -2170,7 +2421,7 @@ mod tests {
         r.check();
         // Each was a first fragment, kept for its Time Exceeded answer and
         // counted until taken; taking them all leaves nothing counted.
-        let kept: usize = r.expired.iter().map(|p| p.len()).sum();
+        let kept: usize = r.expired.values().map(|p| p.len() + EXPIRED_COST).sum();
         assert_eq!(r.size, kept);
         let mut taken = 0;
         while let Some(p) = r.take_expired() {

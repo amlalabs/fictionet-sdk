@@ -6,9 +6,9 @@ use std::net::{IpAddr, SocketAddr};
 
 use fictionet::Entropy;
 use fictionet::stdlib::layer::{
-    Admit, Charge, ChargedBytes, ChildId, Chunk, CommandOf, Datagram, DatagramCommand,
-    DatagramEvent, Datagrams, Env, EventOf, Layer, MessageCommand, MessageEvent, Messages,
-    MuxEvent, MuxOp, PacketCommand, PacketEvent, Packets, Slots,
+    Admit, Budget, Charge, ChargedBytes, ChargedDeque, ChildId, Chunk, CommandOf, Datagram,
+    DatagramCommand, DatagramEvent, Datagrams, Env, EventOf, Layer, MessageCommand, MessageEvent,
+    Messages, MuxEvent, MuxOp, PacketCommand, PacketEvent, Packets, Slots,
 };
 use fictionet::stdlib::network::Transport;
 use fictionet::stdlib::network::icmp;
@@ -22,10 +22,13 @@ use super::{PortZero, Settings};
 /// How many bytes of datagrams a socket holds before it drops new ones,
 /// like a full socket buffer, counting [`DATAGRAM_COST`] more for each.
 pub(super) const QUEUE: usize = 1 << 20;
-/// What a queued datagram costs beyond its bytes: its sender's address and
-/// its place in the queue. So a flood of tiny datagrams is bounded too: a
-/// socket holds at most `QUEUE / DATAGRAM_COST` of them.
-pub(super) const DATAGRAM_COST: usize = 64;
+/// What a queued datagram costs beyond its bytes: its chunk's header
+/// ([`Chunk::HEADER`]) and its place in the queue, with its sender's
+/// address. So a flood of tiny datagrams is bounded too: a socket holds at
+/// most `QUEUE / DATAGRAM_COST` of them.
+pub(super) const DATAGRAM_COST: usize = 256;
+
+const _: () = assert!(DATAGRAM_COST >= Chunk::HEADER + size_of::<(Datagram<SocketAddr>, Charge)>());
 /// How many datagrams each socket may have handed to the layer and not yet
 /// seen go down: the command credit a socket starts with.
 const SEND_WINDOW: u64 = 64;
@@ -65,12 +68,14 @@ const SOCKETS: usize = 1 << 16;
 /// the notice still goes up. A datagram for a group goes unanswered.
 ///
 /// Each socket holds at most 1 MiB of datagrams the port above has not
-/// taken, counting 64 bytes more for each. A datagram past that is dropped,
-/// as with a full socket buffer, and reported ([`UdpReport::Dropped`]).
-/// Each one it keeps is charged, its bytes and those 64 more, to the
-/// layer's [budget](Env::budget) before it is
-/// copied, and the charge goes up with it; one the budget has no room for
-/// is dropped and reported the same way. When the packets below end, each
+/// taken, counting 256 bytes more for each. A datagram past that is
+/// dropped, as with a full socket buffer, and reported
+/// ([`UdpReport::Dropped`]). What each one it keeps holds is charged to the
+/// layer's [budget](Env::budget) before it is allocated: its place in the
+/// queue, whose places stay paid for until the socket closes, its bytes and
+/// its chunk's header ([`Chunk::HEADER`]). The bytes' charge goes up with
+/// it; one the budget has no room for is dropped and reported the same
+/// way. When the packets below end, each
 /// socket's [`DatagramEvent::Ended`] follows the datagrams it still holds.
 ///
 /// A socket's datagrams go up within the credit the port above grants, one
@@ -113,10 +118,10 @@ struct Pending {
 /// One bound socket.
 struct Socket {
     port: u16,
-    /// The datagrams waiting, each with the charge for its place: its
-    /// sender's address and its slot, [`DATAGRAM_COST`], given back when
+    /// The datagrams waiting, in places the queue paid for, each with the
+    /// charge for its chunk's header ([`Chunk::HEADER`]), given back when
     /// it leaves. Its bytes carry their own charge.
-    queue: VecDeque<(Datagram<SocketAddr>, Charge)>,
+    queue: ChargedDeque<(Datagram<SocketAddr>, Charge)>,
     /// What `queue` holds, counted as for [`QUEUE`].
     bytes: usize,
     /// Credit the port above granted for this socket's datagrams.
@@ -136,6 +141,23 @@ struct Socket {
 }
 
 impl Socket {
+    /// Keeps a datagram of `payload` from `peer`, or says why not. All it
+    /// holds is charged to `budget` before it is allocated: a place in the
+    /// queue when the queue grows, its chunk's header and its bytes. A
+    /// refusal keeps nothing.
+    fn keep(&mut self, budget: &Budget, payload: &[u8], peer: SocketAddr) -> Result<(), Dropped> {
+        let cost = payload.len() + DATAGRAM_COST;
+        if self.bytes + cost > QUEUE {
+            return Err(Dropped::QueueFull);
+        }
+        let header = budget.charge(Chunk::HEADER).ok_or(Dropped::Budget)?;
+        let bytes = ChargedBytes::copy_of(budget, payload).ok_or(Dropped::Budget)?;
+        let place = self.queue.place().ok_or(Dropped::Budget)?;
+        place.push_back((Datagram::new(Chunk::from(bytes), peer), header));
+        self.bytes += cost;
+        Ok(())
+    }
+
     /// Whether the socket has an event the port above may take now.
     fn has_event(&self) -> bool {
         self.completed > 0
@@ -251,7 +273,7 @@ impl UdpLayer {
         None
     }
 
-    fn bind(&mut self, request: Request, port: u16) {
+    fn bind(&mut self, budget: &Budget, request: Request, port: u16) {
         let bound = if port == 0 {
             self.ephemeral()
         } else {
@@ -259,7 +281,7 @@ impl UdpLayer {
         };
         let socket = bound.map(|port| Socket {
             port,
-            queue: VecDeque::new(),
+            queue: ChargedDeque::new(budget, QUEUE / DATAGRAM_COST),
             bytes: 0,
             granted: 0,
             credit: 0,
@@ -356,22 +378,10 @@ impl UdpLayer {
         };
         let socket = self.sockets.get_mut(id).expect("a bound port has a socket");
         let payload = udp.payload();
-        let cost = payload.len() + DATAGRAM_COST;
-        let cause = if socket.bytes + cost > QUEUE {
-            Dropped::QueueFull
-        } else if let Some(place) = env.budget().charge(DATAGRAM_COST)
-            && let Some(bytes) = ChargedBytes::copy_of(env.budget(), payload)
-        {
-            socket.bytes += cost;
-            socket
-                .queue
-                .push_back((Datagram::new(Chunk::from(bytes), peer), place));
-            self.wake(id);
-            return;
-        } else {
-            Dropped::Budget
-        };
-        env.report(UdpReport::Dropped { local, peer, cause });
+        match socket.keep(env.budget(), payload, peer) {
+            Ok(()) => self.wake(id),
+            Err(cause) => env.report(UdpReport::Dropped { local, peer, cause }),
+        }
     }
 
     /// The next event of a socket in turn, if any has one.
@@ -452,7 +462,7 @@ impl Layer for UdpLayer {
 
     fn on_command(
         &mut self,
-        _env: &mut Env<'_, UdpReport>,
+        env: &mut Env<'_, UdpReport>,
         command: CommandOf<Self::Upper>,
     ) -> Result<Admit<CommandOf<Self::Upper>>, Overrun> {
         let blocked = match command.op() {
@@ -469,7 +479,7 @@ impl Layer for UdpLayer {
         }
         match command.into_op() {
             MuxOp::Control(MessageCommand::Send(control)) => match control {
-                UdpControl::Bind { request, port } => self.bind(request, port),
+                UdpControl::Bind { request, port } => self.bind(env.budget(), request, port),
                 UdpControl::Join(group) => {
                     if !group.is_multicast() || group.is_ipv4() != self.addr.is_ipv4() {
                         self.notice(UdpNotice::JoinFailed(group));
@@ -588,3 +598,10 @@ fn port_unreachable(
 
 #[cfg(test)]
 mod tests;
+
+/// Bounded proofs that a socket pays for what it keeps before it allocates
+/// it, with every allocation counted, run with `cargo kani -Z stubbing -Z
+/// c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../../verification/packet-udp/kani/udp_resources.rs"]
+mod resource_proofs;

@@ -104,7 +104,7 @@ deframer (`msgs/deframer/`), the record layer, the output queue
 | The output a client's message makes: the server's flight, a KeyUpdate's reply, an alert | the config (the flight: certificate chain, CA names, tickets) and the protocol (control records) | room charged before the message (`reserve_step`, `handshake_room` from `ServerConfig::most_connection`), and the room for the final alert from the first byte |
 | The session store's slots | the config: `size` slots of 32 + 1,024 bytes | made and paid for once (`ServerSessionSlots::with_budget`); a session put is copied into its slot, one found or taken is copied out, at most 1,024 bytes |
 | rustls's protocol state: the handshake state, the key schedule, the record protection each way, the transcript hash | constant for a connection | not a buffer and not charged, by design (`TlsLayer`'s docs). `budget_oracle`'s `tls_bulk_holds_no_heap_its_budget_does_not_cover` measures it once the handshake settles and holds the connection to it, within 1 KiB, through a mebibyte echoed; a KeyUpdate replaces the keys |
-| A chunk's shared backing (`Chunk::BACKING`) | constant for a chunk | not charged, by design; at most two chunks each way in the layer |
+| A chunk's shared backing (`Chunk::HEADER`) | constant for a chunk | not charged, by design; at most two chunks each way in the layer |
 
 Two allocations a client sets are kept from one step to a later one with
 no charge. Both need a config that asks for client certificates, and each
@@ -197,7 +197,7 @@ run. Neither is in `tls-verify resources`. The layer's join is checked by
 `Join.tla` and by the replay `a_message_joined_from_one_byte_records_is_moved_a_few_times`,
 whose control is the code from before 6371855ae.
 
-The constants: `Chunk::BACKING` is the backing's size, two counts and the
+The constants: `Chunk::HEADER` is the backing's size, two counts and the
 `Backing` struct (`buf/src/chunk.rs`); `blocks(N)` is one more than the
 doublings from two records to `N`.
 

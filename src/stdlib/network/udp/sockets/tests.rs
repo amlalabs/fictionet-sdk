@@ -486,16 +486,18 @@ fn a_full_queue_drops_what_does_not_fit_and_charges_go_with_datagrams() {
         ]
     );
     let held = budget.used();
-    assert!(held >= fits * cost, "{held} for {fits} datagrams");
+    let kept = payload.len() + Chunk::HEADER + size_of::<(Datagram<SocketAddr>, Charge)>();
+    assert!(held >= fits * kept, "{held} for {fits} datagrams");
 
     command(&mut d, child.grant(1));
     let mut first = up(&mut d);
     assert_eq!(first.len(), 1);
-    // The datagram took the charge for its bytes up with it, and its place
-    // in the queue went back as it left.
-    assert_eq!(budget.used(), held - DATAGRAM_COST);
+    // The datagram took the charge for its bytes up with it, and the charge
+    // for its chunk's header went back as it left. Its place stays paid
+    // for, for the next one.
+    assert_eq!(budget.used(), held - Chunk::HEADER);
     first.clear();
-    assert_eq!(budget.used(), held - cost);
+    assert_eq!(budget.used(), held - Chunk::HEADER - payload.len());
     // And room for one more.
     arrive(&mut d, datagram(peer, bound.local, &payload));
     assert_eq!(d.observations().drain().count(), 0);
@@ -503,7 +505,9 @@ fn a_full_queue_drops_what_does_not_fit_and_charges_go_with_datagrams() {
 
 #[test]
 fn a_datagram_the_budget_has_no_room_for_is_dropped() {
-    let budget = Budget::new(100);
+    // Room for an empty datagram, its chunk's header and its place, and
+    // ten bytes more: not for fifty.
+    let budget = Budget::new(Chunk::HEADER + size_of::<(Datagram<SocketAddr>, Charge)>() + 10);
     let mut d = stack(budget.clone());
     let (child, bound, _) = bind(&mut d, 0, 53);
     let peer = addr("10.0.0.2:1234");

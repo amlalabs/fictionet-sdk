@@ -59,12 +59,12 @@ fn icmp_messages_match_the_lean_model() {
                 };
                 ip::parameter_problem(&packet, reject)
             }
-            "echo" => icmp::echo_reply(&Packet(packet.clone()), addr(&case["addr"])),
+            "echo" => icmp::echo_reply(&Packet::new(packet.clone()), addr(&case["addr"])),
             other => panic!("unknown entry point {other}"),
         };
         let want = (!case["out"].is_null()).then(|| support::bytes(&case["out"]));
         assert_eq!(
-            out.map(|p| p.0),
+            out.map(|p| p.to_vec()),
             want,
             "{} {packet:?}",
             case["fn"].as_str().unwrap()

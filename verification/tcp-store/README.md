@@ -72,3 +72,20 @@ randomized ring comparisons each cover 48 seeds and 3,000 operations per
 seed. Gathering reuse is checked over 64 cycles in each direction.
 Workspace checks, strict clippy on the touched crates, and formatting
 checks pass. No throughput or per-request allocation benchmark was run.
+
+## Resource properties
+
+The stores' resource properties are part of TCP and below's, run by
+`cargo xtask ip-verify resources` and described with their bounds and
+constants in `../packet-udp/README.md`, "Resource properties". In short:
+what the stores hold is paid for at every moment, by the store's budget
+for the blocks it makes, by the budget that paid a packet's slot for what
+it keeps of it, and by `PLACES`, which the engine charges a socket when it
+opens: the stores' places and a `Chunk::HEADER` for each backing they
+retain. `kani/resources.rs` states it for a segment copied into an empty
+store and across one and two waiting pieces, and for short writes
+gathered into a pooled block, but none of those harnesses finishes within
+14 GiB and 25 minutes; `smoltcp/src/socket/tcp/store_costs.rs` costs
+every step of random, out-of-order, one-byte, joined and sending
+sessions with the counting allocator. They found that `PLACES` left out
+the headers (fixed in e141c7cb3).

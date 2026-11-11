@@ -97,12 +97,13 @@ fn exact(bytes: &[u8]) -> Vec<u8> {
 }
 
 impl Chunk {
-    /// The allocation a chunk's shared backing takes beside its bytes: two
-    /// reference counts, the bytes' vector, what pays for them, what they
-    /// hold and their pool. A budget pays for the bytes, not for this; a
-    /// bound on what a layer allocates counts it once for each backing the
-    /// layer makes.
-    pub const BACKING: usize = 2 * size_of::<usize>() + size_of::<Backing>();
+    /// The bytes every backing allocates besides the bytes it holds: its
+    /// shared header, two reference counts, the bytes' vector, what pays
+    /// for them, what they hold back and their pool. No charge counts it,
+    /// so a holder that keeps many small chunks counts it with each one it
+    /// keeps, and a bound on what a layer allocates counts it once for each
+    /// backing the layer makes.
+    pub const HEADER: usize = 2 * size_of::<usize>() + size_of::<Backing>();
 
     /// Bytes nothing pays for yet: input from the wire, data from the
     /// world. Whoever takes them in pays at admission

@@ -26,7 +26,7 @@
 //!
 //! - **Paid**: after each record, the bytes the step has left allocated
 //!   are at most what the budget is charged and one chunk's backing
-//!   (`Chunk::BACKING`, which no budget pays for): the input holds nothing
+//!   (`Chunk::HEADER`, which no budget pays for): the input holds nothing
 //!   its budget does not pay for. That the new buffer is charged before it
 //!   is made, while the old one is held, is `Join.tla`'s (`ChargeOld`) and
 //!   the replay's.
@@ -87,7 +87,7 @@ fn joins<const N: usize>() {
                 }
             }
             assert!(
-                so_far().live <= before.live + budget.used() + Chunk::BACKING,
+                so_far().live <= before.live + budget.used() + Chunk::HEADER,
                 "the input held more than its budget pays for"
             );
         }
@@ -97,7 +97,7 @@ fn joins<const N: usize>() {
     });
     assert!(
         cost.requested - before.requested
-            <= 4 * taken + 2 * RECORD + (blocks(N) + 1) * Chunk::BACKING,
+            <= 4 * taken + 2 * RECORD + (blocks(N) + 1) * Chunk::HEADER,
         "the input copied what it held once a record"
     );
 }

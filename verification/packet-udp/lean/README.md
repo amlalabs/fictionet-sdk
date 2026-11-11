@@ -248,11 +248,17 @@ length or IPv6 payload length of 65,535 and 65,536.
 
 - Octets are `Nat`s below 256; time is a `Nat` of milliseconds (the
   theorems only add and compare times).
-- The `HashMap` is an association list with distinct keys. The code's
-  `by_expiry` index is read off its entries (`check` asserts the two
-  agree). The cap drops the soonest deadline; between equal deadlines the
-  model drops the first entry, the code the least `Key`. No theorem depends
-  on which.
+- The map of packets (a `BTreeMap`) is an association list with distinct
+  keys. The code's `by_expiry` index is read off its entries (`check`
+  asserts the two agree). The cap drops the soonest deadline; between
+  equal deadlines the model drops the first entry, the code the least
+  `Key`. No theorem depends on which.
+- The model takes a fragment, then caps. The code makes room first
+  (`make_room`), dropping the same packets in the same order, then copies
+  the fragment in, so the state and the result are the same; the vectors
+  hold the code to them. The code keeps a timed-out packet's first
+  fragment in the parts its packet held and rebuilds it when it is taken;
+  the model keeps it rebuilt. Both count its bytes and `EXPIRED_COST`.
 - A piece carries the "more fragments" flag of its fragment as a ghost
   field that the step never reads, for the soundness theorem.
 - The table also holds `out`, the first fragments kept for answers, as

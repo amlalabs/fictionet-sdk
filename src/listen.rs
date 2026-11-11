@@ -649,7 +649,8 @@ const QUEUE_LIMIT: usize = 32 << 20;
 
 /// The bytes of a block a packet from attach is read into: its tag and an
 /// MTU of 1500, with room to spare. A longer packet spills into the link's
-/// own buffer and is copied out whole.
+/// own buffer and is copied out whole, into storage paid from the same
+/// budget before it is made; with no room, it is dropped.
 const PACKET_SLOT: usize = 2048;
 
 /// The most blocks a link keeps for reuse.
@@ -749,10 +750,19 @@ impl SocketLink {
                         block.advance(1);
                         block
                     } else {
-                        let mut whole = Vec::with_capacity(n - 1);
-                        whole.extend_from_slice(&block[1..]);
-                        whole.extend_from_slice(&self.buf[..n - room]);
-                        Chunk::unpaid(whole)
+                        // Copied out of the link's buffer into storage the
+                        // sandbox's budget pays for first. With no room, the
+                        // packet is dropped, as on a congested link.
+                        let Some(mut whole) = Chunk::block(&self.memory, 0, n - 1) else {
+                            continue;
+                        };
+                        whole
+                            .extend_within(&block[1..])
+                            .expect("the block holds the packet");
+                        whole
+                            .extend_within(&self.buf[..n - room])
+                            .expect("the block holds the packet");
+                        whole
                     };
                     return Poll::Ready(Ok(Packet::from_chunk(packet)));
                 }
@@ -1085,6 +1095,43 @@ mod tests {
             drop(first);
             assert_eq!(third.await?, packets[2][..]);
             drop(second);
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    /// A packet longer than a block is copied out of the link's buffer
+    /// into storage the sandbox's budget paid for first; with no room for
+    /// it, it is dropped, as on a congested link, and the next one comes.
+    #[test]
+    fn a_packet_longer_than_a_block_is_paid_from_the_sandboxs_budget() {
+        let (attacher, mut attachments) = attachments();
+        let listening = listen(socket("long-paid"), attacher).unwrap();
+        let client = Client::hello(&listening.path, "agent");
+        assert_eq!(client.recv(), [relay::ACCEPT]);
+        let short: Vec<u8> = (0..100).map(|i| i as u8).collect();
+        let long: Vec<u8> = (0..3 * PACKET_SLOT).map(|i| (i * 7) as u8).collect();
+        for bytes in [&long, &short, &long, &short] {
+            unix::send_parts(client.0.as_raw_fd(), &[&[relay::PACKET], bytes], false).unwrap();
+        }
+        block_on(run(Seed::from_u64(0), move |fcx| async move {
+            let mut agent = attachments.get(&fcx, "agent").await?;
+            let budget = Budget::new(6 * PACKET_SLOT);
+            agent.pay_from(&budget);
+            let first = agent.recv(&fcx).await?;
+            assert_eq!(first, long[..]);
+            assert!(
+                first.chunk().charged() >= first.len() && budget.used() >= first.len(),
+                "a long packet kept is not paid from the sandbox's budget"
+            );
+            // With the first kept, the budget has no room for the second
+            // long one: it is dropped, and the short one after it comes.
+            let second = agent.recv(&fcx).await?;
+            assert_eq!(second, short[..]);
+            let third = agent.recv(&fcx).await?;
+            assert_eq!(third, short[..]);
+            assert!(budget.used() <= budget.limit());
+            drop((first, second, third));
             Ok(())
         }))
         .unwrap();
