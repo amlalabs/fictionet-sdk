@@ -25,7 +25,7 @@ impl quinn_proto::TimeSource for Calendar {
     }
 }
 
-fn configs(
+pub(super) fn configs(
     entropy: Arc<dyn Entropy>,
     datagrams: bool,
 ) -> (ClientConfig, ServerConfig, Arc<EndpointConfig>) {

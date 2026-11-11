@@ -1,7 +1,8 @@
 //! QUIC over the world's datagram carrier.
 //!
-//! A layer owns one connection and its endpoint routing state. Its lower
-//! carrier must retire tracked sends, including local drops. It offers
+//! `QuicLayer` owns one connection. `Listener` routes many connections on
+//! one lower carrier and exposes a QUIC mux per child. The lower carrier
+//! must retire tracked sends, including local drops. Each connection offers
 //! independently credited, directionally cancellable byte streams above,
 //! plus the connection's application datagram carrier in its control port.
 //! The engine does no socket I/O. The caller supplies its monotonic epoch;
@@ -15,7 +16,10 @@
 
 mod layer;
 
-pub use layer::{Control, ControlCommand, ControlEvent, Error, Quic, QuicLayer, Stream};
+pub use layer::{
+    Connections, Control, ControlCommand, ControlEvent, Error, Listener, ListenerConfig, Quic,
+    QuicLayer, Stream,
+};
 pub use quinn_proto::{ClientConfig, Dir, EndpointConfig, ServerConfig, StreamId, VarInt};
 
 #[cfg(test)]

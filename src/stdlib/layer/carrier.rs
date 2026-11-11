@@ -514,6 +514,10 @@ impl<C: Port, K: Port> MuxCommand<C, K> {
         &self.0
     }
 
+    pub(crate) fn op_mut(&mut self) -> &mut MuxOp<C, K> {
+        &mut self.0
+    }
+
     /// What it asks for, owned.
     pub fn into_op(self) -> MuxOp<C, K> {
         self.0

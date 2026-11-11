@@ -145,8 +145,8 @@ impl Channel {
 /// A sans-I/O QUIC connection over `Datagrams<SocketAddr>`.
 ///
 /// A server accepts the first connection on its lower carrier and ignores
-/// other Initials. A listener serving many connections must route them to
-/// separate connection layers. Address metadata is the remote socket;
+/// other Initials. Use [`Listener`] to serve many connections on one
+/// datagram carrier. Address metadata is the remote socket;
 /// this carrier has no ECN or local-destination metadata. MTU discovery is
 /// disabled at endpoint creation because it cannot promise no fragmentation.
 /// Crypto providers and calendar time belong to the supplied configuration;
@@ -1064,3 +1064,7 @@ impl Layer for QuicLayer {
         self.ended && self.lower_ended && self.up.is_none() && self.down.is_none() && !self.flight.0
     }
 }
+
+#[path = "listener.rs"]
+mod listener;
+pub use listener::{Connections, Listener, ListenerConfig};
