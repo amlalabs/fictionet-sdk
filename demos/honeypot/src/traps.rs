@@ -206,12 +206,12 @@ impl Drop for Active {
     fn drop(&mut self) {
         let mut state = self.state.lock();
         state.active -= 1;
-        if let Some(peer) = self.check_peer {
-            if let Some(count) = state.host_checks.get_mut(&peer) {
-                *count -= 1;
-                if *count == 0 {
-                    state.host_checks.remove(&peer);
-                }
+        if let Some(peer) = self.check_peer
+            && let Some(count) = state.host_checks.get_mut(&peer)
+        {
+            *count -= 1;
+            if *count == 0 {
+                state.host_checks.remove(&peer);
             }
         }
     }
@@ -749,8 +749,10 @@ impl PortServer for Trap {
                                 ProbeKind::HostCheck => 2,
                             };
                             streaming = kind == ProbeKind::Trickle;
-                            if streaming {
-                                if let Err(error)=bounded_write(&fcx,conn.as_mut(),b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await {end=error;}
+                            if streaming
+                                && let Err(error)=bounded_write(&fcx,conn.as_mut(),b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await
+                            {
+                                end=error;
                             }
                             let mut tick = if streaming { 45 } else { duration };
                             while end == ProbeEnd::Answered {
