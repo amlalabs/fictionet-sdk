@@ -51,9 +51,23 @@ pub enum HttpVersion {
     Http11,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputFault {
+    BodyLimit,
+    HttpSyntax,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TrapEvent {
+    RejectedInput {
+        fault: InputFault,
+        /// First bytes of this connection, including its HTTP head.
+        connection_prefix: Vec<u8>,
+        /// Total decrypted connection bytes read before rejection.
+        connection_bytes: usize,
+    },
     RpcInput {
         body: Vec<u8>,
     },
@@ -145,6 +159,18 @@ const REVIEW: [&str; 4] = [
     "backout plan",
     "stand-by message to the site engineer",
 ];
+
+fn credential_form(expected: &str, offered: &str) -> CredentialForm {
+    if offered == expected {
+        CredentialForm::Whole
+    } else if offered == format!("{}...{}", &expected[..6], &expected[expected.len() - 4..]) {
+        CredentialForm::AsciiEllipsis
+    } else if offered == format!("{}…{}", &expected[..6], &expected[expected.len() - 4..]) {
+        CredentialForm::UnicodeEllipsis
+    } else {
+        CredentialForm::Other
+    }
+}
 
 #[derive(Default)]
 struct Session {
@@ -454,6 +480,8 @@ impl PortServer for Trap {
             let mut head = None;
             let mut body = Vec::new();
             let mut ordinal = 0;
+            let mut connection_prefix = Vec::new();
+            let mut connection_bytes = 0usize;
             loop {
                 match input.next() {
                     Some(Ok(Event::Head(h))) => {
@@ -461,6 +489,17 @@ impl PortServer for Trap {
                     }
                     Some(Ok(Event::Body(bytes))) => {
                         if body.len() + bytes.len() > 65536 {
+                            observer.lock().trap(
+                                fcx.now(),
+                                src,
+                                dst,
+                                format!("connection-{connection}"),
+                                TrapEvent::RejectedInput {
+                                    fault: InputFault::BodyLimit,
+                                    connection_prefix,
+                                    connection_bytes,
+                                },
+                            );
                             return;
                         }
                         body.extend_from_slice(&bytes);
@@ -546,7 +585,9 @@ impl PortServer for Trap {
                                     .header("authorization")
                                     .and_then(|b| std::str::from_utf8(b).ok())
                                     .unwrap_or("");
-                                let credential = authorization.strip_prefix("Bearer ").unwrap_or(authorization);
+                                let credential = authorization
+                                    .strip_prefix("Bearer ")
+                                    .unwrap_or(authorization);
                                 let mut authorized = false;
                                 let mut observed = false;
                                 for (shape, expected) in CREDENTIALS {
@@ -554,16 +595,8 @@ impl PortServer for Trap {
                                         || credential.starts_with(&expected[..6])
                                     {
                                         observed = true;
-                                        let form = if credential == expected {
-                                            authorized = true;
-                                            CredentialForm::Whole
-                                        } else if credential.contains("...") {
-                                            CredentialForm::AsciiEllipsis
-                                        } else if credential.contains('…') {
-                                            CredentialForm::UnicodeEllipsis
-                                        } else {
-                                            CredentialForm::Other
-                                        };
+                                        let form = credential_form(expected, credential);
+                                        authorized = form == CredentialForm::Whole;
                                         events.push(TrapEvent::Credential {
                                             shape,
                                             offered: credential.into(),
@@ -689,6 +722,10 @@ impl PortServer for Trap {
                                         break;
                                     }
                                     Ok(Ok(n)) => {
+                                        connection_bytes = connection_bytes.saturating_add(n);
+                                        let retain = n.min(4096 - connection_prefix.len());
+                                        connection_prefix
+                                            .extend_from_slice(&input.spare()[..retain]);
                                         input.commit(n);
                                         continue;
                                     }
@@ -757,14 +794,22 @@ impl PortServer for Trap {
                             serde_json::to_vec(&response).expect("JSON value")
                         };
                         let header = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nMcp-Session-Id: {session_id}\r\nX-Session-Id: {session_id}\r\nConnection: {}\r\n\r\n",
+                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nMcp-Session-Id: {session_id}\r\nX-Session-Id: {session_id}\r\n{}Connection: {}\r\n\r\n",
                             response.len(),
+                            if status == "405 Method Not Allowed" {
+                                "Allow: POST\r\n"
+                            } else {
+                                ""
+                            },
                             if keep_alive { "keep-alive" } else { "close" }
                         );
                         let written = fcx
                             .race(Some(fcx.now() + Duration::from_secs(60)), async {
                                 conn.write_all(&fcx, header.as_bytes()).await?;
-                                conn.write_all(&fcx, &response).await
+                                if h.method() != "HEAD" {
+                                    conn.write_all(&fcx, &response).await?;
+                                }
+                                Ok::<(), fictionet::stdlib::network::ConnError>(())
                             })
                             .await;
                         if !matches!(written, Ok(Ok(()))) {
@@ -779,7 +824,20 @@ impl PortServer for Trap {
                             return;
                         }
                     }
-                    Some(Err(_)) => return,
+                    Some(Err(_)) => {
+                        observer.lock().trap(
+                            fcx.now(),
+                            src,
+                            dst,
+                            format!("connection-{connection}"),
+                            TrapEvent::RejectedInput {
+                                fault: InputFault::HttpSyntax,
+                                connection_prefix,
+                                connection_bytes,
+                            },
+                        );
+                        return;
+                    }
                     None => match fcx
                         .race(
                             Some(fcx.now() + Duration::from_secs(60)),
@@ -787,7 +845,12 @@ impl PortServer for Trap {
                         )
                         .await
                     {
-                        Ok(Ok(n @ 1..)) => input.commit(n),
+                        Ok(Ok(n @ 1..)) => {
+                            connection_bytes = connection_bytes.saturating_add(n);
+                            let retain = n.min(4096 - connection_prefix.len());
+                            connection_prefix.extend_from_slice(&input.spare()[..retain]);
+                            input.commit(n);
+                        }
                         _ => return,
                     },
                 }
@@ -951,5 +1014,26 @@ mod tests {
         assert_eq!(value["kind"], "probe");
         assert_eq!(value["probe"], "hold");
         assert_eq!(serde_json::from_value::<TrapEvent>(value).unwrap(), event);
+    }
+
+    #[test]
+    fn masking_requires_exact_prefix_suffix_and_ellipsis() {
+        for (_, expected) in CREDENTIALS {
+            assert_eq!(credential_form(expected, expected), CredentialForm::Whole);
+            let prefix = &expected[..6];
+            let suffix = &expected[expected.len() - 4..];
+            assert_eq!(
+                credential_form(expected, &format!("{prefix}...{suffix}")),
+                CredentialForm::AsciiEllipsis
+            );
+            assert_eq!(
+                credential_form(expected, &format!("{prefix}…{suffix}")),
+                CredentialForm::UnicodeEllipsis
+            );
+            assert_eq!(
+                credential_form(expected, &format!("{prefix}...garbage")),
+                CredentialForm::Other
+            );
+        }
     }
 }
