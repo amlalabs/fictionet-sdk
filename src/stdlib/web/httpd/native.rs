@@ -188,6 +188,13 @@ pub struct Http1 {
 }
 
 impl Http1 {
+    /// The slot of the connection's small pool, for heads and answers.
+    pub const SMALL_SLOT: usize = 2048;
+
+    /// The slot of the connection's large pool, for heads and answers too
+    /// long for a small slot: 16 KiB and the headroom before it.
+    pub const LARGE_SLOT: usize = 16384 + HEADROOM;
+
     /// Answers with `handler`, with default options.
     pub fn new(handler: impl Handler) -> Http1 {
         Http1::with(Arc::new(handler), Limits::default())
@@ -285,8 +292,8 @@ impl Http1 {
             return self.over_budget(env);
         };
         self.charge = Some(charge);
-        let small = fictionet::Pool::new(env.budget(), 2048, 4);
-        let large = fictionet::Pool::new(env.budget(), 16384 + HEADROOM, 2);
+        let small = fictionet::Pool::new(env.budget(), Self::SMALL_SLOT, 4);
+        let large = fictionet::Pool::new(env.budget(), Self::LARGE_SLOT, 2);
         // Reserve the reusable small head at open, so its cache is part of
         // the connection's idle storage rather than an outstanding response.
         let Some(head) = small.take(env.budget(), HEADROOM) else {

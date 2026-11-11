@@ -29,20 +29,14 @@ use crate::common::alloc::measuring;
 /// it does not fit.
 const JOIN_PER: usize = 4;
 
-/// The HTTP/1 head pools' slots (`native.rs`, `Http1::open`): the small
-/// one, 2048 bytes, and the large one, 16 KiB and its 64 bytes of
-/// headroom. A head may be joined in one of each before it needs a block
-/// of its own.
-const POOL_SLOTS: usize = 2048 + 16384 + 64;
-
-/// A chunk's shared backing, at most: two reference counts, its vector,
-/// its reservation (a charge: a budget handle and a count), what it holds
-/// and its pool's handle. Each block a unit moves through has one.
-const BACKING: usize = 128;
+/// The HTTP/1 head pools' slots: a head may be joined in one of each
+/// before it needs a block of its own.
+const POOL_SLOTS: usize = Http1::SMALL_SLOT + Http1::LARGE_SLOT;
 
 /// The most blocks a head moves through: the delivered chunk, a small
 /// and a large pool slot, the doubling blocks from 32 KiB to the 64 KiB
 /// limit, and one the budget had room for when it had none for doubling.
+/// Each has a backing ([`Chunk::HEADER`]).
 const HEAD_BLOCKS: usize = 6;
 
 /// A request head with `fields` fields of `value` bytes each.
@@ -105,7 +99,7 @@ fn a_head_trickled_into_a_tight_budget_is_copied_linearly() {
         }
         taken
     });
-    let bound = JOIN_PER * taken + POOL_SLOTS + HEAD_BLOCKS * BACKING;
+    let bound = JOIN_PER * taken + POOL_SLOTS + HEAD_BLOCKS * Chunk::HEADER;
     assert!(
         stats.bytes_requested <= bound,
         "{} bytes asked for to join {taken} bytes of a head, past {bound}",
@@ -175,7 +169,7 @@ fn a_body_in_many_data_frames_is_collected_linearly() {
     // `ANSWER` is the handler's answer, its head block and its frames,
     // once: well under the 64 KiB the connection queues for output.
     const ANSWER: usize = 64 << 10;
-    let bound = frames.len() + FRAMES * (1 + BACKING) + JOIN_PER * FRAMES + ANSWER;
+    let bound = frames.len() + FRAMES * (1 + Chunk::HEADER) + JOIN_PER * FRAMES + ANSWER;
     assert!(
         stats.bytes_requested <= bound,
         "{} bytes asked for to collect a body of {FRAMES} frames, past {bound}",

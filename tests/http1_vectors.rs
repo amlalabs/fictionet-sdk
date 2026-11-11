@@ -298,18 +298,12 @@ fn chunks<'a>(input: &'a [u8], ends: &'a [usize]) -> impl Iterator<Item = Chunk>
 }
 
 /// The budget a request vector of `input` bytes is served with: the
-/// connection's pools' slots (2 KiB and 16 KiB, with 64 bytes of headroom
-/// each, `Http1::open`), an answer's head in a small slot, and room for
-/// the input held twice while it moves, and twice again for the block it
-/// moves to.
+/// connection's pools' slots (`Http1::open`), an answer's head in a small
+/// slot, and room for the input held twice while it moves, and twice again
+/// for the block it moves to.
 fn served_budget(input: usize) -> usize {
-    2 * (2048 + 64) + 16_384 + 64 + 4 * input
+    2 * Http1::SMALL_SLOT + Http1::LARGE_SLOT + 4 * input
 }
-
-/// A chunk's shared backing, at most: two reference counts, its vector,
-/// its reservation (a budget handle and a count), what it holds and its
-/// pool's handle.
-const BACKING: usize = 128;
 
 /// What the server's own state takes, made with it: the layer's queues
 /// and timers, the driver's, and the handler.
@@ -317,19 +311,19 @@ const LAYER: usize = 1024;
 
 /// What the connection allocates when it opens, besides its layer: the
 /// pools' shared state, the rejected-request record and the dates
-/// (`Http1::open`), and the small pool's first slot.
-const OPENING: usize = 512 + 2048;
+/// (`Http1::open`), within 512 bytes, and the small pool's first slot.
+const OPENING: usize = 512 + Http1::SMALL_SLOT;
 
-/// The head pools' slots: a head may be joined in a small slot (2 KiB)
-/// and a large one (16 KiB and 64 bytes of headroom) however few bytes it
-/// has, before it needs a block of its own.
-const POOL_SLOTS: usize = 2048 + 16_384 + 64;
+/// The head pools' slots: a head may be joined in a small slot and a
+/// large one however few bytes it has, before it needs a block of its
+/// own.
+const POOL_SLOTS: usize = Http1::SMALL_SLOT + Http1::LARGE_SLOT;
 
 /// What each message asks for besides its bytes, at most: a field block
 /// for its head, a copy of a head refused for its `Host` (`Http1::fail`),
 /// and its answer's head, each a small pool slot when the pool's are out;
 /// and the answer's body, fields and the refusal's record, within 1 KiB.
-const PER_MESSAGE: usize = 3 * (2048 + 64) + 1024;
+const PER_MESSAGE: usize = 3 * Http1::SMALL_SLOT + 1024;
 
 /// Chunks live at once: a delivery, the block it joins, the block that
 /// block moves to, a head's field block, a body, the answer, and the
@@ -372,11 +366,11 @@ fn served(
         .scan(0, |start, &end| Some(end - std::mem::replace(start, end)))
         .max()
         .unwrap_or(0);
-    let charge = budget.limit() + LAYER + OPENING + LIVE_CHUNKS * BACKING + most_piece;
+    let charge = budget.limit() + LAYER + OPENING + LIVE_CHUNKS * Chunk::HEADER + most_piece;
     let linear = Linear {
         num: JOIN_PER + 1,
         den: 1,
-        fixed: BACKING * ends.len() + LAYER + OPENING + POOL_SLOTS + PER_MESSAGE * messages,
+        fixed: Chunk::HEADER * ends.len() + LAYER + OPENING + POOL_SLOTS + PER_MESSAGE * messages,
     };
     costs.step(input.len(), charge, linear, || {
         let mut driver = server(head, budget);
@@ -413,7 +407,7 @@ fn heads_a_byte_a_delivery() {
     let wire = padded_head(97, 640);
     let ends: Vec<usize> = (1..=wire.len()).collect();
     let mut total = Costs::new("heads");
-    for (session, room) in [("roomy", 1 << 20), ("tight", 2048 + 16_448 + 80_000)] {
+    for (session, room) in [("roomy", 1 << 20), ("tight", POOL_SLOTS + 80_000)] {
         let budget = Budget::new(room);
         let mut costs = Costs::new(format!("heads, {session} budget"));
         let taken = served(
