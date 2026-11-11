@@ -388,6 +388,7 @@ where
     let mut driver = Driver::new(stack, std::sync::Arc::new(fcx.clone()), budget, fcx.now());
     let mut jobs = Jobs::new(driver.budget());
     let mut input: Option<DatagramEvent<SocketAddr>> = None;
+    let mut completion = None;
     let mut socket_closed = false;
     let mut rounds = 0u32;
     loop {
@@ -411,6 +412,12 @@ where
             refusals = driver.refusals();
             let mut moved = false;
             moved |= jobs.take(&mut driver);
+            if let Some(event) = completion.take() {
+                match driver.deliver(event).map_err(StackError::Layer)? {
+                    Admit::Taken | Admit::Closed(_) => moved = true,
+                    Admit::Partial(rest) | Admit::Blocked(rest) => completion = Some(rest),
+                }
+            }
             if let Some(event) = input.take() {
                 match driver.deliver(event).map_err(StackError::Layer)? {
                     Admit::Taken | Admit::Closed(_) => moved = true,
@@ -420,9 +427,14 @@ where
             moved |= driver.run().map_err(StackError::Layer)?;
             let sent = driver.send_below(|command| match command {
                 _ if ended => Admit::Closed(command),
+                _ if completion.is_some() => Admit::Blocked(command),
                 DatagramCommand::Send(datagram) => {
+                    let tracked = datagram.wants_completion();
                     let (payload, to) = datagram.into_parts();
                     socket.send_to(&payload, to);
+                    if tracked {
+                        completion = Some(DatagramEvent::Sent(1));
+                    }
                     Admit::Taken
                 }
                 DatagramCommand::End => {
@@ -448,7 +460,13 @@ where
         }
         // A closed socket still gets what the stack has left, so only a
         // settled stack is done with it.
-        if ended || (settled && socket_closed && input.is_none() && jobs.is_empty()) {
+        if ended
+            || (settled
+                && socket_closed
+                && input.is_none()
+                && completion.is_none()
+                && jobs.is_empty())
+        {
             jobs.close_completed();
             // As the stream runner does, a cancel that landed meanwhile wins.
             if fcx.is_cancelled() {

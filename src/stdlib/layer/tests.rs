@@ -19,6 +19,93 @@ use fictionet::stdlib::codec::{Ending, Lines, Stream};
 use fictionet::stdlib::services::stack::{BoxError, Boxed, Job};
 use fictionet::{Entropy, Seed, SeededEntropy};
 
+#[test]
+fn directional_stream_errors_preserve_the_child_lifetime() {
+    use super::probe::Probe;
+    let entropy = SeededEntropy::new(Seed::from_u64(29));
+    let budget = Budget::new(1 << 20);
+    let mut reports = Observations::new(0);
+    let mut env = Env::new(Instant::ZERO, &entropy, &budget, &mut reports);
+    let mut children =
+        Children::<Probe<ByteStream<u64>, Top>, Top>::new(1, 16, |_, _, _| Some(Probe::new().0));
+    let mut slots = Slots::new(1);
+    let child = slots.insert(()).unwrap();
+    let id = child.id();
+    assert!(matches!(
+        children.on_event(&mut env, MuxEvent::Opened(child, (), 16)),
+        Ok(Admit::Taken)
+    ));
+    for event in [
+        StreamEvent::ReceiveReset(0x10c),
+        StreamEvent::SendStopped(17),
+    ] {
+        assert!(!event.terminal_reset());
+        assert_eq!(event.credit(), 0);
+        assert!(matches!(
+            children.on_event(&mut env, MuxEvent::Child(id, event)),
+            Ok(Admit::Taken)
+        ));
+        children.advance(&mut env).unwrap();
+        assert!(children.child(id).is_some());
+    }
+    assert!(matches!(
+        children.on_event(&mut env, MuxEvent::Child(id, StreamEvent::Reset)),
+        Ok(Admit::Taken)
+    ));
+    assert!(children.child(id).is_none());
+}
+
+#[test]
+fn directional_cancellation_keeps_its_code_without_byte_credit() {
+    assert!(ByteStream::<u64>::urgent(&StreamEvent::SendStopped(17)));
+    assert!(!ByteStream::<u64>::urgent(&StreamEvent::ReceiveReset(17)));
+    assert!(matches!(
+        StreamCommand::ResetSend(0x10c_u64).admit_credit(0),
+        Ok((StreamCommand::ResetSend(0x10c), None))
+    ));
+    assert!(matches!(
+        StreamCommand::StopReceive(17_u64).admit_credit(0),
+        Ok((StreamCommand::StopReceive(17), None))
+    ));
+    let budget = Budget::new(1024);
+    let payload = b"request and response";
+    let command = StreamCommand::<u64>::Write(Chunk::copy_of(&budget, payload).unwrap());
+    let Ok((StreamCommand::Write(prefix), Some(StreamCommand::Write(suffix)))) =
+        command.admit_credit(7)
+    else {
+        panic!("write was not split")
+    };
+    assert_eq!(&*prefix, &payload[..7]);
+    assert_eq!(&*suffix, &payload[7..]);
+    assert!(prefix.shares(&suffix));
+    drop((prefix, suffix));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn datagram_payloads_keep_their_charge_and_refuse_without_losing_bytes() {
+    let budget = Budget::new(1024);
+    let small = Budget::new(0);
+    let payload = vec![42; 128];
+    let mut command = DatagramCommand::Send(Datagram::new(Chunk::unpaid(payload.clone()), ()));
+    assert!(!command.reserve(&small));
+    assert_eq!(small.used(), 0);
+    assert!(command.reserve(&budget));
+    assert!(budget.used() >= payload.len());
+    let DatagramCommand::Send(datagram) = command else {
+        unreachable!()
+    };
+    assert_eq!(datagram.payload(), payload);
+    let mut event = DatagramEvent::Datagram(datagram);
+    let paid = budget.used();
+    assert!(event.reserve(&budget));
+    assert_eq!(budget.used(), paid);
+    drop(event);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(DatagramEvent::<()>::Sent(1).credit(), 0);
+    assert!(Datagrams::<()>::urgent(&DatagramEvent::Sent(1)));
+}
+
 // ---------------------------------------------------------------------------
 // A transform: every byte XORed with a key, both ways
 

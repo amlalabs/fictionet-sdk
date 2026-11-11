@@ -540,6 +540,7 @@ mod tests {
             .map(|event| match event {
                 DatagramEvent::Datagram(d) => (d.payload().to_vec(), *d.meta()),
                 DatagramEvent::Ended => panic!("the socket ended"),
+                DatagramEvent::Sent(_) => panic!("no completion was requested"),
             })
             .collect();
         assert_eq!(got, [(Vec::new(), peer), (b"query".to_vec(), peer)]);

@@ -106,7 +106,7 @@ impl Credited for ChannelEvent {
         }
     }
     fn receive_bytes(window: u64) -> Option<usize> {
-        StreamEvent::receive_bytes(window)
+        StreamEvent::<core::convert::Infallible>::receive_bytes(window)
     }
     fn reserve_receive(&mut self, budget: &Budget, window: &Arc<Charge>) -> bool {
         match self {

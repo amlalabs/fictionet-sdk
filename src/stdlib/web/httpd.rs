@@ -72,6 +72,14 @@
 //! set in 2019 never sends a date from the year it runs in. A `Date` the
 //! handler sets itself is sent as it is.
 //!
+//! HTTP/3 uses [`Http3`] over the QUIC stream carrier. Compose
+//! [`Responder::http3`] above a [`QuicLayer`](fictionet::stdlib::services::quic::QuicLayer)
+//! configured to negotiate only `h3`. It serves the same handlers, body
+//! streams, virtual hosts and observations, with HTTP/3 request metadata.
+//! Its QPACK profile advertises zero dynamic capacity; static references,
+//! literals and Huffman coding are supported. A shared UDP listener is not
+//! yet provided by this server, so the current stack serves one connection.
+//!
 //! HTTP/2 uses the same [`Handler`], [`Limits`] and seeded randomness.
 //! The connection charges its frame buffer, HPACK state, stream state and
 //! output frames, and each exchange its request head and body and its
@@ -140,6 +148,7 @@ mod body;
 mod detect;
 mod handlers;
 mod http2;
+mod http3;
 mod native;
 mod response;
 mod sites;
@@ -155,6 +164,13 @@ pub use http2::{
     HttpExchange, Opening, Report as Http2Report, RequestHead as Http2RequestHead, RequestTrailers,
     Respond, RespondWork, Responder, ResponseHead, Timer as Http2Timer,
 };
+pub use http3::Http3;
+/// HTTP/3 with the SDK handler on each exchange.
+pub type Http3Server = fictionet::stdlib::layer::Chain<
+    Http3,
+    fictionet::stdlib::layer::Children<Respond, fictionet::stdlib::layer::Top, Opening>,
+>;
+
 pub use native::{
     Closing, Done as Http1Done, Http1, Next, Report as Http1Report, Timer as Http1Timer, Upgraded,
     Work as Http1Work,

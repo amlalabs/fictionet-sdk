@@ -281,12 +281,7 @@ impl Chunk {
         if self.backing.is_none() {
             return true;
         }
-        let paid_here = self
-            .backing()
-            .reservation
-            .as_ref()
-            .is_some_and(|reservation| reservation.charge().budget().same(budget));
-        if paid_here {
+        if self.is_paid_by(budget) {
             if let Some(backing) = self.sole_whole()
                 && let Some(Reservation::Own(charge)) = &mut backing.reservation
             {
@@ -487,6 +482,18 @@ impl Chunk {
             };
         }
         self.to_vec()
+    }
+
+    /// Whether this budget already pays for the backing. An empty chunk
+    /// without backing needs no payment and returns true for any budget.
+    /// Unlike [`repay`](Self::repay), this query never shrinks spare capacity.
+    pub fn is_paid_by(&self, budget: &Budget) -> bool {
+        self.backing.as_ref().is_none_or(|backing| {
+            backing
+                .reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.charge().budget().same(budget))
+        })
     }
 
     /// The charge that pays for the backing. Pieces of one backing name

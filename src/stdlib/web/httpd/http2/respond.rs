@@ -101,6 +101,23 @@ impl Responder {
         self.server(Http2::new(self.limits))
     }
 
+    /// HTTP/3 over an established QUIC stream carrier, with a handler on each request.
+    pub fn http3(&self) -> super::super::Http3Server {
+        let mut connection = super::super::Http3::new(self.limits);
+        if let Some(start) = self.date {
+            connection = connection.date(start);
+        }
+        let shared = Arc::new(self.clone());
+        Chain::new(
+            connection,
+            Children::new(
+                (self.limits.streams as usize).min(4096),
+                Http2::WINDOW,
+                move |_, opening, budget| Respond::new(shared.clone(), opening, budget),
+            ),
+        )
+    }
+
     /// HTTP/2 after an HTTP/1 `Upgrade: h2c`: `request`, whose whole body
     /// came over HTTP/1, is stream 1, and the client's `settings` apply.
     pub(in super::super) fn upgraded(
@@ -199,7 +216,8 @@ impl Respond {
     fn new(responder: Arc<Responder>, opening: Opening, budget: &Budget) -> Option<Respond> {
         let reserve = budget.charge(answer_reserve())?;
         let deadline = (!opening.ended).then(|| opening.at + responder.limits.body_timeout);
-        let head = crate::stdlib::web::Head::http2(opening.head.into_fields());
+        let version = opening.head.version();
+        let head = crate::stdlib::web::Head::multiplexed(opening.head.into_fields(), version);
         let (stage, next) = match head {
             Some(_) => (Stage::Collecting, None),
             // A head the connection could check but whose pseudo-fields

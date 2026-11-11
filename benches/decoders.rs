@@ -464,6 +464,15 @@ fn qpack_long_instruction(bencher: Bencher, size: usize) {
         });
 }
 
+#[divan::bench(args = [1200, 65_527])]
+fn quic_wire_admission(bencher: Bencher, size: usize) {
+    let input = vec![0x42; size];
+    let budget = fictionet_buf::Budget::new(size + 4096);
+    bencher.counter(BytesCount::new(size)).bench_local(|| {
+        black_box(quinn_proto::PacketBuffer::copy_from(&budget, black_box(&input)).unwrap());
+    });
+}
+
 #[divan::bench(args = [16_384, 65_536])]
 fn quic_sparse_reassembly(bencher: Bencher, size: usize) {
     bencher.counter(ItemsCount::new(size)).bench_local(|| {

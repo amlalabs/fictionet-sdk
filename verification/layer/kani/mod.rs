@@ -15,6 +15,33 @@ use std::time::Duration;
 use super::*;
 use fictionet::time::Instant;
 
+/// Directional cancellation keeps the child alive, costs no byte credit,
+/// and carries its application error without truncation.
+#[kani::proof]
+fn directional_stream_cancellation_keeps_its_code_and_other_direction() {
+    let code: u64 = kani::any();
+    let receive = StreamEvent::ReceiveReset(code);
+    let send = StreamEvent::SendStopped(code);
+    assert!(!receive.terminal_reset());
+    assert!(!send.terminal_reset());
+    assert_eq!(receive.credit(), 0);
+    assert_eq!(send.credit(), 0);
+    assert!(!ByteStream::<u64>::urgent(&receive));
+    assert!(ByteStream::<u64>::urgent(&send));
+    let Ok((StreamCommand::ResetSend(found), None)) =
+        StreamCommand::ResetSend(code).admit_credit(0)
+    else {
+        panic!("directional reset refused")
+    };
+    assert_eq!(found, code);
+    let Ok((StreamCommand::StopReceive(found), None)) =
+        StreamCommand::StopReceive(code).admit_credit(0)
+    else {
+        panic!("stop request refused")
+    };
+    assert_eq!(found, code);
+}
+
 // ---------------------------------------------------------------------------
 // Slots (src/stdlib/layer/carrier.rs, `Slots`)
 
@@ -756,7 +783,7 @@ fn stream_credit_splits_keep_the_allocation_owned() {
     let units: usize = kani::any();
     kani::assume(units > 0 && units < CHUNK);
     let budget = Budget::new(CHUNK);
-    let command =
+    let command: StreamCommand =
         StreamCommand::Write(ChargedBytes::copy_of(&budget, &bytes).unwrap().into_chunk());
     let (StreamCommand::Write(prefix), Some(StreamCommand::Write(suffix))) =
         command.admit_credit(units as u64).unwrap()

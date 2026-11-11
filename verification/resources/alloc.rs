@@ -14,11 +14,11 @@ struct RefusingAllocator;
 
 thread_local! {
     static REFUSE_LARGE: Cell<bool> = const { Cell::new(false) };
-    pub static MEASUREMENT: Cell<Option<Measurement>> = const { Cell::new(None) };
+    pub(crate) static MEASUREMENT: Cell<Option<Measurement>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AllocationStats {
+pub(crate) struct AllocationStats {
     // Allocation and reallocation requests, including refused requests.
     pub allocations: usize,
     pub bytes_requested: usize,
@@ -28,7 +28,7 @@ pub struct AllocationStats {
 }
 
 #[derive(Clone, Copy, Default)]
-pub struct Measurement {
+pub(crate) struct Measurement {
     stats: AllocationStats,
     // Signed because an operation can release a prebuilt fixture.
     live: i128,
@@ -111,7 +111,7 @@ unsafe impl GlobalAlloc for RefusingAllocator {
 #[global_allocator]
 static ALLOCATOR: RefusingAllocator = RefusingAllocator;
 
-pub fn refusing_large<T>(write: impl FnOnce() -> T) -> T {
+pub(crate) fn refusing_large<T>(write: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -126,7 +126,7 @@ pub fn refusing_large<T>(write: impl FnOnce() -> T) -> T {
 // Build fixtures before calling. Only allocator events on this thread count.
 // Reallocation requests count their full new size; live bytes change only on
 // success. Freeing fixture storage lowers net live bytes, not requested bytes.
-pub fn measuring<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
+pub(crate) fn measuring<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
     let (result, measurement) = measure(operation);
     let stats = measurement.stats;
     assert!(
@@ -142,14 +142,14 @@ pub fn measuring<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
 
 /// As [`measuring`], and also the bytes `operation` left allocated, as
 /// [`left_allocated`] gives them.
-pub fn measuring_left<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats, i128) {
+pub(crate) fn measuring_left<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats, i128) {
     let (result, measurement) = measure(operation);
     (result, measurement.stats, measurement.live)
 }
 
 /// Runs `f` and counts the allocations and reallocations it makes on this
 /// thread.
-pub fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
+pub(crate) fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let (value, stats) = measuring(f);
     (value, stats.allocations)
 }
@@ -157,14 +157,14 @@ pub fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
 /// Runs `operation` and returns the bytes it left allocated on this
 /// thread: what it allocated less what it freed, below zero when it freed
 /// more than it allocated.
-pub fn left_allocated<T>(operation: impl FnOnce() -> T) -> (T, i128) {
+pub(crate) fn left_allocated<T>(operation: impl FnOnce() -> T) -> (T, i128) {
     let (result, measurement) = measure(operation);
     (result, measurement.live)
 }
 
 /// Runs `f` with this thread's measurement, if any, set aside: what `f`
 /// allocates and frees is not counted.
-pub fn unmeasured<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn unmeasured<T>(f: impl FnOnce() -> T) -> T {
     struct Restore(Option<Measurement>);
     impl Drop for Restore {
         fn drop(&mut self) {

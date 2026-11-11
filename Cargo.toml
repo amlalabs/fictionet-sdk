@@ -17,6 +17,8 @@ members = [
     "buf",
     "smoltcp",
     "rustls",
+    "quinn-proto",
+    "tests/quic-interop",
     "xtask",
 ]
 default-members = [".", "buf", "cli", "codegen", "codegen/tests/golden", "codegen/tests/layouts", "xtask"]
@@ -79,6 +81,7 @@ rustls-pki-types = "1"
 rustls = { package = "fictionet-rustls", path = "rustls", default-features = false, features = ["std", "ring", "tls12"] }
 smoltcp = { path = "smoltcp", default-features = false }
 fictionet-buf = { path = "buf" }
+quinn-proto = { package = "fictionet-quinn-proto", path = "quinn-proto", default-features = false, features = ["rustls-ring"] }
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
 
 # The host side: real sockets, threads, the relay and the listener.

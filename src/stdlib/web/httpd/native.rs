@@ -1034,6 +1034,7 @@ impl Layer for Http1 {
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<StreamCommand> {
         let command = self.out.pop_front()?;
         match &command {
+            StreamCommand::ResetSend(error) | StreamCommand::StopReceive(error) => match *error {},
             StreamCommand::Write(chunk) => self.handed += chunk.len() as u64,
             StreamCommand::End | StreamCommand::Reset => self.phase = Phase::Closed,
         }
@@ -1246,6 +1247,7 @@ fn version_of(head: &Head) -> Version {
         http1::Version::Http10 => Version::HTTP_10,
         http1::Version::Http11 => Version::HTTP_11,
         http1::Version::Http2 => Version::HTTP_2,
+        http1::Version::Http3 => Version::HTTP_3,
     }
 }
 

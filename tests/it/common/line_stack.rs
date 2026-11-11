@@ -562,6 +562,7 @@ impl<A: DatagramApp> Layer for Datagrammed<A> {
         event: DatagramEvent<SocketAddr>,
     ) -> Result<Admit<DatagramEvent<SocketAddr>>, Infallible> {
         let datagram = match event {
+            DatagramEvent::Sent(_) => return Ok(Admit::Taken),
             event if !self.opened => return Ok(Admit::Blocked(event)),
             DatagramEvent::Datagram(d) => d,
             DatagramEvent::Ended => {

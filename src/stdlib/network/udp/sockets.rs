@@ -98,8 +98,16 @@ pub struct UdpLayer {
     closed: VecDeque<ChildId>,
     /// Packets for the layer below, with the socket each one's credit goes
     /// back to.
-    down: VecDeque<(Chunk, Option<ChildId>)>,
+    down: VecDeque<Pending>,
+    /// Avoid scanning receive-ready sockets when no tracked send retired.
+    has_completions: bool,
     input_ended: bool,
+}
+
+struct Pending {
+    packet: Option<Chunk>,
+    sender: Option<ChildId>,
+    completion: bool,
 }
 
 /// One bound socket.
@@ -117,6 +125,8 @@ struct Socket {
     credit: u64,
     /// Command credit to give back.
     owed: u64,
+    /// Requested send completions, independent of receive credit.
+    completed: u64,
     /// The packets below ended, so the socket ends after its queue.
     ending: bool,
     /// Whether [`DatagramEvent::Ended`] has gone up.
@@ -128,7 +138,8 @@ struct Socket {
 impl Socket {
     /// Whether the socket has an event the port above may take now.
     fn has_event(&self) -> bool {
-        self.owed > 0
+        self.completed > 0
+            || self.owed > 0
             || (self.granted > 0 && !self.queue.is_empty())
             || (self.ending && !self.ended && self.queue.is_empty())
     }
@@ -188,6 +199,7 @@ impl UdpLayer {
             up: VecDeque::new(),
             closed: VecDeque::new(),
             down: VecDeque::new(),
+            has_completions: false,
             input_ended: false,
         }
     }
@@ -252,6 +264,7 @@ impl UdpLayer {
             granted: 0,
             credit: 0,
             owed: SEND_WINDOW,
+            completed: 0,
             ending: self.input_ended,
             ended: false,
             queued: false,
@@ -332,7 +345,11 @@ impl UdpLayer {
             }
             let silent = local.port() == 0 && self.settings.port_zero == PortZero::Silent;
             if !silent && let Some(answer) = port_unreachable(packet.bytes(), dst, &self.icmp) {
-                self.down.push_back((answer.into_chunk(), None));
+                self.down.push_back(Pending {
+                    packet: Some(answer.into_chunk()),
+                    sender: None,
+                    completion: false,
+                });
             }
             self.notice(UdpNotice::Refused { peer, local });
             return;
@@ -365,7 +382,12 @@ impl UdpLayer {
                 continue;
             };
             socket.queued = false;
-            let event = if socket.owed > 0 {
+            let event = if socket.completed > 0 {
+                MuxEvent::Child(
+                    id,
+                    DatagramEvent::Sent(std::mem::take(&mut socket.completed)),
+                )
+            } else if socket.owed > 0 {
                 let owed = std::mem::take(&mut socket.owed);
                 socket.credit += owed;
                 MuxEvent::Credit(id, owed)
@@ -479,14 +501,18 @@ impl Layer for UdpLayer {
                 };
                 socket.credit -= 1;
                 let port = socket.port;
+                let completion = datagram.wants_completion();
                 let (payload, to) = datagram.into_parts();
-                match self.packet(port, &payload, to) {
-                    Some(packet) => self.down.push_back((packet, Some(id))),
-                    None => {
-                        let socket = self.sockets.get_mut(id).expect("checked above");
-                        socket.owed += 1;
-                        self.wake(id);
-                    }
+                let packet = self.packet(port, &payload, to);
+                if packet.is_none() && !completion {
+                    self.sockets.get_mut(id).expect("checked above").owed += 1;
+                    self.wake(id);
+                } else {
+                    self.down.push_back(Pending {
+                        packet,
+                        sender: Some(id),
+                        completion,
+                    });
                 }
             }
         }
@@ -494,14 +520,25 @@ impl Layer for UdpLayer {
     }
 
     fn take_command(&mut self, _: &mut Env<'_, Self::Report>) -> Option<CommandOf<Self::Lower>> {
-        let (packet, sender) = self.down.pop_front()?;
-        if let Some(id) = sender
-            && let Some(socket) = self.sockets.get_mut(id)
+        while let Some(Pending {
+            packet,
+            sender,
+            completion,
+        }) = self.down.pop_front()
         {
-            socket.owed += 1;
-            self.wake(id);
+            if let Some(id) = sender
+                && let Some(socket) = self.sockets.get_mut(id)
+            {
+                socket.owed += 1;
+                socket.completed += u64::from(completion);
+                self.has_completions |= completion;
+                self.wake(id);
+            }
+            if let Some(packet) = packet {
+                return Some(PacketCommand::Send(Packet::from_chunk(packet)));
+            }
         }
-        Some(PacketCommand::Send(Packet::from_chunk(packet)))
+        None
     }
 
     fn take_event(&mut self) -> Option<EventOf<Self::Upper>> {
@@ -512,6 +549,27 @@ impl Layer for UdpLayer {
             return Some(MuxEvent::Closed(id));
         }
         self.socket_event()
+    }
+
+    fn take_urgent(&mut self) -> Option<EventOf<Self::Upper>> {
+        if !self.has_completions {
+            return None;
+        }
+        for _ in 0..self.ready.len() {
+            let id = self.ready.pop_front()?;
+            let Some(socket) = self.sockets.get_mut(id) else {
+                continue;
+            };
+            self.ready.push_back(id);
+            if socket.completed > 0 {
+                return Some(MuxEvent::Child(
+                    id,
+                    DatagramEvent::Sent(std::mem::take(&mut socket.completed)),
+                ));
+            }
+        }
+        self.has_completions = false;
+        None
     }
 }
 

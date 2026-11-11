@@ -98,7 +98,7 @@
 //! # use fictionet::stdlib::layer::*;
 //! let mut slots = Slots::new(8);
 //! let child = slots.insert(()).unwrap();
-//! let bye: MuxCommand<ByteStream, Top> = child.close();
+//! let bye: MuxCommand<ByteStream, Top> = child.close(Closing::Done);
 //! let again: MuxCommand<ByteStream, Top> = child.grant(1);
 //! ```
 //!
@@ -109,7 +109,7 @@
 //! let mut slots = Slots::new(8);
 //! let child = slots.insert(()).unwrap();
 //! let more: MuxCommand<ByteStream, Top> = child.grant(1);
-//! let bye: MuxCommand<ByteStream, Top> = child.close();
+//! let bye: MuxCommand<ByteStream, Top> = child.close(Closing::Done);
 //! ```
 //!
 //! And a handle that outlives its child on the other side, because the peer

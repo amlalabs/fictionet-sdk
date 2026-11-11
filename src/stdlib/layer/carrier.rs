@@ -111,21 +111,31 @@ pub trait Credited {
 /// ([`Admit::Partial`](super::Admit::Partial)). Writing is three steps: the
 /// layer below takes the bytes, hands them on, and later says the transport
 /// took them ([`StreamEvent::Written`]).
+///
+/// The default error type makes directional cancellation uninhabited.
+/// Transports such as QUIC use `ByteStream<Code>` with a copyable
+/// application error code: a reset of the receive direction and a peer
+/// request to stop the send direction remain distinct. Such a port cannot
+/// be connected to an ordinary byte-stream layer without an adapter that
+/// explicitly handles those errors.
 #[derive(Clone, Copy, Debug)]
-pub struct ByteStream;
+pub struct ByteStream<E = core::convert::Infallible>(PhantomData<fn() -> E>);
 
-impl Port for ByteStream {
-    type Event = StreamEvent;
-    type Command = StreamCommand;
+impl<E: Copy> Port for ByteStream<E> {
+    type Event = StreamEvent<E>;
+    type Command = StreamCommand<E>;
 
-    fn urgent(event: &StreamEvent) -> bool {
-        matches!(event, StreamEvent::Written(_) | StreamEvent::Reset)
+    fn urgent(event: &StreamEvent<E>) -> bool {
+        matches!(
+            event,
+            StreamEvent::Written(_) | StreamEvent::Reset | StreamEvent::SendStopped(_)
+        )
     }
 }
 
 /// What comes up a byte stream.
 #[derive(Debug)]
-pub enum StreamEvent {
+pub enum StreamEvent<E = core::convert::Infallible> {
     /// The next bytes from the peer.
     Data(Chunk),
     /// The transport took this many more of the bytes written to it. This
@@ -135,20 +145,33 @@ pub enum StreamEvent {
     Ended,
     /// The connection was reset: both directions are gone.
     Reset,
+    /// The peer reset its send direction with this application error.
+    /// Earlier admitted data precedes this event. The local send direction
+    /// stays open, and the child retains its identity and work.
+    ReceiveReset(E),
+    /// The peer requested cancellation of the local send direction. The
+    /// receive direction stays open. This passes blocked receive data.
+    SendStopped(E),
 }
 
 /// What goes down a byte stream.
 #[derive(Debug)]
-pub enum StreamCommand {
+pub enum StreamCommand<E = core::convert::Infallible> {
     /// Bytes to send, after the ones before.
     Write(Chunk),
     /// Nothing more will be sent. The other direction stays open.
     End,
     /// Reset the connection.
     Reset,
+    /// Abandon the send direction with this application error. The receive
+    /// direction remains open.
+    ResetSend(E),
+    /// Ask the peer to stop its send direction. The local send direction
+    /// remains open.
+    StopReceive(E),
 }
 
-impl Credited for StreamEvent {
+impl<E: Copy> Credited for StreamEvent<E> {
     fn terminal_reset(&self) -> bool {
         matches!(self, Self::Reset)
     }
@@ -185,7 +208,7 @@ impl Credited for StreamEvent {
     }
 }
 
-impl Credited for StreamCommand {
+impl<E: Copy> Credited for StreamCommand<E> {
     fn splittable(&self) -> bool {
         matches!(self, Self::Write(_))
     }
@@ -233,6 +256,10 @@ pub struct Datagrams<M>(PhantomData<fn() -> M>);
 impl<M> Port for Datagrams<M> {
     type Event = DatagramEvent<M>;
     type Command = DatagramCommand<M>;
+
+    fn urgent(event: &Self::Event) -> bool {
+        matches!(event, DatagramEvent::Sent(_))
+    }
 }
 
 /// One whole datagram and where it is from or going.
@@ -240,12 +267,32 @@ impl<M> Port for Datagrams<M> {
 pub struct Datagram<M> {
     payload: Chunk,
     meta: M,
+    completion: bool,
 }
 
 impl<M> Datagram<M> {
     /// A datagram of `payload`, from or to `meta`.
     pub fn new(payload: Chunk, meta: M) -> Datagram<M> {
-        Datagram { payload, meta }
+        Datagram {
+            payload,
+            meta,
+            completion: false,
+        }
+    }
+
+    /// Requests a completion when the lower transport retires this send
+    /// attempt. Completion does not guarantee delivery: a local drop also
+    /// retires the attempt. Completions count only datagrams that request
+    /// them, in send order, and may be combined in one event. Closing the
+    /// carrier cancels completions still outstanding.
+    pub fn with_completion(mut self) -> Self {
+        self.completion = true;
+        self
+    }
+
+    /// Whether this datagram requests a send completion.
+    pub fn wants_completion(&self) -> bool {
+        self.completion
     }
 
     /// Its bytes.
@@ -273,6 +320,10 @@ impl<M> Datagram<M> {
 pub enum DatagramEvent<M> {
     /// One datagram.
     Datagram(Datagram<M>),
+    /// This many requested send attempts have retired at the lower
+    /// transport. This is independent of receive credit and must be
+    /// accepted even while incoming datagrams are blocked.
+    Sent(u64),
     /// The socket closed: no more datagrams.
     Ended,
 }
@@ -287,12 +338,26 @@ pub enum DatagramCommand<M> {
 }
 
 impl<M> Credited for DatagramEvent<M> {
+    fn reserve(&mut self, budget: &Budget) -> bool {
+        match self {
+            Self::Datagram(datagram) => datagram.payload.repay(budget),
+            _ => true,
+        }
+    }
+
     fn credit(&self) -> u64 {
         u64::from(matches!(self, DatagramEvent::Datagram(_)))
     }
 }
 
 impl<M> Credited for DatagramCommand<M> {
+    fn reserve(&mut self, budget: &Budget) -> bool {
+        match self {
+            Self::Send(datagram) => datagram.payload.repay(budget),
+            Self::End => true,
+        }
+    }
+
     fn credit(&self) -> u64 {
         u64::from(matches!(self, DatagramCommand::Send(_)))
     }
@@ -367,6 +432,14 @@ pub struct Mux<C, K, O = ()>(PhantomData<fn(C, K, O)>);
 impl<C: Port, K: Port, O> Port for Mux<C, K, O> {
     type Event = MuxEvent<C, K, O>;
     type Command = MuxCommand<C, K>;
+
+    fn urgent(event: &Self::Event) -> bool {
+        match event {
+            MuxEvent::Child(_, event) => C::urgent(event),
+            MuxEvent::Control(event) => K::urgent(event),
+            _ => false,
+        }
+    }
 }
 
 /// What comes up from a multiplexed connection.
@@ -439,6 +512,10 @@ impl<C: Port, K: Port> MuxCommand<C, K> {
     /// What it asks for.
     pub fn op(&self) -> &MuxOp<C, K> {
         &self.0
+    }
+
+    pub(crate) fn op_mut(&mut self) -> &mut MuxOp<C, K> {
+        &mut self.0
     }
 
     /// What it asks for, owned.
@@ -761,7 +838,7 @@ mod slot_tests {
     fn admitting_bytes_paid_elsewhere_moves_their_charge_to_the_receiver() {
         let sender = Budget::new(4);
         let receiver = Budget::new(4);
-        let mut event = StreamEvent::Data(paid(&sender, &[1, 2, 3, 4]));
+        let mut event: StreamEvent = StreamEvent::Data(paid(&sender, &[1, 2, 3, 4]));
         assert!(!event.reserve(&Budget::new(3)));
         assert_eq!(
             sender.used(),

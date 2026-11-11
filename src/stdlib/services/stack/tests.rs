@@ -731,7 +731,7 @@ impl Layer for Counter {
                 self.reply = Some(Datagram::new(payload, from));
                 Ok(Admit::Taken)
             }
-            DatagramEvent::Ended => Ok(Admit::Taken),
+            DatagramEvent::Ended | DatagramEvent::Sent(_) => Ok(Admit::Taken),
         }
     }
 
@@ -827,6 +827,91 @@ struct Goodbyes {
     left: usize,
     closing: bool,
     slot: Option<Datagram<SocketAddr>>,
+}
+
+#[test]
+fn datagram_send_completion_releases_the_next_send() {
+    struct CompletionGate {
+        handed: u64,
+        completed: u64,
+        ended: bool,
+        socket_sends: Arc<fictionet::sync::Mutex<usize>>,
+    }
+    impl Layer for CompletionGate {
+        type Lower = Datagrams<SocketAddr>;
+        type Upper = Top;
+        type Report = Infallible;
+        type Timer = ();
+        type Work = Infallible;
+        type Done = Infallible;
+        type Error = Infallible;
+
+        fn on_event(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            event: DatagramEvent<SocketAddr>,
+        ) -> Result<Admit<DatagramEvent<SocketAddr>>, Infallible> {
+            if let DatagramEvent::Sent(n) = event {
+                self.completed += n;
+                assert!(self.completed <= self.handed);
+                assert_eq!(self.completed as usize, *self.socket_sends.lock());
+            }
+            Ok(Admit::Taken)
+        }
+
+        fn on_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+            command: Infallible,
+        ) -> Result<Admit<Infallible>, Infallible> {
+            match command {}
+        }
+
+        fn take_command(
+            &mut self,
+            _: &mut Env<'_, Infallible>,
+        ) -> Option<DatagramCommand<SocketAddr>> {
+            if self.ended || self.completed != self.handed {
+                return None;
+            }
+            if self.completed == 3 {
+                self.ended = true;
+                return Some(DatagramCommand::End);
+            }
+            let data = vec![17; self.handed as usize];
+            self.handed += 1;
+            Some(DatagramCommand::Send(
+                Datagram::new(Chunk::unpaid(data), server_addr()).with_completion(),
+            ))
+        }
+
+        fn take_event(&mut self) -> Option<Infallible> {
+            None
+        }
+    }
+    let sent = Arc::new(fictionet::sync::Mutex::new(0));
+    let observed = sent.clone();
+    block_on(lab(Seed::from_u64(17), move |fcx| async move {
+        let gate = CompletionGate {
+            handed: 0,
+            completed: 0,
+            ended: false,
+            socket_sends: sent.clone(),
+        };
+        let end = datagrams(
+            &fcx,
+            ClosedSocket { sent },
+            server_addr(),
+            gate,
+            Budget::unlimited(),
+            |_| {},
+        )
+        .await?;
+        assert_eq!(end, DatagramEnd::Finished);
+        Ok(())
+    }))
+    .unwrap();
+    assert_eq!(*observed.lock(), 3);
 }
 
 impl Layer for Goodbyes {

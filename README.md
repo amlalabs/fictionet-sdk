@@ -111,12 +111,12 @@ fn world(
 ) -> Result {
     web::Sites::new(fictionet_extras::network::cdn_pools(), move |host: &str| match host {
         "en.wikipedia.org" => Some(
-            web::Site::new(wiki.clone())
+            web::SiteConfig::handler(fictionet_extras::httpd::tower(wiki.clone()))
                 .at(Ipv4Addr::new(185, 15, 59, 224))
                 .tls(wikipedia_tls.clone()),
         ),
         "api.stripe.com" => Some(
-            web::Site::new(fake_stripe.clone())
+            web::SiteConfig::handler(fictionet_extras::httpd::tower(fake_stripe.clone()))
                 .tls(stripe_tls.clone()),
         ),
         _ => None, // NXDOMAIN: the world stays closed
