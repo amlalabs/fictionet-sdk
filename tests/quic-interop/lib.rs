@@ -19,6 +19,10 @@ mod tests {
     mod interop {
         include!("interop.rs");
     }
+
+    mod sites {
+        include!("sites.rs");
+    }
 }
 
 #[cfg(test)]

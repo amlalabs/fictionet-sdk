@@ -318,8 +318,54 @@ where
     }
 }
 
-/// Starts serving a UDP port of a machine: the socket and its address.
-pub(super) type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr) + Send + Sync>;
+/// Serves one UDP port of a host with one layer stack on the port's socket,
+/// which gets every datagram with its sender's address. [`Host::udp_stack`]
+/// makes one from a factory; [`httpd::Server`] serves HTTP/3 with one.
+pub trait DatagramServer: Any + Send + Sync {
+    /// The stack for the port's socket, from the socket's [`ConnInfo`]: its
+    /// address, which says the port the endpoint chose for port zero, and
+    /// [`Transport::Udp`]. Also the budget the socket's retained datagrams
+    /// and the stack's storage are charged to.
+    fn stack(&self, fcx: &Cx, info: &ConnInfo) -> (Boxed<Datagrams<SocketAddr>>, Budget);
+
+    /// Prepares to serve `other`'s DNS `names` at the local endpoint, as
+    /// [`PortServer::prepare_share`] does for a TCP port: this must not
+    /// change either server, and the token commits the registration
+    /// without failure. The first host at an address is offered its own
+    /// server; every later host that serves the port is offered to the
+    /// first one's. `None` declines, and placing that host fails. The
+    /// default shares only with itself.
+    fn prepare_share(
+        &self,
+        local: SocketAddr,
+        names: &[String],
+        other: &Arc<dyn DatagramServer>,
+    ) -> Option<PreparedShare> {
+        let _ = (local, names);
+        std::ptr::addr_eq(self as *const Self, Arc::as_ptr(other))
+            .then(|| PreparedShare::new(|| {}))
+    }
+}
+
+/// Serves a UDP port with one layer stack made by `make`.
+struct StackDatagrams<M> {
+    make: M,
+    budget: Budget,
+}
+
+impl<L, M> DatagramServer for StackDatagrams<M>
+where
+    L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top> + Send + 'static,
+    L::Work: Job<Done = L::Done>,
+    L::Report: core::fmt::Debug + Send,
+    L::Done: Send,
+    L::Error: core::error::Error + Send + Sync + 'static,
+    M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
+{
+    fn stack(&self, _: &Cx, info: &ConnInfo) -> (Boxed<Datagrams<SocketAddr>>, Budget) {
+        (Boxed::new((self.make)(info)), self.budget.clone())
+    }
+}
 
 /// Which names a TLS service on a port answers to, by the SNI the client
 /// sends.
@@ -348,7 +394,7 @@ pub(super) enum PortSpec {
         config: CertificateFor,
         accept: Arc<dyn PortServer>,
     },
-    Udp(UdpStart),
+    Udp(Arc<dyn DatagramServer>),
 }
 
 /// One host: its addresses, DNS names, services and programs. See
@@ -627,7 +673,7 @@ impl Host {
     /// `budget` across every sender and every instance of this host.
     /// A machine's native UDP application router holds at most 4096 socket
     /// children, the bound of [`fictionet::stdlib::layer::Children`].
-    pub fn udp_stack<L, M>(mut self, port: u16, budget: Budget, make: M) -> Host
+    pub fn udp_stack<L, M>(self, port: u16, budget: Budget, make: M) -> Host
     where
         L: Layer<Lower = Datagrams<SocketAddr>, Upper = Top> + Send + 'static,
         L::Work: Job<Done = L::Done>,
@@ -636,16 +682,14 @@ impl Host {
         L::Error: core::error::Error + Send + Sync + 'static,
         M: Fn(&ConnInfo) -> L + Send + Sync + 'static,
     {
-        let start: UdpStart = Arc::new(move |_, socket, local| {
-            let budget = budget.clone();
-            let layer = make(&ConnInfo {
-                local: Some(local),
-                transport: Transport::Udp,
-                ..ConnInfo::default()
-            });
-            socket.attach(Boxed::new(layer), budget);
-        });
-        self.ports.push((port, PortSpec::Udp(start)));
+        self.udp_server(port, StackDatagrams { make, budget })
+    }
+
+    /// Serves UDP `port` with `server`. Hosts at one address that serve the
+    /// same port share its one socket when the first host's server agrees
+    /// ([`DatagramServer::prepare_share`]), as sites share a TCP port.
+    pub fn udp_server(mut self, port: u16, server: impl DatagramServer) -> Host {
+        self.ports.push((port, PortSpec::Udp(Arc::new(server))));
         self
     }
 
@@ -1488,8 +1532,11 @@ struct PortPlan {
 enum PreparedPort {
     Udp {
         socket: udp::Socket,
-        start: UdpStart,
+        server: Arc<dyn DatagramServer>,
+        share: Option<PreparedShare>,
     },
+    /// Another host's names on a UDP port this address already serves.
+    UdpShare(PreparedShare),
     Tcp {
         number: u16,
         port: Arc<Port>,
@@ -1536,6 +1583,9 @@ pub(super) struct Machine {
     tcp: tcp::Endpoint,
     udp: udp::Endpoint,
     ports: Mutex<HashMap<u16, Arc<Port>>>,
+    /// The server of each UDP port a host serves here, which later hosts
+    /// share the port through.
+    udp_ports: Mutex<HashMap<u16, Arc<dyn DatagramServer>>>,
     admission: Admission,
     limits: Limits,
 }
@@ -1615,6 +1665,7 @@ impl Machine {
             tcp,
             udp,
             ports: Mutex::new(HashMap::new()),
+            udp_ports: Mutex::new(HashMap::new()),
             admission: installation.admission.clone(),
             limits: installation.limits,
         });
@@ -1631,17 +1682,44 @@ impl Machine {
     fn prepare(&self, host: &Host) -> Result<Vec<PreparedPort>, String> {
         let addr = self.addr;
         let mut ports = HashMap::<u16, PortPlan>::new();
+        let mut udp_ports = HashMap::<u16, Arc<dyn DatagramServer>>::new();
         let mut prepared = Vec::new();
         for (number, spec) in &host.ports {
             let local = SocketAddr::new(addr, *number);
-            if let PortSpec::Udp(start) = spec {
+            if let PortSpec::Udp(server) = spec {
+                // Port zero asks for a port of its own, which no host shares.
+                let front = (*number != 0)
+                    .then(|| {
+                        udp_ports
+                            .get(number)
+                            .cloned()
+                            .or_else(|| self.udp_ports.lock().get(number).cloned())
+                    })
+                    .flatten();
+                if let Some(front) = front {
+                    let share =
+                        front
+                            .prepare_share(local, &host.names, server)
+                            .ok_or_else(|| {
+                                format!(
+                                    "UDP port {number} at {addr} is already served by another host"
+                                )
+                            })?;
+                    prepared.push(PreparedPort::UdpShare(share));
+                    continue;
+                }
                 let socket = self
                     .udp
                     .bind(*number)
                     .map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
+                let share = server.prepare_share(socket.local_addr(), &host.names, server);
+                if *number != 0 {
+                    udp_ports.insert(*number, server.clone());
+                }
                 prepared.push(PreparedPort::Udp {
                     socket,
-                    start: start.clone(),
+                    server: server.clone(),
+                    share,
                 });
                 continue;
             }
@@ -1796,10 +1874,25 @@ impl Machine {
     fn add(self: &Arc<Self>, prepared: Vec<PreparedPort>) {
         for prepared in prepared {
             match prepared {
-                PreparedPort::Udp { socket, start } => {
+                PreparedPort::Udp {
+                    socket,
+                    server,
+                    share,
+                } => {
+                    if let Some(share) = share {
+                        share.commit();
+                    }
                     let local = socket.local_addr();
-                    start(&self.fcx, socket, local);
+                    self.udp_ports.lock().insert(local.port(), server.clone());
+                    let info = ConnInfo {
+                        local: Some(local),
+                        transport: Transport::Udp,
+                        ..ConnInfo::default()
+                    };
+                    let (stack, budget) = server.stack(&self.fcx, &info);
+                    socket.attach(stack, budget);
                 }
+                PreparedPort::UdpShare(share) => share.commit(),
                 PreparedPort::Tcp {
                     number,
                     port,

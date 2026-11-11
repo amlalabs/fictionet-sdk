@@ -22,7 +22,7 @@
 //! [`PortServer`](fictionet::stdlib::world::net::PortServer) that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
 //! hosts. [`Server::served_by`] puts a site on ports 80 and 443 the way
-//! websites are served. `Net` knows nothing of HTTP, so a copy of this
+//! websites are served, HTTP/3 on UDP 443 included. `Net` knows nothing of HTTP, so a copy of this
 //! component with its own handlers plugs in the same way. Copy `httpd.rs`
 //! together with the `httpd/` directory, keeping the relative paths.
 //!
@@ -72,13 +72,18 @@
 //! set in 2019 never sends a date from the year it runs in. A `Date` the
 //! handler sets itself is sent as it is.
 //!
-//! HTTP/3 uses [`Http3`] over the QUIC stream carrier. Compose
-//! [`Responder::http3`] above a [`QuicLayer`](fictionet::stdlib::services::quic::QuicLayer)
-//! configured to negotiate only `h3`. It serves the same handlers, body
-//! streams, virtual hosts and observations, with HTTP/3 request metadata.
-//! Its QPACK profile advertises zero dynamic capacity; static references,
-//! literals and Huffman coding are supported. A shared UDP listener is not
-//! yet provided by this server, so the current stack serves one connection.
+//! HTTP/3 uses [`Http3`] over the QUIC stream carrier, configured to
+//! negotiate only `h3`. [`Responder::http3_listener`] serves it on every
+//! connection a QUIC [`Listener`](fictionet::stdlib::services::quic::Listener)
+//! accepts on one UDP socket, each connection's application charged to that
+//! connection's budget; [`Responder::http3`] serves one connection above a
+//! [`QuicLayer`](fictionet::stdlib::services::quic::QuicLayer). Either way it
+//! serves the same handlers, body streams, virtual hosts and observations,
+//! with HTTP/3 request metadata. [`Server::served_by`] puts it on UDP port
+//! 443 next to HTTP/1 and HTTP/2 on TCP, and advertises it in their
+//! responses with `Alt-Svc`, as real sites do. Its QPACK profile advertises
+//! zero dynamic capacity; static references, literals and Huffman coding
+//! are supported.
 //!
 //! HTTP/2 uses the same [`Handler`], [`Limits`] and seeded randomness.
 //! The connection charges its frame buffer, HPACK state, stream state and
@@ -149,6 +154,7 @@ mod detect;
 mod handlers;
 mod http2;
 mod http3;
+mod http3_sites;
 mod native;
 mod response;
 mod sites;
@@ -156,7 +162,7 @@ mod sites;
 pub use body::{Body, BodyStream};
 pub use detect::{Detect, Http, MakeVersion, Versions};
 pub use handlers::{
-    BadGateway, Exchange, Handler, Later, Reply, Reset, Responses, UpgradeHandler, text,
+    AltSvc, BadGateway, Exchange, Handler, Later, Reply, Reset, Responses, UpgradeHandler, text,
 };
 
 pub use http2::{
@@ -170,6 +176,16 @@ pub type Http3Server = fictionet::stdlib::layer::Chain<
     Http3,
     fictionet::stdlib::layer::Children<Respond, fictionet::stdlib::layer::Top, Opening>,
 >;
+/// HTTP/3 on every connection of one UDP socket, from
+/// [`Responder::http3_listener`].
+pub type Http3Listener = fictionet::stdlib::layer::Chain<
+    fictionet::stdlib::services::quic::Listener,
+    fictionet::stdlib::layer::Children<
+        Http3Server,
+        fictionet::stdlib::layer::Top,
+        fictionet::stdlib::services::quic::Accepted,
+    >,
+>;
 
 pub use native::{
     Closing, Done as Http1Done, Http1, Next, Report as Http1Report, Timer as Http1Timer, Upgraded,
@@ -177,7 +193,7 @@ pub use native::{
 };
 use response::Dates;
 pub use response::{date_header, http_date};
-pub use sites::{Answer, Routing, Server, VHost, VirtualHosts};
+pub use sites::{Answer, HTTP3_CONNECTIONS, Routing, Server, VHost, VirtualHosts};
 
 /// How receipt of a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -253,7 +253,8 @@ impl Network {
     }
 
     /// Run both endpoints until `done`, or until neither has anything left
-    /// to do and nothing is in flight, in virtual time
+    /// to do and nothing is in flight, in virtual time. A network carries
+    /// one run after another, its clock going on.
     pub fn run<C: Endpoint, S: Endpoint>(
         &mut self,
         client: &mut C,
@@ -261,6 +262,7 @@ impl Network {
         mut done: impl FnMut(&mut C, &mut S, Duration) -> bool,
     ) {
         const LIMIT: Duration = Duration::from_secs(300);
+        let limit = self.now + LIMIT;
         loop {
             for datagram in self.arrivals(Side::Server) {
                 server.receive(&datagram, self.now);
@@ -287,7 +289,7 @@ impl Network {
             // A timer due now has run; the next step is strictly later.
             self.now = next.max(self.now + Duration::from_micros(1));
             assert!(
-                self.now < LIMIT,
+                self.now < limit,
                 "no completion in {LIMIT:?} of virtual time"
             );
         }

@@ -10,7 +10,10 @@ The current server composes HTTP/3 and static QPACK over `QuicLayer` into
 the SDK's existing web handlers, with independent quiche interoperability.
 The shared listener also serves these handlers through a world host UDP
 socket, tested with several independent quiche connections at once. See
-[Shared datagram listener](#shared-datagram-listener) for the latest boundaries.
+[Shared datagram listener](#shared-datagram-listener) for its boundaries, and
+[Connection budgets and HTTP/3 sites](#connection-budgets-and-http3-sites)
+for each connection's own budget, the reserved routing tables, Retry, and
+HTTP/3 on the sites `served_by` installs.
 Wire input now retains reservations through packet and frame ownership;
 see [Reserved reassembly storage](#reserved-reassembly-storage) for the latest
 resource evidence and the acknowledgment admission fix. Application send
@@ -2312,3 +2315,139 @@ the code they now share, where the server chooses its version in
 
 `version_information_checks_the_connection_without_allocating` still has
 no verdict within 10 GiB.
+
+## Connection budgets and HTTP/3 sites
+
+The shared listener now pays for each connection from a budget of the
+connection's own, reserves the endpoint's routing storage before it grows,
+offers Retry, and serves the sites `httpd::Server::served_by` installs on
+UDP port 443.
+
+### What is charged
+
+- **Routing tables.** `Endpoint::reserve(connections, budget)` charges
+  `Endpoint::reserved_bytes(connections)` and then makes the connection
+  slab, the indexes by connection ID, initial ID, address and reset token,
+  and each connection's table of its own IDs at that size. Each table is
+  made for twice the entries it may hold, so hashbrown rehashes in place
+  instead of growing. The endpoint then keeps to those bounds: `accept`
+  refuses a connection past the reservation with `CONNECTION_REFUSED`, a
+  connection holds at most seventeen local IDs (eight issued, eight more
+  while a rotation waits for the peer to retire the old ones, and the
+  preferred address's), one `Incoming` waits at a time, and no datagram is
+  buffered for it. The reset-token index is one flat table, so a new peer
+  address allocates no table of its own.
+- **Each connection's storage.** `accept` takes the connection's budget,
+  which its datagram receive arenas, reassembly descriptors and copies, and
+  send descriptors are charged to. A datagram whose destination connection
+  ID names that connection moves its wire reservation there before it is
+  decoded (`PacketBuffer::transfer`); refused, the datagram is dropped, as
+  lost input would be. The listener runs each connection's engine calls in
+  that budget (`Env::scoped_in`), so its stream slots and reads go there
+  too, and the child opens with `Accepted { info, budget }`, which
+  `Children::budgets` hands to the application above.
+  `Responder::http3_listener` composes it that way.
+- **Shares.** The listener's budget pays `connection_budget` when it admits
+  a connection, and gets it back once nothing is charged to the
+  connection's budget, which may be after the connection retires, when the
+  application above closes its child. Until then the share counts against
+  `connections`. A connection past either limit is refused with
+  `CONNECTION_REFUSED` before any per-connection state is made; existing
+  connections go on.
+- **Retry.** With `AddressValidation::Retry` an unvalidated first Initial
+  gets a Retry in the listener's send buffer and nothing else.
+
+`httpd::Server::served_by` installs this listener on UDP 443 for a site
+whose certificate `tls_with` picks at once, through a new
+`world::net::DatagramServer`, which hosts at one address share as they
+share a TCP port: their sites go into one virtual-host table and one
+certificate table by SNI. `Host::udp_stack` is now a `DatagramServer`
+too. HTTP/1 and HTTP/2 responses over TLS from such a site carry
+`Alt-Svc: h3=":443"; ma=86400`, written by the server as it writes
+`Date` (`Exchange::advertise`, `ResponsePolicy::alt_svc`), so the field
+costs no allocation: HTTP/1 writes it into the head it already reserved,
+and HTTP/2 and HTTP/3 add a static value to the head's field map, made
+with room for it. An earlier version added the field to the handler's
+response and failed `allocations::http1_server_allocations` (56,329
+allocations against 50,000) and `http2_server_allocations` (74,717
+against 66,000); the ceilings are unchanged and both pass.
+
+### Evidence
+
+Replays, with the counting allocator:
+
+- `reserving_routing_storage_stays_within_its_charge`: for 1, 3, 64 and
+  1,000 connections, every table `reserve` makes fits in what it charged,
+  at every moment, and it asks for no more than it charged. This is also
+  the check on `table_bytes`, which models hashbrown's layout: a std
+  `HashMap` that allocated more would fail this replay, not the build.
+- `a_refused_reservation_allocates_nothing`.
+- `a_transfer_moves_the_whole_reservation_or_nothing`: a refused transfer
+  leaves both budgets as they were, a transfer allocates nothing, and views
+  that share a backing refuse.
+
+Engine tests, through the test harness:
+
+- `a_reserved_endpoint_keeps_its_tables_through_connection_id_rotation`:
+  two connections whose server IDs expire every two seconds keep every
+  table's capacity and the budget's charge through five lifetimes.
+- `a_full_reserved_endpoint_refuses_a_connection_and_admits_one_after_a_drain`.
+
+These needed two fixes to the engine's test harness, which was written for
+one connection per endpoint: it fired the endpoint's one deadline on
+whichever connection came first and handed every connection's events to
+the first one. It now fires each connection's own timers and routes each
+event to its connection. All existing engine tests pass with it.
+
+Listener tests: `a_connection_pays_from_its_own_share_and_returns_it_once_freed`
+holds storage on a retired connection's budget and checks that its share
+still counts (a newcomer is refused) until the storage is freed (the next
+newcomer is admitted); `a_retry_listener_admits_only_a_client_that_returns_its_token`
+checks that a Retry takes no share; `full_listener_refuses_new_initials_and_keeps_the_existing_connection`
+now checks the newcomer's `CONNECTION_REFUSED`.
+
+Independent peers:
+
+- quiche, in memory: `an_exhausted_listener_budget_refuses_new_connections_and_keeps_the_others`
+  (two uploads mid-transfer finish while a third is refused, and a fourth is
+  admitted once one drains) and `a_retry_listener_keeps_no_state_until_a_client_proves_its_address`.
+  The earlier listener tests now build their stack with
+  `Responder::http3_listener`.
+- quiche, in a world on the real clock, which quiche's timers read:
+  `a_site_serves_http3_to_many_clients_at_once_on_udp_443` (32 clients on
+  one socket, each with its own page) and
+  `sites_at_one_address_share_udp_443_each_with_its_own_certificate` (two
+  hosts at one address, each client trusting only its site's CA, and an
+  unknown name refused in the handshake). On the lab's virtual clock the
+  32-client test stalled: one request never reached the handler, and
+  quiche, whose timers read the host clock, had not retransmitted it when
+  the lab's clock ran out, a few real milliseconds later.
+- ngtcp2: the `http3` case now runs against the listener. `http3_clients_at_once_share_one_listener`
+  runs eight clients at once on the runner's link, and
+  `http3_multiconnect_through_one_listener` runs the runner's multiconnect
+  workload (fifty connections in turn, 30% loss each way) over HTTP/3, all
+  to one listener, which holds the earlier connections while they drain.
+  Every connection settles version 2. `peer.c` gained `fn_owns`, which
+  tells a client's datagrams by its connection IDs.
+- `https_responses_advertise_http3_when_the_site_serves_it` checks the
+  field over HTTP/1.1 and HTTP/2, its absence with `without_http3`, with
+  `tls_when`, and over plain HTTP, and that a handler's own `Alt-Svc` is
+  the only one sent. The HTTP/3 site tests check it over HTTP/3.
+
+### Not covered
+
+- No Kani harness or TLA+ model was added. `Listener.tla` still models one
+  abstract unit of stream-slot storage per connection, not shares; a model
+  of shares returned only once their budget is empty, and a Kani harness
+  for `PacketBuffer::transfer`, are the next proofs.
+- Engine metadata inside a connection (stream records, unordered-read
+  ranges, recovery, TLS) is still not charged, to the connection's budget
+  or any other. A connection's budget bounds what is charged, not the
+  connection's heap.
+- A connection's first datagram stays charged to the listener's budget:
+  it arrives before the connection has a budget.
+- Admission is not per sandbox. One sandbox can hold all of a socket's
+  connections, and an HTTP/3 connection's `ConnInfo` names no sandbox.
+- A site whose certificate `tls_when` picks serves no HTTP/3: rustls picks
+  a QUIC certificate synchronously, inside the handshake.
+- QPACK stays static-only.

@@ -37,7 +37,7 @@ use crate::{
     transport_parameters::{PreferredAddress, TransportParameters},
     version::{VersionInformation, VersionList},
     Duration, Instant, ResetToken, Side, Transmit, TransportConfig, TransportError, INITIAL_MTU,
-    MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE,
+    LOC_CID_COUNT, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE,
 };
 
 /// The main entry point to the library
@@ -61,6 +61,53 @@ pub struct Endpoint {
     /// Buffered Initial and 0-RTT messages for pending incoming connections
     incoming_buffers: Slab<IncomingBuffer>,
     all_incoming_buffers_total_bytes: u64,
+    /// Routing storage paid for up front, when the owner bounds connections
+    reserved: Option<Reserved>,
+}
+
+/// The connections an endpoint's routing storage was reserved for, and the
+/// charge that pays for it ([`Endpoint::reserve`])
+struct Reserved {
+    connections: usize,
+    _charge: fictionet_buf::Charge,
+}
+
+/// Local connection IDs one connection may hold at once on a reserved
+/// endpoint: the most it issues ([`LOC_CID_COUNT`]), as many again while a
+/// rotation waits for the peer to retire the old ones, and the preferred
+/// address's.
+const RESERVED_CIDS: usize = 2 * LOC_CID_COUNT as usize + 1;
+
+/// What `HashMap::with_capacity(capacity)` allocates for entries of `T`, at
+/// most. hashbrown rounds the capacity up to a power-of-two bucket count at a
+/// load of 7/8 (4, 8 or 16 buckets below 15), and keeps one control byte per
+/// bucket and one more group of them after the entries, aligned to a group of
+/// 16. The entries here are aligned to at most 16 bytes.
+fn table_bytes<T>(capacity: usize) -> usize {
+    const GROUP: usize = 16;
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        8..15 => 16,
+        _ => (capacity * 8 / 7).next_power_of_two(),
+    };
+    (buckets * size_of::<T>()).next_multiple_of(GROUP) + buckets + GROUP
+}
+
+/// What `Slab::with_capacity(capacity)` allocates for `T`, at most: one entry
+/// each, `T` or a vacancy's index, with its tag.
+fn slab_bytes<T>(capacity: usize) -> usize {
+    capacity * (size_of::<T>() + 2 * size_of::<usize>())
+}
+
+/// A table that holds at most `items` entries through any order of inserts
+/// and removals keeps half its buckets free, so hashbrown rehashes it in
+/// place instead of growing it.
+const fn churn(items: usize) -> usize {
+    2 * items
 }
 
 impl Endpoint {
@@ -100,7 +147,71 @@ impl Endpoint {
             last_stateless_reset: None,
             incoming_buffers: Slab::new(),
             all_incoming_buffers_total_bytes: 0,
+            reserved: None,
         }
+    }
+
+    /// The bytes [`reserve`](Self::reserve) charges for `connections`.
+    pub fn reserved_bytes(connections: usize) -> usize {
+        let cids = connections * RESERVED_CIDS;
+        slab_bytes::<ConnectionMeta>(connections)
+            + slab_bytes::<IncomingBuffer>(1)
+            + table_bytes::<(ConnectionId, ConnectionHandle)>(churn(cids))
+            + table_bytes::<(ConnectionId, RouteDatagramTo)>(churn(connections + 1))
+            + table_bytes::<(FourTuple, ConnectionHandle)>(churn(connections))
+            + table_bytes::<(SocketAddr, ConnectionHandle)>(churn(connections))
+            + table_bytes::<((SocketAddr, ResetToken), ConnectionHandle)>(churn(connections))
+            + connections * table_bytes::<(u64, ConnectionId)>(churn(RESERVED_CIDS))
+    }
+
+    /// Pays `budget` for the routing storage of at most `connections`
+    /// connections, then makes it, so it never grows: the connection table,
+    /// the indexes by connection ID, address and reset token, and each
+    /// connection's own table of its IDs. Refused, it allocates nothing and
+    /// returns `false`.
+    ///
+    /// The endpoint then holds to those bounds: `accept` refuses a
+    /// connection past `connections`, a connection holds at most seventeen
+    /// local IDs, and one `Incoming` waits at a time, with no datagrams buffered
+    /// for it, so the owner answers each before handling the next datagram.
+    /// Call it on a new endpoint.
+    pub fn reserve(&mut self, connections: usize, budget: &fictionet_buf::Budget) -> bool {
+        assert!(self.connections.is_empty() && self.incoming_buffers.is_empty());
+        let Some(charge) = budget.charge(Self::reserved_bytes(connections)) else {
+            return false;
+        };
+        let cids = connections * RESERVED_CIDS;
+        self.connections = Slab::with_capacity(connections);
+        self.incoming_buffers = Slab::with_capacity(1);
+        self.index = ConnectionIndex {
+            connection_ids_initial: HashMap::with_capacity(churn(connections + 1)),
+            connection_ids: FxHashMap::with_capacity_and_hasher(churn(cids), Default::default()),
+            incoming_connection_remotes: HashMap::with_capacity(churn(connections)),
+            outgoing_connection_remotes: HashMap::with_capacity(churn(connections)),
+            connection_reset_tokens: ResetTokenTable(HashMap::with_capacity(churn(connections))),
+        };
+        self.reserved = Some(Reserved {
+            connections,
+            _charge: charge,
+        });
+        true
+    }
+
+    /// Whether a reserved endpoint holds every connection it was reserved for
+    fn full(&self) -> bool {
+        self.reserved
+            .as_ref()
+            .is_some_and(|reserved| self.connections.len() >= reserved.connections)
+    }
+
+    /// Whether a reserved endpoint has room for another local connection ID,
+    /// for connection `ch` when given.
+    fn cid_room(&self, ch: Option<ConnectionHandle>) -> bool {
+        let Some(reserved) = &self.reserved else {
+            return true;
+        };
+        self.index.connection_ids.len() < reserved.connections * RESERVED_CIDS
+            && ch.is_none_or(|ch| self.connections[ch].loc_cids.len() < RESERVED_CIDS)
     }
 
     /// Pay for application datagram receive arenas of future connections.
@@ -198,6 +309,16 @@ impl Endpoint {
         data: PacketBuffer,
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
+        // A datagram for a connection with its own budget is charged there
+        // before it is decoded, so one connection's input never holds room
+        // another needs. Refused, it is dropped, as if lost on the way.
+        let mut data = data;
+        if let Some(budget) = self.input_budget(&data) {
+            if !data.transfer(budget) {
+                trace!("dropping datagram past its connection's budget");
+                return None;
+            }
+        }
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
         let event = match PartialDecode::new_buffer(
@@ -262,10 +383,13 @@ impl Endpoint {
                     let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
                     let config = &incoming_buffer.server_config;
 
-                    if incoming_buffer
-                        .total_bytes
-                        .checked_add(datagram_len as u64)
-                        .is_some_and(|n| n <= config.incoming_buffer_size)
+                    // A reserved endpoint's owner answers each Incoming before
+                    // the next datagram, and buffers nothing for it.
+                    if self.reserved.is_none()
+                        && incoming_buffer
+                            .total_bytes
+                            .checked_add(datagram_len as u64)
+                            .is_some_and(|n| n <= config.incoming_buffer_size)
                         && self
                             .all_incoming_buffers_total_bytes
                             .checked_add(datagram_len as u64)
@@ -382,6 +506,9 @@ impl Endpoint {
         if self.cids_exhausted() {
             return Err(ConnectError::CidsExhausted);
         }
+        if self.full() {
+            return Err(ConnectError::Full);
+        }
         if remote.port() == 0 || remote.ip().is_unspecified() {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
@@ -447,6 +574,7 @@ impl Endpoint {
                 crypto: config.crypto,
             },
             negotiation,
+            None,
         );
         Ok((ch, conn))
     }
@@ -459,6 +587,11 @@ impl Endpoint {
     ) -> ConnectionEvent {
         let mut ids = vec![];
         for _ in 0..num {
+            if !self.cid_room(Some(ch)) {
+                // A reserved endpoint's tables hold no more; the connection
+                // asks again once the peer retires one.
+                break;
+            }
             let id = self.new_cid(ch);
             let meta = &mut self.connections[ch];
             let sequence = meta.cids_issued;
@@ -471,6 +604,31 @@ impl Endpoint {
             });
         }
         ConnectionEvent(ConnectionEventInner::NewIdentifiers(ids, now))
+    }
+
+    /// The budget of the connection a datagram's destination connection ID
+    /// names, read from its header before it is decoded, when that
+    /// connection has one
+    fn input_budget(&self, data: &[u8]) -> Option<&fictionet_buf::Budget> {
+        let first = *data.first()?;
+        let dcid = if first & 0x80 != 0 {
+            let len = usize::from(*data.get(5)?);
+            data.get(6..6 + len)?
+        } else {
+            data.get(1..1 + self.local_cid_generator.cid_len())?
+        };
+        if dcid.is_empty() || dcid.len() > MAX_CID_SIZE {
+            return None;
+        }
+        let cid = ConnectionId::new(dcid);
+        let ch = match self.index.connection_ids.get(&cid) {
+            Some(ch) => *ch,
+            None => match self.index.connection_ids_initial.get(&cid)? {
+                RouteDatagramTo::Connection(ch) => *ch,
+                RouteDatagramTo::Incoming(_) => return None,
+            },
+        };
+        self.connections.get(ch.0)?.budget.as_ref()
     }
 
     /// Generate a connection ID for `ch`
@@ -513,7 +671,11 @@ impl Endpoint {
 
         // Saturation only happens under heavy load, where deriving initial keys per Initial just to
         // reply with CONNECTION_REFUSED would starve packet processing for existing connections.
-        if self.cids_exhausted() || self.incoming_buffers.len() >= server_config.max_incoming {
+        let incoming_limit = match self.reserved {
+            Some(_) => 1,
+            None => server_config.max_incoming,
+        };
+        if self.cids_exhausted() || self.incoming_buffers.len() >= incoming_limit {
             debug!(
                 "ignoring initial for connection {} due to saturation",
                 dst_cid
@@ -605,6 +767,10 @@ impl Endpoint {
     }
 
     /// Attempt to accept this incoming connection (an error may still occur)
+    ///
+    /// With `budget`, the connection pays for its charged storage there,
+    /// datagrams routed to it included, instead of the endpoint's budgets:
+    /// one connection's storage then never takes room from another's.
     // AcceptError cannot be made smaller without semver breakage
     #[allow(clippy::result_large_err)]
     pub fn accept(
@@ -613,6 +779,7 @@ impl Endpoint {
         now: Instant,
         buf: &mut Vec<u8>,
         server_config: Option<Arc<ServerConfig>>,
+        budget: Option<&fictionet_buf::Budget>,
     ) -> Result<(ConnectionHandle, Connection), AcceptError> {
         let remote_address_validated = incoming.remote_address_validated();
         incoming.improper_drop_warner.dismiss();
@@ -643,7 +810,7 @@ impl Endpoint {
             });
         }
 
-        if self.cids_exhausted() {
+        if self.cids_exhausted() || self.full() {
             debug!("refusing connection");
             self.index.remove_initial(dst_cid);
             return Err(AcceptError {
@@ -733,6 +900,7 @@ impl Endpoint {
                 path_validated: remote_address_validated,
             },
             Negotiation::server(version, params),
+            budget,
         );
         self.index.insert_initial(dst_cid, ch);
 
@@ -898,6 +1066,7 @@ impl Endpoint {
         transport_config: Arc<TransportConfig>,
         side_args: SideArgs,
         negotiation: Negotiation,
+        budget: Option<&fictionet_buf::Budget>,
     ) -> Connection {
         let mut rng_seed = [0; 32];
         self.rng.fill_bytes(&mut rng_seed);
@@ -920,13 +1089,18 @@ impl Endpoint {
             rng_seed,
             side_args,
             negotiation,
-            self.datagram_receive_budget.as_ref(),
-            self.reassembly_budget.as_ref(),
-            self.send_buffer_budget.as_ref(),
+            budget.or(self.datagram_receive_budget.as_ref()),
+            budget.or(self.reassembly_budget.as_ref()),
+            budget.or(self.send_buffer_budget.as_ref()),
         );
 
         let mut cids_issued = 0;
-        let mut loc_cids = FxHashMap::default();
+        let mut loc_cids = match self.reserved {
+            Some(_) => {
+                FxHashMap::with_capacity_and_hasher(churn(RESERVED_CIDS), Default::default())
+            }
+            None => FxHashMap::default(),
+        };
 
         loc_cids.insert(cids_issued, loc_cid);
         cids_issued += 1;
@@ -944,6 +1118,7 @@ impl Endpoint {
             addresses,
             side,
             reset_token: None,
+            budget: budget.cloned(),
         });
         debug_assert_eq!(id, ch.0, "connection handle allocation out of sync");
 
@@ -1015,6 +1190,26 @@ impl Endpoint {
         debug_assert!(x >= self.index.incoming_connection_remotes.len());
         debug_assert!(x >= self.index.outgoing_connection_remotes.len());
         x
+    }
+
+    /// The capacity of every routing table, its connections' own included
+    #[cfg(test)]
+    pub(crate) fn table_capacities(&self) -> Vec<usize> {
+        let mut capacities = vec![
+            self.connections.capacity(),
+            self.incoming_buffers.capacity(),
+            self.index.connection_ids_initial.capacity(),
+            self.index.connection_ids.capacity(),
+            self.index.incoming_connection_remotes.capacity(),
+            self.index.outgoing_connection_remotes.capacity(),
+            self.index.connection_reset_tokens.0.capacity(),
+        ];
+        capacities.extend(
+            self.connections
+                .iter()
+                .map(|(_, meta)| meta.loc_cids.capacity()),
+        );
+        capacities
     }
 
     #[cfg(test)]
@@ -1221,6 +1416,9 @@ pub(crate) struct ConnectionMeta {
     /// Reset token provided by the peer for the CID we're currently sending to, and the address
     /// being sent to
     reset_token: Option<(SocketAddr, ResetToken)>,
+    /// What datagrams routed to this connection are charged to, when it has
+    /// its own budget
+    budget: Option<fictionet_buf::Budget>,
 }
 
 /// Internal identifier for a `Connection` currently associated with an endpoint
@@ -1353,6 +1551,10 @@ pub enum ConnectError {
     /// Try using longer connection IDs
     #[error("CIDs exhausted")]
     CidsExhausted,
+    /// The endpoint already holds every connection its routing storage was
+    /// reserved for ([`Endpoint::reserve`])
+    #[error("reserved connections full")]
+    Full,
     /// The given server name was malformed
     #[error("invalid server name: {0}")]
     InvalidServerName(String),
@@ -1395,35 +1597,23 @@ impl RetryError {
 /// Reset Tokens which are associated with peer socket addresses
 ///
 /// The standard `HashMap` is used since both `SocketAddr` and `ResetToken` are
-/// peer generated and might be usable for hash collision attacks.
+/// peer generated and might be usable for hash collision attacks. One flat
+/// table, so a new peer address allocates no table of its own.
 #[derive(Default, Debug)]
-struct ResetTokenTable(HashMap<SocketAddr, HashMap<ResetToken, ConnectionHandle>>);
+struct ResetTokenTable(HashMap<(SocketAddr, ResetToken), ConnectionHandle>);
 
 impl ResetTokenTable {
     fn insert(&mut self, remote: SocketAddr, token: ResetToken, ch: ConnectionHandle) -> bool {
-        self.0
-            .entry(remote)
-            .or_default()
-            .insert(token, ch)
-            .is_some()
+        self.0.insert((remote, token), ch).is_some()
     }
 
     fn remove(&mut self, remote: SocketAddr, token: ResetToken) {
-        use std::collections::hash_map::Entry;
-        match self.0.entry(remote) {
-            Entry::Vacant(_) => {}
-            Entry::Occupied(mut e) => {
-                e.get_mut().remove(&token);
-                if e.get().is_empty() {
-                    e.remove_entry();
-                }
-            }
-        }
+        self.0.remove(&(remote, token));
     }
 
     fn get(&self, remote: SocketAddr, token: &[u8]) -> Option<&ConnectionHandle> {
         let token = ResetToken::from(<[u8; RESET_TOKEN_SIZE]>::try_from(token).ok()?);
-        self.0.get(&remote)?.get(&token)
+        self.0.get(&(remote, token))
     }
 }
 

@@ -21,7 +21,8 @@ use fictionet::{Cx, Error};
 
 use super::super::response::{Asked, ResponsePolicy, error_response};
 use super::super::{
-    Body, Delivery, Exchange, Handler, Later, Limits, Observe, PIECE, Received, Reply, Reset, text,
+    AltSvc, Body, Delivery, Exchange, Handler, Later, Limits, Observe, PIECE, Received, Reply,
+    Reset, text,
 };
 use super::{Ending, ExchangeCommand, ExchangeEvent, Http2, HttpExchange, Opening, ResponseHead};
 
@@ -118,6 +119,25 @@ impl Responder {
         )
     }
 
+    /// HTTP/3 for every connection `listener` accepts on one UDP socket:
+    /// [`http3`](Self::http3) on each, with that connection's metadata,
+    /// and charged to that connection's budget
+    /// ([`Accepted::budget`](fictionet::stdlib::services::quic::Accepted::budget)).
+    pub fn http3_listener(
+        &self,
+        listener: fictionet::stdlib::services::quic::Listener,
+    ) -> super::super::Http3Listener {
+        use fictionet::stdlib::services::quic::Accepted;
+        let responder = self.clone();
+        let applications = Children::new(
+            listener.connections(),
+            0,
+            move |_, accepted: Accepted, _| Some(responder.clone().conn(accepted.info).http3()),
+        )
+        .budgets(|_, accepted: &Accepted, _| accepted.budget.clone());
+        Chain::new(listener, applications)
+    }
+
     /// HTTP/2 after an HTTP/1 `Upgrade: h2c`: `request`, whose whole body
     /// came over HTTP/1, is stream 1, and the client's `settings` apply.
     pub(in super::super) fn upgraded(
@@ -185,6 +205,8 @@ pub struct Respond {
     ended: bool,
     stage: Stage,
     wants: Asked,
+    /// What the response advertises, as the handler's exchange said.
+    alt_svc: Option<AltSvc>,
     delivery: Option<Delivery>,
     /// The next command, for the connection to take.
     next: Option<ExchangeCommand>,
@@ -242,6 +264,7 @@ impl Respond {
             ended: opening.ended,
             stage,
             wants: Asked::Body,
+            alt_svc: None,
             delivery: None,
             next,
             rest: Chunk::default(),
@@ -326,10 +349,13 @@ impl Respond {
         self.delivery = Delivery::new(&responder.observe, &request, &responder.conn, now, received);
         let responses = super::super::Responses::unpooled(env.budget());
         let reply = match received {
-            Received::Complete => responder.handler.call(
-                request,
-                &mut Exchange::new(now, env.entropy(), &responder.conn, responses.clone()),
-            ),
+            Received::Complete => {
+                let mut exchange =
+                    Exchange::new(now, env.entropy(), &responder.conn, responses.clone());
+                let reply = responder.handler.call(request, &mut exchange);
+                self.alt_svc = exchange.advertised();
+                reply
+            }
             refused => {
                 // Nothing reads a body that was not received whole: its
                 // storage goes before the answer is made, which may need
@@ -422,9 +448,11 @@ impl Respond {
             delivery.response(&parts);
         }
         // No `Date` here: the connection adds it when it frames the head.
-        let policy = ResponsePolicy::new(&parts, body.remaining(), self.wants, || None);
+        let policy =
+            ResponsePolicy::new(&parts, body.remaining(), self.wants, || None, self.alt_svc);
+        // Room for the length and the advertisement the policy may add.
         let Ok(mut headers) =
-            HeaderMap::try_with_capacity(parts.fields.iter().len().saturating_add(1))
+            HeaderMap::try_with_capacity(parts.fields.iter().len().saturating_add(2))
         else {
             self.reset();
             return;
@@ -458,6 +486,12 @@ impl Respond {
             headers.insert(http::header::CONTENT_LENGTH, length);
         } else if let Some(length) = policy.len {
             headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from(length));
+        }
+        if let Some(alt_svc) = policy.alt_svc {
+            headers.append(
+                http::header::ALT_SVC,
+                HeaderValue::from_static(alt_svc.value()),
+            );
         }
         let end = policy.bodiless || body.is_end_stream();
         self.next = Some(ExchangeCommand::Head(Box::new(ResponseHead {

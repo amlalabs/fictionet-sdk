@@ -35,6 +35,7 @@ unsafe extern "C" {
     fn fn_serve(peer: *mut Raw, path: *const i8, data: *const u8, len: usize) -> i32;
     fn fn_request(peer: *mut Raw, path: *const i8) -> i32;
     fn fn_recv(peer: *mut Raw, pkt: *const u8, len: usize, now: u64) -> i32;
+    fn fn_owns(peer: *mut Raw, pkt: *const u8, len: usize) -> i32;
     fn fn_send(peer: *mut Raw, out: *mut u8, cap: usize, now: u64) -> i64;
     fn fn_expiry(peer: *mut Raw) -> u64;
     fn fn_expire(peer: *mut Raw, now: u64) -> i32;
@@ -173,6 +174,12 @@ impl Ngtcp2 {
         (0..self.requests).map(|i| self.response(i)).collect()
     }
 
+    /// Whether `datagram` is for this client, by its destination
+    /// connection ID
+    pub fn owns(&self, datagram: &[u8]) -> bool {
+        unsafe { fn_owns(self.raw.as_ptr(), datagram.as_ptr(), datagram.len()) == 1 }
+    }
+
     /// Close with no error; the CONNECTION_CLOSE leaves on the next transmit
     pub fn close(&mut self, now: Duration) {
         let mut out = vec![0; 1500];
@@ -236,6 +243,30 @@ impl Endpoint for Ngtcp2 {
     fn version(&self) -> Option<u32> {
         let version = unsafe { fn_version(self.raw.as_ptr()) };
         (version != 0).then_some(version)
+    }
+}
+
+/// Several clients at one address on the client's side of the link. Each
+/// datagram goes to the client whose connection ID it names.
+pub struct Clients(pub Vec<Ngtcp2>);
+
+impl Endpoint for Clients {
+    fn receive(&mut self, datagram: &[u8], now: Duration) {
+        if let Some(client) = self.0.iter_mut().find(|client| client.owns(datagram)) {
+            client.receive(datagram, now);
+        }
+    }
+
+    fn transmit(&mut self, now: Duration) -> Option<Vec<u8>> {
+        self.0.iter_mut().find_map(|client| client.transmit(now))
+    }
+
+    fn timer(&self) -> Option<Duration> {
+        self.0.iter().filter_map(Endpoint::timer).min()
+    }
+
+    fn version(&self) -> Option<u32> {
+        self.0.first().and_then(Endpoint::version)
     }
 }
 

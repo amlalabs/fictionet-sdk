@@ -44,6 +44,32 @@ impl PacketBuffer {
         })
     }
 
+    /// Moves the reservation to `to`, charging `to` before giving back what
+    /// it held. Refused, nothing changes. Only an undivided buffer moves:
+    /// one whose views share the backing keeps it where it is and refuses.
+    /// Legacy unbudgeted storage has nothing to move.
+    #[must_use = "a refused transfer leaves the reservation where it was"]
+    pub fn transfer(&mut self, to: &Budget) -> bool {
+        let (Some(backing), Some(owner)) = (self.backing.as_mut(), self.owner.as_mut()) else {
+            return true;
+        };
+        let Some(backing) = Arc::get_mut(backing) else {
+            return false;
+        };
+        if backing.budget().same(to) {
+            return true;
+        }
+        let Some(mut moved) = to.charge(backing.bytes() + owner.bytes()) else {
+            return false;
+        };
+        let moved_owner = moved
+            .split(owner.bytes())
+            .expect("the owner's share was charged");
+        *backing = moved;
+        *owner = moved_owner;
+        true
+    }
+
     fn split_charge(&self) -> Result<Option<Charge>, PacketDecodeError> {
         self.backing
             .as_ref()
@@ -226,6 +252,44 @@ mod tests {
             assert!(packet.is_none());
             assert_eq!(budget.used(), 0);
         }
+    }
+
+    #[test]
+    fn a_transfer_moves_the_whole_reservation_or_nothing() {
+        let first = Budget::unlimited();
+        let input = [7; 100];
+        let mut packet = PacketBuffer::copy_from(&first, &input).unwrap();
+        let held = first.used();
+
+        // Too little room: both charges stay where they were.
+        let short = Budget::new(held - 1);
+        assert!(!packet.transfer(&short));
+        assert_eq!((first.used(), short.used()), (held, 0));
+
+        // Room for the move, and for the split view below.
+        let second = Budget::new(held + OWNER_OVERHEAD);
+        let mut costs = Costs::new("QUIC wire transfer");
+        let moved = costs.step(
+            0,
+            0,
+            Linear {
+                num: 0,
+                den: 1,
+                fixed: 0,
+            },
+            || Charged::new(packet.transfer(&second), 0),
+        );
+        assert!(moved);
+        assert_eq!((first.used(), second.used()), (0, held));
+        assert_eq!(&packet[..], &input[..]);
+
+        // Views that share the backing keep it on its budget.
+        let _tail = packet.split_off(50).unwrap();
+        let third = Budget::unlimited();
+        assert!(!packet.transfer(&third));
+        assert_eq!(third.used(), 0);
+        drop((packet, _tail));
+        assert_eq!(second.used(), 0);
     }
 
     #[test]

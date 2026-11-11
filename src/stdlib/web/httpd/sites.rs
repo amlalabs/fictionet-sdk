@@ -18,7 +18,10 @@ use fictionet::stdlib::world::net::{
     PreparedShare, Sni,
 };
 
-use super::{Exchange, Handler, HttpOptions, Limits, Reply, http_for, serve_connection, text};
+use super::http3_sites::{Http3Sites, PickNow};
+use super::{
+    AltSvc, Exchange, Handler, HttpOptions, Limits, Reply, http_for, serve_connection, text,
+};
 
 /// How [`VirtualHosts`] selected a request's handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +58,10 @@ pub struct VHost {
     pub https: bool,
     /// Its handler answers plain HTTP too, even with `https`.
     pub plain_http: bool,
+    /// It is also served over HTTP/3 on UDP port 443 at the same address.
+    /// Its handler's responses over TLS then advertise it
+    /// ([`AltSvc::Http3`]), as real sites do.
+    pub http3: bool,
 }
 
 impl VHost {
@@ -64,6 +71,7 @@ impl VHost {
             handler: Arc::new(handler),
             https: false,
             plain_http: false,
+            http3: false,
         }
     }
 }
@@ -200,6 +208,9 @@ impl Handler for VirtualHosts {
                     Arc::from(std::str::from_utf8(host).expect("validated host"))
                 });
                 request.site.routing = routing;
+                if tls && site.http3 {
+                    ex.advertise(AltSvc::Http3);
+                }
                 site.handler.call(request, ex)
             }
         }
@@ -231,6 +242,21 @@ pub(super) fn no_host(storage: &super::Responses) -> crate::stdlib::web::Respons
 /// Names and defaults belong to the local address and port where `Net`
 /// installed them. Sharing one address does not add sites at another.
 /// Over TLS, ALPN offers `h2` and `http/1.1` with `std` alone.
+///
+/// A site [`served_by`](Self::served_by) a host with a certificate from
+/// [`tls_with`](Self::tls_with) also serves HTTP/3 on UDP port 443, with
+/// the same handler, virtual hosts, limits, date and observer, and its
+/// HTTP/1 and HTTP/2 responses over TLS advertise it with `Alt-Svc`, as
+/// real sites do ([`VHost::http3`]). [`without_http3`](Self::without_http3)
+/// leaves it out. A certificate from [`tls_when`](Self::tls_when) serves
+/// no HTTP/3: QUIC's handshake cannot wait for one. Sites of several hosts
+/// at one address share the UDP port as they share TCP 443, each with its
+/// own certificate by SNI. One UDP socket serves at most
+/// [`HTTP3_CONNECTIONS`] connections at once, each with a budget of the
+/// request body limit and 16 MiB besides ([`Limits::body`]); a connection
+/// past either is refused with `CONNECTION_REFUSED`, and the client goes
+/// on over TCP.
+///
 /// The default stack is `Chain<TlsLayer, Later<Boxed>>`; its application
 /// is [`Http`](super::Http), from [`http_for`]. HTTP/2 in turn composes
 /// `Chain<Http2, Children<Respond, Top, Opening>>`. Replace the TLS factory
@@ -251,10 +277,36 @@ pub struct Server {
     limits: Limits,
     date: Option<SystemTime>,
     vhosts: Arc<RwLock<HashMap<SocketAddr, VirtualHosts>>>,
-    tls: Option<CertificateFor>,
+    tls: Option<Certificates>,
+    http3: bool,
     tls_layer: tls::Factory,
     application: ApplicationFor,
     protocols: Vec<Vec<u8>>,
+}
+
+/// The most HTTP/3 connections one UDP socket serves at once.
+pub const HTTP3_CONNECTIONS: usize = 64;
+
+/// How a site's certificate is picked for each handshake.
+#[derive(Clone)]
+enum Certificates {
+    /// At once, which an HTTP/3 handshake needs.
+    Now(PickNow),
+    /// Perhaps after a while; TCP's TLS waits for it.
+    Later(CertificateFor),
+}
+
+impl Certificates {
+    /// The picker as TLS over TCP takes it.
+    fn later(&self) -> CertificateFor {
+        match self {
+            Certificates::Now(pick) => {
+                let pick = pick.clone();
+                Arc::new(move |fcx| Box::pin(std::future::ready(pick(fcx))) as CertificateFuture)
+            }
+            Certificates::Later(pick) => pick.clone(),
+        }
+    }
 }
 
 type ApplicationFor =
@@ -274,12 +326,14 @@ impl Server {
                 handler,
                 https: false,
                 plain_http: false,
+                http3: false,
             },
             default_host: false,
             limits: Limits::default(),
             date: None,
             vhosts: Arc::default(),
             tls: None,
+            http3: true,
             tls_layer: tls::Factory::default(),
             application: Arc::new(|cx, opening, handler, opts| {
                 Boxed::new(http_for(handler, opts, &opening.info, cx.now()))
@@ -373,18 +427,30 @@ impl Server {
         self
     }
 
-    /// Serves HTTPS on 443 with a certificate selected for each handshake.
+    /// Serves HTTPS on 443 with a certificate selected for each handshake,
+    /// over TCP and, unless [`without_http3`](Self::without_http3), over
+    /// HTTP/3 on UDP.
     /// Port 80 redirects to HTTPS unless [`plain_http`](Self::plain_http) was selected.
     pub fn tls_with(
-        self,
+        mut self,
         certificate_for: impl Fn(&Cx) -> Arc<CertifiedKey> + Send + Sync + 'static,
     ) -> Server {
-        self.tls_when(move |fcx| std::future::ready(certificate_for(fcx)))
+        self.vhost.https = true;
+        self.tls = Some(Certificates::Now(Arc::new(certificate_for)));
+        self
+    }
+
+    /// Serves no HTTP/3 and advertises none: only HTTP/1 and HTTP/2, over
+    /// TCP.
+    pub fn without_http3(mut self) -> Server {
+        self.http3 = false;
+        self
     }
 
     /// [`tls_with`](Self::tls_with) with a certificate that may take time to
     /// select: each handshake waits for its own, up to its deadline, while
-    /// the world goes on.
+    /// the world goes on. This serves no HTTP/3, whose handshake cannot
+    /// wait for a certificate.
     pub fn tls_when<F>(
         mut self,
         certificate_for: impl Fn(&Cx) -> F + Send + Sync + 'static,
@@ -393,31 +459,47 @@ impl Server {
         F: Future<Output = Arc<CertifiedKey>> + Send + 'static,
     {
         self.vhost.https = true;
-        self.tls = Some(Arc::new(move |fcx| {
+        self.tls = Some(Certificates::Later(Arc::new(move |fcx| {
             Box::pin(certificate_for(fcx)) as CertificateFuture
-        }));
+        })));
         self
     }
 
-    /// Installs this site on ports 80 and, with TLS, 443.
+    /// Installs this site on TCP ports 80 and, with TLS, 443, and on UDP
+    /// port 443 for HTTP/3 when its certificate is picked at once
+    /// ([`tls_with`](Self::tls_with)) and HTTP/3 is not left out.
     /// TLS uses the host's names for SNI; without TLS only port 80 opens.
     /// Each installed port has a fresh virtual-host table, including
     /// when this builder was cloned.
     pub fn served_by(mut self, host: Host) -> Host {
         self.vhosts = Arc::default();
-        let secure = self.tls.take().map(|config| {
+        let secure = self.tls.take().map(|certificates| {
             let mut server = self.clone();
             server.vhosts = Arc::default();
             server.vhost.plain_http = false;
-            (config, server)
+            server.vhost.http3 = self.http3 && matches!(certificates, Certificates::Now(_));
+            (certificates, server)
         });
         let host = host.port_server(80, self);
-        match secure {
-            None => host,
-            Some((config, server)) => {
-                host.tls_accept_when(443, Sni::Names, move |fcx| config(fcx), server)
-            }
-        }
+        let Some((certificates, server)) = secure else {
+            return host;
+        };
+        let host = match &certificates {
+            Certificates::Now(pick) if server.vhost.http3 => host.udp_server(
+                443,
+                Http3Sites::new(
+                    server.vhost.clone(),
+                    server.default_host,
+                    pick.clone(),
+                    server.limits,
+                    server.observe.clone(),
+                    server.date,
+                ),
+            ),
+            _ => host,
+        };
+        let pick = certificates.later();
+        host.tls_accept_when(443, Sni::Names, move |fcx| pick(fcx), server)
     }
 }
 

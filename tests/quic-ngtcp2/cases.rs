@@ -14,7 +14,7 @@ use std::time::Duration;
 use fictionet::stdlib::services::quic::{AddressValidation, QUIC_V1, QUIC_V2};
 
 use crate::network::{Endpoint, Kind, Network, Scenario, Side};
-use crate::ngtcp2::{App, Closed, Ngtcp2};
+use crate::ngtcp2::{App, Clients, Closed, Ngtcp2};
 use crate::sdk::{SdkH3, SdkHq, Versions};
 
 const KB: usize = 1 << 10;
@@ -485,4 +485,90 @@ fn the_version_2_checks_reject_a_connection_that_stays_in_version_1() {
         assert!(version_2(&run).is_err());
         assert!(check(Case::new(&[KB]), &run).is_err());
     }
+}
+
+/// Every file arrived intact over HTTP/3, in version 2
+fn served(client: &Ngtcp2, files: &BTreeMap<String, Vec<u8>>) {
+    assert_eq!(client.failure(), None);
+    let responses = client.responses().expect("every response");
+    assert_eq!(responses.len(), files.len());
+    for (response, want) in responses.iter().zip(files.values()) {
+        assert_eq!(response.status, Some(200));
+        assert!(&response.body == want, "every file arrives intact");
+    }
+    assert_eq!(client.version(), Some(QUIC_V2));
+}
+
+#[test]
+fn http3_clients_at_once_share_one_listener() {
+    // Eight ngtcp2 clients at one address, each on its own connection at
+    // the same time, through one SDK HTTP/3 listener on the runner's link.
+    let case = Case {
+        app: App::H3,
+        ..Case::new(&[5 * KB, 100 * KB])
+    };
+    let seed = 0x5eed_1000;
+    let files = files(case.sizes, seed);
+    let mut net = Network::new((case.scenario)(seed));
+    let mut clients = Clients(
+        (0..8)
+            .map(|i| {
+                let mut client =
+                    Ngtcp2::client(case.first, case.client, App::H3, seed + i, net.now);
+                for path in files.keys() {
+                    client.request(path);
+                }
+                client
+            })
+            .collect(),
+    );
+    let versions = Versions {
+        first: case.first,
+        preferred: case.server,
+    };
+    let mut server = SdkH3::server(versions, &files, seed);
+    net.run(&mut clients, &mut server, |clients, _, _| {
+        clients.0.iter().all(|client| client.responses().is_some())
+    });
+    for client in &clients.0 {
+        served(client, &files);
+    }
+    assert_eq!(server.version(), Some(QUIC_V2));
+}
+
+#[test]
+fn http3_multiconnect_through_one_listener() {
+    // The runner's multiconnect case: fifty connections in turn through
+    // 30% loss each way, here over HTTP/3 and all to one SDK listener,
+    // which holds the earlier ones while they drain.
+    let case = Case {
+        app: App::H3,
+        scenario: |seed| Scenario::drop_rate(30, seed),
+        ..Case::new(&[KB])
+    };
+    let seed = 0x5eed_2000;
+    let files = files(case.sizes, seed);
+    let mut net = Network::new((case.scenario)(seed));
+    let versions = Versions {
+        first: case.first,
+        preferred: case.server,
+    };
+    let mut server = SdkH3::server(versions, &files, seed);
+    for i in 0..50 {
+        let mut client = Ngtcp2::client(case.first, case.client, App::H3, seed + i, net.now);
+        for path in files.keys() {
+            client.request(path);
+        }
+        let mut closed = None;
+        net.run(&mut client, &mut server, |client, _, now| {
+            if closed.is_none() && client.responses().is_some() {
+                client.close(now);
+                closed = Some(now);
+            }
+            closed.is_some_and(|at| now >= at + Duration::from_secs(1))
+        });
+        served(&client, &files);
+    }
+    assert_eq!(server.version(), Some(QUIC_V2));
+    assert!(net.impaired().0 > 0, "the link dropped packets");
 }

@@ -24,6 +24,26 @@ pub struct Exchange<'a> {
     entropy: &'a dyn fictionet::Entropy,
     conn: &'a ConnInfo,
     responses: Responses,
+    alt_svc: Option<AltSvc>,
+}
+
+/// An alternative service a response advertises (RFC 7838). The server
+/// writes it as the response's `Alt-Svc` field, as it writes `Date`, unless
+/// the handler set an `alt-svc` field itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AltSvc {
+    /// HTTP/3 at the same host on UDP port 443, good for a day.
+    Http3,
+}
+
+impl AltSvc {
+    /// The field's value.
+    pub fn value(self) -> &'static str {
+        match self {
+            AltSvc::Http3 => r#"h3=":443"; ma=86400"#,
+        }
+    }
 }
 
 impl<'a> Exchange<'a> {
@@ -40,7 +60,19 @@ impl<'a> Exchange<'a> {
             entropy,
             conn,
             responses,
+            alt_svc: None,
         }
+    }
+
+    /// Advertises `alt_svc` with this request's response, whenever it is
+    /// made ([`AltSvc`]).
+    pub fn advertise(&mut self, alt_svc: AltSvc) {
+        self.alt_svc = Some(alt_svc);
+    }
+
+    /// What the response advertises.
+    pub fn advertised(&self) -> Option<AltSvc> {
+        self.alt_svc
     }
 
     /// Charged response storage shared with this connection.

@@ -188,8 +188,8 @@ use attachments::{Destinations, Hooks, filter, udp_packet};
 use dns::Recursive;
 use hosts::{Admission, Installation, Machines, Peers, World, host_prefix};
 pub use hosts::{
-    Arrival, CertificateFor, CertificateFuture, DEFAULT_MAX_CONNS, Declared, Endpoints, Host,
-    Opening, PortServer, PortStack, PreparedShare, Program, Sni,
+    Arrival, CertificateFor, CertificateFuture, DEFAULT_MAX_CONNS, DatagramServer, Declared,
+    Endpoints, Host, Opening, PortServer, PortStack, PreparedShare, Program, Sni,
 };
 pub use names::normalize;
 

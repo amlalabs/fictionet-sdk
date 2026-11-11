@@ -31,6 +31,12 @@ impl Client {
         }
     }
 
+    /// Whether the connection is open: not closed, and not closing at the
+    /// listener's word.
+    fn open(&self) -> bool {
+        !self.quic.is_closed() && self.quic.peer_error().is_none()
+    }
+
     fn receive(&mut self, bytes: &mut [u8]) {
         self.quic
             .recv(
@@ -111,12 +117,50 @@ impl Client {
     }
 }
 
+/// Echoes, after checking and recording the connection each request came
+/// over.
+struct Recording {
+    local: SocketAddr,
+    seen: Arc<std::sync::Mutex<Vec<stdlib::network::ConnInfo>>>,
+}
+
+impl httpd::Handler for Recording {
+    fn call(&self, request: web::Request, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        let info = ex.conn();
+        assert_eq!(info.local, Some(self.local));
+        assert!(info.tls);
+        assert_eq!(info.alpn.as_deref(), Some(b"h3".as_slice()));
+        assert_eq!(info.sni.as_deref(), Some("localhost"));
+        self.seen.lock().unwrap().push(info.clone());
+        httpd::Handler::call(&Echo { streamed: false }, request, ex)
+    }
+}
+
+fn listener_config(
+    entropy: Arc<dyn Entropy>,
+    connections: usize,
+    connection_budget: usize,
+    validation: AddressValidation,
+    controller: Arc<dyn quinn_proto::congestion::ControllerFactory + Send + Sync>,
+) -> ListenerConfig {
+    let (_, server, endpoint) = configs_with_controller(entropy, false, b"h3", controller);
+    ListenerConfig {
+        endpoint,
+        server: Arc::new(server),
+        connections,
+        streams: 16,
+        connection_budget,
+        validation,
+        cancel: |_| 0x10cu32.into(),
+    }
+}
+
 fn listener_stack(
     entropy: Arc<dyn Entropy>,
     local: SocketAddr,
     connections: usize,
     seen: Arc<std::sync::Mutex<Vec<stdlib::network::ConnInfo>>>,
-) -> Chain<Listener, Children<httpd::Http3Server, Top, stdlib::network::ConnInfo>> {
+) -> httpd::Http3Listener {
     listener_stack_with_controller(
         entropy,
         local,
@@ -132,38 +176,16 @@ fn listener_stack_with_controller(
     connections: usize,
     seen: Arc<std::sync::Mutex<Vec<stdlib::network::ConnInfo>>>,
     controller: Arc<dyn quinn_proto::congestion::ControllerFactory + Send + Sync>,
-) -> Chain<Listener, Children<httpd::Http3Server, Top, stdlib::network::ConnInfo>> {
-    let (_, server, endpoint) = configs_with_controller(entropy, false, b"h3", controller);
-    let listener = Listener::new(
-        ListenerConfig {
-            endpoint,
-            server: Arc::new(server),
-            connections,
-            streams: 16,
-            cancel: |_| 0x10cu32.into(),
-        },
-        std::time::Instant::now(),
-        Some(local),
+) -> httpd::Http3Listener {
+    let config = listener_config(
+        entropy,
+        connections,
+        8 << 20,
+        AddressValidation::Accept,
+        controller,
     );
-    Chain::new(
-        listener,
-        Children::new(
-            connections,
-            0,
-            move |_, info: stdlib::network::ConnInfo, _| {
-                assert_eq!(info.local, Some(local));
-                assert!(info.tls);
-                assert_eq!(info.alpn.as_deref(), Some(b"h3".as_slice()));
-                assert_eq!(info.sni.as_deref(), Some("localhost"));
-                seen.lock().unwrap().push(info.clone());
-                Some(
-                    httpd::Responder::new(Echo { streamed: false })
-                        .conn(info)
-                        .http3(),
-                )
-            },
-        ),
-    )
+    let listener = Listener::new(config, std::time::Instant::now(), Some(local));
+    httpd::Responder::new(Recording { local, seen }).http3_listener(listener)
 }
 
 #[test]
@@ -431,6 +453,8 @@ fn refused_listener_admission_allocates_nothing() {
         server: Arc::new(server),
         connections: 3,
         streams: 16,
+        connection_budget: 1 << 20,
+        validation: AddressValidation::Accept,
         cancel: |_| 0u32.into(),
     };
     let epoch = std::time::Instant::now();
@@ -504,6 +528,8 @@ fn an_unread_connection_does_not_block_another_http3_handler() {
             server: Arc::new(server),
             connections: 2,
             streams: 16,
+            connection_budget: 8 << 20,
+            validation: AddressValidation::Accept,
             cancel: |_| 0x10cu32.into(),
         },
         std::time::Instant::now(),
@@ -511,17 +537,18 @@ fn an_unread_connection_does_not_block_another_http3_handler() {
     );
     let stack = Chain::new(
         listener,
-        Children::new(2, 0, move |_, info: stdlib::network::ConnInfo, _| {
-            Some(if info.peer == Some(blocked) {
+        Children::new(2, 0, move |_, accepted: Accepted, _| {
+            Some(if accepted.info.peer == Some(blocked) {
                 Boxed::new(Unread)
             } else {
                 Boxed::new(
                     httpd::Responder::new(Echo { streamed: false })
-                        .conn(info)
+                        .conn(accepted.info)
                         .http3(),
                 )
             })
-        }),
+        })
+        .budgets(|_, accepted: &Accepted, _| accepted.budget.clone()),
     );
     let mut sdk = Driver::new(stack, entropy, Budget::new(64 << 20), Instant::ZERO);
     let mut worker = stdlib::services::stack::Polling::new();
@@ -564,4 +591,197 @@ fn an_unread_connection_does_not_block_another_http3_handler() {
         }
     }
     panic!("unread sibling blocked HTTP/3");
+}
+
+type Listening = Driver<httpd::Http3Listener>;
+type Working = stdlib::services::stack::Polling<<httpd::Http3Listener as Layer>::Work>;
+
+/// Hands every datagram the listener has to the open client it is for,
+/// by address and connection ID, completing each send. Records the type
+/// of each.
+fn flush(
+    sdk: &mut Listening,
+    worker: &mut Working,
+    peers: &mut [Client],
+    sent: &mut Vec<quiche::Type>,
+) {
+    loop {
+        sdk.run().unwrap();
+        worker.work(sdk).unwrap();
+        sdk.run().unwrap();
+        let Some(DatagramCommand::Send(datagram)) = sdk.take_command() else {
+            return;
+        };
+        let to = *datagram.meta();
+        let mut bytes = datagram.into_parts().0.into_vec();
+        let header = quiche::Header::from_slice(&mut bytes.clone(), 16).unwrap();
+        sent.push(header.ty);
+        if let Some(peer) = peers.iter_mut().find(|peer| {
+            peer.local == to && peer.open() && peer.quic.source_ids().any(|id| *id == header.dcid)
+        }) {
+            peer.receive(&mut bytes);
+        }
+        assert!(matches!(
+            sdk.deliver(DatagramEvent::Sent(1)).unwrap(),
+            Admit::Taken
+        ));
+    }
+}
+
+/// One round between the listener and its clients, each at its own
+/// address: the listener sends all it has, then each open client makes
+/// progress, unless the listener closed it, and sends. A datagram the
+/// listener holds back while an answer of its own waits goes in once that
+/// answer is out, as a socket would hold it. Returns the type of each
+/// datagram the listener sent.
+fn round(sdk: &mut Listening, worker: &mut Working, peers: &mut [Client]) -> Vec<quiche::Type> {
+    let mut sent = Vec::new();
+    flush(sdk, worker, peers, &mut sent);
+    let mut outgoing = Vec::new();
+    let mut buffer = [0; 65535];
+    for peer in peers.iter_mut().filter(|peer| peer.open()) {
+        peer.progress();
+        while let Ok((n, _)) = peer.quic.send(&mut buffer) {
+            outgoing.push((peer.local, buffer[..n].to_vec()));
+        }
+    }
+    for (from, bytes) in outgoing {
+        let chunk = Chunk::copy_of(sdk.budget(), &bytes).unwrap();
+        let mut event = DatagramEvent::Datagram(Datagram::new(chunk, from));
+        loop {
+            match sdk.deliver(event).unwrap() {
+                Admit::Taken => break,
+                Admit::Blocked(held) => {
+                    event = held;
+                    flush(sdk, worker, peers, &mut sent);
+                }
+                _ => panic!("the listener closed"),
+            }
+        }
+    }
+    sent
+}
+
+/// Rounds until `done`, within a bound.
+fn rounds_until(
+    sdk: &mut Listening,
+    worker: &mut Working,
+    peers: &mut [Client],
+    mut done: impl FnMut(&[Client]) -> bool,
+) -> Vec<quiche::Type> {
+    let mut sent = Vec::new();
+    for _ in 0..10000 {
+        sent.extend(round(sdk, worker, peers));
+        if done(peers) {
+            return sent;
+        }
+    }
+    panic!(
+        "the clients stalled: {:?}",
+        peers
+            .iter()
+            .map(|peer| (
+                peer.quic.is_established(),
+                peer.sent,
+                peer.received.len(),
+                peer.finished,
+                peer.quic.peer_error(),
+                peer.quic.stats().recv,
+                peer.quic.stats().sent,
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn client_at(number: u8, port: u16, server: SocketAddr) -> Client {
+    Client::new(number, SocketAddr::from(([127, 0, 0, 1], port)), server)
+}
+
+/// What one connection may hold in these tests: HTTP/3's codec scratch,
+/// its streams and a request body, with room to spare.
+const CONNECTION: usize = 16 << 20;
+
+#[test]
+fn an_exhausted_listener_budget_refuses_new_connections_and_keeps_the_others() {
+    let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(96)));
+    let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The cap would admit eight; the budget pays for two connections'
+    // shares and the listener's own tables, and not for a third share.
+    let config = listener_config(
+        entropy.clone(),
+        8,
+        CONNECTION,
+        AddressValidation::Accept,
+        Arc::new(quinn_proto::congestion::CubicConfig::default()),
+    );
+    let listener = Listener::new(config, std::time::Instant::now(), Some(local));
+    let stack = httpd::Responder::new(Recording {
+        local,
+        seen: seen.clone(),
+    })
+    .http3_listener(listener);
+    let budget = Budget::new(2 * CONNECTION + CONNECTION / 4);
+    let mut sdk = Driver::new(stack, entropy, budget.clone(), Instant::ZERO);
+    let mut worker = stdlib::services::stack::Polling::new();
+    let mut peers = vec![client_at(81, 5001, local), client_at(82, 5002, local)];
+
+    // Both are mid-upload when the third arrives.
+    rounds_until(&mut sdk, &mut worker, &mut peers, |peers| {
+        peers.iter().all(|peer| peer.sent.is_some())
+    });
+    assert!(peers.iter().all(|peer| !peer.finished));
+    assert!(budget.used() >= 2 * CONNECTION);
+    peers.push(client_at(83, 5003, local));
+    rounds_until(&mut sdk, &mut worker, &mut peers, |peers| {
+        peers[..2].iter().all(|peer| peer.finished) && peers[2].quic.peer_error().is_some()
+    });
+    let refused = peers[2].quic.peer_error().expect("a refusal");
+    assert!(!refused.is_app);
+    assert_eq!(refused.error_code, 0x2, "CONNECTION_REFUSED");
+    assert!(!peers[2].quic.is_established());
+    assert!(peers[..2].iter().all(|peer| !peer.quic.is_closed()));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+
+    // Closing one gives its share back once it drains.
+    peers[0].quic.close(true, 0x100, b"").unwrap();
+    round(&mut sdk, &mut worker, &mut peers);
+    sdk.set_now(Instant::from_since_start(Duration::from_secs(10)));
+    for _ in 0..100 {
+        round(&mut sdk, &mut worker, &mut peers);
+    }
+    peers.push(client_at(84, 5004, local));
+    rounds_until(&mut sdk, &mut worker, &mut peers, |peers| peers[3].finished);
+    assert!(!peers[1].quic.is_closed());
+    assert_eq!(seen.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn a_retry_listener_keeps_no_state_until_a_client_proves_its_address() {
+    let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(97)));
+    let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = listener_config(
+        entropy.clone(),
+        2,
+        CONNECTION,
+        AddressValidation::Retry,
+        Arc::new(quinn_proto::congestion::CubicConfig::default()),
+    );
+    let listener = Listener::new(config, std::time::Instant::now(), Some(local));
+    let stack = httpd::Responder::new(Recording {
+        local,
+        seen: seen.clone(),
+    })
+    .http3_listener(listener);
+    let budget = Budget::new(64 << 20);
+    let mut sdk = Driver::new(stack, entropy, budget, Instant::ZERO);
+    let mut worker = stdlib::services::stack::Polling::new();
+    let mut peers = vec![client_at(91, 5001, local)];
+
+    // The listener's first answer is a Retry; the client comes back with
+    // its token and is served.
+    let sent = rounds_until(&mut sdk, &mut worker, &mut peers, |peers| peers[0].finished);
+    assert_eq!(sent.first(), Some(&quiche::Type::Retry));
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }
