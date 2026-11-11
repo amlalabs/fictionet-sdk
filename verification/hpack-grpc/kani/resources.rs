@@ -115,7 +115,7 @@ fn decode_one(named: Named, count: usize) {
         fill(&mut table.table, max, count);
         let charge = table.most_held();
         let name = match named {
-            Named::Literal => Name::Literal(Text::Raw(NAME)),
+            Named::Literal => Name::Literal(Text::Raw(NAME.into())),
             Named::Dynamic => Name::Index(62),
             Named::Static => Name::Index(2),
         };
@@ -130,7 +130,7 @@ fn decode_one(named: Named, count: usize) {
         table
             .index(
                 name,
-                Text::Raw(VALUE),
+                Text::Raw(VALUE.into()),
                 name_len + VALUE.len() + ENTRY_OVERHEAD,
             )
             .unwrap();

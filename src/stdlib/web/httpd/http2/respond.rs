@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 
 use fictionet::stdlib::layer::{
-    Budget, Chain, Charge, ChargedBytes, Children, Chunk, Env, Layer, Top,
+    Budget, Chain, Charge, ChargedSegments, Children, Chunk, Env, Layer, Top,
 };
 use fictionet::stdlib::network::ConnInfo;
 use fictionet::stdlib::protocols::http2::{ErrorCode, Setting};
@@ -175,8 +175,11 @@ pub struct Respond {
     /// What this exchange holds besides the request's head and body: the
     /// response's head. Response chunks carry their own charge.
     charge: Option<Charge>,
-    /// The request's body as it is collected, which carries its charge.
-    body: Option<ChargedBytes>,
+    /// The request's body as it is collected, in segments that carry
+    /// their charge.
+    body: Option<ChargedSegments>,
+    /// The body's length, when `content-length` gave it.
+    length: Option<u64>,
     deadline: Option<Instant>,
     /// The request ended before it was answered.
     ended: bool,
@@ -217,6 +220,7 @@ impl Respond {
         let reserve = budget.charge(answer_reserve())?;
         let deadline = (!opening.ended).then(|| opening.at + responder.limits.body_timeout);
         let version = opening.head.version();
+        let length = opening.head.content_length();
         let head = crate::stdlib::web::Head::multiplexed(opening.head.into_fields(), version);
         let (stage, next) = match head {
             Some(_) => (Stage::Collecting, None),
@@ -233,6 +237,7 @@ impl Respond {
             head,
             charge: Some(reserve),
             body: None,
+            length,
             deadline: deadline.filter(|_| next.is_none()),
             ended: opening.ended,
             stage,
@@ -273,30 +278,47 @@ impl Respond {
     }
 
     /// The request's body grows by `chunk`, into room charged before it is
-    /// allocated.
+    /// allocated. A body whose `content-length` passes the limit is too
+    /// large at its first bytes: the connection holds the body to that
+    /// length.
     fn collect(&mut self, env: &mut Env<'_, Infallible>, chunk: Chunk) {
         let limits = self.responder.limits;
         let len = self.collected();
-        if len.saturating_add(chunk.len()) > limits.body {
+        let length = self
+            .length
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+        if len.saturating_add(chunk.len()) > limits.body || length.is_some_and(|n| n > limits.body)
+        {
             return self.dispatch(env, Received::TooLarge);
         }
-        if !collect_into(&mut self.body, &chunk, limits.body, env.budget()) {
+        if !collect_into(&mut self.body, &chunk, length, limits.body, env.budget()) {
             self.dispatch(env, Received::Budget);
         }
     }
 
     /// Answers the request: with the handler for a whole one, or with the
     /// status for one that could not be received.
-    fn dispatch(&mut self, env: &mut Env<'_, Infallible>, received: Received) {
+    fn dispatch(&mut self, env: &mut Env<'_, Infallible>, mut received: Received) {
         let Some(head) = self.head.take() else {
             return;
         };
         self.deadline = None;
         let responder = self.responder.clone();
-        let body = self.body.take().map(Chunk::from).unwrap_or_default();
+        // A body not received whole is never read: its storage goes now,
+        // as the answer may need the room.
+        let segments = self.body.take();
+        let body = match segments {
+            Some(segments) if matches!(received, Received::Complete) => {
+                Body::from_segments(segments, env.budget()).unwrap_or_else(|| {
+                    received = Received::Budget;
+                    Body::empty()
+                })
+            }
+            _ => Body::empty(),
+        };
         let request = crate::stdlib::web::Request {
             head,
-            body: Body::from(body),
+            body,
             site: responder.site.clone(),
         };
         self.wants = Asked::of(request.head.method());
@@ -717,32 +739,30 @@ impl Job for Work {
     }
 }
 
-/// Joins `piece` to the request body collected in `body`, which with it
-/// is at most `most` bytes, in room charged to `budget` before it is
-/// allocated. Full storage grows to twice its capacity, up to `most`, or
-/// as far as the budget has room for if that is less, so a body that
-/// comes in many pieces is copied a few times, not once a piece. `false`,
-/// with the body as it was, when the budget has no room for the body and
-/// the piece.
+/// Keeps `piece` with the request body collected in `body`, in room
+/// charged to `budget` before it is allocated, and moves nothing already
+/// kept. A body whose `length` is known, within the limit, takes one
+/// segment of exactly that length with its first bytes and never grows;
+/// one of unknown length, at most `most` bytes, grows by a segment at a
+/// time ([`ChargedSegments::extend`]). `false`, with the body as it was,
+/// when the budget has no room for the piece.
 pub(super) fn collect_into(
-    body: &mut Option<ChargedBytes>,
+    body: &mut Option<ChargedSegments>,
     piece: &[u8],
+    length: Option<usize>,
     most: usize,
     budget: &Budget,
 ) -> bool {
-    use fictionet::stdlib::codec::Storage;
     if body.is_none() {
-        *body = ChargedBytes::with_capacity(budget, piece.len());
+        *body = match length {
+            Some(length) => ChargedSegments::with_capacity(budget, length),
+            None => Some(ChargedSegments::new(budget)),
+        };
     }
     let Some(body) = body else {
         return false;
     };
-    let need = body.len() + piece.len();
-    let want = need.max(2 * body.capacity()).min(most);
-    if need > body.capacity() && !body.grow_within(need..=want) {
-        return false;
-    }
-    body.extend_within(piece).is_ok()
+    body.extend(piece, length.unwrap_or(most))
 }
 
 pub(super) fn response_held(response: &Response) -> usize {
@@ -784,3 +804,44 @@ fn over_budget(storage: &super::super::Responses) -> Response {
 #[cfg(kani)]
 #[path = "../../../../../verification/http/kani/collect.rs"]
 mod collect_proofs;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body whose `content-length` is known takes one allocation of
+    /// that length with its first bytes, and every later piece goes in it:
+    /// the budget holds the length and one place from the first piece to
+    /// the last, and nothing moves. Before, the body doubled as it came,
+    /// and each growth needed the old allocation beside the new.
+    #[test]
+    fn a_body_of_known_length_is_reserved_once() {
+        const LENGTH: usize = 8800;
+        let budget = Budget::new(LENGTH + ChargedSegments::PLACE);
+        let mut body = None;
+        let mut at = None;
+        for piece in [b'e'; LENGTH].chunks(37) {
+            assert!(collect_into(
+                &mut body,
+                piece,
+                Some(LENGTH),
+                LENGTH,
+                &budget
+            ));
+            let kept = body.as_ref().unwrap();
+            assert_eq!(kept.pieces().len(), 1);
+            let first = kept.pieces()[0].as_ptr();
+            assert_eq!(*at.get_or_insert(first), first, "the body moved");
+            assert!(budget.used() <= LENGTH + ChargedSegments::PLACE);
+        }
+        let body = Body::from_segments(body.unwrap(), &budget).unwrap();
+        assert_eq!(
+            body.bytes().unwrap().as_ptr(),
+            at.unwrap(),
+            "handed on where it lies"
+        );
+        assert_eq!(body.remaining(), Some(LENGTH as u64));
+        drop(body);
+        assert_eq!(budget.used(), 0);
+    }
+}

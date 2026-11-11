@@ -195,8 +195,12 @@ pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
 /// Decodes a Huffman string into the start of `out`, writing nothing
 /// past it, and returns how many octets it wrote. Refuses invalid codes,
 /// EOS and padding as [`decode_limited`] does, and output longer than
-/// `out` as [`Error::TooLong`]. Allocates nothing.
-pub fn decode_into(bytes: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+/// `out` as [`Error::TooLong`]. Allocates nothing. The code may lie in
+/// pieces: `bytes` yields its octets in order.
+pub fn decode_into<'a>(
+    bytes: impl IntoIterator<Item = &'a u8>,
+    out: &mut [u8],
+) -> Result<usize, Error> {
     let mut written = 0;
     walk(bytes, |octet| {
         let slot = out.get_mut(written).ok_or(Error::TooLong)?;
@@ -209,8 +213,11 @@ pub fn decode_into(bytes: &[u8], out: &mut [u8]) -> Result<usize, Error> {
 
 /// How many octets a Huffman string decodes to, checking it as
 /// [`decode_limited`] does, with at most `limit` of them. Allocates
-/// nothing.
-pub fn decoded_len(bytes: &[u8], limit: usize) -> Result<usize, Error> {
+/// nothing. The code may lie in pieces, as for [`decode_into`].
+pub fn decoded_len<'a>(
+    bytes: impl IntoIterator<Item = &'a u8>,
+    limit: usize,
+) -> Result<usize, Error> {
     let mut len = 0usize;
     walk(bytes, |_| {
         if len >= limit {
@@ -231,7 +238,10 @@ pub fn most_decoded(len: usize) -> usize {
 /// Reads the codes of `bytes` in order, handing each decoded octet to
 /// `emit`, and checks the padding at the end. The one decoder every
 /// entry point above shares.
-fn walk(bytes: &[u8], mut emit: impl FnMut(u8) -> Result<(), Error>) -> Result<(), Error> {
+fn walk<'a>(
+    bytes: impl IntoIterator<Item = &'a u8>,
+    mut emit: impl FnMut(u8) -> Result<(), Error>,
+) -> Result<(), Error> {
     let (mut code, mut len) = (0u32, 0usize);
     for byte in bytes {
         for bit in (0..8).rev() {

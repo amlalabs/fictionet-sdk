@@ -27,15 +27,14 @@ use std::process::Command;
 use crate::Result;
 use crate::resources;
 
-/// The counter's own check, the constant the bounds use, then body
-/// collection's copying on a roomy budget. The head-assembly harnesses in
-/// `verification/http/kani/resources.rs` did not finish in an hour each,
-/// and `a_collected_body_stays_within_its_charge` runs CBMC out of 14 GiB
+/// The counter's own check and the constant the bounds use. The
+/// head-assembly harnesses in `verification/http/kani/resources.rs` did
+/// not finish in an hour each, and the body-collection harnesses in
+/// `verification/http/kani/collect.rs` run CBMC out of 14 GiB
 /// (`verification/http/README.md`).
-const KANI_RESOURCES: [&str; 3] = [
+const KANI_RESOURCES: [&str; 2] = [
     "counting::proofs::the_counter_sees_every_allocation",
     "stdlib::protocols::http1::resource_proofs::a_backing_is_within_its_constant",
-    "stdlib::web::httpd::http2::respond::collect_proofs::a_collected_body_copies_linearly",
 ];
 
 /// The configs that check the joins and the send holds, each with the
@@ -47,7 +46,11 @@ const TLC_RESOURCES: [(&str, &[&str]); 2] = [
             "Assembly_head_base.cfg",
             "Assembly_head_long_base.cfg",
             "Assembly_block_base.cfg",
+            "Assembly_block_budgetmoves_base.cfg",
             "Assembly_body_base.cfg",
+            "Assembly_body_length_base.cfg",
+            "Assembly_block_moving.cfg",
+            "Assembly_body_moving.cfg",
             "Assembly_head_without_double.cfg",
             "Assembly_head_without_largestwhenrefused.cfg",
             "Assembly_head_without_chargefirst.cfg",

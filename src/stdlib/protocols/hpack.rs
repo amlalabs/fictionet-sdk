@@ -23,7 +23,7 @@
 //! ```
 
 use fictionet::Budget;
-use fictionet::stdlib::codec::{Reader, Trailing, Truncated};
+use fictionet::stdlib::codec::{Trailing, Truncated};
 
 use fictionet::stdlib::{
     codec::Wire,
@@ -164,9 +164,200 @@ pub const STATIC_TABLE: [(&str, &str); 61] = [
     ("www-authenticate", ""),
 ];
 
-trait ReadFields<'a> {
-    fn integer(&mut self, prefix: u8) -> Result<u64, Error>;
-    fn text(&mut self, limit: usize) -> Result<Text<'a>, Error>;
+/// An encoded block, read in order as if its pieces were joined: one
+/// slice for a block that came whole, or the fragments it was kept in when
+/// it came split, read where they lie. Reading moves past what is read.
+#[derive(Clone, Copy, Debug)]
+pub struct Block<'a> {
+    /// The unread part of the piece being read.
+    first: &'a [u8],
+    /// The pieces after it.
+    rest: &'a [Vec<u8>],
+}
+impl<'a> Block<'a> {
+    /// A block in `pieces`, in order.
+    pub fn pieces(pieces: &'a [Vec<u8>]) -> Self {
+        match pieces.split_first() {
+            Some((first, rest)) => Self { first, rest },
+            None => Self::from(&[][..]),
+        }
+    }
+
+    /// The unread bytes.
+    pub fn len(&self) -> usize {
+        self.rest.iter().fold(self.first.len(), |len, piece| {
+            len.saturating_add(piece.len())
+        })
+    }
+
+    /// Whether every byte was read.
+    pub fn is_empty(&self) -> bool {
+        self.first.is_empty() && self.rest.iter().all(Vec::is_empty)
+    }
+
+    /// Moves to the next piece that has bytes, if the one being read has
+    /// none left.
+    fn settle(&mut self) {
+        while self.first.is_empty() {
+            let Some((next, rest)) = self.rest.split_first() else {
+                return;
+            };
+            self.first = next;
+            self.rest = rest;
+        }
+    }
+
+    fn peek_u8(&mut self) -> Option<u8> {
+        self.settle();
+        self.first.first().copied()
+    }
+
+    fn u8(&mut self) -> Result<u8, Error> {
+        let byte = self.peek_u8().ok_or(Error::Truncated)?;
+        self.first = &self.first[1..];
+        Ok(byte)
+    }
+
+    /// The next `len` bytes, wherever they lie, and moves past them.
+    fn take(&mut self, len: usize) -> Result<Span<'a>, Error> {
+        self.settle();
+        let span = Span {
+            first: self.first,
+            rest: self.rest,
+            len,
+        };
+        let mut left = len;
+        while left > self.first.len() {
+            left -= self.first.len();
+            let (next, rest) = self.rest.split_first().ok_or(Error::Truncated)?;
+            self.first = next;
+            self.rest = rest;
+        }
+        self.first = &self.first[left..];
+        Ok(span)
+    }
+
+    /// An RFC 7541 section 5.1 integer whose first byte has `prefix` bits
+    /// of it, read across pieces: at most [`prefix_int::MAX_BYTES`] bytes,
+    /// copied out to be read.
+    fn integer(&mut self, prefix: u8) -> Result<u64, Error> {
+        let mut head = [0; prefix_int::MAX_BYTES];
+        let mut ahead = *self;
+        let mut n = 0;
+        while n < head.len()
+            && let Some(byte) = ahead.peek_u8()
+        {
+            head[n] = byte;
+            ahead.first = &ahead.first[1..];
+            n += 1;
+        }
+        let (value, used) = prefix_int::read(&head[..n], prefix).map_err(|error| match error {
+            prefix_int::Error::Truncated => Error::Truncated,
+            _ => Error::IntegerOverflow,
+        })?;
+        self.take(used)?;
+        Ok(value)
+    }
+
+    /// A string literal of at most `limit` encoded octets.
+    fn text(&mut self, limit: usize) -> Result<Text<'a>, Error> {
+        let coded = self.peek_u8().ok_or(Error::Truncated)? & 0x80 != 0;
+        let len = usize::try_from(self.integer(7)?).map_err(|_| Error::StringTooLong)?;
+        if len > limit {
+            return Err(Error::StringTooLong);
+        }
+        let octets = self.take(len)?;
+        Ok(if coded {
+            Text::Huffman(octets)
+        } else {
+            Text::Raw(octets)
+        })
+    }
+
+    /// Refuses bytes left after a value that must end its input.
+    fn finish(&mut self) -> Result<(), Error> {
+        if self.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Trailing)
+        }
+    }
+}
+impl<'a> From<&'a [u8]> for Block<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        Self {
+            first: bytes,
+            rest: &[],
+        }
+    }
+}
+impl<'a> From<&'a Vec<u8>> for Block<'a> {
+    fn from(bytes: &'a Vec<u8>) -> Self {
+        Self::from(&bytes[..])
+    }
+}
+impl<'a, const N: usize> From<&'a [u8; N]> for Block<'a> {
+    fn from(bytes: &'a [u8; N]) -> Self {
+        Self::from(&bytes[..])
+    }
+}
+
+/// Octets of a block, borrowed where they lie, which may cross from one
+/// of its pieces into the next.
+#[derive(Clone, Copy)]
+pub struct Span<'a> {
+    first: &'a [u8],
+    rest: &'a [Vec<u8>],
+    len: usize,
+}
+impl<'a> Span<'a> {
+    /// How many octets.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The octets in the pieces they lie in, in order.
+    pub fn slices(&self) -> impl Iterator<Item = &'a [u8]> + use<'a> {
+        let mut left = self.len;
+        std::iter::once(self.first)
+            .chain(self.rest.iter().map(Vec::as_slice))
+            .map_while(move |piece| {
+                let here = &piece[..piece.len().min(left)];
+                left -= here.len();
+                (!here.is_empty() || left > 0).then_some(here)
+            })
+            .filter(|here| !here.is_empty())
+    }
+
+    /// The octets, one at a time.
+    pub fn bytes(&self) -> impl Iterator<Item = &'a u8> + use<'a> {
+        self.slices().flatten()
+    }
+}
+impl<'a> From<&'a [u8]> for Span<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        Self {
+            first: bytes,
+            rest: &[],
+            len: bytes.len(),
+        }
+    }
+}
+impl PartialEq for Span<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.bytes().eq(other.bytes())
+    }
+}
+impl Eq for Span<'_> {}
+impl core::fmt::Debug for Span<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.bytes()).finish()
+    }
 }
 
 /// A string literal as it is on the wire, borrowed: raw octets, or a
@@ -175,18 +366,18 @@ trait ReadFields<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Text<'a> {
     /// The octets themselves.
-    Raw(&'a [u8]),
+    Raw(Span<'a>),
     /// The Huffman code of the octets.
-    Huffman(&'a [u8]),
+    Huffman(Span<'a>),
 }
 impl Text<'_> {
     /// How many octets the string decodes to, checking its code, with at
     /// most `limit` of them. Allocates nothing.
     pub fn decoded_len(&self, limit: usize) -> Result<usize, Error> {
         match self {
-            Text::Raw(bytes) if bytes.len() > limit => Err(Error::StringTooLong),
-            Text::Raw(bytes) => Ok(bytes.len()),
-            Text::Huffman(code) => huffman::decoded_len(code, limit).map_err(huffman_error),
+            Text::Raw(octets) if octets.len() > limit => Err(Error::StringTooLong),
+            Text::Raw(octets) => Ok(octets.len()),
+            Text::Huffman(code) => huffman::decoded_len(code.bytes(), limit).map_err(huffman_error),
         }
     }
 
@@ -195,13 +386,16 @@ impl Text<'_> {
     /// [`StringTooLong`](Error::StringTooLong). Allocates nothing.
     pub fn decode_into(&self, out: &mut [u8]) -> Result<usize, Error> {
         match self {
-            Text::Raw(bytes) => {
-                out.get_mut(..bytes.len())
-                    .ok_or(Error::StringTooLong)?
-                    .copy_from_slice(bytes);
-                Ok(bytes.len())
+            Text::Raw(octets) => {
+                let mut room = out.get_mut(..octets.len()).ok_or(Error::StringTooLong)?;
+                for piece in octets.slices() {
+                    let (here, rest) = room.split_at_mut(piece.len());
+                    here.copy_from_slice(piece);
+                    room = rest;
+                }
+                Ok(octets.len())
             }
-            Text::Huffman(code) => huffman::decode_into(code, out).map_err(huffman_error),
+            Text::Huffman(code) => huffman::decode_into(code.bytes(), out).map_err(huffman_error),
         }
     }
 
@@ -218,35 +412,6 @@ fn huffman_error(error: huffman::Error) -> Error {
     match error {
         huffman::Error::TooLong => Error::StringTooLong,
         _ => Error::Huffman,
-    }
-}
-
-impl<'a> ReadFields<'a> for Reader<'a> {
-    fn integer(&mut self, prefix: u8) -> Result<u64, Error> {
-        let bytes = self.clone().rest();
-        let (value, used) = prefix_int::read(bytes, prefix).map_err(|error| match error {
-            prefix_int::Error::Truncated => Error::Truncated,
-            _ => Error::IntegerOverflow,
-        })?;
-        self.skip(used)?;
-        Ok(value)
-    }
-
-    fn text(&mut self, limit: usize) -> Result<Text<'a>, Error> {
-        let coded = self.peek_u8().ok_or(Error::Truncated)? & 0x80 != 0;
-        let len = usize::try_from(self.integer(7)?).map_err(|_| Error::StringTooLong)?;
-        if len > limit {
-            return Err(Error::StringTooLong);
-        }
-        self.position()
-            .checked_add(len)
-            .ok_or(Error::StringTooLong)?;
-        let bytes = self.take(len)?;
-        Ok(if coded {
-            Text::Huffman(bytes)
-        } else {
-            Text::Raw(bytes)
-        })
     }
 }
 
@@ -277,7 +442,7 @@ impl Wire for StringLiteral {
 
     /// Reads one string. Refuses truncation, trailing bytes, overflow, bad Huffman, and limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Reader::new(bytes);
+        let mut c = Block::from(bytes);
         let value = c.text(MAX_STRING)?.to_vec(MAX_STRING)?;
         c.finish()?;
         Ok(Self(value))
@@ -348,7 +513,7 @@ impl Wire for Field {
     /// table references, nonliterals,
     /// truncation, trailing bytes, bad Huffman, integer overflow, and string limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Reader::new(bytes);
+        let mut c = Block::from(bytes);
         let first = c.u8()?;
         if !matches!(first, 0 | 0x10) {
             return Err(Error::ContextRequired);
@@ -427,7 +592,7 @@ pub enum Representation<'a> {
 /// the consumer.
 #[derive(Debug)]
 pub struct Representations<'a> {
-    reader: Reader<'a>,
+    reader: Block<'a>,
     string_limit: usize,
     fields_started: bool,
     failed: bool,
@@ -436,12 +601,13 @@ impl<'a> Representations<'a> {
     /// Bounds the encoded block by [`MAX_BLOCK`] and each encoded
     /// string by `string_limit`; a reader bounds decoded strings as it
     /// decodes them ([`Text`]). Updates must precede every field.
-    pub fn new(bytes: &'a [u8], string_limit: usize) -> Result<Self, Error> {
-        if bytes.len() > MAX_BLOCK {
+    pub fn new(block: impl Into<Block<'a>>, string_limit: usize) -> Result<Self, Error> {
+        let block = block.into();
+        if block.len() > MAX_BLOCK {
             return Err(Error::BlockTooLong);
         }
         Ok(Self {
-            reader: Reader::new(bytes),
+            reader: block,
             string_limit,
             fields_started: false,
             failed: false,
@@ -791,9 +957,11 @@ impl Table {
         }
     }
 
-    /// Reads one complete block into `out`, keeping at most
-    /// `limit.min(MAX_DECODED)` name and value octets and [`MAX_HEADERS`]
-    /// headers; `out`'s room is charged to `budget` as it grows. Each kept
+    /// Reads one complete block into `out`, where it lies: one slice, or
+    /// the pieces it was kept in when it came split ([`Block`]), never
+    /// joined. It keeps at most `limit.min(MAX_DECODED)` name and value
+    /// octets and [`MAX_HEADERS`] headers; `out`'s room is charged to
+    /// `budget` as it grows. Each kept
     /// field is decoded straight into `out`'s block, its literals from the
     /// wire and its references from the table, and nothing else is
     /// allocated for it. A field left out, past the limits or for want of
@@ -803,14 +971,14 @@ impl Table {
     /// Errors clear retained entries, and leave `out` with the fields read
     /// before them; an endpoint must close the connection after a
     /// compression error.
-    pub fn decode_block(
+    pub fn decode_block<'a>(
         &mut self,
-        bytes: &[u8],
+        block: impl Into<Block<'a>>,
         out: &mut Fields,
         budget: &Budget,
         limit: usize,
     ) -> Result<(), Error> {
-        let result = self.read_block(bytes, out, budget, limit.min(MAX_DECODED));
+        let result = self.read_block(block.into(), out, budget, limit.min(MAX_DECODED));
         if result.is_err() {
             self.table.clear();
         }
@@ -819,14 +987,14 @@ impl Table {
 
     fn read_block(
         &mut self,
-        bytes: &[u8],
+        block: Block<'_>,
         out: &mut Fields,
         budget: &Budget,
         limit: usize,
     ) -> Result<(), Error> {
         let mut updates = 0;
         let mut previous = 0;
-        for representation in Representations::new(bytes, MAX_STRING)? {
+        for representation in Representations::new(block, MAX_STRING)? {
             match representation? {
                 Representation::SizeUpdate(size) => {
                     // Endpoint validation deliberately also bounds the number and
@@ -853,7 +1021,8 @@ impl Table {
                     match field {
                         Representation::Indexed(index) => {
                             let entry = self.table.get(index)?.ok_or(Error::Index)?;
-                            let (name, value) = (Text::Raw(entry.name), Text::Raw(entry.value));
+                            let (name, value) =
+                                (Text::Raw(entry.name.into()), Text::Raw(entry.value.into()));
                             keep(out, budget, limit, name, value, false)?;
                         }
                         Representation::Literal {
@@ -864,9 +1033,9 @@ impl Table {
                             let never = indexing == Indexing::Never;
                             let text = match name {
                                 Name::Literal(text) => text,
-                                Name::Index(index) => {
-                                    Text::Raw(self.table.get(index)?.ok_or(Error::Index)?.name)
-                                }
+                                Name::Index(index) => Text::Raw(
+                                    self.table.get(index)?.ok_or(Error::Index)?.name.into(),
+                                ),
                             };
                             let size = text.decoded_len(MAX_STRING)?
                                 + value.decoded_len(MAX_STRING)?
@@ -1565,6 +1734,66 @@ mod tests {
             }
         }
         assert!(widest > 1000, "some blocks were large");
+    }
+
+    /// A block read across the pieces it was kept in, cut anywhere, some
+    /// pieces empty, decodes as the same block in one slice does: the same
+    /// fields, the same table after it, and the same error for a block
+    /// cut short or corrupted. Integers and strings cross the cuts.
+    #[test]
+    fn a_block_in_pieces_decodes_as_the_block_whole() {
+        use fictionet::{Entropy, Seed, SeededEntropy};
+        let rng = SeededEntropy::new(Seed::from_u64(11));
+        let below = |n: usize| rng.random_below(n as u64) as usize;
+        let mut encoder = Encoder::new(4096);
+        let (mut whole, mut cut) = (Table::new(4096), Table::new(4096));
+        let mut failed = 0;
+        for round in 0..400 {
+            encoder.set_huffman(below(2) == 0);
+            let fields: Vec<Field> = (0..below(10))
+                .map(|i| {
+                    let mut value = vec![0; below(400)];
+                    rng.fill_random(&mut value);
+                    Field::new(format!("x-{}", below(4) + i), value)
+                })
+                .collect();
+            let mut block = Vec::new();
+            encoder.encode_block(&fields, &mut block).unwrap();
+            if round % 5 == 4 && !block.is_empty() {
+                // Cut short or corrupted: both decoders read it alike,
+                // and start again if it fails.
+                let at = below(block.len());
+                match below(2) {
+                    0 => block.truncate(at),
+                    _ => block[at] ^= 1 << below(8),
+                }
+            }
+            let mut pieces = Vec::new();
+            let mut rest = &block[..];
+            while !rest.is_empty() || below(4) == 0 {
+                let n = below(rest.len().min(64) + 1);
+                pieces.push(rest[..n].to_vec());
+                rest = &rest[n..];
+            }
+            let (mut from_whole, mut from_pieces) = (Fields::new(), Fields::new());
+            let budget = Budget::unlimited();
+            let a = whole.decode_block(&block, &mut from_whole, &budget, MAX_DECODED);
+            let b = cut.decode_block(
+                Block::pieces(&pieces),
+                &mut from_pieces,
+                &budget,
+                MAX_DECODED,
+            );
+            assert_eq!(a, b, "round {round}: {pieces:?}");
+            assert_eq!(from_whole, from_pieces, "round {round}");
+            assert_eq!(whole.table_size(), cut.table_size(), "round {round}");
+            assert_eq!(whole.table_len(), cut.table_len(), "round {round}");
+            if a.is_err() {
+                failed += 1;
+                (encoder, whole, cut) = (Encoder::new(4096), Table::new(4096), Table::new(4096));
+            }
+        }
+        assert!(failed > 0, "some blocks failed to decode");
     }
 
     #[test]

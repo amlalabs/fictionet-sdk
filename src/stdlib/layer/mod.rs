@@ -236,7 +236,10 @@ mod proofs;
 #[path = "../../../verification/layer/kani/resources.rs"]
 mod resource_proofs;
 
-pub use charged::{BoundedMap, ChargedBytes, ChargedDeque, ChargedVec, FIRST_PLACES, Owned, Place};
+pub use charged::{
+    BoundedMap, ChargedBytes, ChargedDeque, ChargedSegments, ChargedVec, FIRST_PLACES, IntoChunks,
+    Owned, Place,
+};
 pub use fictionet_buf::{Budget, Charge, Chunk, Held, Pool, Refusals, Starved, Waiter};
 pub use work::{OwnedWork, WorkOwner};
 

@@ -5,96 +5,96 @@
 //! of src/stdlib/web/httpd/http2/respond.rs. Run with
 //! `-Z restrict-vtable`.
 //!
-//! The step. A body of eight one-byte pieces, each joined with
-//! `collect_into`, as `Respond::collect` joins each DATA frame's data. The
+//! The step. A body of two one-byte pieces, each kept with
+//! `collect_into`, as `Respond::collect` keeps each DATA frame's data. The
 //! pieces are a static byte: the harness allocates nothing.
 //!
-//! The bounds:
+//! The bounds. The body is kept in `ChargedSegments`, which grow by one
+//! more segment and never move what they hold:
 //!
-//! - **Linear copying**: joining the body asks the allocator for at most
-//!   `JOIN_PER` times its bytes. The body's storage doubles when it is
-//!   full, so the sizes it asks for form a doubling series whose sum is
-//!   under twice its last, and the last is under twice the body.
-//! - **Within the charge**: on a budget of `TIGHT`, the most bytes live at
-//!   once is at most what was live before the body (the budget's own
-//!   state) plus `TIGHT`. While `ChargedBytes` reallocates, the old
-//!   allocation and the new one are both live, and both are charged
-//!   (84530d0d5); before, only the new one was, and a body growing from 2
-//!   to 3 bytes held 5 on a budget of 3
-//!   (`a_collected_body_stays_within_its_charge`, which does not fit in
-//!   14 GiB; the layer area's `charged_bytes_grow_within_their_budget_*`
-//!   prove the growth).
+//! - **No moves**: collecting a body of unknown length asks the allocator
+//!   for its bytes, the room a new segment has past them (a share of what
+//!   is held, at least `LEAST_SEGMENT`) and the places of its segments;
+//!   a body whose `content-length` is known asks for that length and one
+//!   place, once. Before, the body doubled, and each move asked for the
+//!   new allocation while the old one was live.
+//! - **Within the charge**: on a budget of exactly what that asks for,
+//!   every piece is taken, and the most bytes live at once is at most
+//!   what was live before the body (the budget's own state) plus the
+//!   budget. A growth that moved would need the old allocation beside the
+//!   new, which such a budget has no room for.
 
 use super::*;
-use crate::counting::{counted_proof, measure, so_far};
+use fictionet::stdlib::layer::FIRST_PLACES;
 
-/// See the module's bounds.
-const JOIN_PER: usize = 4;
+/// The bytes of the body: two pieces of one.
+const LENGTH: usize = 2;
 
-/// A budget with room for the body to double to 2 bytes, and for a move
-/// out of 2 bytes only if the move charges no more than the growth: the
-/// budget that tells the two apart.
-const TIGHT: usize = 3;
+/// What a body of unknown length asks for while it is under the least
+/// segment: that segment, and the first places of the list it is in.
+const UNKNOWN: usize = ChargedSegments::LEAST_SEGMENT + FIRST_PLACES * ChargedSegments::PLACE;
 
-/// A budget with room for the whole body at every doubling.
+/// What a body of known length asks for: its length, and one place.
+const KNOWN: usize = LENGTH + ChargedSegments::PLACE;
+
+/// A budget with room for every growth many times over.
 const ROOMY: usize = 1 << 12;
 
 /// The data of one DATA frame.
 static PIECE: [u8; 1] = *b"a";
 
-/// The body, joined from eight pieces under a budget of `limit`: what was
-/// live before it, the bytes it asked for, the bytes taken and its charge
-/// at the end.
-fn collect(limit: usize) -> ((usize, usize, usize, usize), crate::counting::Cost) {
+use crate::counting::{counted_proof, measure, so_far};
+
+/// The body, kept from two pieces under a budget of `limit`, its
+/// length given or not: what was live before it, the bytes it asked for
+/// and the bytes taken.
+fn collect(limit: usize, length: Option<usize>) -> ((usize, usize, usize), crate::counting::Cost) {
     measure(|| {
         let budget = Budget::new(limit);
         let base = so_far().live;
         let mut body = None;
         let mut taken = 0;
         let before = so_far().requested;
-        let mut join = || {
-            let joined = collect_into(&mut body, &PIECE, usize::MAX, &budget);
-            taken += usize::from(joined) * PIECE.len();
-            joined
+        let mut keep = || {
+            let kept = collect_into(&mut body, &PIECE, length, usize::MAX, &budget);
+            taken += usize::from(kept) * PIECE.len();
+            kept
         };
         // Written out rather than looped, so that the unwinding bound stays
         // the small one the budget's own loops need.
-        let _ = join() && join() && join() && join() && join() && join() && join() && join();
+        let _ = keep() && keep();
         let asked = so_far().requested - before;
-        let charged = body.as_ref().map_or(0, ChargedBytes::charged);
         // Dropping the body and the budget is not the step.
         std::mem::forget((body, budget));
-        (base, asked, taken, charged)
+        (base, asked, taken)
     })
 }
 
 counted_proof! {
     #[kani::unwind(3)]
-    fn a_collected_body_copies_linearly() {
-        let ((_, asked, taken, _), _) = collect(ROOMY);
-        assert!(
-            asked <= JOIN_PER * taken,
-            "collecting the body copied more than its bytes allow"
-        );
+    fn a_collected_body_moves_nothing() {
+        let ((_, asked, taken), _) = collect(ROOMY, None);
+        assert_eq!(taken, LENGTH);
+        assert!(asked <= UNKNOWN, "collecting the body asked for more than its segment");
     }
 }
 
-// The tight budget's run checks both bounds. It does not fit: since the
-// growth charges its move (84530d0d5), CBMC runs out of 14 GiB in the
-// propositional reduction, on a budget of 6 or of 3, as it did with a
-// choice between this budget and the roomy one in one harness. Not in
-// `http-verify resources`.
 counted_proof! {
     #[kani::unwind(3)]
     fn a_collected_body_stays_within_its_charge() {
-        let ((base, asked, taken, _), cost) = collect(TIGHT);
-        assert!(
-            cost.peak <= base + TIGHT,
-            "the body held more than it was charged"
-        );
-        assert!(
-            asked <= JOIN_PER * taken,
-            "collecting the body copied more than its bytes allow"
-        );
+        let ((base, asked, taken), cost) = collect(UNKNOWN, None);
+        assert_eq!(taken, LENGTH, "a body that fits its charge is refused");
+        assert!(cost.peak <= base + UNKNOWN, "the body held more than it was charged");
+        assert!(asked <= UNKNOWN, "collecting the body asked for more than its segment");
+    }
+}
+
+counted_proof! {
+    #[kani::unwind(3)]
+    fn a_body_of_known_length_is_reserved_once() {
+        let ((base, asked, taken), cost) = collect(KNOWN, Some(LENGTH));
+        assert_eq!(taken, LENGTH, "a body that fits its charge is refused");
+        assert!(cost.peak <= base + KNOWN, "the body held more than it was charged");
+        assert!(asked <= KNOWN, "collecting the body asked for more than its length");
     }
 }

@@ -38,7 +38,8 @@
 
 use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{
-    codec::{Decode, Fail, Step, Storage, Stream, Wire, be32},
+    codec::{Decode, Fail, Step, Stream, Wire, be32},
+    layer::ChargedSegments,
     protocols::{fields::Fields, hpack},
 };
 use fictionet::{Budget, Chunk};
@@ -1651,8 +1652,8 @@ pub enum Credit {
     StreamOverflow,
 }
 /// The block being read: the frame that opened it and what that frame
-/// said. Its fragments so far, when they had to be joined, are in the
-/// assembly storage.
+/// said. Its fragments so far, when they could not be read where they
+/// lay, are in the assembly segments.
 #[derive(Clone, Copy)]
 struct Pending {
     stream: u32,
@@ -1679,16 +1680,17 @@ pub struct BlockRead {
 ///
 /// A block that arrives whole, in one HEADERS frame whose fragment is in
 /// one piece, is decoded from where it lies. A block split into
-/// CONTINUATION frames, or a fragment that came in pieces, is joined in
-/// storage `S`: a vector, or a container whose growth is paid for first,
-/// such as a layer's [`ChargedBytes`](fictionet::stdlib::layer::ChargedBytes).
+/// CONTINUATION frames, or a fragment that came in pieces, is kept in
+/// [`ChargedSegments`], each growth one more segment charged before it is
+/// allocated, and decoded across them ([`hpack::Block`]): nothing kept is
+/// moved or joined.
 ///
 /// A frame is read either whole ([`read`](Self::read)) or in steps, as a
 /// reader that gets its input in pieces does: [`begin`](Self::begin) with
 /// its header, [`join`](Self::join) each piece of its fragment, then
 /// [`end_frame`](Self::end_frame), and, for a block it completes,
 /// [`decode`](Self::decode) with the caller's choice of fields.
-pub struct HeaderBlocks<S = Vec<u8>> {
+pub struct HeaderBlocks {
     table: hpack::Table,
     /// The block being read, from its first frame's header to its last.
     pending: Option<Pending>,
@@ -1696,9 +1698,9 @@ pub struct HeaderBlocks<S = Vec<u8>> {
     last: bool,
     /// The fragment bytes of the frame being read.
     frame_len: usize,
-    /// The fragments of the pending block, joined; empty between blocks,
-    /// with its floor allocated.
-    assembly: S,
+    /// The fragments of the pending block, in the segments they were kept
+    /// in; empty between blocks, with its floor kept.
+    assembly: ChargedSegments,
     /// The storage the assembly keeps between blocks ([`keep`](Self::keep)).
     floor: usize,
     limit: usize,
@@ -1707,21 +1709,20 @@ pub struct HeaderBlocks<S = Vec<u8>> {
 impl HeaderBlocks {
     /// Bounds encoded block storage and retained decoded field bytes.
     pub fn with_limits(limits: Limits) -> Self {
-        Self::in_storage(limits, Vec::new())
+        Self::charged_to(limits, &Budget::unlimited())
     }
-}
-impl<S: Storage> HeaderBlocks<S> {
-    /// As [`with_limits`](HeaderBlocks::with_limits), joining split blocks
-    /// in `storage`, which grows only as far as it allows.
-    pub fn in_storage(limits: Limits, mut storage: S) -> Self {
+
+    /// As [`with_limits`](HeaderBlocks::with_limits), keeping split blocks
+    /// in segments charged to `budget`, which grow only as far as it has
+    /// room.
+    pub fn charged_to(limits: Limits, budget: &Budget) -> Self {
         let limits = limits.bounded();
-        storage.shrink_to(0);
         Self {
             table: hpack::Table::new(4096),
             pending: None,
             last: false,
             frame_len: 0,
-            assembly: storage,
+            assembly: ChargedSegments::new(budget),
             limit: limits.header_block,
             decoded: limits.header_list,
             floor: 0,
@@ -1729,38 +1730,28 @@ impl<S: Storage> HeaderBlocks<S> {
     }
 
     /// The assembly storage, to see what pays for it.
-    pub fn storage(&self) -> &S {
+    pub fn storage(&self) -> &ChargedSegments {
         &self.assembly
     }
 
-    /// Keeps `floor` bytes of assembly storage, within the block limit,
-    /// from now on: grown to it now, and given back no further than it
-    /// after each block, so a block split across frames or pieces that
-    /// fits in it is joined without growing. `false`, changing nothing,
-    /// if the storage cannot grow to it.
+    /// Keeps a first segment of `floor` bytes, within the block limit,
+    /// from now on: made now, and kept after each block, so a block split
+    /// across frames or pieces that fits in it is kept without growing.
+    /// `false`, changing nothing, if the budget has no room for it.
     #[must_use = "a refused floor keeps no storage"]
     pub fn keep(&mut self, floor: usize) -> bool {
         let floor = floor.min(self.limit);
-        if !self.assembly.grow_within(floor..=floor) {
+        if !self.assembly.keep(floor) {
             return false;
         }
         self.floor = floor;
         true
     }
 
-    fn assembly_capacity(&self, len: usize, capacity: usize, fragment: usize) -> usize {
-        let needed = len.saturating_add(fragment).min(self.limit);
-        if needed > capacity {
-            needed.max(capacity.saturating_mul(2)).min(self.limit)
-        } else {
-            capacity
-        }
-    }
-
-    /// The joined length of the pending block.
+    /// The kept length of the pending block.
     fn joined(&self) -> usize {
         if self.pending.is_some() {
-            self.assembly.bytes().len()
+            self.assembly.len()
         } else {
             0
         }
@@ -1788,9 +1779,10 @@ impl<S: Storage> HeaderBlocks<S> {
     pub fn held(&self) -> usize {
         self.table.table_size().saturating_add(self.joined())
     }
-    /// Bytes allocated by the compression table and an unfinished block.
+    /// Bytes allocated by the compression table and an unfinished block:
+    /// its segments and their places.
     pub fn allocated(&self) -> usize {
-        self.table.held().saturating_add(self.assembly.capacity())
+        self.table.held().saturating_add(self.assembly.charged())
     }
     /// Bytes allocated by the compression table.
     pub fn table_held(&self) -> usize {
@@ -1798,9 +1790,12 @@ impl<S: Storage> HeaderBlocks<S> {
     }
     /// The most [`allocated`](Self::allocated) reaches while the table's
     /// settings limit stays where it is: the table's own bound, and an
-    /// unfinished block's storage, which grows to at most the block limit.
+    /// unfinished block's segments, which come to at most the block limit,
+    /// with their places ([`ChargedSegments::most_charged`]).
     pub fn most_allocated(&self) -> usize {
-        self.table.most_held().saturating_add(self.limit)
+        self.table
+            .most_held()
+            .saturating_add(ChargedSegments::most_charged(self.limit))
     }
     /// Whether a block waits for CONTINUATION, or for the rest of the
     /// frame being read.
@@ -1854,27 +1849,18 @@ impl<S: Storage> HeaderBlocks<S> {
         self.last && self.joined() == 0 && fragment == self.frame_len
     }
 
-    /// Joins `piece`, the next bytes of the fragment of the frame begun
-    /// last, to the pending block. `Ok(false)`, changing nothing, when the
-    /// storage refuses room for it, so the caller can join it again once
-    /// memory frees. A block past the direction's limit is an error.
+    /// Keeps `piece`, the next bytes of the fragment of the frame begun
+    /// last, with the pending block: in the room its last segment has, and
+    /// a new segment for the rest, so nothing kept moves. `Ok(false)`,
+    /// changing nothing, when the budget has no room for it, so the caller
+    /// can join it again once memory frees. A block past the direction's
+    /// limit is an error.
     pub fn join(&mut self, piece: &[u8]) -> Result<bool, Error> {
-        let len = self.joined();
-        let Some(needed) = len.checked_add(piece.len()).filter(|&n| n <= self.limit) else {
+        if self.joined().saturating_add(piece.len()) > self.limit {
             self.assembly.clear_to(self.floor);
             return Err(self::budget("header block exceeds limit"));
-        };
-        if needed > self.assembly.capacity() {
-            let target = self.assembly_capacity(len, self.assembly.capacity(), piece.len());
-            if !self.assembly.grow_within(needed..=target) {
-                return Ok(false);
-            }
         }
-        // Within the capacity, so this cannot fail.
-        let resized = self.assembly.resize_within(needed);
-        debug_assert!(resized, "the assembly has room for the fragment");
-        self.assembly.bytes_mut()[len..needed].copy_from_slice(piece);
-        Ok(true)
+        Ok(self.assembly.extend(piece, self.limit))
     }
 
     /// Ends the frame begun last: whether it ends its block, which the
@@ -1885,9 +1871,9 @@ impl<S: Storage> HeaderBlocks<S> {
 
     /// Decodes the block the last frame ended into `out`, its room
     /// charged to `budget`: from `whole`, the block as it lies when it
-    /// came whole ([`is_whole`](Self::is_whole)), or else from what was
-    /// joined. The joined fragments go, and the next frame starts a new
-    /// block.
+    /// came whole ([`is_whole`](Self::is_whole)), or else from the
+    /// segments it was kept in, read where they lie. The kept fragments
+    /// go, and the next frame starts a new block.
     pub fn decode(
         &mut self,
         whole: Option<&[u8]>,
@@ -1896,11 +1882,11 @@ impl<S: Storage> HeaderBlocks<S> {
     ) -> Result<(), Error> {
         self.pending = None;
         let encoded = match whole {
-            Some(whole) => whole,
-            None => self.assembly.bytes(),
+            Some(whole) => hpack::Block::from(whole),
+            None => hpack::Block::pieces(self.assembly.pieces()),
         };
         let decoded = self.table.decode_block(encoded, out, budget, self.decoded);
-        // The block is decoded: its joined fragments go.
+        // The block is decoded: its kept fragments go.
         self.assembly.clear_to(self.floor);
         decoded.map_err(|_| error(ErrorCode::CompressionError, "invalid HPACK block"))
     }

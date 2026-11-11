@@ -773,6 +773,254 @@ impl<T> std::fmt::Debug for ChargedVec<T> {
     }
 }
 
+/// Bytes kept in segments that never move: growing charges and allocates
+/// one more segment, and copies nothing already held, so what is held is
+/// at most its bytes and the room left in the last segment, never an old
+/// allocation beside a new one. A unit whose length is known takes one
+/// segment of exactly that length ([`with_capacity`](Self::with_capacity)).
+///
+/// The segments are vectors whose capacity one charge pays for, and their
+/// places in a [`ChargedVec`]. A reader that takes the bytes in pieces
+/// reads them where they lie ([`pieces`](Self::pieces)); the segments
+/// become chunks, each with its share of the charge, when they are handed
+/// on ([`into_chunks`](Self::into_chunks)).
+pub struct ChargedSegments {
+    segments: ChargedVec<Vec<u8>>,
+    /// Pays for every segment's capacity.
+    charge: Charge,
+    len: usize,
+}
+
+impl ChargedSegments {
+    /// A new segment holds the rest of the piece that needs it, or this
+    /// share of what is held if that is more, within
+    /// [`LEAST_SEGMENT`](Self::LEAST_SEGMENT) and
+    /// [`MOST_SEGMENT`](Self::MOST_SEGMENT): so the room left in the last
+    /// segment is under an eighth of what is held, or the least segment,
+    /// and under the most segment, while the segments a unit takes grow
+    /// in number as the logarithm of its bytes, then linearly past the
+    /// most segment.
+    pub const SHARE: usize = 8;
+    /// The most a segment grows to beyond the piece that needs it: one
+    /// HTTP/2 frame.
+    pub const MOST_SEGMENT: usize = 16 << 10;
+    /// The least segment, unless the limit needs less, even when the
+    /// budget has no room for the one wanted: so a unit takes at most one
+    /// segment for each of these bytes, and one more.
+    pub const LEAST_SEGMENT: usize = 256;
+    /// What a segment's place costs.
+    pub const PLACE: usize = size_of::<Vec<u8>>();
+
+    /// No segments and no places, which costs nothing, counted against
+    /// `budget` as they are added.
+    pub fn new(budget: &Budget) -> ChargedSegments {
+        ChargedSegments {
+            segments: ChargedVec::new(budget, usize::MAX),
+            charge: Charge::nothing(budget),
+            len: 0,
+        }
+    }
+
+    /// One segment of exactly `capacity` bytes and its place, charged
+    /// before they are allocated: for a unit whose length is known, which
+    /// then never grows. `None`, with nothing allocated, if the budget has
+    /// no room.
+    pub fn with_capacity(budget: &Budget, capacity: usize) -> Option<ChargedSegments> {
+        let mut segments = ChargedSegments {
+            segments: ChargedVec::with_places(budget, 1, usize::MAX)?,
+            charge: Charge::nothing(budget),
+            len: 0,
+        };
+        segments.add(capacity..=capacity).then_some(segments)
+    }
+
+    /// The most [`charged`](Self::charged) reaches while at most `most`
+    /// bytes are held, with every growth asking for at most `most`: the
+    /// segments' capacity, at most `most`, and the places of as many
+    /// segments as that can take, doubled as the places grow. Every
+    /// segment but the first and the one that reaches `most` is at least
+    /// [`LEAST_SEGMENT`](Self::LEAST_SEGMENT).
+    pub fn most_charged(most: usize) -> usize {
+        let segments = most.div_ceil(Self::LEAST_SEGMENT) + 2;
+        most.saturating_add(segments.saturating_mul(2 * Self::PLACE))
+    }
+
+    /// Adds a segment of as much of `capacity` as the budget has room
+    /// for, and its place, each charged before it is allocated. `false`,
+    /// with nothing charged or allocated, if not even its start fits.
+    fn add(&mut self, capacity: RangeInclusive<usize>) -> bool {
+        let budget = self.charge.budget().clone();
+        let Some(room) = budget.charge_within(capacity) else {
+            return false;
+        };
+        if !self.segments.reserve(1) {
+            return false;
+        }
+        let pushed = self.segments.push(Vec::with_capacity(room.bytes()));
+        debug_assert!(pushed.is_ok(), "the place was reserved");
+        self.charge
+            .absorb(room)
+            .expect("a segment is charged to the segments' budget");
+        true
+    }
+
+    /// Room for `floor` bytes kept from now on: a first segment of exactly
+    /// that, and its place, made now if there is none, and kept by
+    /// [`clear_to`](Self::clear_to). `false`, changing nothing, if the
+    /// budget has no room for them.
+    #[must_use = "a refused floor keeps no storage"]
+    pub fn keep(&mut self, floor: usize) -> bool {
+        if floor == 0 || self.segments.first().is_some_and(|s| s.capacity() >= floor) {
+            return true;
+        }
+        if !self.segments.is_empty() {
+            return false;
+        }
+        if self.segments.places() == 0 {
+            let budget = self.charge.budget().clone();
+            let Some(places) = ChargedVec::with_places(&budget, 1, usize::MAX) else {
+                return false;
+            };
+            self.segments = places;
+        }
+        self.add(floor..=floor)
+    }
+
+    /// Appends `bytes`, which with what is held come to at most `most`.
+    /// What fits goes in the room left in the last segment, and the rest
+    /// in one new segment, charged before it is allocated: the rest, or a
+    /// [`SHARE`](Self::SHARE) of what is held if that is more, never past
+    /// `most`, and as small as the budget needs down to the rest or the
+    /// least segment. Nothing held moves. `false`, writing nothing and
+    /// changing nothing, if the bytes would pass `most` or the budget has
+    /// no room.
+    #[must_use = "refused bytes are not held"]
+    pub fn extend(&mut self, bytes: &[u8], most: usize) -> bool {
+        if self.len.checked_add(bytes.len()).is_none_or(|n| n > most) {
+            return false;
+        }
+        let room = self.segments.last().map_or(0, |s| s.capacity() - s.len());
+        let (here, rest) = bytes.split_at(bytes.len().min(room));
+        if !rest.is_empty() {
+            let reach = self.len + room;
+            let share = (self.len / Self::SHARE).clamp(Self::LEAST_SEGMENT, Self::MOST_SEGMENT);
+            let want = rest.len().max(share).min(most - reach);
+            let least = rest.len().max(want.min(Self::LEAST_SEGMENT));
+            let filled = self.segments.len();
+            if !self.add(least..=want) {
+                return false;
+            }
+            if let Some(last) = filled.checked_sub(1) {
+                self.segments[last].extend_from_slice(here);
+            }
+            self.segments[filled].extend_from_slice(rest);
+        } else if let Some(last) = self.segments.last_mut() {
+            last.extend_from_slice(here);
+        }
+        self.len += bytes.len();
+        true
+    }
+
+    /// The bytes held.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no bytes are held.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The segments' capacity, written or not.
+    pub fn capacity(&self) -> usize {
+        self.charge.bytes()
+    }
+
+    /// The bytes charged: the segments' capacity and their places.
+    pub fn charged(&self) -> usize {
+        self.charge.bytes() + self.segments.charged()
+    }
+
+    /// The segments, in order: the bytes held are theirs, joined.
+    pub fn pieces(&self) -> &[Vec<u8>] {
+        &self.segments
+    }
+
+    /// Forgets every byte. A first segment of at most `keep` bytes stays,
+    /// empty, with one place; every other segment goes, with its charge.
+    pub fn clear_to(&mut self, keep: usize) {
+        self.len = 0;
+        let kept = usize::from(self.segments.first().is_some_and(|s| s.capacity() <= keep));
+        while self.segments.len() > kept {
+            self.segments.pop();
+        }
+        if let Some(first) = self.segments.first_mut() {
+            first.clear();
+        }
+        self.charge
+            .shrink_to(self.segments.first().map_or(0, Vec::capacity));
+        self.segments.shrink_to(kept);
+    }
+
+    /// The segments as chunks, in order, each carrying its share of the
+    /// charge, taken one at a time; their places go back with the last.
+    pub fn into_chunks(self) -> IntoChunks {
+        IntoChunks {
+            segments: self.segments,
+            charge: self.charge,
+            next: 0,
+            left: self.len,
+        }
+    }
+}
+
+/// The segments of a [`ChargedSegments`], as chunks, in order. Empty
+/// segments are left out.
+pub struct IntoChunks {
+    segments: ChargedVec<Vec<u8>>,
+    charge: Charge,
+    next: usize,
+    left: usize,
+}
+
+impl IntoChunks {
+    /// The bytes not yet taken.
+    pub fn remaining(&self) -> usize {
+        self.left
+    }
+}
+
+impl Iterator for IntoChunks {
+    type Item = Chunk;
+
+    fn next(&mut self) -> Option<Chunk> {
+        while let Some(segment) = self.segments.get_mut(self.next) {
+            self.next += 1;
+            let segment = std::mem::take(segment);
+            let share = self
+                .charge
+                .split(segment.capacity())
+                .expect("the charge pays for every segment");
+            if segment.is_empty() {
+                continue;
+            }
+            self.left -= segment.len();
+            return Some(Chunk::paid(segment, share).expect("a segment is charged its capacity"));
+        }
+        None
+    }
+}
+
+impl std::fmt::Debug for ChargedSegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChargedSegments")
+            .field("len", &self.len)
+            .field("segments", &self.segments.len())
+            .field("capacity", &self.charge.bytes())
+            .finish()
+    }
+}
+
 /// A map of at most `limit` entries, paid for once when it is made, so
 /// nothing it holds grows its charge. Its nodes are not visible, so the
 /// charge is what `limit` entries may take at most
@@ -2234,5 +2482,103 @@ mod tests {
         covered(&buffer, 0);
         drop(buffer);
         assert_eq!(budget.used(), 0);
+    }
+
+    /// Segmented bytes grow without moving what they hold: every segment
+    /// written stays where it is, the capacity stays within the bytes and
+    /// one segment's growth, the charge is what is allocated, and a
+    /// refusal writes and charges nothing. Before, a body grew in
+    /// `ChargedBytes`, whose growth needs the old allocation and the new
+    /// one at once.
+    #[test]
+    fn segments_grow_without_moving_what_they_hold() {
+        let rng = SeededEntropy::new(Seed::from_u64(3));
+        for limit in [usize::MAX, 600, 5000, 40_000] {
+            let budget = Budget::new(limit);
+            let most = 64 << 10;
+            let mut segments = ChargedSegments::new(&budget);
+            let mut written = Vec::new();
+            let mut places: Vec<(*const u8, usize)> = Vec::new();
+            loop {
+                let n = 1 + rng.random_below(3000) as usize;
+                let piece: Vec<u8> = (0..n).map(|i| (written.len() + i) as u8).collect();
+                let (len, used) = (segments.len(), budget.used());
+                if !segments.extend(&piece, most) {
+                    assert_eq!(
+                        (segments.len(), budget.used()),
+                        (len, used),
+                        "a refusal changed nothing"
+                    );
+                    break;
+                }
+                written.extend_from_slice(&piece);
+                // What was written before is where it was.
+                for (segment, &(at, capacity)) in segments.pieces().iter().zip(&places) {
+                    assert_eq!((segment.as_ptr(), segment.capacity()), (at, capacity));
+                }
+                places = segments
+                    .pieces()
+                    .iter()
+                    .map(|s| (s.as_ptr(), s.capacity()))
+                    .collect();
+                let joined: Vec<u8> = segments.pieces().concat();
+                assert_eq!(joined, written);
+                assert_eq!(segments.len(), written.len());
+                // The room left is in the last segment alone, under a share
+                // of what is held.
+                let share = (written.len() / ChargedSegments::SHARE).clamp(
+                    ChargedSegments::LEAST_SEGMENT,
+                    ChargedSegments::MOST_SEGMENT,
+                );
+                assert!(
+                    segments.capacity() <= written.len() + share,
+                    "{} held for {} bytes",
+                    segments.capacity(),
+                    written.len()
+                );
+                let allocated: usize = segments.pieces().iter().map(Vec::capacity).sum();
+                assert_eq!(segments.capacity(), allocated);
+                assert_eq!(budget.used(), segments.charged());
+                assert!(segments.charged() <= ChargedSegments::most_charged(most));
+                if written.len() + 3000 > most {
+                    break;
+                }
+            }
+            let chunks: Vec<Chunk> = segments.into_chunks().collect();
+            let joined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+            assert_eq!(joined, written);
+            assert!(budget.used() <= chunks.iter().map(Chunk::capacity).sum::<usize>());
+            drop(chunks);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    /// A known length takes one segment, and a floor stays between units
+    /// while what grew past it goes.
+    #[test]
+    fn segments_keep_their_floor_and_take_a_known_length_once() {
+        let budget = Budget::new(1 << 20);
+        let mut known = ChargedSegments::with_capacity(&budget, 1000).unwrap();
+        for piece in [&[1u8; 300][..], &[2; 700]] {
+            assert!(known.extend(piece, 1000));
+        }
+        assert_eq!(known.pieces().len(), 1);
+        assert!(!known.extend(&[3], 1000), "past the length it was given");
+        drop(known);
+        assert_eq!(budget.used(), 0);
+
+        let mut kept = ChargedSegments::new(&budget);
+        assert!(kept.keep(100));
+        let floor = budget.used();
+        assert_eq!(kept.charged(), floor);
+        for _ in 0..3 {
+            assert!(kept.extend(&[7; 90], 4096));
+            assert_eq!(budget.used(), floor, "within the floor nothing grows");
+            assert!(kept.extend(&[8; 900], 4096));
+            assert!(kept.pieces().len() > 1);
+            kept.clear_to(100);
+            assert_eq!(budget.used(), floor, "the growth went back");
+            assert!(kept.is_empty());
+        }
     }
 }
