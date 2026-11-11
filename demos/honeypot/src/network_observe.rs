@@ -5,7 +5,7 @@ use fictionet::stdlib::{
     protocols::dns,
 };
 use serde::Serialize;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 /// Facts retained independently of successful application requests.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -62,7 +62,7 @@ struct Stream {
 /// retransmitted prefixes are trimmed and never interpreted twice.
 #[derive(Default)]
 pub(crate) struct Observer {
-    streams: HashMap<Key, Stream>,
+    streams: BTreeMap<Key, Stream>,
 }
 
 impl Observer {
