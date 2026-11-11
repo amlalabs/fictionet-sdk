@@ -712,12 +712,40 @@ impl Message {
 use fictionet::stdlib::codec::Side;
 
 /// A text or binary message whose last frame has not come yet.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Partial {
     opcode: Opcode,
     data: Vec<u8>,
     /// How many bytes of text are known to be valid UTF-8.
     checked: usize,
+}
+
+impl Partial {
+    /// Appends a continuation's payload. The allocation grows by doubling,
+    /// as a vector's does, but never past `limit`: `check_header` keeps
+    /// the message within it, so its allocation stays within it too.
+    fn append(&mut self, payload: &[u8], limit: usize) {
+        let want = self.data.len() + payload.len();
+        if want > self.data.capacity() {
+            let to = self.data.capacity().saturating_mul(2).min(limit).max(want);
+            self.data.reserve_exact(to - self.data.len());
+        }
+        self.data.extend_from_slice(payload);
+    }
+}
+
+/// A copy holds what the original holds, its allocation included, so the
+/// two report the same [`held`](codec::Decode::held) and grow alike.
+impl Clone for Partial {
+    fn clone(&self) -> Self {
+        let mut data = Vec::with_capacity(self.data.capacity());
+        data.extend_from_slice(&self.data);
+        Partial {
+            opcode: self.opcode,
+            data,
+            checked: self.checked,
+        }
+    }
 }
 
 impl Wire for Frame {
@@ -969,13 +997,16 @@ impl Messages {
                 }
                 _ => {}
             }
-            if !h.opcode.is_control()
-                && codec::Decode::held(self).saturating_add(h.len) > self.limit
-            {
+            if !h.opcode.is_control() && self.assembled().saturating_add(h.len) > self.limit {
                 return Err(Error::TooBig);
             }
         }
         Ok(())
+    }
+
+    /// The bytes of the message in progress so far.
+    fn assembled(&self) -> usize {
+        self.partial.as_ref().map_or(0, |p| p.data.len())
     }
 }
 
@@ -988,8 +1019,10 @@ impl codec::Decode for Messages {
         self.frames.capacity()
     }
 
+    /// What the message in progress holds: its allocation, never past the
+    /// limit.
     fn held(&self) -> usize {
-        self.partial.as_ref().map_or(0, |p| p.data.len())
+        self.partial.as_ref().map_or(0, |p| p.data.capacity())
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Self::Error> {
@@ -1024,7 +1057,7 @@ impl codec::Decode for Messages {
             }
             Opcode::Continuation => {
                 if let Some(p) = self.partial.as_mut() {
-                    p.data.extend_from_slice(&frame.payload);
+                    p.append(&frame.payload, self.limit);
                 }
             }
         }
@@ -2422,6 +2455,39 @@ mod tests {
         assert_eq!(messages.decode(&LO, false), copy.decode(&LO, false));
         assert_eq!(messages.limit(), 100);
         assert_eq!(messages.held(), 0);
+    }
+
+    /// A message in fragments grows its allocation by doubling, but never
+    /// past the limit, and `held()` reports the allocation, not the bytes
+    /// so far. Before, six bytes and then three at a limit of ten grew it
+    /// to twelve while `held()` said nine.
+    #[test]
+    fn a_message_in_fragments_holds_no_more_than_its_limit() {
+        let limit = 10;
+        let mut messages = Messages::for_receiver(Side::Client).with_limit(limit);
+        let frames: [&[u8]; 3] = [
+            &[0x02, 6, 0, 0, 0, 0, 0, 0],
+            &[0x00, 3, 0, 0, 0],
+            &[0x80, 1, 0],
+        ];
+        for bytes in frames {
+            let step = messages.decode(bytes, false);
+            assert!(step.is_ok(), "{step:?}");
+            let capacity = messages.partial.as_ref().map_or(0, |p| p.data.capacity());
+            assert!(
+                capacity <= limit,
+                "{capacity} bytes allocated, past {limit}"
+            );
+            assert_eq!(messages.held(), capacity, "held() is the allocation");
+        }
+        // A fragment that would take the message past the limit is refused
+        // from its header, before its payload is copied.
+        let mut messages = Messages::for_receiver(Side::Client).with_limit(limit);
+        assert!(messages.decode(&[0x02, 6, 0, 0, 0, 0, 0, 0], false).is_ok());
+        assert_eq!(
+            messages.decode(&[0x80, 5], false),
+            Err(AssembleError::Inner(Error::TooBig))
+        );
     }
 
     #[test]
