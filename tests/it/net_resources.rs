@@ -252,3 +252,184 @@ fn packets_completed_from_small_pieces_stay_within_most_held() {
     assert_eq!(whole, 20);
     eprintln!("cost: completed from small pieces: {}", costs.summary());
 }
+
+/// UDP sockets under floods of datagrams, through the IP layer as a host
+/// runs them: what a socket keeps is paid for by the layer's budget.
+mod udp {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use fictionet::stdlib::layer::{
+        Admit, Budget, Chain, Child, Datagrams, Driver, MessageCommand, Messages, MuxCommand,
+        MuxEvent, PacketEvent,
+    };
+    use fictionet::stdlib::network::ip::{self, protocol};
+    use fictionet::stdlib::network::packet::IpLayer;
+    use fictionet::stdlib::network::transport::{Request, UdpControl, UdpNotice};
+    use fictionet::stdlib::network::udp::UdpLayer;
+    use fictionet::time::Instant;
+    use fictionet::{Chunk, Packet, Seed, SeededEntropy};
+
+    use crate::cost::{Charged, Costs, Linear};
+
+    type Stack = Chain<IpLayer, UdpLayer>;
+    type Command = MuxCommand<Datagrams<SocketAddr>, Messages<UdpNotice, UdpControl>>;
+
+    /// What the stack holds outside the budget while a step runs: the
+    /// packet the step takes in (built inside it, at most 1,500 bytes and
+    /// two chunk headers), and the layers' queues of control events and
+    /// packets, at most 64 entries each (`HELD` in udp/sockets.rs), which
+    /// a flood with no reader leaves empty.
+    const STACK: usize = 4096;
+
+    /// A step's linear bound, besides what it charged to the budget: the
+    /// packet built (its bytes and two chunk headers) and the datagram's
+    /// bytes copied out of it, two bytes for each byte of input. Growing
+    /// the queue is charged before it is allocated, and counted with the
+    /// step's charge. The layers' own queues ([`STACK`]) may grow in any
+    /// step, outside the budget, up to their bound.
+    const STEP: Linear = Linear {
+        num: 2,
+        den: 1,
+        fixed: 2 * Chunk::HEADER + STACK,
+    };
+
+    struct Host {
+        d: Driver<Stack>,
+        budget: Budget,
+        child: Child,
+        local: SocketAddr,
+    }
+
+    /// A host at 10.0.0.1 with a socket on port 53 and `limit` bytes of
+    /// budget.
+    fn host(limit: usize) -> Host {
+        let budget = Budget::new(limit);
+        let entropy = Arc::new(SeededEntropy::new(Seed::from_u64(7)));
+        let udp = UdpLayer::new("10.0.0.1".parse().unwrap(), &*entropy);
+        let mut d = Driver::new(
+            Chain::new(IpLayer::host(), udp),
+            entropy,
+            budget.clone(),
+            Instant::ZERO,
+        );
+        let bind: Command = MuxCommand::control(MessageCommand::Send(UdpControl::Bind {
+            request: Request(0),
+            port: 53,
+        }));
+        assert!(matches!(d.command(bind), Ok(Admit::Taken)));
+        d.run().unwrap();
+        let mut opened = None;
+        d.send_above(|event| {
+            if let MuxEvent::Opened(child, bound, _) = event {
+                opened = Some((child, bound.local));
+            }
+            Admit::Taken
+        });
+        let (child, local) = opened.expect("port 53 opened");
+        Host {
+            d,
+            budget,
+            child,
+            local,
+        }
+    }
+
+    /// A UDP packet from `from` to `to`, its checksum filled in.
+    fn datagram(from: SocketAddr, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut udp = [
+            &from.port().to_be_bytes()[..],
+            &to.port().to_be_bytes(),
+            &((8 + payload.len()) as u16).to_be_bytes(),
+            &[0, 0],
+            payload,
+        ]
+        .concat();
+        let sum = ip::transport_checksum(from.ip(), to.ip(), protocol::UDP, &udp);
+        udp[6..8].copy_from_slice(&sum.to_be_bytes());
+        ip::packet(from.ip(), to.ip(), protocol::UDP, &udp).into_vec()
+    }
+
+    /// Runs `f` on the host as one costed step: within what the budget
+    /// paid before it, what the step charged, and [`STACK`]. Of what it
+    /// charged, all but `kept` (a datagram's bytes and its chunk's header)
+    /// is places the queue grew by; growing to at least twice its places,
+    /// it moved no more than that.
+    fn step(costs: &mut Costs, h: &mut Host, input: usize, kept: usize, f: impl FnOnce(&mut Host)) {
+        let before = h.budget.used();
+        costs.step(input, before + STACK, STEP, || {
+            f(h);
+            let charged = h.budget.used().saturating_sub(before);
+            Charged {
+                value: (),
+                charged,
+                moved: charged.saturating_sub(kept),
+            }
+        });
+    }
+
+    /// A datagram of `payload` from `peer` arrives, as one costed step.
+    fn arrive(costs: &mut Costs, h: &mut Host, peer: SocketAddr, payload: &[u8]) {
+        let input = 28 + payload.len();
+        let kept = payload.len() + Chunk::HEADER;
+        step(costs, h, input, kept, |h| {
+            let packet = Packet::new(datagram(peer, h.local, payload));
+            assert!(matches!(
+                h.d.deliver(PacketEvent::Packet(packet)),
+                Ok(Admit::Taken)
+            ));
+            h.d.run().unwrap();
+            // A runner reads what the stack reports as it goes.
+            h.d.observations().drain().for_each(drop);
+        });
+    }
+
+    /// The port above takes `n` datagrams, as one costed step.
+    fn take(costs: &mut Costs, h: &mut Host, n: u64) {
+        step(costs, h, 0, 0, |h| {
+            let grant: Command = h.child.grant(n);
+            assert!(matches!(h.d.command(grant), Ok(Admit::Taken)));
+            h.d.run().unwrap();
+            h.d.send_above(|event| {
+                drop(event);
+                Admit::Taken
+            });
+        });
+    }
+
+    /// Floods of tiny datagrams, then of mixed sizes, each past what one
+    /// socket keeps; then the port above takes them all and the flood
+    /// comes again, into places the queue already paid for.
+    #[test]
+    fn floods_of_tiny_datagrams_stay_within_what_the_budget_paid() {
+        let mut costs = Costs::new("udp floods");
+        let mut h = host(64 << 20);
+        let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        for round in 0..2 {
+            for size in [0usize, 1, 7] {
+                for _ in 0..3000 {
+                    arrive(&mut costs, &mut h, peer, &vec![round as u8; size]);
+                }
+            }
+            for i in 0..3000usize {
+                arrive(&mut costs, &mut h, peer, &vec![1; i % 1400]);
+            }
+            take(&mut costs, &mut h, 20_000);
+        }
+        eprintln!("cost: udp floods: {}", costs.summary());
+    }
+
+    /// A budget smaller than a flood: datagrams are dropped once it is
+    /// spent, and what is kept stays within it.
+    #[test]
+    fn a_flood_past_the_budget_stays_within_it() {
+        let mut costs = Costs::new("udp budget");
+        let mut h = host(256 << 10);
+        let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        for i in 0..5000usize {
+            arrive(&mut costs, &mut h, peer, &vec![2; i % 300]);
+        }
+        assert!(h.budget.used() <= 256 << 10);
+        eprintln!("cost: udp budget: {}", costs.summary());
+    }
+}
