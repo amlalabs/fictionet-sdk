@@ -199,17 +199,20 @@ pub fn select_compatible(original: u32, preference: &[u32], client: &VersionList
 }
 
 /// The downgrade check of RFC 9368 section 4 for a client that reacted to a
-/// Version Negotiation packet: the client must have chosen `negotiated` had
-/// it been offered the server's Available Versions plus `negotiated`.
+/// Version Negotiation packet by attempting `attempted`: the client must
+/// have attempted the same version had the packet listed the server's
+/// Available Versions plus the `negotiated` one. The two differ when the
+/// server then upgraded the attempt (RFC 9368 section 2.3, Figure 1).
 pub fn negotiation_was_genuine(
     preference: &VersionList,
     server: &VersionInformation,
+    attempted: u32,
     negotiated: u32,
 ) -> bool {
     !server.lists_nothing()
         && preference
             .first_offered(|version| version == negotiated || server.available.contains(version))
-            == Some(negotiated)
+            == Some(attempted)
 }
 
 #[cfg(test)]
@@ -279,23 +282,50 @@ mod tests {
             unknown_available,
         };
         let both = server(&[QUIC_V1, QUIC_V2], false);
-        assert!(negotiation_was_genuine(&preference, &both, QUIC_V2));
-        assert!(!negotiation_was_genuine(&preference, &both, QUIC_V1));
+        assert!(negotiation_was_genuine(
+            &preference,
+            &both,
+            QUIC_V2,
+            QUIC_V2
+        ));
+        assert!(!negotiation_was_genuine(
+            &preference,
+            &both,
+            QUIC_V1,
+            QUIC_V1
+        ));
         assert!(negotiation_was_genuine(
             &preference,
             &server(&[QUIC_V1], false),
+            QUIC_V1,
             QUIC_V1
         ));
         assert!(!negotiation_was_genuine(
             &preference,
             &server(&[], false),
+            QUIC_V1,
             QUIC_V1
         ));
         // A server may list only versions this engine does not know.
         assert!(negotiation_was_genuine(
             &preference,
             &server(&[], true),
+            QUIC_V1,
             QUIC_V1
+        ));
+        // The client attempted 2 and the server upgraded it to 1.
+        assert!(negotiation_was_genuine(
+            &preference,
+            &both,
+            QUIC_V2,
+            QUIC_V1
+        ));
+        // An attempt in 1 was a downgrade, whatever it was upgraded to.
+        assert!(!negotiation_was_genuine(
+            &preference,
+            &both,
+            QUIC_V1,
+            QUIC_V2
         ));
     }
 }

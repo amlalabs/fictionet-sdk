@@ -225,6 +225,8 @@ impl Negotiation {
     /// A client's check of the server's transport parameters once the
     /// connection runs `negotiated` (RFC 9368 section 4). The decoder has
     /// already compared the server's Chosen Version with `negotiated`.
+    /// After Version Negotiation, `original` is the version the client
+    /// attempted in answer, which the server may have upgraded.
     pub(super) fn check_server(
         &self,
         params: &TransportParameters,
@@ -240,7 +242,12 @@ impl Negotiation {
             ),
             Some(info)
                 if self.reacted
-                    && !negotiation_was_genuine(&self.preference, &info, negotiated) =>
+                    && !negotiation_was_genuine(
+                        &self.preference,
+                        &info,
+                        self.original,
+                        negotiated,
+                    ) =>
             {
                 Err(TransportError::VERSION_NEGOTIATION_ERROR(
                     "Version Negotiation contradicts the server's versions",
