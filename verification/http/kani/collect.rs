@@ -15,12 +15,12 @@
 //!   `JOIN_PER` times its bytes. The body's storage doubles when it is
 //!   full, so the sizes it asks for form a doubling series whose sum is
 //!   under twice its last, and the last is under twice the body.
-//! - **Within the charge**: the most bytes live at once is at most what
-//!   was live before the body (the budget's own state), plus what the body
-//!   is charged at the end, which is the most it is ever charged. This one
-//!   is reported, not passing: `ChargedBytes` grows in place, charging
-//!   only the growth, so while it reallocates the old allocation and the
-//!   new one are both live with only the new one charged
+//! - **Within the charge**: on a budget of `TIGHT`, the most bytes live at
+//!   once is at most what was live before the body (the budget's own
+//!   state) plus `TIGHT`. While `ChargedBytes` reallocates, the old
+//!   allocation and the new one are both live, and both are charged
+//!   (84530d0d5); before, only the new one was, and a body growing from 4
+//!   to 6 bytes held 10 on a budget of 6
 //!   (`a_collected_body_stays_within_its_charge`).
 
 use super::*;
@@ -28,6 +28,11 @@ use crate::counting::{counted_proof, measure, so_far};
 
 /// See the module's bounds.
 const JOIN_PER: usize = 4;
+
+/// A budget with room for the body to double to 4 bytes, and for a move
+/// out of 4 bytes only if the move charges no more than the growth: the
+/// budget that tells the two apart.
+const TIGHT: usize = 6;
 
 /// The data of one DATA frame.
 static PIECE: [u8; 1] = *b"a";
@@ -73,9 +78,9 @@ counted_proof! {
 counted_proof! {
     #[kani::unwind(3)]
     fn a_collected_body_stays_within_its_charge() {
-        let ((base, _, _, charged), cost) = collect(1 << 12);
+        let ((base, _, _, _), cost) = collect(TIGHT);
         assert!(
-            cost.peak <= base + charged,
+            cost.peak <= base + TIGHT,
             "the body held more than it was charged"
         );
     }

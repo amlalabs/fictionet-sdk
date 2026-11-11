@@ -35,6 +35,7 @@ fn keep_one(count: usize) {
             granted: 0,
             credit: 0,
             owed: 0,
+            completed: 0,
             ending: false,
             ended: false,
             queued: false,

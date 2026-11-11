@@ -518,16 +518,17 @@ paid for.
 
 ### Found, not fixed
 
-- **A charged container's growth holds its old and new places for a
-  moment.** `ChargedDeque` and `ChargedVec` (`layer/charged.rs`) charge
-  the places they grow by, not the old block a reallocation holds while it
-  moves. A UDP socket's queue growing from 2,048 places to 4,096 holds
-  about 160 KiB more than charged until the old block is freed. Charging
-  the old places again for the move breaks two tests of the layer's
-  randomized model, whose wakes and refusals assume the old rule; it is
-  left for the layer's owner. The UDP Kani harnesses stay within the
-  first four places, and the replay's allocator counts a reallocation as
-  its change in size, so neither sees it.
+- **A charged container's growth held its old and new places for a
+  moment** (fixed in the layer area, 84530d0d5). `ChargedDeque` and
+  `ChargedVec` (`layer/charged.rs`) charged the places they grew by, not
+  the old block a reallocation holds while it moves: a UDP socket's queue
+  growing from 2,048 places to 4,096 held about 160 KiB more than charged
+  until the old block was freed. A growth now charges the old block with
+  the new places (`Charge::grow_by_units_moving`), and the layer's Kani
+  harnesses and `Growth.tla` check it (`layer/README.md`). The UDP Kani
+  harnesses stay within the first four places, and the replay's allocator
+  counts a reallocation as its change in size, so neither of this area's
+  checks saw it.
 - **The cache's normalized copy deduplicates in quadratic time**
   (`normalized` in `resolver/cache.rs` compares each record with every
   one kept). Its memory is linear; its time for an RRset of n records is
