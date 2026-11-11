@@ -402,3 +402,30 @@ or forgetting closed streams, and has no production trace replay yet.
 The successful Kani proof is of the guard, not those caller properties.
 Clippy with warnings denied passes for the SDK, engine and interop crate,
 including their tests.
+
+## Sustained transfers under adverse delivery
+
+`sustained_streams_survive_loss_duplicates_and_reordering` sends 128 KiB
+in one direction and 96 KiB in the other through the production adapter.
+Both exceed the configured stream and connection flow-control windows.
+Application receive grants are only 113 and 127 bytes; each delivered
+chunk returns exactly its consumed credit. The link drops every eleventh
+packet, duplicates every seventh surviving packet, and alternates queue
+ends on delivery. Both peers use the same virtual network time for
+pacing and recovery, without a host clock or sleeps driving the schedule.
+
+The test checks the complete streams against their supplied inputs,
+ordered FIN delivery exactly once, including late duplicates after both
+FINs, the exact total of write completions,
+and that loss, duplication and reordering actually occurred in each
+direction. Dropping the link and both layers returns all adapter budget
+charges. This does not measure uncharged engine allocations or prove
+congestion behavior. It passes with the existing receive and send windows;
+none was raised to make progress. The shared regression also runs in the
+isolated interoperability crate, alongside the two independent peers.
+All twelve tests in that crate pass. Clippy with warnings denied and the
+workspace formatting check pass after adding the regression.
+
+All 302 SDK doctests and three engine doctests pass. Rustdoc builds both
+libraries, retaining the pre-existing redundant-link warning in
+`network/packet.rs`.

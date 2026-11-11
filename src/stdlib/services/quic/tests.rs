@@ -528,3 +528,222 @@ fn queued_writes_do_not_postpone_reading_the_reverse_direction() {
     assert!(read, "reading progresses before the write queue drains");
     assert!(written < 100);
 }
+
+#[test]
+fn sustained_streams_survive_loss_duplicates_and_reordering() {
+    struct Transfer {
+        child: Child,
+        output: Vec<u8>,
+        sent: usize,
+        written: u64,
+        credit: u64,
+        input: Vec<u8>,
+        ended: bool,
+        finished: bool,
+    }
+    impl Transfer {
+        fn step(&mut self, peer: &mut Peer) {
+            for event in std::mem::take(&mut peer.events) {
+                match event {
+                    MuxEvent::Credit(id, n) if id == self.child.id() => self.credit += n,
+                    MuxEvent::Child(id, StreamEvent::Written(n)) if id == self.child.id() => {
+                        self.written += n;
+                    }
+                    MuxEvent::Child(id, StreamEvent::Data(bytes)) if id == self.child.id() => {
+                        assert!(!self.ended, "no bytes follow FIN");
+                        self.input.extend_from_slice(&bytes);
+                        peer.command(self.child.grant(bytes.len() as u64));
+                    }
+                    MuxEvent::Child(id, StreamEvent::Ended) if id == self.child.id() => {
+                        assert!(!self.ended, "FIN is delivered once");
+                        self.ended = true;
+                    }
+                    MuxEvent::Child(
+                        _,
+                        StreamEvent::ReceiveReset(_) | StreamEvent::SendStopped(_),
+                    ) => {
+                        panic!("loss does not cancel a reliable stream");
+                    }
+                    _ => {}
+                }
+            }
+            if self.sent < self.output.len() && self.credit > 0 {
+                let n = (self.output.len() - self.sent)
+                    .min(self.credit as usize)
+                    .min(977);
+                let bytes =
+                    Chunk::copy_of(peer.driver.budget(), &self.output[self.sent..self.sent + n])
+                        .unwrap();
+                peer.command(self.child.send(StreamCommand::Write(bytes)));
+                self.sent += n;
+                self.credit -= n as u64;
+            }
+            if self.sent == self.output.len() && !self.finished {
+                peer.command(self.child.send(StreamCommand::End));
+                self.finished = true;
+            }
+        }
+    }
+
+    struct Link {
+        packets: std::collections::VecDeque<Chunk>,
+        sent: usize,
+        dropped: usize,
+        duplicated: usize,
+        reordered: usize,
+    }
+    impl Link {
+        fn take(&mut self, from: &mut Peer, to: SocketAddr) {
+            let Some(DatagramCommand::Send(packet)) = from.driver.take_command() else {
+                return;
+            };
+            assert!(packet.wants_completion());
+            assert_eq!(*packet.meta(), to);
+            let (payload, _) = packet.into_parts();
+            self.sent += 1;
+            if self.sent.is_multiple_of(11) {
+                self.dropped += 1;
+            } else {
+                if self.sent.is_multiple_of(7) {
+                    self.packets.push_back(payload.slice(0..payload.len()));
+                    self.duplicated += 1;
+                }
+                self.packets.push_back(payload);
+            }
+            assert!(matches!(
+                from.driver.deliver(DatagramEvent::Sent(1)).unwrap(),
+                Admit::Taken
+            ));
+        }
+
+        fn deliver(&mut self, from: SocketAddr, to: &mut Peer, reverse: bool) {
+            let packet = if reverse {
+                self.reordered += usize::from(self.packets.len() > 1);
+                self.packets.pop_back()
+            } else {
+                self.packets.pop_front()
+            };
+            let Some(payload) = packet else {
+                return;
+            };
+            match to
+                .driver
+                .deliver(DatagramEvent::Datagram(Datagram::new(payload, from)))
+                .unwrap()
+            {
+                Admit::Taken => {}
+                Admit::Blocked(DatagramEvent::Datagram(packet)) => {
+                    self.packets.push_front(packet.into_parts().0);
+                }
+                _ => panic!("live connection retains a refused datagram"),
+            }
+        }
+    }
+
+    let mut pair = Pair::new();
+    pair.handshake();
+    pair.client
+        .command(MuxCommand::control(ControlCommand::Open(Dir::Bi)));
+    pair.drive();
+    let (client, _) = pair.client.opened();
+    let output: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+    pair.client.command(client.send(StreamCommand::Write(
+        Chunk::copy_of(pair.client.driver.budget(), &output[..1]).unwrap(),
+    )));
+    pair.drive();
+    let (server, _) = pair.server.opened();
+    pair.client.command(client.grant(127));
+    pair.server.command(server.grant(113));
+    let credit = pair
+        .client
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            MuxEvent::Credit(id, n) if *id == client.id() => Some(*n),
+            _ => None,
+        })
+        .sum::<u64>();
+    pair.client
+        .events
+        .retain(|event| !matches!(event, MuxEvent::Credit(..)));
+    let mut transfers = [
+        Transfer {
+            child: client,
+            output,
+            sent: 1,
+            written: 0,
+            credit: credit - 1,
+            input: Vec::new(),
+            ended: false,
+            finished: false,
+        },
+        Transfer {
+            child: server,
+            output: (0..96 * 1024).map(|i| (250 - i % 251) as u8).collect(),
+            sent: 0,
+            written: 0,
+            credit: 0,
+            input: Vec::new(),
+            ended: false,
+            finished: false,
+        },
+    ];
+    let mut links = std::array::from_fn::<_, 2, _>(|_| Link {
+        packets: Default::default(),
+        sent: 0,
+        dropped: 0,
+        duplicated: 0,
+        reordered: 0,
+    });
+    for round in 0..10000 {
+        // Virtual network time drives both pacing and recovery. Packet
+        // delivery occurs every third millisecond, alternately from each end
+        // of the link queue. No host clock or sleeping drives this schedule.
+        let now = Instant::from_since_start(Duration::from_millis(round));
+        pair.client.driver.set_now(now);
+        pair.server.driver.set_now(now);
+        pair.client.driver.run().unwrap();
+        pair.server.driver.run().unwrap();
+        pair.client.events();
+        pair.server.events();
+        transfers[0].step(&mut pair.client);
+        transfers[1].step(&mut pair.server);
+        links[0].take(&mut pair.client, pair.server.address);
+        links[1].take(&mut pair.server, pair.client.address);
+        if round % 3 == 0 {
+            links[0].deliver(pair.client.address, &mut pair.server, round % 2 == 0);
+            links[1].deliver(pair.server.address, &mut pair.client, round % 2 != 0);
+        }
+        if transfers
+            .iter()
+            .all(|t| t.ended && t.written == t.output.len() as u64)
+        {
+            break;
+        }
+    }
+    assert!(transfers.iter().all(|t| t.ended && t.finished));
+    // Deliver the copies still in the link after both FINs. They must not
+    // produce another byte or another terminal event.
+    while links.iter().any(|link| !link.packets.is_empty()) {
+        links[0].deliver(pair.client.address, &mut pair.server, false);
+        links[1].deliver(pair.server.address, &mut pair.client, false);
+        pair.drive();
+        transfers[0].step(&mut pair.client);
+        transfers[1].step(&mut pair.server);
+    }
+    assert_eq!(transfers[0].input, transfers[1].output);
+    assert_eq!(transfers[1].input, transfers[0].output);
+    for transfer in &transfers {
+        assert_eq!(transfer.written, transfer.output.len() as u64);
+    }
+    for link in &links {
+        assert!(link.dropped > 0 && link.duplicated > 0 && link.reordered > 0);
+    }
+    let budgets = [
+        pair.client.driver.budget().clone(),
+        pair.server.driver.budget().clone(),
+    ];
+    drop(links);
+    drop(pair);
+    assert!(budgets.iter().all(|budget| budget.used() == 0));
+}
