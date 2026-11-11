@@ -914,7 +914,7 @@ impl Connection {
                     && !can_send.acks
                     && can_send.other
                     && (buf_capacity - builder.datagram_start) == self.path.current_mtu() as usize
-                    && self.datagrams.outgoing.is_empty()),
+                    && self.datagrams.is_send_empty()),
                 "SendableFrames was {can_send:?}, but only ACKs have been written"
             );
             pad_datagram |= sent.requires_padding;
@@ -3507,6 +3507,7 @@ impl Connection {
 
     fn close_common(&mut self) {
         trace!("connection closed");
+        self.datagrams().discard_chunk();
         for &timer in &Timer::VALUES {
             self.timers.stop(timer);
         }
@@ -3744,7 +3745,7 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|(_, x)| x.challenge_pending)
             || !self.path_responses.is_empty()
-            || self.datagrams.outgoing.can_send_1rtt(max_size)
+            || self.datagrams.can_send_1rtt(max_size)
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned

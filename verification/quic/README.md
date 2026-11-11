@@ -455,3 +455,46 @@ covers wire admission, local drops and oldest-first eviction. It does not
 replay production traces, count heap storage or establish a resource bound.
 Run these configs with `DatagramReceive.tla`, and the Kani harness with the
 same commands and scope above.
+
+## Charged application datagrams
+
+The engine's `Datagrams::send_chunk` admits one charged backing into an
+inline slot. It allocates no queue descriptor, including for empty
+messages, and preserves already-paid spare capacity. A busy slot or a
+budget refusal returns without changing the source. The payload remains
+charged until packet construction, path-size eviction, explicit discard,
+or connection closure. Packet construction copies directly into the
+caller's wire buffer; loss does not retain or retransmit the datagram.
+The legacy byte-buffer queue remains separate and uncharged. Mixing its
+explicit drop mode with the chunk API can evict the chunk.
+
+`recv_chunk` reserves its output before removing a received datagram;
+a refusal leaves the next datagram available. This does not charge the
+engine's existing receive queue or packet backing. Sending uses the peer's
+advertisement, independently of local receive support. A peer limit too
+small for an empty frame with a length field makes sending unavailable.
+
+The engine's 331 library tests and three doctests pass. The tests cover
+backing identity, spare capacity, empty messages, refusal, path-size
+changes, loss without retransmission, receive refusal without consumption,
+and one-way negotiation. A new closure regression failed while the
+accepted chunk remained retained; connection closure now discards it.
+
+The shared counting allocator and `Costs` measure slot admission for
+payload/capacity pairs zero/zero, four/four and four/eight, and refusal
+by a zero-byte budget. The caller's input backing and budget are fixtures;
+the slot is inline. Each step checks `peak <= 0` and
+`requested <= 0 * input + 0`. Temporarily copying into a fresh unpaid
+chunk failed the resource bound, including for an empty message; that
+mutation was removed. These bounds concern admission of already-paid
+backings and refusal, not repayment, wire encoding or the complete engine.
+
+`a_paid_datagram_moves_into_its_slot_without_allocating` retains the same
+bounds in Kani over arbitrary four-byte input. It uses the shared
+allocation stubs, without stubbing production functions. Its run has no
+verdict recorded yet; the ordinary allocation test is not a substitute.
+Run it with `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
+-Z c-ffi -Z mem-predicates -Z restrict-vtable --harness
+a_paid_datagram_moves_into_its_slot_without_allocating` under the required
+scope. Receive storage, recovery, TLS, routing and other engine metadata
+still prevent any whole-engine resource claim.

@@ -2360,6 +2360,84 @@ fn datagram_send_recv() {
 }
 
 #[test]
+fn charged_datagrams_can_be_enabled_in_only_one_direction() {
+    let mut pair = Pair::default();
+    let mut config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.datagram_receive_buffer_size(None);
+    config.transport_config(Arc::new(transport));
+    let (client, server) = pair.connect_with(config);
+    let budget = fictionet_buf::Budget::new(4);
+    let mut chunk = fictionet_buf::Chunk::copy_of(&budget, b"sent").unwrap();
+    assert!(pair.client_datagrams(client).max_size().is_some());
+    assert!(pair.server_datagrams(server).max_size().is_none());
+    assert!(pair
+        .client_datagrams(client)
+        .send_chunk(&mut chunk, &budget)
+        .unwrap());
+    pair.drive();
+    assert_eq!(pair.server_datagrams(server).recv().unwrap(), &b"sent"[..]);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn closing_discards_a_queued_charged_datagram() {
+    let mut pair = Pair::default();
+    let (client, _) = pair.connect();
+    let budget = fictionet_buf::Budget::new(4);
+    let mut chunk = fictionet_buf::Chunk::copy_of(&budget, b"held").unwrap();
+    assert!(pair
+        .client_datagrams(client)
+        .send_chunk(&mut chunk, &budget)
+        .unwrap());
+    assert_eq!(budget.used(), 4);
+    let now = pair.time;
+    pair.client_conn_mut(client)
+        .close(now, VarInt::from_u32(0), Bytes::new());
+    assert!(!pair.client_datagrams(client).has_pending_chunk());
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn charged_datagrams_release_on_send_and_are_not_retransmitted() {
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    let budget = fictionet_buf::Budget::new(8);
+    let mut chunk = fictionet_buf::Chunk::copy_of(&budget, b"datagram").unwrap();
+    assert!(pair
+        .client_datagrams(client)
+        .send_chunk(&mut chunk, &budget)
+        .unwrap());
+    assert!(chunk.is_empty());
+    assert_eq!(budget.used(), 8);
+    pair.drive_client();
+    assert!(!pair.server.inbound.is_empty());
+    pair.server.inbound.clear();
+    assert_eq!(budget.used(), 0);
+    assert!(!pair.client_datagrams(client).has_pending_chunk());
+    pair.drive();
+    assert!(pair.server_datagrams(server).recv().is_none());
+    assert!(!pair.client_conn_mut(client).is_closed());
+    assert!(!pair.server_conn_mut(server).is_closed());
+    let mut next = fictionet_buf::Chunk::copy_of(&budget, b"received").unwrap();
+    assert!(pair
+        .client_datagrams(client)
+        .send_chunk(&mut next, &budget)
+        .unwrap());
+    pair.drive();
+    assert!(pair
+        .server_datagrams(server)
+        .recv_chunk(&fictionet_buf::Budget::new(0))
+        .is_none());
+    let received = pair.server_datagrams(server).recv_chunk(&budget).unwrap();
+    assert_eq!(&*received, b"received");
+    assert_eq!(budget.used(), 8);
+    assert!(pair.server_datagrams(server).recv().is_none());
+    drop(received);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn datagram_storage_pressure_does_not_close_the_connection() {
     let server = ServerConfig {
         transport: Arc::new(TransportConfig {

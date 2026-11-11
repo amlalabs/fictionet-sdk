@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
+use fictionet_buf::{Budget, Chunk};
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -40,19 +41,71 @@ impl Datagrams<'_> {
             return Err(SendDatagramError::TooLarge);
         }
         if drop {
+            self.conn.datagrams.chunk.0 = None;
             self.conn
                 .datagrams
                 .make_space_for(data.len(), send_buffer_size);
-        } else if !self
-            .conn
-            .datagrams
-            .has_send_buffer_space(data.len(), send_buffer_size)
+        } else if self.has_pending_chunk()
+            || !self
+                .conn
+                .datagrams
+                .has_send_buffer_space(data.len(), send_buffer_size)
         {
             self.conn.datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
         self.conn.datagrams.outgoing.push_back(Datagram { data });
         Ok(())
+    }
+
+    /// Offer a charged datagram without allocating a queue descriptor.
+    ///
+    /// One chunk can wait for transmission at a time. Returns `Ok(false)`
+    /// without taking or changing `data` when storage or a previous send
+    /// prevents admission. Other errors also preserve `data`. A successful
+    /// offer retains the backing until packet construction or a local drop;
+    /// datagrams are never retained for retransmission. Do not mix this API
+    /// with `send(..., true)` if local eviction is undesirable.
+    /// Sending requires the peer's receive support, independently of whether
+    /// this endpoint advertises support for receiving datagrams itself.
+    pub fn send_chunk(
+        &mut self,
+        data: &mut Chunk,
+        budget: &Budget,
+    ) -> Result<bool, SendDatagramError> {
+        let max = self
+            .max_size()
+            .ok_or(SendDatagramError::UnsupportedByPeer)?;
+        if data.len() > max || data.len() > self.conn.config.datagram_send_buffer_size {
+            return Err(SendDatagramError::TooLarge);
+        }
+        if !self.conn.datagrams.outgoing.is_empty() || self.has_pending_chunk() {
+            self.conn.datagrams.send_blocked = true;
+            return Ok(false);
+        }
+        Ok(self.conn.datagrams.chunk.admit(data, budget))
+    }
+
+    /// Whether the chunk accepted by `send_chunk` is still waiting for
+    /// packet construction. Once false, the caller still has to retire any
+    /// packet carrying it at its lower transport before reporting completion.
+    pub fn has_pending_chunk(&self) -> bool {
+        self.conn.datagrams.chunk.0.is_some()
+    }
+
+    /// Cancel the pending chunk, releasing its backing without transmission.
+    pub fn discard_chunk(&mut self) {
+        self.conn.datagrams.chunk.0 = None;
+    }
+
+    /// Copy the next received datagram to charged storage before removing it.
+    /// A budget refusal leaves the queue unchanged, just as an empty queue
+    /// returns `None`. Empty datagrams return `Some` of an empty chunk.
+    pub fn recv_chunk(&mut self, budget: &Budget) -> Option<Chunk> {
+        let front = self.conn.datagrams.incoming.queue.front()?;
+        let chunk = Chunk::copy_of(budget, &front.data)?;
+        self.conn.datagrams.recv();
+        Some(chunk)
     }
 
     /// Discard queued datagrams that no longer fit the active path, waking blocked senders.
@@ -72,7 +125,7 @@ impl Datagrams<'_> {
 
     /// Compute the maximum size of datagrams that may passed to `send_datagram`
     ///
-    /// Returns `None` if datagrams are unsupported by the peer or disabled locally.
+    /// Returns `None` if the peer does not allow a datagram with a length field.
     ///
     /// This may change over the lifetime of a connection according to variation in the path MTU
     /// estimate. The peer can also enforce an arbitrarily small fixed limit, but if the peer's
@@ -86,12 +139,12 @@ impl Datagrams<'_> {
         let max_size = self.conn.path.current_mtu() as usize
             - self.conn.predict_1rtt_overhead(None)
             - Datagram::SIZE_BOUND;
-        let limit = self
-            .conn
-            .peer_params
-            .max_datagram_frame_size?
-            .into_inner()
-            .saturating_sub(Datagram::SIZE_BOUND as u64);
+        let limit = self.conn.peer_params.max_datagram_frame_size?.into_inner();
+        // The encoder always includes a length, even for an empty payload.
+        if limit < 2 {
+            return None;
+        }
+        let limit = limit.saturating_sub(Datagram::SIZE_BOUND as u64);
         Some(limit.min(max_size as u64) as usize)
     }
 
@@ -105,6 +158,9 @@ impl Datagrams<'_> {
     /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
     /// guaranteed not to cause older datagrams to be dropped.
     pub fn send_buffer_space(&self) -> usize {
+        if self.has_pending_chunk() {
+            return 0;
+        }
         self.conn
             .config
             .datagram_send_buffer_size
@@ -118,6 +174,22 @@ pub(super) struct DatagramState {
     pub(super) incoming: DatagramBuffer,
     pub(super) outgoing: DatagramBuffer,
     pub(super) send_blocked: bool,
+    chunk: DatagramSlot,
+}
+
+/// The descriptor is part of the connection itself; only the payload can
+/// allocate. Keeping one slot bounds metadata independently of empty sends.
+#[derive(Default)]
+struct DatagramSlot(Option<Chunk>);
+
+impl DatagramSlot {
+    fn admit(&mut self, data: &mut Chunk, budget: &Budget) -> bool {
+        if self.0.is_some() || (!data.is_paid_by(budget) && !data.repay(budget)) {
+            return false;
+        }
+        self.0 = Some(std::mem::take(data));
+        true
+    }
 }
 
 impl DatagramState {
@@ -177,6 +249,15 @@ impl DatagramState {
     /// queued but can't send it.
     pub(super) fn drop_oversized(&mut self, max_payload: usize) -> bool {
         let mut dropped_any = false;
+        if self
+            .chunk
+            .0
+            .as_ref()
+            .is_some_and(|data| data.len() > max_payload)
+        {
+            self.chunk.0 = None;
+            dropped_any = true;
+        }
         self.outgoing.queue.retain(|datagram| {
             let result = datagram.data.len() <= max_payload;
             if !result {
@@ -198,6 +279,14 @@ impl DatagramState {
     /// Returns whether a frame was written. At most `max_size` bytes will be written, including
     /// framing.
     pub(super) fn write(&mut self, buf: &mut Vec<u8>, max_size: usize) -> bool {
+        if let Some(chunk) = &self.chunk.0 {
+            if Datagram::size_for(chunk.len(), true) > max_size.saturating_sub(buf.len()) {
+                return false;
+            }
+            Datagram::encode_data(chunk, true, buf);
+            self.chunk.0 = None;
+            return true;
+        }
         let datagram = match self.outgoing.pop_front() {
             Some(x) => x,
             None => return false,
@@ -218,6 +307,18 @@ impl DatagramState {
     pub(super) fn recv(&mut self) -> Option<Bytes> {
         let x = self.incoming.pop_front()?.data;
         Some(x)
+    }
+
+    pub(super) fn can_send_1rtt(&self, max_size: usize) -> bool {
+        self.chunk
+            .0
+            .as_ref()
+            .is_some_and(|chunk| Datagram::size_for(chunk.len(), true) <= max_size)
+            || self.outgoing.can_send_1rtt(max_size)
+    }
+
+    pub(super) fn is_send_empty(&self) -> bool {
+        self.chunk.0.is_none() && self.outgoing.is_empty()
     }
 }
 
@@ -278,6 +379,83 @@ impl DatagramBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charged_datagrams_hold_backings_until_encoded_or_dropped() {
+        use crate::cost::{Charged, Costs, Linear};
+        let mut costs = Costs::new("QUIC datagram slot");
+        let linear = Linear {
+            num: 0,
+            den: 1,
+            fixed: 0,
+        };
+        for (size, capacity) in [(0, 0), (4, 4), (4, 8)] {
+            let budget = Budget::new(capacity);
+            let mut source = Chunk::block(&budget, 0, capacity).unwrap();
+            source.extend_within(&b"data"[..size]).unwrap();
+            let pointer = source.as_ptr();
+            let mut state = DatagramState::default();
+            let mut wire = Vec::with_capacity(32);
+            let accepted = costs.step(size, 0, linear, || Charged {
+                value: state.chunk.admit(&mut source, &budget),
+                charged: 0,
+            });
+            assert!(accepted);
+            assert!(source.is_empty());
+            assert_eq!(state.chunk.0.as_ref().unwrap().as_ptr(), pointer);
+            assert_eq!(budget.used(), capacity);
+            assert!(!state.write(&mut wire, 1));
+            assert!(wire.is_empty());
+            assert_eq!(budget.used(), capacity);
+            assert!(state.write(&mut wire, 32));
+            assert_eq!(budget.used(), 0);
+            assert!(!state.write(&mut wire, 32));
+            let (frame, _) = crate::frame::Iter::new(Bytes::from(wire))
+                .unwrap()
+                .next_with_size()
+                .unwrap();
+            let crate::frame::Frame::Datagram(datagram) = frame.unwrap() else {
+                panic!("datagram")
+            };
+            assert_eq!(datagram.data, &b"data"[..size]);
+        }
+        let budget = Budget::new(4);
+        let unavailable = Budget::new(0);
+        let mut source = Chunk::copy_of(&budget, b"held").unwrap();
+        let pointer = source.as_ptr();
+        let mut slot = DatagramSlot::default();
+        let accepted = costs.step(4, 0, linear, || Charged {
+            value: slot.admit(&mut source, &unavailable),
+            charged: 0,
+        });
+        assert!(!accepted);
+        assert_eq!(source.as_ptr(), pointer);
+        assert_eq!(&*source, b"held");
+        assert_eq!(budget.used(), 4);
+        assert_eq!(unavailable.used(), 0);
+        assert!(slot.0.is_none());
+    }
+
+    #[test]
+    fn charged_datagram_slot_refuses_replacement_and_releases_on_path_change() {
+        let budget = Budget::new(8);
+        let mut first = Chunk::copy_of(&budget, b"held").unwrap();
+        let mut second = Chunk::copy_of(&budget, b"next").unwrap();
+        let pointer = second.as_ptr();
+        let mut state = DatagramState::default();
+        assert!(state.chunk.admit(&mut first, &budget));
+        assert!(!state.chunk.admit(&mut second, &budget));
+        assert_eq!(second.as_ptr(), pointer);
+        assert!(!state.is_send_empty());
+        assert!(state.can_send_1rtt(6));
+        assert!(!state.can_send_1rtt(5));
+        assert!(!state.drop_oversized(4));
+        assert_eq!(budget.used(), 8);
+        assert!(state.drop_oversized(3));
+        assert!(state.is_send_empty());
+        assert_eq!(budget.used(), 4);
+        assert_eq!(&*second, b"next");
+    }
 
     #[test]
     fn receive_checks_wire_size_before_storage() {

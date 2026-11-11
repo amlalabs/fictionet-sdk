@@ -916,20 +916,28 @@ impl FrameStruct for Datagram {
 
 impl Datagram {
     pub(crate) fn encode(&self, length: bool, out: &mut Vec<u8>) {
+        Self::encode_data(&self.data, length, out);
+    }
+
+    pub(crate) fn encode_data(data: &[u8], length: bool, out: &mut Vec<u8>) {
         out.write(FrameType(*DATAGRAM_TYS.start() | u64::from(length))); // 1 byte
         if length {
             // Safe to unwrap because we check length sanity before queueing datagrams
-            out.write(VarInt::from_u64(self.data.len() as u64).unwrap()); // <= 8 bytes
+            out.write(VarInt::from_u64(data.len() as u64).unwrap()); // <= 8 bytes
         }
-        out.extend_from_slice(&self.data);
+        out.extend_from_slice(data);
     }
 
     pub(crate) fn size(&self, length: bool) -> usize {
+        Self::size_for(self.data.len(), length)
+    }
+
+    pub(crate) fn size_for(len: usize, length: bool) -> usize {
         1 + if length {
-            VarInt::from_u64(self.data.len() as u64).unwrap().size()
+            VarInt::from_u64(len as u64).unwrap().size()
         } else {
             0
-        } + self.data.len()
+        } + len
     }
 }
 
