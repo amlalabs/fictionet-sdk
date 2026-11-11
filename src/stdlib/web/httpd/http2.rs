@@ -13,9 +13,9 @@ use http::{HeaderMap, HeaderValue, Request};
 
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::layer::{
-    Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedDeque, ChargedVec, ChildId, Chunk,
-    Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Pool, Slots, StreamCommand, StreamEvent,
-    Top,
+    Admit, Budget, ByteStream, Charge, ChargedBytes, ChargedDeque, ChargedSegments, ChargedVec,
+    ChildId, Chunk, Closing, Env, Layer, Mux, MuxCommand, MuxEvent, MuxOp, Pool, Slots,
+    StreamCommand, StreamEvent, Top,
 };
 use fictionet::stdlib::protocols::fields::Fields;
 use fictionet::stdlib::protocols::hpack;
@@ -250,11 +250,11 @@ enum Phase {
 }
 
 /// The connection's input: the frame reader, header blocks split across
-/// frames or pieces joined in storage of their own, and the HPACK table,
+/// frames or pieces kept in segments of their own, and the HPACK table,
 /// charged at its bound once. Nothing here holds a frame.
 struct InputState {
     reader: wire::FrameReader,
-    headers: wire::HeaderBlocks<ChargedBytes>,
+    headers: wire::HeaderBlocks,
     /// What the HPACK table can hold: the server never raises its table
     /// setting, so the table holds at most this.
     table: Charge,
@@ -264,13 +264,13 @@ impl InputState {
     /// Input on `budget` that holds nothing: what it is before the
     /// connection opens, on a budget with no room.
     fn new(limits: Limits, budget: &Budget) -> Self {
-        let headers = wire::HeaderBlocks::in_storage(
+        let headers = wire::HeaderBlocks::charged_to(
             wire::Limits {
                 header_list: limits.head.head,
                 header_block: limits.head.head,
                 ..wire::Limits::default()
             },
-            ChargedBytes::new(budget),
+            budget,
         );
         Self {
             reader: wire::FrameReader::client_side(wire::DEFAULT_FRAME_SIZE),
@@ -280,14 +280,15 @@ impl InputState {
     }
 
     /// The input of a connection opening on `budget`: the table charged
-    /// at its bound, and storage to join split header blocks in, so that
-    /// with the block a request's head is decoded into ([`HEAD_SLOT`])
-    /// the input keeps one frame ([`INPUT`]) while the connection is open.
+    /// at its bound, and a first segment to keep split header blocks in,
+    /// with its place, so that with the block a request's head is decoded
+    /// into ([`HEAD_SLOT`]) the input keeps one frame ([`INPUT`]) while
+    /// the connection is open.
     /// `None`, with nothing charged, if the budget has no room for them.
     fn open(limits: Limits, budget: &Budget) -> Option<Self> {
         let mut input = Self::new(limits, budget);
         input.table = budget.charge(input.headers.most_table())?;
-        let floor = INPUT.saturating_sub(input.table.bytes() + HEAD_SLOT);
+        let floor = INPUT.saturating_sub(input.table.bytes() + HEAD_SLOT + ChargedSegments::PLACE);
         input.headers.keep(floor).then_some(input)
     }
 }
