@@ -46,6 +46,7 @@ mod range_set;
 mod tests;
 pub mod transport_parameters;
 mod varint;
+pub mod version;
 
 pub use varint::{VarInt, VarIntBoundsExceeded};
 

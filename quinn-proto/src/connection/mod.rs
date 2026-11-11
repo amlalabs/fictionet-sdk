@@ -2511,7 +2511,9 @@ impl Connection {
 
         match packet.header {
             Header::Retry {
-                src_cid: rem_cid, ..
+                src_cid: rem_cid,
+                version,
+                ..
             } => {
                 if self.side.is_server() {
                     return Err(TransportError::PROTOCOL_VIOLATION("client sent Retry").into());
@@ -2520,6 +2522,7 @@ impl Connection {
                 if self.total_authed_packets > 1
                             || packet.payload.len() <= 16 // token + 16 byte tag
                             || !self.crypto.is_valid_retry(
+                                version,
                                 &self.rem_cids.active(),
                                 &packet.header_data,
                                 &packet.payload,

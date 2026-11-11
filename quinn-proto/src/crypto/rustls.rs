@@ -19,6 +19,7 @@ use crate::{
         self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, UnsupportedVersion,
     },
     transport_parameters::TransportParameters,
+    version::{QUIC_V1, QUIC_V2},
     ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
 };
 
@@ -173,31 +174,14 @@ impl crypto::Session for TlsSession {
         })
     }
 
-    fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
-        let tag_start = match payload.len().checked_sub(16) {
-            Some(x) => x,
-            None => return false,
-        };
-
-        let mut pseudo_packet =
-            Vec::with_capacity(header.len() + payload.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(orig_dst_cid.len() as u8);
-        pseudo_packet.extend_from_slice(orig_dst_cid);
-        pseudo_packet.extend_from_slice(header);
-        let tag_start = tag_start + pseudo_packet.len();
-        pseudo_packet.extend_from_slice(payload);
-
-        let (nonce, key) = match self.version {
-            Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
-            _ => unreachable!(),
-        };
-
-        let nonce = aead::Nonce::assume_unique_for_key(nonce);
-        let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
-
-        let (aad, tag) = pseudo_packet.split_at_mut(tag_start);
-        key.open_in_place(nonce, aead::Aad::from(aad), tag).is_ok()
+    fn is_valid_retry(
+        &self,
+        version: u32,
+        orig_dst_cid: &ConnectionId,
+        header: &[u8],
+        payload: &[u8],
+    ) -> bool {
+        is_valid_retry(version, orig_dst_cid, header, payload)
     }
 
     fn export_keying_material(
@@ -226,6 +210,25 @@ const RETRY_INTEGRITY_KEY_V1: [u8; 16] = [
 const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
+
+// RFC 9369 section 3.3.3
+const RETRY_INTEGRITY_KEY_V2: [u8; 16] = [
+    0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92,
+];
+const RETRY_INTEGRITY_NONCE_V2: [u8; 12] = [
+    0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a,
+];
+
+/// The Retry Integrity Tag nonce and key of a version (RFC 9001 section 5.8,
+/// RFC 9369 section 3.3.3)
+fn retry_integrity(version: Version) -> Option<([u8; 12], [u8; 16])> {
+    match version {
+        Version::V1Draft => Some((RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT)),
+        Version::V1 => Some((RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1)),
+        Version::V2 => Some((RETRY_INTEGRITY_NONCE_V2, RETRY_INTEGRITY_KEY_V2)),
+        _ => None,
+    }
+}
 
 impl crypto::HeaderKey for Box<dyn HeaderProtectionKey> {
     fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
@@ -526,28 +529,64 @@ impl crypto::ServerConfig for QuicServerConfig {
 
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
         // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
-        let version = interpret_version(version).unwrap();
-        let (nonce, key) = match version {
-            Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, RETRY_INTEGRITY_KEY_DRAFT),
-            _ => unreachable!(),
-        };
-
-        let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(orig_dst_cid.len() as u8);
-        pseudo_packet.extend_from_slice(orig_dst_cid);
-        pseudo_packet.extend_from_slice(packet);
-
-        let nonce = aead::Nonce::assume_unique_for_key(nonce);
-        let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
-
-        let tag = key
-            .seal_in_place_separate_tag(nonce, aead::Aad::from(pseudo_packet), &mut [])
-            .unwrap();
-        let mut result = [0; 16];
-        result.copy_from_slice(tag.as_ref());
-        result
+        retry_tag(version, orig_dst_cid, packet).unwrap()
     }
+}
+
+/// The Retry Integrity Tag of `packet`, a Retry packet without its tag, sent
+/// in answer to a client whose first Initial went to `orig_dst_cid`
+pub(crate) fn retry_tag(
+    version: u32,
+    orig_dst_cid: &ConnectionId,
+    packet: &[u8],
+) -> Option<[u8; 16]> {
+    let (nonce, key) = interpret_version(version).ok().and_then(retry_integrity)?;
+
+    let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
+    pseudo_packet.push(orig_dst_cid.len() as u8);
+    pseudo_packet.extend_from_slice(orig_dst_cid);
+    pseudo_packet.extend_from_slice(packet);
+
+    let nonce = aead::Nonce::assume_unique_for_key(nonce);
+    let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
+
+    let tag = key
+        .seal_in_place_separate_tag(nonce, aead::Aad::from(pseudo_packet), &mut [])
+        .unwrap();
+    let mut result = [0; 16];
+    result.copy_from_slice(tag.as_ref());
+    Some(result)
+}
+
+/// Whether the Retry packet `header` followed by `payload`, its token and
+/// tag, carries a valid tag for `version` and `orig_dst_cid`
+pub(crate) fn is_valid_retry(
+    version: u32,
+    orig_dst_cid: &ConnectionId,
+    header: &[u8],
+    payload: &[u8],
+) -> bool {
+    let Some((nonce, key)) = interpret_version(version).ok().and_then(retry_integrity) else {
+        return false;
+    };
+    let tag_start = match payload.len().checked_sub(16) {
+        Some(x) => x,
+        None => return false,
+    };
+
+    let mut pseudo_packet =
+        Vec::with_capacity(header.len() + payload.len() + orig_dst_cid.len() + 1);
+    pseudo_packet.push(orig_dst_cid.len() as u8);
+    pseudo_packet.extend_from_slice(orig_dst_cid);
+    pseudo_packet.extend_from_slice(header);
+    let tag_start = tag_start + pseudo_packet.len();
+    pseudo_packet.extend_from_slice(payload);
+
+    let nonce = aead::Nonce::assume_unique_for_key(nonce);
+    let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
+
+    let (aad, tag) = pseudo_packet.split_at_mut(tag_start);
+    key.open_in_place(nonce, aead::Aad::from(aad), tag).is_ok()
 }
 
 pub(crate) fn initial_suite_from_provider(
@@ -634,7 +673,8 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
 fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {
     match version {
         0xff00_001d..=0xff00_0020 => Ok(Version::V1Draft),
-        0x0000_0001 | 0xff00_0021..=0xff00_0022 => Ok(Version::V1),
+        QUIC_V1 | 0xff00_0021..=0xff00_0022 => Ok(Version::V1),
+        QUIC_V2 => Ok(Version::V2),
         _ => Err(UnsupportedVersion),
     }
 }

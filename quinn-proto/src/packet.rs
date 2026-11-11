@@ -2,13 +2,17 @@ use std::{cmp::Ordering, io, ops::Range, str};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+#[cfg(all(test, feature = "rustls-ring"))]
+mod rfc9369_vectors;
 mod storage;
 pub use storage::PacketBuffer;
 use thiserror::Error;
 
 use crate::{
     coding::{self, BufExt, BufMutExt},
-    crypto, ConnectionId,
+    crypto,
+    version::TypeBits,
+    ConnectionId,
 };
 
 /// Decodes a QUIC packet's invariant header
@@ -309,7 +313,7 @@ impl Header {
                 number,
                 version,
             }) => {
-                w.write(u8::from(LongHeaderType::Initial) | number.tag());
+                w.write(LongHeaderType::Initial.to_byte(version) | number.tag());
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -330,7 +334,7 @@ impl Header {
                 number,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Standard(ty)) | number.tag());
+                w.write(LongHeaderType::Standard(ty).to_byte(version) | number.tag());
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -347,7 +351,7 @@ impl Header {
                 ref src_cid,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Retry));
+                w.write(LongHeaderType::Retry.to_byte(version));
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -635,7 +639,7 @@ impl ProtectedHeader {
                 });
             }
 
-            match LongHeaderType::from_byte(first)? {
+            match LongHeaderType::from_byte(first, version) {
                 LongHeaderType::Initial => {
                     let token_len = buf.get_var()? as usize;
                     let token_start = buf.position() as usize;
@@ -832,28 +836,30 @@ pub(crate) enum LongHeaderType {
 }
 
 impl LongHeaderType {
-    fn from_byte(b: u8) -> Result<Self, PacketDecodeError> {
+    /// The packet type that `version` encodes in the first byte `b`
+    pub(crate) fn from_byte(b: u8, version: u32) -> Self {
         use {LongHeaderType::*, LongType::*};
         debug_assert!(b & LONG_HEADER_FORM != 0, "not a long packet");
-        Ok(match (b & 0x30) >> 4 {
-            0x0 => Initial,
-            0x1 => Standard(ZeroRtt),
-            0x2 => Standard(Handshake),
-            0x3 => Retry,
-            _ => unreachable!(),
-        })
-    }
-}
-
-impl From<LongHeaderType> for u8 {
-    fn from(ty: LongHeaderType) -> Self {
-        use {LongHeaderType::*, LongType::*};
-        match ty {
-            Initial => LONG_HEADER_FORM | FIXED_BIT,
-            Standard(ZeroRtt) => LONG_HEADER_FORM | FIXED_BIT | (0x1 << 4),
-            Standard(Handshake) => LONG_HEADER_FORM | FIXED_BIT | (0x2 << 4),
-            Retry => LONG_HEADER_FORM | FIXED_BIT | (0x3 << 4),
+        match (TypeBits::of(version), (b & 0x30) >> 4) {
+            (TypeBits::V1, 0) | (TypeBits::V2, 1) => Initial,
+            (TypeBits::V1, 1) | (TypeBits::V2, 2) => Standard(ZeroRtt),
+            (TypeBits::V1, 2) | (TypeBits::V2, 3) => Standard(Handshake),
+            (TypeBits::V1, 3) | (TypeBits::V2, 0) => Retry,
+            _ => unreachable!("two bits"),
         }
+    }
+
+    /// The first byte, before packet number and reserved bits, of this type
+    /// in `version`
+    pub(crate) fn to_byte(self, version: u32) -> u8 {
+        use {LongHeaderType::*, LongType::*};
+        let bits = match (TypeBits::of(version), self) {
+            (TypeBits::V1, Initial) | (TypeBits::V2, Retry) => 0,
+            (TypeBits::V1, Standard(ZeroRtt)) | (TypeBits::V2, Initial) => 1,
+            (TypeBits::V1, Standard(Handshake)) | (TypeBits::V2, Standard(ZeroRtt)) => 2,
+            (TypeBits::V1, Retry) | (TypeBits::V2, Standard(Handshake)) => 3,
+        };
+        LONG_HEADER_FORM | FIXED_BIT | (bits << 4)
     }
 }
 

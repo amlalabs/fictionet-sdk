@@ -76,8 +76,14 @@ pub trait Session: Send + Sync + 'static {
     /// Compute keys for the next key update
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>>;
 
-    /// Verify the integrity of a retry packet
-    fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool;
+    /// Verify the integrity of a retry packet of the given wire `version`
+    fn is_valid_retry(
+        &self,
+        version: u32,
+        orig_dst_cid: &ConnectionId,
+        header: &[u8],
+        payload: &[u8],
+    ) -> bool;
 
     /// Fill `output` with `output.len()` bytes of keying material derived
     /// from the [Session]'s secrets, using `label` and `context` for domain
