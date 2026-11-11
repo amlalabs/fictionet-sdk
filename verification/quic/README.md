@@ -12,9 +12,13 @@ The shared listener also serves these handlers through a world host UDP
 socket, tested with several independent quiche connections at once. See
 [Shared datagram listener](#shared-datagram-listener) for the latest boundaries.
 Wire input now retains reservations through packet and frame ownership;
-see [Reserved wire backings](#reserved-wire-backings) for the latest resource
-evidence. Earlier sections record the state at each step. Remaining priorities
-are whole-engine budgeting, the remaining version-two work and unresolved proofs.
+see [Reserved reassembly storage](#reserved-reassembly-storage) for the latest
+resource evidence and the acknowledgment admission fix. Application send
+descriptors now also reserve storage before consuming writes. The latest
+sections cover that reservation, corrected BBR sampling and startup growth,
+and independent HTTP/3 transfers over a lossy world network. Earlier sections
+record the state at each step. Whole-engine budgeting, version two, the
+complete standard test matrix and unresolved proofs remain incomplete.
 
 The intended boundary is a layer over the world's datagram carrier, with
 typed multiplexed streams and application datagrams above it. The engine
@@ -1229,3 +1233,295 @@ All 4,373 pre-existing SDK library tests, the new listener regression,
 1,413 integration tests and 303 SDK doctests pass. Rustfmt and clippy with
 warnings denied pass. All Cargo, Kani and TLC invocations use the required
 memory-limited scope and the separate target directory.
+
+
+## Reserved reassembly storage
+
+`Endpoint::set_reassembly_budget` installs a budget on future connections
+before either STREAM or CRYPTO frames are processed. The assembler reserves
+its descriptor growth before allocating. It retains the geometric growth
+history as its charge, less than twice the current descriptor capacity;
+that covers old and replacement allocations together and each replacement's
+copying cost. Clearing or recycling a receive stream retains both capacity
+and its reservation. Dropping it releases both.
+
+Compaction now sorts, deduplicates and rebuilds in the same descriptor
+allocation. It reserves one new payload and its shared owner before copying,
+while original wire owners remain live. Every contiguous output run shares
+that new backing. Application slices keep its payment after the connection
+and other slices are gone. A refused compaction still removes duplicate
+ranges in place and preserves every useful byte; it allocates nothing.
+An insertion that cannot reserve another descriptor, or that leaves more
+than the existing gap limit after compaction, ends the connection with an
+internal transport error. It does not silently discard reliable data.
+
+The pressure regression exposed an acknowledgment error in the previous
+receive path. Authentication inserted the packet number into pending ACKs
+before frame processing. When storage admission then failed, the closing
+packet ACKed the rejected bytes and the sender reported its stream finished.
+ACK admission now follows successful processing, including the first Initial
+packet. Closing packets can still acknowledge earlier successfully processed
+packets. This enforces the enqueue-before-ACK rule in
+[RFC 9000 section 13.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-13.1).
+The unchanged pressure regression now receives a connection error without
+stream success or application acceptance. No rollback of earlier frames in
+that rejected packet is claimed; the connection closes.
+
+The resource replays measure descriptor growth and reuse, successful copies
+from charged wire input at one, sixty-four, twelve hundred and sixteen
+thousand bytes per fragment, and allocation-free descriptor/copy refusal.
+Compaction makes at most one copy of its retained useful input plus one owner;
+it creates no new descriptor allocation. These are individual compaction
+costs, not an amortized bound over arbitrary packet delivery. A seeded
+regression mixes small copied spans, large retained spans, overlaps, gaps and
+partial reads, checking every byte and final budget release. A protected-peer
+regression checks CRYPTO admission from the endpoint's budget, then exhausts
+that budget and checks STREAM refusal and close behavior.
+
+Four Kani harnesses pass with the shared counting stubs and no production
+stubs: copy refusal, arbitrary four-byte copying with two shared slices,
+descriptor refusal and two empty descriptor-capacity growth steps. Each
+checks actual peak allocation against its reservation and requested bytes
+against a linear bound. The copy coefficient is one, with one owner as its
+fixed term. Descriptor growth has no input-byte term and a fixed term for
+four initial and eight replacement descriptors. The allocator sanity
+harness also passes. Run under the required scope:
+
+```sh
+cargo kani -p fictionet-quinn-proto --lib -Z stubbing -Z c-ffi \
+  -Z mem-predicates -Z restrict-vtable --harness reassembly_copy_ \
+  --harness reassembly_empty_descriptor --harness reassembly_descriptors_refuse \
+  --harness the_counter_sees_every_allocation
+```
+
+The broader `reassembly_descriptor_growth_fits_its_reservation` harness
+inserts five descriptors with an arbitrary offset and checks their contents
+as well as both allocation bounds. Its first run exhausted the fourteen
+GiB scope during propositional conversion. A repeat with twelve object bits
+also exhausted the scope; ten object bits failed on the tool's addressed-object
+limit before a solver verdict. The focused empty-capacity proof
+does not prove heap ordering, payload preservation or the full insertion
+path. The existing five-insertion assertions remain in the broader harness.
+
+`ReassemblyStorage.tla` models descriptor growth, shared compacted backings,
+retained source owners and application slices. Its base passes with 473
+generated states, 173 distinct states and depth twenty-one. Removing
+descriptor admission, removing copy admission, or releasing payment while
+a slice remains each violates `StoragePaid`. The model checks the combined
+budget and tracked storage in abstract descriptor/backing units; it is not
+a byte bound or a production trace replay.
+
+`ReceiveAdmission.tla` separately models two protected packets with two
+reliable frames each, partial processing, storage refusal, malformed frames
+and normal or closing ACK output. Its base passes with 61 generated states,
+41 distinct states and depth eight. Restoring ACK admission at authentication
+violates `AckAfterProcessing`. The reachability control violates
+`NoCompletedPacket`. This model abstracts cryptography, frame parsing and
+application consumption; it does not prove the production packet loop.
+Run both modules' configurations with the scoped TLC command and shared
+resource library described above.
+
+Whole-engine budgeting remains incomplete. Wire backings must still enter
+through `PacketBuffer`; the legacy byte APIs cannot acquire a retrospective
+charge. Unordered-read interval sets, stream records and maps, sent-packet
+and retransmission metadata, TLS queues and endpoint routing are outside
+these bounds. A dedicated control-input reserve and progress under sustained
+budget pressure also remain unresolved. No rustls files changed. The next
+priority remains those engine allocations, followed by version two and the
+older unresolved proofs.
+
+
+Two scratch allocation mutations were tested and removed. Omitting heap
+admission makes the refusal replay observe 224 live bytes against zero
+reserved; its Kani refusal assertion fails too. Allocating the compaction
+vector before reserving makes the copy-refusal replay observe five live
+bytes against zero; Kani fails the zero-peak-allocation bound. The restored
+production code passes the unchanged replays and focused proofs. The
+scratch commits are not on this branch. The acknowledgment regression
+also failed before moving admission, as described above.
+
+Both datagram adapters now install the reassembly budget before creating
+any connections. The same world/socket budget therefore covers the layer's
+storage, wire owners, application datagram arena, and the newly reserved
+STREAM and CRYPTO storage. They still make no whole-engine memory claim.
+The independent suite passes all 31 tests, including HTTP/3 handler traffic
+through the shared world UDP listener, concurrent quiche clients, streamed
+responses and trailers, and sustained QUIC loss and reordering.
+
+Validation: all 357 engine library tests, 4,374 SDK library tests, 1,413
+integration tests, 303 SDK doctests and three engine doctests pass. Clippy
+with warnings denied and workspace formatting pass. Rustdoc succeeds with
+the existing redundant-link warning in `network/packet.rs`. The existing
+`quic_wire_admission` benchmark ran at 1,200 and 65,527 bytes with ten samples;
+it measures wire copying, not reassembly throughput. All Cargo, Kani and
+TLC commands ran under the required memory-limited scope with Cargo targets
+outside the worktree.
+
+## BBR bandwidth sampling and startup growth
+
+The bandwidth sampler now feeds lower non-application-limited samples to
+its windowed filter, so an old high estimate can expire. Application-limited
+samples may raise that estimate but cannot lower it. Previously the guard
+prevented both downward aging and every application-limited update. Startup
+now compares the congestion window, in bytes, with the target window;
+previously it compared the dimensionless gain instead, continuing growth
+after the target and initial window were satisfied. These rules follow the
+[reference BBR sender](https://github.com/google/quiche/blob/main/quiche/quic/core/congestion_control/bbr_sender.cc).
+They are BBR algorithm properties, not a claim of RFC recovery conformance.
+
+Bandwidth conversion now multiplies and divides in full-width intermediate
+arithmetic and saturates rates above the output type's maximum. Previously
+large byte counts overflowed and long durations were truncated before
+division. Four regressions failed on the old code and pass after these
+changes. All 361 engine tests passed at this step.
+
+Kani passes `bbr_bandwidth_samples_expire_without_allocating` over arbitrary
+full-width old and new samples and either application-limited flag. The
+production sampler and filter run under the shared counting allocator;
+peak and requested allocations are both bounded by zero. Kani also passes
+`bbr_bandwidth_conversion_saturates_unrepresentable_rates` over every byte
+count at a one-nanosecond interval, and
+`bbr_startup_respects_its_target_window` over arbitrary valid full-width
+windows and acknowledged byte counts, after the initial window
+has been acknowledged and with no bandwidth estimate yet. There are no
+production stubs in these proofs. They do not prove the complete controller,
+packet sampling accuracy, recovery state machine or pacing cycle.
+
+The separate full-width rate harness retains assertions for one second,
+zero time and the maximum duration. CaDiCaL timed out after five minutes
+without a verdict. The older entropy proof remains open. Run the new
+harnesses with `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
+-Z c-ffi -Z mem-predicates -Z restrict-vtable --harness bbr_bandwidth_
+--harness bbr_startup_respects_its_target_window` under the required scope.
+
+## Reserved application send descriptors
+
+`Endpoint::set_send_buffer_budget` now installs a reservation source for
+application-stream send descriptors on future connections. Both datagram
+adapters use their existing budget. `Send::write` reserves descriptor growth
+before asking its source for bytes, so refusal preserves the source, offset
+and flow-control accounting. Empty writes and writes blocked by peer flow
+control need no descriptor allocation. The protected-peer regression
+exhausts this budget, checks that refusal retains the original charged
+backing and then completes the transfer after the reservation is released.
+
+The deque retains capacity and its charge after acknowledgments. Geometric
+growth keeps the allocation history reserved, less than twice the current
+capacity, covering both old and new allocations during replacement. Reset
+and stream retirement release descriptors before their charge. The resource
+replay measures each of sixty-four descriptor insertions; each allocation
+and replacement copy must fit the newly acquired reservation, with no
+additional per-input or fixed allowance. Reuse after acknowledgments and
+release on reset are checked separately. ACK-range allocation itself is
+outside this replay and remains unbudgeted.
+
+Kani passes `send_descriptors_refuse_before_allocating` and
+`send_empty_descriptors_fit_their_reservation`, using the shared counting
+stubs and no production stubs. The latter covers initial capacity and its
+reuse before an insertion; its fixed allocation bound is four descriptors
+and its per-input coefficient is zero. The allocator sanity harness passes.
+The broader `send_descriptors_fit_their_reservation`, including insertion
+and payload lookup, was terminated during propositional conversion without
+a verdict. Its assertions remain in place. Run these with the usual scoped
+`cargo kani -p fictionet-quinn-proto --lib -Z stubbing -Z c-ffi
+-Z mem-predicates -Z restrict-vtable` and the named harnesses.
+
+`SendDescriptors.tla` models the deque's capacity, entries, growth history,
+acknowledgment and disposal in descriptor units using `Resources`. The base
+passes with 85 generated states, 19 distinct states and depth nine. Omitting
+growth reservation or returning it on ACK while capacity remains each
+violates `DescriptorsPaid`. This model does not cover payload ownership,
+range trees, sent packets or production trace replay.
+
+This extends the resource boundary; it is not whole-engine budgeting.
+Stream records and maps, ACK and retransmission ranges, packet recovery
+records, CRYPTO send queues, TLS, endpoint routing, and control progress
+under budget exhaustion remain outside it. Legacy byte payload APIs are
+still uncharged. All 364 engine tests and the existing 31 layer/independent
+peer tests pass with these changes.
+
+A scratch commit removed descriptor reservation. The refusal replay failed
+with 128 live bytes against zero paid, and the empty-capacity Kani harness
+failed `cost.peak <= budget.used()`. The refusal harness also rejected the
+unexpected successful admission. The scratch commit was removed; both
+focused resource proofs and all 364 engine tests passed again unchanged.
+A repeat of the broader insertion harness with a smaller sufficient unwind
+bound also terminated during conversion without a verdict. Neither run is
+reported as proved.
+
+## Independent HTTP/3 through a lossy world network
+
+The additional world test starts three quiche connections on a shared UDP
+socket. Each uploads a one-mebibyte body and receives an identical response
+through the existing HTTP/3 handlers. Stream windows begin at four kibibytes
+and connection windows at thirty-two kibibytes. Fictionet's `filter` drops
+the first packet in each direction and every seventeenth subsequent packet;
+`delay` adds one millisecond each way. The test requires more than ten drops
+in each direction, complete byte equality, and three separate accepted
+connections. It passed first with Cubic and then with BBR on the server;
+the committed test uses BBR. No host networking devices are involved.
+
+This runs Fictionet's simulated network in its real-time world mode.
+quiche's public receive, send and timeout APIs use the host monotonic clock,
+so the client waits on its actual earliest timeout alongside socket input.
+It does not add sleeps to make a test pass, force premature timeouts, or
+claim virtual-time determinism for the external peer. The existing pure
+Fictionet adversarial-transfer test still uses injected virtual time.
+
+The [Interop Runner definitions](https://github.com/quic-interop/quic-interop-runner/blob/master/quic.md)
+require more than similarly named local tests. In particular, most transfer
+cases use HTTP/0.9 and the v2 case requires compatible negotiation from v1.
+The following distinguishes available evidence from actual runner verdicts:
+
+| Requested case | Evidence at this tip | Standard runner verdict |
+| --- | --- | --- |
+| Handshake | Protected quiche exchange with Fictionet in both roles | Not run |
+| Transfer | Sustained local transport tests; independent HTTP/3 uploads and responses | Not run; HTTP/0.9 concurrent-file case remains |
+| Retry, resumption, zero RTT | Vendored engine tests only | Not run against an independent peer |
+| HTTP/3 | Parallel quiche requests, streamed responses, trailers and shared listeners pass | Native integration passes; external runner not run |
+| Multiconnect | Three concurrent independent connections under loss pass | Runner workload not run |
+| Version two | Version-information validation and version-bound tokens only | Not implemented end to end; compatible negotiation remains |
+| ChaCha20, key update | Vendored engine coverage only | Not run against an independent peer |
+| ECN | Engine metadata exists; datagram carrier still lacks ECN propagation | Not run |
+| Amplification limit | Engine regression and allowance proofs | Independent runner case not run |
+| Handshake loss, transfer loss | Bidirectional recurring loss in the new independent HTTP/3 world test passes | Runner workloads not run |
+| Blackhole, corruption | No independent world scenario yet | Not run |
+| Rebinding, migration | Engine tests; listener connection-ID rotation | Independent path-validation scenarios not run |
+| h3spec | Executable not installed in this environment | Not run |
+
+There is no standard-suite certification claim. Adding compatible v2 also
+still requires emitted version information, packet mappings and protection,
+version-bound TLS tickets and authenticated negotiation. HTTP/3 client
+service integration and the full RFC correctness/resource proofs remain
+unfinished.
+
+The original paid-source allocation harness was retried with a ten-minute
+timeout and unchanged assertions. It timed out during path expansion;
+there is still no solver verdict. The full receive-path harness still
+triggers Kani's internal intrinsic-signature assertion, including runs
+without default features, requesting `tracing/max_level_off`, and with the fixture left
+undropped. None of those diagnostic variants changed the committed harness.
+The new full-width BBR rate harness also timed out under Kissat after five
+minutes. Its successful focused proofs do not replace that open assertion.
+The unchanged BBR entropy assertions were also tried with a diagnostic
+constructor spelling out seed acquisition before `Pcg32::from_seed`.
+That reached the solver but timed out after three minutes. The constructor
+was restored; no proof or production behavior change is claimed from it.
+
+Final validation for this step: 366 engine library tests, 4,374 SDK library
+tests, 1,413 SDK integration tests, 32 isolated layer/interoperability tests,
+303 SDK doctests and three engine doctests pass. The send tests additionally
+cover empty writes requiring no reservation and a multi-chunk write that
+returns its accepted prefix while preserving the next chunk under descriptor
+pressure, then resumes after budget release. Clippy with warnings denied,
+workspace formatting and rustdoc pass; rustdoc retains the existing redundant
+link warning in `network/packet.rs`. The existing `quic_wire_admission`
+benchmark ran at 1,200 and 65,527 bytes with ten samples.
+
+Run SDK and independent-peer packages separately. Combining their tests in
+one Cargo invocation made six SDK doctests fail to link BoringSSL's C++
+exception symbol. All 303 pass when run separately, with no source or test
+changes. This is why the quiche suite has its own crate. The full receive
+compiler failure and solver timeouts above remain open despite these test
+results. No rustls source changed, and all Cargo, Kani and TLC commands used
+the required memory-limited scope and external target directory.

@@ -62,7 +62,11 @@ impl BandwidthEstimation {
         };
 
         let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
+        self.update_bandwidth(round, bandwidth, app_limited);
+    }
+
+    fn update_bandwidth(&mut self, round: u64, bandwidth: u64, app_limited: bool) {
+        if !app_limited || self.max_filter.get() < bandwidth {
             self.max_filter.update_max(round, bandwidth);
         }
     }
@@ -79,14 +83,13 @@ impl BandwidthEstimation {
         self.max_filter.get()
     }
 
-    pub(crate) const fn bw_from_delta(bytes: u64, delta: Duration) -> Option<u64> {
+    pub(crate) fn bw_from_delta(bytes: u64, delta: Duration) -> Option<u64> {
         let window_duration_ns = delta.as_nanos();
         if window_duration_ns == 0 {
             return None;
         }
-        let b_ns = bytes * 1_000_000_000;
-        let bytes_per_second = b_ns / (window_duration_ns as u64);
-        Some(bytes_per_second)
+        let bytes_per_second = u128::from(bytes) * 1_000_000_000 / window_duration_ns;
+        Some(bytes_per_second.min(u128::from(u64::MAX)) as u64)
     }
 }
 
@@ -97,5 +100,64 @@ impl Display for BandwidthEstimation {
             "{:.3} MB/s",
             self.get_estimate() as f32 / (1024 * 1024) as f32
         )
+    }
+}
+
+#[cfg(kani)]
+#[path = "../../../../verification/quic/kani/bandwidth.rs"]
+mod proofs;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(estimator: &mut BandwidthEstimation, round: u64, bytes: u64, limited: bool) {
+        let now = estimator.sent_time.unwrap() + Duration::from_secs(1);
+        estimator.on_sent(now, bytes);
+        estimator.on_ack(now, now, bytes, round, limited);
+    }
+
+    #[test]
+    fn bandwidth_tracks_a_slower_path_after_the_window_expires() {
+        let mut estimator = BandwidthEstimation::default();
+        let now = Instant::now();
+        estimator.on_sent(now, 1000);
+        estimator.on_ack(now, now, 1000, 0, false);
+        sample(&mut estimator, 1, 1000, false);
+        assert_eq!(estimator.get_estimate(), 1000);
+        for round in 2..=12 {
+            sample(&mut estimator, round, 100, false);
+        }
+        assert_eq!(estimator.get_estimate(), 100);
+    }
+
+    #[test]
+    fn application_limited_samples_can_raise_but_not_lower_the_estimate() {
+        let mut estimator = BandwidthEstimation::default();
+        let now = Instant::now();
+        estimator.on_sent(now, 1000);
+        estimator.on_ack(now, now, 1000, 0, false);
+        sample(&mut estimator, 1, 1000, false);
+        sample(&mut estimator, 12, 100, true);
+        assert_eq!(estimator.get_estimate(), 1000);
+        sample(&mut estimator, 13, 2000, true);
+        assert_eq!(estimator.get_estimate(), 2000);
+    }
+
+    #[test]
+    fn bandwidth_conversion_preserves_large_counts_and_durations() {
+        assert_eq!(
+            BandwidthEstimation::bw_from_delta(u64::MAX, Duration::from_secs(1)),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            BandwidthEstimation::bw_from_delta(u64::MAX, Duration::from_nanos(1)),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            BandwidthEstimation::bw_from_delta(1, Duration::MAX),
+            Some(0)
+        );
+        assert_eq!(BandwidthEstimation::bw_from_delta(1, Duration::ZERO), None);
     }
 }

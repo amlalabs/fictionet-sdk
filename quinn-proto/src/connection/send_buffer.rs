@@ -4,7 +4,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use fictionet_buf::Chunk;
+use fictionet_buf::{Budget, Charge, Chunk};
 
 use crate::{range_set::RangeSet, VarInt};
 
@@ -53,6 +53,7 @@ impl From<&'static [u8]> for Segment {
 pub(super) struct SendBuffer {
     /// Data queued by the application but not yet acknowledged. May or may not have been sent.
     unacked_segments: VecDeque<Segment>,
+    descriptor_charge: Option<Charge>,
     /// Total size of `unacked_segments`
     unacked_len: usize,
     /// Acknowledged bytes removed from the first segment's view but still held by its allocation
@@ -75,6 +76,41 @@ impl SendBuffer {
     /// Construct an empty buffer at the initial offset
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn set_budget(&mut self, budget: Option<&Budget>) {
+        if self.descriptor_charge.is_none() {
+            if let Some(budget) = budget {
+                assert_eq!(self.unacked_segments.capacity(), 0);
+                self.descriptor_charge = Some(Charge::nothing(budget));
+            }
+        }
+    }
+
+    /// Reserve a descriptor before taking any bytes from the caller.
+    pub(super) fn prepare_write(&mut self) -> bool {
+        let Some(charge) = &mut self.descriptor_charge else {
+            return true;
+        };
+        if self.unacked_segments.len() < self.unacked_segments.capacity() {
+            return true;
+        }
+        let Some(capacity) = self.unacked_segments.capacity().checked_mul(2) else {
+            return false;
+        };
+        let capacity = capacity.max(4);
+        let Some(reserved) = capacity
+            .checked_mul(size_of::<Segment>())
+            .and_then(|bytes| charge.bytes().checked_add(bytes))
+        else {
+            return false;
+        };
+        if !charge.grow_to(reserved) {
+            return false;
+        }
+        self.unacked_segments
+            .reserve_exact(capacity - self.unacked_segments.len());
+        true
     }
 
     /// Append application data to the end of the stream
@@ -109,7 +145,9 @@ impl SendBuffer {
                     self.unacked_segments.pop_front();
                     self.front_trimmed = 0;
 
-                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                    if self.descriptor_charge.is_none()
+                        && self.unacked_segments.len() * 4 < self.unacked_segments.capacity()
+                    {
                         self.unacked_segments.shrink_to_fit();
                     }
                 } else {
@@ -247,9 +285,82 @@ impl SendBuffer {
     }
 }
 
+#[cfg(kani)]
+#[path = "../../../verification/quic/kani/send_descriptors.rs"]
+mod descriptor_proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_descriptors_grow_only_after_reservation() {
+        use crate::cost::{Charged, Costs, Linear};
+        let budget = Budget::unlimited();
+        let mut buffer = SendBuffer::new();
+        buffer.set_budget(Some(&budget));
+        let mut costs = Costs::new("QUIC send descriptors");
+        for _ in 0..64 {
+            let before = budget.used();
+            costs.step(
+                1,
+                before,
+                Linear {
+                    num: 0,
+                    den: 1,
+                    fixed: 0,
+                },
+                || {
+                    assert!(buffer.prepare_write());
+                    buffer.write(b"x".as_slice().into());
+                    Charged {
+                        value: (),
+                        charged: budget.used() - before,
+                    }
+                },
+            );
+        }
+        let reserved = budget.used();
+        buffer.ack(0..64);
+        assert!(buffer.is_fully_acked());
+        assert_eq!(budget.used(), reserved);
+        // The acknowledged descriptors remain available without growing again.
+        for _ in 0..64 {
+            assert!(buffer.prepare_write());
+            buffer.write(b"y".as_slice().into());
+        }
+        assert_eq!(budget.used(), reserved);
+        buffer.discard();
+        assert_eq!(budget.used(), 0);
+        assert_eq!(buffer.offset(), 128);
+        println!("cost: {}", costs.summary());
+    }
+
+    #[test]
+    fn send_descriptor_refusal_allocates_nothing() {
+        use crate::cost::{Charged, Costs, Linear};
+        let budget = Budget::new(0);
+        let mut buffer = SendBuffer::new();
+        buffer.set_budget(Some(&budget));
+        let mut costs = Costs::new("QUIC send descriptor refusal");
+        let admitted = costs.step(
+            1,
+            0,
+            Linear {
+                num: 0,
+                den: 1,
+                fixed: 0,
+            },
+            || Charged {
+                value: buffer.prepare_write(),
+                charged: budget.used(),
+            },
+        );
+        assert!(!admitted);
+        assert_eq!(buffer.unacked_segments.capacity(), 0);
+        assert_eq!(buffer.offset(), 0);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn charged_backing_survives_loss_and_partial_acknowledgment() {

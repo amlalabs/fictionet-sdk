@@ -9,9 +9,9 @@
 //! every subsequent timestamp is derived from the layer environment.
 //!
 //! This integration is under construction. Adapter queues and outgoing
-//! application backings and datagram receive arenas are charged, but the
-//! vendored engine's stream receive, recovery, TLS and routing allocations
-//! are not yet budgeted. Configured
+//! application backings, wire input, datagram receive arenas and reassembly
+//! descriptors and copies are charged. Stream records, unordered-read ranges,
+//! recovery, TLS and routing allocations still need budgeting. Configured
 //! stream and flow-control limits do not constitute a heap bound.
 
 mod layer;

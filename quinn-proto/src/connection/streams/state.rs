@@ -68,6 +68,8 @@ impl StreamRecv {
 #[allow(unreachable_pub)] // fuzzing only
 pub struct StreamsState {
     pub(super) side: Side,
+    pub(crate) reassembly_budget: Option<fictionet_buf::Budget>,
+    pub(crate) send_buffer_budget: Option<fictionet_buf::Budget>,
     // Set of streams that are currently open, or could be immediately opened by the peer
     pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
     pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
@@ -155,6 +157,8 @@ impl StreamsState {
     ) -> Self {
         let mut this = Self {
             side,
+            reassembly_budget: None,
+            send_buffer_budget: None,
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
             free_recv: Vec::new(),
@@ -284,6 +288,7 @@ impl StreamsState {
             return Ok(ShouldTransmit(false));
         }
 
+        rs.assembler.set_budget(self.reassembly_budget.as_ref());
         let (new_bytes, closed) =
             rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);

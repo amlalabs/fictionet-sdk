@@ -77,6 +77,12 @@ impl Send {
 
         let mut result = Written::default();
         loop {
+            if limit != 0 && !source.is_empty() && !self.pending.prepare_write() {
+                if result.bytes != 0 {
+                    break;
+                }
+                return Err(WriteError::Budget);
+            }
             let (chunk, chunks_consumed) = match source.pop_chunk(limit) {
                 Ok(chunk) => chunk,
                 Err(_) if result.bytes != 0 => break,
@@ -179,6 +185,10 @@ impl<'a> BytesArray<'a> {
 }
 
 impl BytesSource for BytesArray<'_> {
+    fn is_empty(&self) -> bool {
+        self.chunks[self.consumed..].iter().all(Bytes::is_empty)
+    }
+
     fn pop_chunk(&mut self, limit: usize) -> Result<(Segment, usize), WriteError> {
         // The loop exists to skip empty chunks while still marking them as
         // consumed
@@ -224,6 +234,10 @@ impl<'a> ByteSlice<'a> {
 }
 
 impl BytesSource for ByteSlice<'_> {
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     fn pop_chunk(&mut self, limit: usize) -> Result<(Segment, usize), WriteError> {
         let limit = limit.min(self.data.len());
         if limit == 0 {
@@ -244,6 +258,10 @@ pub(super) struct ChunkSource<'a> {
 }
 
 impl BytesSource for ChunkSource<'_> {
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     fn pop_chunk(&mut self, limit: usize) -> Result<(Segment, usize), WriteError> {
         let len = limit.min(self.data.len());
         if len == 0 {
@@ -266,6 +284,8 @@ impl BytesSource for ChunkSource<'_> {
 /// The purpose of this data type is to defer conversion as long as possible,
 /// so that no heap allocation is required in case no data is writable.
 pub(super) trait BytesSource {
+    fn is_empty(&self) -> bool;
+
     /// Returns the next chunk from the source of owned chunks.
     ///
     /// This method will consume parts of the source.
@@ -476,6 +496,62 @@ mod tests {
         assert_eq!(retained.used(), 8);
         stream.pending.ack(4..8);
         assert_eq!(retained.used(), 0);
+    }
+
+    #[test]
+    fn descriptor_pressure_preserves_the_next_source_and_partial_progress() {
+        let descriptor = size_of::<Segment>();
+        let budget = Budget::new(12 * descriptor);
+        let held = budget.charge(8 * descriptor).unwrap();
+        let mut stream = Send::new(8u32.into());
+        stream.pending.set_budget(Some(&budget));
+        let mut chunks = [
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+            Bytes::from_static(b"d"),
+            Bytes::from_static(b"e"),
+        ];
+        let mut source = BytesArray::from_chunks(&mut chunks);
+        assert_eq!(
+            stream.write(&mut source, 8),
+            Ok(Written {
+                bytes: 4,
+                chunks: 4
+            })
+        );
+        assert_eq!(stream.offset(), 4);
+        assert_eq!(source.consumed, 4);
+        assert_eq!(&source.chunks[4][..], b"e");
+        assert_eq!(stream.write(&mut source, 8), Err(WriteError::Budget));
+        assert_eq!(source.consumed, 4);
+        assert_eq!(stream.offset(), 4);
+        drop(held);
+        assert_eq!(
+            stream.write(&mut source, 8),
+            Ok(Written {
+                bytes: 1,
+                chunks: 1
+            })
+        );
+        assert_eq!(stream.offset(), 5);
+        assert!(source.is_empty());
+        stream.reset();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn empty_writes_do_not_reserve_descriptors() {
+        let budget = Budget::new(0);
+        let mut stream = Send::new(8u32.into());
+        stream.pending.set_budget(Some(&budget));
+        let before = budget.refusals();
+        assert_eq!(
+            stream.write(&mut ByteSlice::from_slice(&[]), 8),
+            Ok(Written::default())
+        );
+        assert_eq!(budget.used(), 0);
+        assert!(!budget.refused_since(before));
     }
 
     #[test]

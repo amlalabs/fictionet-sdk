@@ -134,6 +134,7 @@ use timer::{Timer, TimerTable};
 pub struct Connection {
     endpoint_config: Arc<EndpointConfig>,
     config: Arc<TransportConfig>,
+    reassembly_budget: Option<fictionet_buf::Budget>,
     rng: StdRng,
     crypto: Box<dyn crypto::Session>,
     /// The CID we initially chose, for use during the handshake
@@ -265,6 +266,8 @@ impl Connection {
         rng_seed: [u8; 32],
         side_args: SideArgs,
         datagram_receive_budget: Option<&fictionet_buf::Budget>,
+        reassembly_budget: Option<&fictionet_buf::Budget>,
+        send_buffer_budget: Option<&fictionet_buf::Budget>,
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
@@ -282,6 +285,7 @@ impl Connection {
         let mut rng = StdRng::from_seed(rng_seed);
         let mut this = Self {
             endpoint_config,
+            reassembly_budget: reassembly_budget.cloned(),
             crypto,
             handshake_cid: loc_cid,
             rem_handshake_cid: rem_cid,
@@ -366,6 +370,8 @@ impl Connection {
             stats: ConnectionStats::default(),
             version,
         };
+        this.streams.reassembly_budget = reassembly_budget.cloned();
+        this.streams.send_buffer_budget = send_buffer_budget.cloned();
         if path_validated {
             this.on_path_validated();
         }
@@ -1983,7 +1989,6 @@ impl Connection {
             }
         }
         let space = &mut self.spaces[space_id];
-        space.pending_acks.insert_one(packet, now);
         if packet >= space.rx_packet {
             space.rx_packet = packet;
             // Update outgoing spin bit, inverting iff we're the client
@@ -2062,6 +2067,9 @@ impl Connection {
         );
 
         self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        self.spaces[SpaceId::Initial]
+            .pending_acks
+            .insert_one(packet_number, now);
         if let Some(data) = remaining {
             self.handle_coalesced(now, remote, ecn, data);
         }
@@ -2150,8 +2158,11 @@ impl Connection {
 
         space
             .crypto_stream
+            .set_budget(self.reassembly_budget.as_ref());
+        space
+            .crypto_stream
             .insert(crypto.offset, crypto.data.clone(), payload_len)
-            .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
+            .map_err(|_| TransportError::INTERNAL_ERROR("crypto receive storage exhausted"))?;
 
         while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
@@ -2393,7 +2404,16 @@ impl Connection {
                         );
                     }
 
-                    self.process_decrypted_packet(now, remote, number, packet)
+                    let space = packet.header.space();
+                    let result = self.process_decrypted_packet(now, remote, number, packet);
+                    // A closing packet may carry ACKs, but never for a packet whose
+                    // frames failed processing or could not retain reliable data.
+                    if result.is_ok() && !was_closed {
+                        if let Some(number) = number {
+                            self.spaces[space].pending_acks.insert_one(number, now);
+                        }
+                    }
+                    result
                 }
             }
         };

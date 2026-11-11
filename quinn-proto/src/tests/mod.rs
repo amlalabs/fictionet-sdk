@@ -136,6 +136,75 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 #[test]
+fn send_descriptor_refusal_preserves_the_write_and_recovers_after_release() {
+    let budget = fictionet_buf::Budget::new(64 << 10);
+    let mut pair = Pair::default();
+    pair.client.endpoint.set_send_buffer_budget(&budget);
+    let (client, server) = pair.connect();
+    let held = budget.charge(budget.limit()).unwrap();
+    let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+    let payload_budget = fictionet_buf::Budget::new(8);
+    let mut data = fictionet_buf::Chunk::copy_of(&payload_budget, b"retained").unwrap();
+    let pointer = data.as_ptr();
+    assert_eq!(
+        pair.client_send(client, stream)
+            .write_chunk(&mut data, &payload_budget),
+        Err(WriteError::Budget)
+    );
+    assert_eq!(&data[..], b"retained");
+    assert_eq!(data.as_ptr(), pointer);
+    assert_eq!(payload_budget.used(), 8);
+    drop(held);
+    assert_eq!(
+        pair.client_send(client, stream)
+            .write_chunk(&mut data, &payload_budget),
+        Ok(Written {
+            bytes: 8,
+            chunks: 1
+        })
+    );
+    assert!(data.is_empty());
+    assert!(budget.used() > 0);
+    pair.client_send(client, stream).finish().unwrap();
+    pair.drive();
+    assert_eq!(pair.server_streams(server).accept(Dir::Uni), Some(stream));
+    let mut recv = pair.server_recv(server, stream);
+    let mut chunks = recv.read(true).unwrap();
+    assert_eq!(&chunks.next(8).unwrap().unwrap().bytes[..], b"retained");
+    assert!(chunks.next(8).unwrap().is_none());
+    let _ = chunks.finalize();
+    pair.drive();
+    drop(pair);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(payload_budget.used(), 0);
+}
+
+#[test]
+fn receive_reassembly_uses_the_endpoint_budget_and_refuses_stream_growth() {
+    let budget = fictionet_buf::Budget::new(64 << 10);
+    let mut pair = Pair::default();
+    pair.server.endpoint.set_reassembly_budget(&budget);
+    let (client, server) = pair.connect();
+    // The handshake's CRYPTO descriptors were admitted against the same budget.
+    assert!(budget.used() > 0);
+    let retained = budget.used();
+    let held = budget.charge(budget.limit() - retained).unwrap();
+    let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+    pair.client_send(client, stream).write(b"unpaid").unwrap();
+    pair.client_send(client, stream).finish().unwrap();
+    pair.drive();
+    assert!(pair.server_conn_mut(server).is_closed());
+    assert_matches!(
+        pair.client_conn_mut(client).poll(),
+        Some(Event::ConnectionLost { reason: ConnectionError::ConnectionClosed(ref close) })
+            if close.error_code == TransportErrorCode::INTERNAL_ERROR
+    );
+    assert_eq!(pair.server_streams(server).accept(Dir::Uni), None);
+    drop((pair, held));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn charged_wire_storage_survives_decryption_and_partial_stream_reads() {
     let mut pair = Pair::default();
     let (client, server) = pair.connect();

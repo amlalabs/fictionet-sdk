@@ -4,7 +4,8 @@ use std::{
     mem,
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
+use fictionet_buf::{Budget, Charge};
 
 use crate::range_set::RangeSet;
 
@@ -13,6 +14,8 @@ use crate::range_set::RangeSet;
 pub(super) struct Assembler {
     state: State,
     data: BinaryHeap<Buffer>,
+    // Drop descriptors before releasing their reservation.
+    charge: Option<Charge>,
     /// Total number of buffered bytes, including duplicates in ordered mode.
     buffered: usize,
     /// Estimated number of allocated bytes, will never be less than `buffered`.
@@ -32,9 +35,21 @@ impl Assembler {
     /// Reset to the initial state
     pub(super) fn reinit(&mut self) {
         let old_data = mem::take(&mut self.data);
+        let charge = self.charge.take();
         *self = Self::default();
+        self.charge = charge;
         self.data = old_data;
         self.data.clear();
+    }
+
+    /// Install before the first insertion; reinitialization retains this budget.
+    pub(super) fn set_budget(&mut self, budget: Option<&Budget>) {
+        if self.charge.is_none() {
+            if let Some(budget) = budget {
+                assert_eq!(self.data.capacity(), 0);
+                self.charge = Some(Charge::nothing(budget));
+            }
+        }
     }
 
     pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
@@ -105,13 +120,13 @@ impl Assembler {
     fn defragment(&mut self) {
         // Chunks smaller than min_chunk_size are merged regardless of fragmentation
         let min_chunk_size = max(self.buffered.div_ceil(MAX_CHUNKS), MIN_RETAINED_CHUNK_SIZE);
-        let new = BinaryHeap::with_capacity(self.data.len());
-        let old = mem::replace(&mut self.data, new);
-        let mut buffers = old.into_sorted_vec();
+        // Sorting, deduplicating and rebuilding reuse the descriptor allocation.
+        let mut buffers = mem::take(&mut self.data).into_sorted_vec();
+        buffers.reverse();
         self.buffered = 0;
         let mut fragmented_buffered = 0;
         let mut offset = 0;
-        for chunk in buffers.iter_mut().rev() {
+        for chunk in &mut buffers {
             chunk.try_mark_defragment(offset);
             let size = chunk.bytes.len();
             offset = chunk.offset + size as u64;
@@ -120,32 +135,53 @@ impl Assembler {
                 fragmented_buffered += size;
             }
         }
-        self.allocated = self.buffered;
-        let mut buffer = BytesMut::with_capacity(fragmented_buffered);
-        let mut offset = 0;
-        for chunk in buffers.into_iter().rev() {
-            // bytes might be empty after try_mark_defragment
-            if chunk.bytes.is_empty() {
-                continue;
-            }
-            if chunk.defragmented && chunk.bytes.len() >= min_chunk_size {
-                self.data.push(chunk);
-                continue;
-            }
-            // Overlap is resolved by try_mark_defragment
-            if chunk.offset != offset + (buffer.len() as u64) {
-                if !buffer.is_empty() {
-                    self.data
-                        .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+        buffers.retain(|chunk| !chunk.bytes.is_empty());
+        if fragmented_buffered != 0 {
+            if let Some(mut compacted) = Compacted::new(
+                fragmented_buffered,
+                self.charge.as_ref().map(Charge::budget),
+            ) {
+                for chunk in &buffers {
+                    if !chunk.defragmented || chunk.bytes.len() < min_chunk_size {
+                        compacted.bytes.extend_from_slice(&chunk.bytes);
+                    }
                 }
-                offset = chunk.offset;
+                let compacted = Bytes::from_owner(compacted);
+                let mut cursor = 0;
+                let mut kept = 0;
+                let mut run: Option<(usize, usize)> = None;
+                // Replace and merge only copied spans. Uncopied spans retain their owners.
+                for i in 0..buffers.len() {
+                    let len = buffers[i].bytes.len();
+                    if buffers[i].defragmented && len >= min_chunk_size {
+                        buffers.swap(kept, i);
+                        kept += 1;
+                        run = None;
+                        continue;
+                    }
+                    let end = cursor + len;
+                    if let Some((previous, start)) = run.filter(|(previous, _)| {
+                        buffers[*previous].offset + buffers[*previous].bytes.len() as u64
+                            == buffers[i].offset
+                    }) {
+                        buffers[previous].bytes = compacted.slice(start..end);
+                        buffers[previous].allocation_size += len;
+                    } else {
+                        buffers[kept] = Buffer::new_defragmented(
+                            buffers[i].offset,
+                            compacted.slice(cursor..end),
+                        );
+                        run = Some((kept, cursor));
+                        kept += 1;
+                    }
+                    cursor = end;
+                }
+                buffers.truncate(kept);
             }
-            buffer.extend_from_slice(&chunk.bytes);
         }
-        if !buffer.is_empty() {
-            self.data
-                .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
-        }
+        // A refused copy still deduplicates, without losing any useful bytes.
+        self.allocated = buffers.iter().map(|chunk| chunk.allocation_size).sum();
+        self.data = BinaryHeap::from(buffers);
     }
 
     // Note: If a packet contains many frames from the same stream, the estimated over-allocation
@@ -172,9 +208,10 @@ impl Assembler {
                         bytes.split_to((duplicate.start - offset) as usize),
                         allocation_size,
                     );
-                    self.buffered += buffer.bytes.len();
-                    self.allocated += buffer.allocation_size;
-                    self.data.push(buffer);
+                    let len = buffer.bytes.len();
+                    push(&mut self.data, &mut self.charge, buffer)?;
+                    self.buffered += len;
+                    self.allocated += allocation_size;
                     offset = duplicate.start;
                 }
                 bytes.advance((duplicate.end - offset) as usize);
@@ -193,9 +230,10 @@ impl Assembler {
         // No early return when empty: the dedup loop above may already have pushed chunks.
         if !bytes.is_empty() {
             let buffer = Buffer::new(offset, bytes, allocation_size);
-            self.buffered += buffer.bytes.len();
-            self.allocated += buffer.allocation_size;
-            self.data.push(buffer);
+            let len = buffer.bytes.len();
+            push(&mut self.data, &mut self.charge, buffer)?;
+            self.buffered += len;
+            self.allocated += allocation_size;
         }
         // `self.buffered` also counts duplicate bytes, therefore we use
         // `self.end - self.bytes_read` as an upper bound of buffered unique
@@ -233,6 +271,64 @@ impl Assembler {
         self.data.clear();
         self.buffered = 0;
         self.allocated = 0;
+    }
+}
+
+/// Grow the heap only after reserving both old and new descriptor allocations.
+fn push(
+    data: &mut BinaryHeap<Buffer>,
+    charge: &mut Option<Charge>,
+    buffer: Buffer,
+) -> Result<(), TooManyChunks> {
+    if data.len() == data.capacity() {
+        grow(data, charge)?;
+    }
+    data.push(buffer);
+    Ok(())
+}
+
+fn grow(data: &mut BinaryHeap<Buffer>, charge: &mut Option<Charge>) -> Result<(), TooManyChunks> {
+    let capacity = data.capacity().saturating_mul(2).max(4);
+    if let Some(charge) = charge {
+        let peak = capacity
+            .checked_mul(size_of::<Buffer>())
+            .and_then(|n| charge.bytes().checked_add(n))
+            .ok_or(TooManyChunks)?;
+        if !charge.grow_to(peak) {
+            return Err(TooManyChunks);
+        }
+    }
+    data.reserve_exact(capacity - data.len());
+    // Keep the growth history reserved. Geometric capacity bounds its sum
+    // below twice the current allocation, including each replacement copy.
+    Ok(())
+}
+
+/// One copied backing, shared by every contiguous run and application slice.
+struct Compacted {
+    bytes: Vec<u8>,
+    // The owner wrapper and payload are freed before the reservation is released.
+    _charge: Option<Charge>,
+}
+
+impl Compacted {
+    const OVERHEAD: usize = size_of::<Self>() + size_of::<usize>();
+
+    fn new(capacity: usize, budget: Option<&Budget>) -> Option<Self> {
+        let charge = match budget {
+            Some(budget) => Some(budget.charge(capacity.checked_add(Self::OVERHEAD)?)?),
+            None => None,
+        };
+        Some(Self {
+            bytes: Vec::with_capacity(capacity),
+            _charge: charge,
+        })
+    }
+}
+
+impl AsRef<[u8]> for Compacted {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -350,7 +446,7 @@ impl State {
 #[derive(Debug)]
 pub struct IllegalOrderedRead;
 
-/// Error indicating that too many chunks are buffered due to maliciously small/gapped frames
+/// Receive storage is exhausted or too many distinct chunks remain after compaction
 #[derive(Debug)]
 pub(crate) struct TooManyChunks;
 
@@ -785,6 +881,237 @@ mod test {
         );
     }
 
+    #[test]
+    fn reassembly_refuses_descriptor_growth_before_allocating() {
+        use crate::cost::{Charged, Costs, Linear};
+        let budget = Budget::new(0);
+        let mut assembler = Assembler::new();
+        assembler.set_budget(Some(&budget));
+        let mut costs = Costs::new("QUIC reassembly refusal");
+        let result = costs.step(
+            4,
+            0,
+            Linear {
+                num: 0,
+                den: 1,
+                fixed: 0,
+            },
+            || Charged {
+                value: assembler.insert(0, Bytes::from_static(b"data"), 4),
+                charged: budget.used(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(assembler.data.is_empty());
+        assert_eq!(assembler.buffered, 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn reassembly_descriptor_growth_and_reuse_are_reserved() {
+        use crate::cost::{Charged, Costs, Linear};
+        let budget = Budget::unlimited();
+        let mut assembler = Assembler::new();
+        assembler.set_budget(Some(&budget));
+        let mut costs = Costs::new("QUIC reassembly descriptors");
+        for round in 0..2 {
+            for offset in 0..64 {
+                let before = budget.used();
+                costs.step(
+                    1,
+                    before,
+                    Linear {
+                        num: 0,
+                        den: 1,
+                        fixed: 0,
+                    },
+                    || {
+                        assembler
+                            .insert(offset, Bytes::from_static(b"x"), 1)
+                            .unwrap();
+                        Charged {
+                            value: (),
+                            charged: budget.used() - before,
+                        }
+                    },
+                );
+            }
+            let before = budget.used();
+            costs.step(
+                0,
+                before,
+                Linear {
+                    num: 0,
+                    den: 1,
+                    fixed: 0,
+                },
+                || {
+                    assembler.reinit();
+                    Charged {
+                        value: (),
+                        charged: 0,
+                    }
+                },
+            );
+            assert_eq!(
+                budget.used(),
+                before,
+                "retained capacity stays paid in round {round}"
+            );
+        }
+        drop(assembler);
+        assert_eq!(budget.used(), 0);
+        println!("cost: {}", costs.summary());
+    }
+
+    #[test]
+    fn reassembly_compaction_retains_payment_through_application_slices() {
+        use crate::cost::{Charged, Costs, Linear};
+        for size in [1, 64, 1200, 16384] {
+            let budget = Budget::unlimited();
+            let mut costs = Costs::new("QUIC reassembly compaction");
+            let input = vec![7; size];
+            // The caller pays for source wire backings before this session.
+            let first = crate::PacketBuffer::copy_from(&budget, &input)
+                .unwrap()
+                .freeze();
+            let second = crate::PacketBuffer::copy_from(&budget, &input)
+                .unwrap()
+                .freeze();
+            let mut assembler = Assembler::new();
+            assembler.set_budget(Some(&budget));
+            for (offset, data) in [(0, first), (size as u64 + 1, second)] {
+                let before = budget.used();
+                costs.step(
+                    size,
+                    before,
+                    Linear {
+                        num: 0,
+                        den: 1,
+                        fixed: 0,
+                    },
+                    || {
+                        assembler.insert(offset, data, size * 2).unwrap();
+                        Charged {
+                            value: (),
+                            charged: budget.used() - before,
+                        }
+                    },
+                );
+            }
+            let before = budget.used();
+            // One copy of retained useful bytes and one shared owner, with no
+            // new descriptors. The old wire owners coexist until replacement.
+            costs.step(
+                2 * size,
+                before,
+                Linear {
+                    num: 1,
+                    den: 1,
+                    fixed: Compacted::OVERHEAD,
+                },
+                || {
+                    assembler.defragment();
+                    Charged {
+                        value: (),
+                        charged: 2 * size + Compacted::OVERHEAD,
+                    }
+                },
+            );
+            let first = assembler.read(usize::MAX, true).unwrap();
+            let second = assembler.read(usize::MAX, false).unwrap();
+            assert_eq!(first.bytes.as_ref(), input);
+            assert_eq!(second.offset, size as u64 + 1);
+            assert_eq!(second.bytes.as_ref(), input);
+            let retained = second.bytes.slice(size / 2..);
+            drop((assembler, first, second));
+            assert_eq!(budget.used(), 2 * size + Compacted::OVERHEAD);
+            assert_eq!(retained.as_ref(), &input[size / 2..]);
+            drop(retained);
+            assert_eq!(budget.used(), 0);
+            println!("cost: {}", costs.summary());
+        }
+    }
+
+    #[test]
+    fn reassembly_refused_compaction_deduplicates_without_copying() {
+        use crate::cost::{Charged, Costs, Linear};
+        let budget = Budget::new(4 * size_of::<Buffer>());
+        let mut assembler = Assembler::new();
+        assembler.set_budget(Some(&budget));
+        assembler.insert(0, Bytes::from_static(b"abcd"), 8).unwrap();
+        assembler.insert(1, Bytes::from_static(b"bcde"), 8).unwrap();
+        assembler.insert(0, Bytes::from_static(b"abcd"), 8).unwrap();
+        assert_eq!(budget.used(), budget.limit());
+        let mut costs = Costs::new("QUIC compaction refusal");
+        costs.step(
+            12,
+            0,
+            Linear {
+                num: 0,
+                den: 1,
+                fixed: 0,
+            },
+            || {
+                assembler.defragment();
+                Charged {
+                    value: (),
+                    charged: 0,
+                }
+            },
+        );
+        assert_eq!(assembler.buffered, 5);
+        assert_eq!(assembler.data.len(), 2);
+        assert_eq!(assembler.read(8, true).unwrap().bytes, b"abcd"[..]);
+        assert_eq!(assembler.read(8, true).unwrap().bytes, b"e"[..]);
+        assert!(assembler.read(8, true).is_none());
+        drop(assembler);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn reassembly_compaction_preserves_overlapping_and_retained_spans() {
+        // Repeated shuffles mix retained large spans with copied tiny spans,
+        // duplicates and overlaps. The byte at each offset is independent of
+        // which packet supplies it.
+        let input: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        for seed in 1..17u64 {
+            let budget = Budget::unlimited();
+            let mut assembler = Assembler::new();
+            assembler.set_budget(Some(&budget));
+            let mut rng = seed;
+            for _ in 0..128 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let start = (rng >> 32) as usize % input.len();
+                let length = [1, 3, 127, 128, 511][rng as usize % 5].min(input.len() - start);
+                let bytes = crate::PacketBuffer::copy_from(&budget, &input[start..start + length])
+                    .unwrap()
+                    .freeze();
+                assembler.insert(start as u64, bytes, length).unwrap();
+                if rng & 7 == 0 {
+                    assembler.defragment();
+                }
+            }
+            // Fill every hole, then compact once more before ordered delivery.
+            for start in (0..input.len()).step_by(64) {
+                let bytes = crate::PacketBuffer::copy_from(&budget, &input[start..start + 64])
+                    .unwrap()
+                    .freeze();
+                assembler.insert(start as u64, bytes, 64).unwrap();
+            }
+            assembler.defragment();
+            let mut read = 0;
+            while let Some(chunk) = assembler.read(73, true) {
+                assert_eq!(chunk.offset, read as u64);
+                assert_eq!(chunk.bytes.as_ref(), &input[read..read + chunk.bytes.len()]);
+                read += chunk.bytes.len();
+            }
+            assert_eq!(read, input.len());
+            drop(assembler);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
     fn next_unordered(x: &mut Assembler) -> Chunk {
         x.read(usize::MAX, false).unwrap()
     }
@@ -793,3 +1120,7 @@ mod test {
         x.read(size, true).map(|chunk| chunk.bytes)
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/quic/kani/reassembly.rs"]
+mod resource_proofs;
