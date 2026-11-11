@@ -733,4 +733,29 @@ scoped TLC command described above.
 The base passes with 1,760 generated and distinct states, depth six. The
 five guard controls violate `Decision`, the copy control violates
 `PaidStorage`, and the reachability control violates `NoAcceptance`.
-Production mutation checks and final Cargo checks are still in progress.
+
+Three scratch mutations were tested and removed. Ignoring the parameter,
+as the earlier engine did, fails three regressions, including the TLS
+adapter test. Removing the connection comparison fails the Kani assertion
+requiring `VersionMismatch`. Copying the body into an uncharged vector
+fails the replay on its first step, with 4,100 bytes live against zero,
+and fails Kani's `cost.peak <= 0` assertion. The restored body proofs pass
+again with unchanged assertions and arbitrary version values.
+
+All 342 engine library tests, 21 isolated layer and interoperability tests,
+and three engine doctests pass. Clippy with warnings denied and the
+workspace formatting check pass. Rustdoc builds the engine and SDK with
+the existing redundant-link warning in `network/packet.rs`. The existing
+`quic_sparse_reassembly` benchmark completes at sixteen and sixty-four
+kibibytes; it measures the legacy codec, not version validation.
+The full QUIC and HTTP/3 build-out remains
+incomplete: whole-engine budgeting, HTTP/3 with QPACK, listener routing,
+QUIC version two and the previously unfinished proofs still need work.
+
+The unchanged BBR entropy harness was also retried with `-Z restrict-vtable`
+under both bundled SAT solvers. Both reached the solver; CaDiCaL was stopped
+after more than nine minutes and Kissat after more than five, without a
+verdict. A separate run with arithmetic refinement also reached the solver
+and was stopped without a verdict. These runs did not exhaust their memory
+limits. The arbitrary seed domain and complete RNG-state equality assertion
+remain unchanged; this does not close the previously recorded BBR proof gap.
