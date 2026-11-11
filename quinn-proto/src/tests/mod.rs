@@ -42,6 +42,36 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
 #[test]
+fn charged_stream_write_survives_a_lost_flight() {
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect();
+    let stream = pair.client_streams(client).open(Dir::Uni).unwrap();
+    let budget = fictionet_buf::Budget::new(8);
+    let mut chunk = fictionet_buf::Chunk::copy_of(&budget, b"abcdefgh").unwrap();
+    assert_eq!(
+        pair.client_send(client, stream)
+            .write_chunk(&mut chunk, &budget)
+            .unwrap(),
+        Written {
+            bytes: 8,
+            chunks: 1
+        }
+    );
+    assert!(chunk.is_empty());
+    pair.drive_client();
+    assert!(!pair.server.inbound.is_empty());
+    pair.server.inbound.clear();
+    assert_eq!(budget.used(), 8);
+    pair.drive();
+    assert_eq!(pair.server_streams(server).accept(Dir::Uni), Some(stream));
+    let mut recv = pair.server_recv(server, stream);
+    let mut chunks = recv.read(true).unwrap();
+    assert_eq!(chunks.next(8).unwrap().unwrap().bytes, b"abcdefgh"[..]);
+    let _ = chunks.finalize();
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn seeded_initials_keep_their_routing_ids() {
     let now = Instant::now();
     let routing = |seed| {
@@ -57,11 +87,12 @@ fn seeded_initials_keep_their_routing_ids() {
             )
             .unwrap();
         let mut packet = Vec::new();
-        conn.poll_transmit(now, 1, &mut packet).unwrap();
+        let transmit = conn.poll_transmit(now, 1, &mut packet).unwrap();
+        assert_eq!(transmit.size, packet.len());
         let (packet, _) = packet::PartialDecode::new(
             packet.as_slice().into(),
             &packet::FixedLengthConnectionIdParser::new(8),
-            &DEFAULT_SUPPORTED_VERSIONS,
+            DEFAULT_SUPPORTED_VERSIONS,
             true,
         )
         .unwrap();

@@ -1699,6 +1699,7 @@ dependencies = [
  "assert_matches",
  "bytes",
  "fastbloom",
+ "fictionet-buf",
  "fictionet-rustls",
  "getrandom 0.4.3",
  "hex-literal",

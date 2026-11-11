@@ -1,14 +1,58 @@
-use std::{collections::VecDeque, ops::Range};
+use std::{
+    collections::VecDeque,
+    ops::{Deref, Range},
+};
 
 use bytes::{Buf, Bytes};
+use fictionet_buf::Chunk;
 
 use crate::{range_set::RangeSet, VarInt};
+
+/// An owned send range. Charged chunks keep their backing and leases through
+/// retransmission; ordinary byte buffers remain supported by the upstream API.
+#[derive(Debug)]
+pub(super) enum Segment {
+    Bytes(Bytes),
+    Chunk(Chunk),
+}
+
+impl Segment {
+    fn advance(&mut self, n: usize) {
+        match self {
+            Self::Bytes(bytes) => bytes.advance(n),
+            Self::Chunk(chunk) => chunk.advance(n),
+        }
+    }
+}
+
+impl Deref for Segment {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Chunk(chunk) => chunk,
+        }
+    }
+}
+
+impl From<Bytes> for Segment {
+    fn from(bytes: Bytes) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+impl From<&'static [u8]> for Segment {
+    fn from(bytes: &'static [u8]) -> Self {
+        Self::Bytes(Bytes::from_static(bytes))
+    }
+}
 
 /// Buffer of outgoing retransmittable stream data
 #[derive(Default, Debug)]
 pub(super) struct SendBuffer {
     /// Data queued by the application but not yet acknowledged. May or may not have been sent.
-    unacked_segments: VecDeque<Bytes>,
+    unacked_segments: VecDeque<Segment>,
     /// Total size of `unacked_segments`
     unacked_len: usize,
     /// Acknowledged bytes removed from the first segment's view but still held by its allocation
@@ -34,7 +78,7 @@ impl SendBuffer {
     }
 
     /// Append application data to the end of the stream
-    pub(super) fn write(&mut self, data: Bytes) {
+    pub(super) fn write(&mut self, data: Segment) {
         self.unacked_len += data.len();
         self.offset += data.len() as u64;
         self.unacked_segments.push_back(data);
@@ -208,6 +252,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn charged_backing_survives_loss_and_partial_acknowledgment() {
+        use fictionet_buf::Budget;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct Lease(Arc<AtomicUsize>);
+        impl fictionet_buf::Held for Lease {}
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for reset in [false, true] {
+            let budget = Budget::new(8);
+            let released = Arc::new(AtomicUsize::new(0));
+            let mut chunk = Chunk::copy_of(&budget, b"abcdefgh").unwrap();
+            assert!(chunk.hold(Lease(released.clone())).is_ok());
+            let pointer = chunk.as_ptr();
+            let mut buffer = SendBuffer::new();
+            buffer.write(Segment::Chunk(chunk));
+            assert_eq!(buffer.get(0..8).as_ptr(), pointer);
+            assert_eq!(buffer.poll_transmit(64).0, 0..8);
+            buffer.retransmit(2..6);
+            assert_eq!(buffer.poll_transmit(64).0, 2..6);
+            assert_eq!(buffer.get(2..6), b"cdef");
+            buffer.ack(4..8);
+            buffer.ack(0..3);
+            assert_eq!(buffer.get(3..8), b"defgh");
+            assert_eq!(budget.used(), 8);
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            if reset {
+                buffer.discard();
+            } else {
+                buffer.ack(3..4);
+            }
+            assert_eq!(buffer.offset(), 8);
+            assert!(buffer.is_fully_acked());
+            assert_eq!(budget.used(), 0);
+            assert_eq!(released.load(Ordering::SeqCst), 1);
+            drop(buffer);
+            assert_eq!(released.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
     fn fragment_with_length() {
         let mut buf = SendBuffer::new();
         const MSG: &[u8] = b"Hello, world!";
@@ -249,7 +341,7 @@ mod tests {
         // Pretend we have more than 1 GB of data in the buffer
         let chunk: Bytes = Bytes::from_static(&[0; 1024 * 1024]);
         for _ in 0..1025 {
-            buf.write(chunk.clone());
+            buf.write(chunk.clone().into());
         }
 
         const SIZE1: u64 = 64;

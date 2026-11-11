@@ -1,8 +1,8 @@
 # QUIC
 
 The vendored `quinn-proto` engine uses the workspace rustls fork. It is
-not yet wired into a Fictionet layer, and its storage is not yet charged
-to Fictionet budgets. This directory records evidence as that work grows;
+not yet wired into a Fictionet layer. Owned stream writes can retain charged
+payloads, but engine metadata and the legacy byte APIs are not budgeted. This directory records evidence as that work grows;
 it does not claim verification of the whole transport or HTTP/3.
 
 The intended boundary is a layer over the world's datagram carrier, with
@@ -51,7 +51,7 @@ outside the worktree:
 ```sh
 export CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-quic
 systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=14G -p MemorySwapMax=0 cargo test -p fictionet-quinn-proto
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=14G -p MemorySwapMax=0 cargo kani -p fictionet-quinn-proto --lib --harness amplification_proofs
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=14G -p MemorySwapMax=0 cargo kani -p fictionet-quinn-proto --lib -Z stubbing --harness amplification_proofs
 ```
 
 From `tla/`, run each configuration with the same scope prefix and
@@ -168,8 +168,11 @@ compare executions and inputs; they do not pin particular random output.
 
 `random_ids_use_the_supplied_bytes` passed in Kani without stubs for every
 valid length and arbitrary source bytes. It checks length, content and
-entropy consumption. The keyed-ID harness is retained separately; a
-completed proof verdict has not yet been obtained for it. The diagnostic
+entropy consumption. The separate malformed-length harness also passed for
+every supported input length and arbitrary key and bytes. The keyed-ID
+round-trip harness also passed over arbitrary key and nonce bytes. All
+three passed without function stubs after separating the independent
+round-trip and malformed-length assertions. The diagnostic
 run with stop-on-failure stopped on Kani's internal assertion reachability
 check, so it is neither a production counterexample nor proof evidence.
 
@@ -179,3 +182,66 @@ reset key, server token keys, TLS provider and calendar time still need
 explicit world sources. Standard hash maps also retain their own hash
 seeding. Engine storage admission, the datagram layer, application stream
 multiplexing, RFC 9221 and the HTTP/3 coordinator remain unimplemented.
+
+## Retained application send backings
+
+`SendStream::write_chunk` admits Fictionet chunks only after stream and
+connection flow control permit a write. It preserves backings already paid
+by the receiving budget and uses `Chunk::repay` to transfer other backings. A budget
+refusal takes no bytes and has its own error, distinct from peer flow
+control. A partial write shares the admitted backing with its remainder.
+The send buffer stores the chunk directly alongside its existing byte
+buffers; it does not allocate a separate owner wrapper for the chunk.
+Charges and leases therefore survive loss and retransmission, prefix ACKs
+and out-of-order ACKs, and are released with the final view on ACK or reset.
+A shared backing paid elsewhere may be copied by `repay`, with payment first.
+
+The tests check source preservation on budget refusal, physical sharing
+on partial admission, payment held through retransmission and partial
+ACKs, final release exactly once, and preservation of the final stream
+offset on reset. A protected two-endpoint transfer discards the first
+outbound flight and then delivers the retransmission, checking both the
+received bytes and release of the sender's payload budget. All 321 engine
+tests and three doctests passed. These are vendored peers, not independent
+interoperability.
+
+`SendBacking.tla` models four payload bytes in a backing of capacity four
+or eight, with source and retained views, using the shared `Resources`
+store. Its base passes: 174 generated states, 70 distinct, depth 6. The copy-before-payment and early-release
+controls both violate `BackingPaid`. Queue and range metadata, packet
+recovery and the ordering of arbitrary stream ranges are not modeled here.
+Freeing and repayment are separate internal steps so the peak before a
+free is checked against its reservation. Run the configs with the same
+scope as above and add
+`-DTLA-Library=<repository>/verification/resources/tla` to Java.
+
+The Rust source-admission replay uses the shared allocator and `Costs`.
+For four payload bytes in a backing of capacity four or eight already paid
+by the receiving budget, taking one byte or the whole backing needs no new
+allocation. A
+refusal by a zero-byte budget also allocates nothing. Each step checks
+`peak <= 0` and `requested <= 0 * input + 0`. The caller's paid backing and
+budget are built before the measured step; queue insertion is excluded.
+A temporary mutation copying into a fresh unpaid chunk failed this bound
+on the first step. It was removed, and the unchanged tests passed again.
+
+The spare-capacity case first failed because `Chunk::repay` shrank the
+backing during admission. Admission now queries `Chunk::is_paid_by` and
+keeps an already-paid allocation unchanged. The bound was not loosened;
+all 54 buffer tests and the 321 engine tests pass after the fix. Clippy
+with warnings denied passes for the buffer, SDK and engine crates.
+
+Five Kani harnesses retain these same bounds, arbitrary four-byte input
+and ownership assertions, with whole and partial admissions at each
+capacity and refused admission separated for solver size. They use only the shared allocation stubs. The
+shared counter's own allocation-detection harness passed in this crate;
+the source-admission harnesses have not yet returned completed verdicts.
+Run them with `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
+-Z c-ffi -Z mem-predicates -Z restrict-vtable --harness source_proofs` under
+the required scope. The ordinary tests, model and counter check do not
+substitute for these unfinished proofs.
+
+This is a payload-ownership step. Descriptor capacity, interval nodes,
+packet records, receive reassembly, crypto queues and endpoint routing
+storage still require admission and resource evidence. The entire engine
+must not yet be described as bounded by a Fictionet budget.

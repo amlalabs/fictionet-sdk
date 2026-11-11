@@ -19,7 +19,7 @@ pub use recv::{Chunks, ReadError, ReadableError};
 
 mod send;
 pub(crate) use send::{ByteSlice, BytesArray};
-use send::{BytesSource, Send, SendState};
+use send::{BytesSource, ChunkSource, Send, SendState};
 pub use send::{FinishError, WriteError, Written};
 
 mod state;
@@ -231,6 +231,27 @@ impl<'a> SendStream<'a> {
     /// the chunk will be advanced and contain only non-written data after the call.
     pub fn write_chunks(&mut self, data: &mut [Bytes]) -> Result<Written, WriteError> {
         self.write_source(&mut BytesArray::from_chunks(data))
+    }
+
+    /// Send an owned chunk while retaining its backing and payment.
+    ///
+    /// Already-paid backings keep their allocation, including spare capacity.
+    /// Otherwise admission uses [`fictionet_buf::Chunk::repay`] before splitting
+    /// the accepted prefix. A shared backing paid elsewhere may be copied, with
+    /// reservation first. The chunk advances only by bytes accepted under
+    /// stream and connection flow control. A partial write shares the admitted
+    /// backing with the remainder. The charge and any lease stay alive until
+    /// every retained piece is released, including through loss,
+    /// retransmission and acknowledgment.
+    ///
+    /// This budgets the payload backing only. Stream descriptors, send ranges
+    /// and packet metadata are not yet charged by this engine.
+    pub fn write_chunk(
+        &mut self,
+        data: &mut fictionet_buf::Chunk,
+        budget: &fictionet_buf::Budget,
+    ) -> Result<Written, WriteError> {
+        self.write_source(&mut ChunkSource { data, budget })
     }
 
     fn write_source<B: BytesSource>(&mut self, source: &mut B) -> Result<Written, WriteError> {

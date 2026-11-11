@@ -44,7 +44,7 @@ fn random_ids_use_the_supplied_bytes() {
 
 #[kani::proof]
 #[kani::unwind(21)]
-fn keyed_ids_validate_and_wrong_lengths_are_rejected() {
+fn keyed_ids_validate_with_their_own_key() {
     let mut entropy = Entropy {
         bytes: kani::any(),
         consumed: 0,
@@ -54,7 +54,12 @@ fn keyed_ids_validate_and_wrong_lengths_are_rejected() {
     assert_eq!(id.len(), generator.cid_len());
     assert!(generator.validate(&id).is_ok());
     assert_eq!(entropy.consumed, 8 + NONCE_LEN);
+}
 
+#[kani::proof]
+#[kani::unwind(21)]
+fn keyed_ids_reject_wrong_lengths() {
+    let generator = HashedConnectionIdGenerator::from_key(kani::any());
     let bytes: [u8; MAX_CID_SIZE] = kani::any();
     let len: usize = kani::any();
     kani::assume(len <= MAX_CID_SIZE && len != generator.cid_len());

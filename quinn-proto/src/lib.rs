@@ -26,6 +26,18 @@ use std::{
     ops,
 };
 
+#[cfg(test)]
+#[path = "../../verification/resources/alloc.rs"]
+mod alloc;
+
+#[cfg(test)]
+#[path = "../../verification/resources/cost.rs"]
+mod cost;
+
+#[cfg(kani)]
+#[path = "../../verification/resources/kani/counting.rs"]
+mod counting;
+
 mod cid_queue;
 pub mod coding;
 mod constant_time;
