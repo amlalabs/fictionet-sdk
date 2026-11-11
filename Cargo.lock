@@ -1484,6 +1484,7 @@ dependencies = [
  "fictionet-codegen-golden",
  "fictionet-extras",
  "fictionet-host",
+ "fictionet-quinn-proto",
  "fictionet-rustls",
  "fictionet-test-support",
  "getrandom 0.4.3",

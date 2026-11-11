@@ -1,7 +1,7 @@
 # QUIC
 
 The vendored `quinn-proto` engine uses the workspace rustls fork. It is
-not yet wired into a Fictionet layer. Owned stream writes can retain charged
+now wired into a single-connection Fictionet layer. Owned stream writes retain charged
 payloads, but engine metadata and the legacy byte APIs are not budgeted. This directory records evidence as that work grows;
 it does not claim verification of the whole transport or HTTP/3.
 
@@ -180,8 +180,9 @@ These claims concern connection ID generation, not cryptographic strength,
 complete packet determinism or endpoint allocation costs. The endpoint's
 reset key, server token keys, TLS provider and calendar time still need
 explicit world sources. Standard hash maps also retain their own hash
-seeding. Engine storage admission, the datagram layer, application stream
-multiplexing, RFC 9221 and the HTTP/3 coordinator remain unimplemented.
+seeding. Engine storage admission, RFC 9221 and the HTTP/3 coordinator remain
+incomplete. The later section describes the first datagram layer and its
+application stream multiplexing.
 
 ## Retained application send backings
 
@@ -278,3 +279,61 @@ without restricting the seed domain. Run it under the required scope with `cargo
 -p fictionet-quinn-proto --lib -Z stubbing --harness bbr_uses_supplied_entropy`.
 The selected harness does not stub production functions; `-Z stubbing`
 permits compiling the separate allocation harnesses in this crate.
+
+## Datagram-backed connection layer
+
+`services::quic::QuicLayer` implements `Layer` with
+`Datagrams<SocketAddr>` below and
+`Mux<ByteStream<VarInt>, Control, Stream>` above. Each stream has its own
+receive credit, bounded pending-write queue and directional cancellation.
+The adapter reserves its slot and queue storage and output backings before
+allocation. Its pending writes use the engine's charged chunk API, so their
+backings stay owned across engine backpressure and retransmission. `Written`
+means the engine took the bytes, not that the peer acknowledged them.
+Generic child closures use an application-supplied error-code policy.
+
+Connection time comes from `Env`, translated using an epoch the caller
+supplies. Endpoint entropy is drawn from `Env` after reserving slots.
+Crypto provider entropy and calendar time still belong to the supplied
+configuration. The adapter does not create an async task or read a socket
+or clock. It keeps at most one tracked UDP send outside the layer, accepts
+its completion even while receive input is blocked, and closes the lower
+carrier after the engine's draining period. Engine notifications continue
+to be polled while application receive output is blocked.
+
+The production tests exercise protected bidirectional transfer,
+Initial loss and timer-driven retransmission, lower-send completion gating,
+directional reset with reverse-direction traffic, independent sibling
+receive credit, urgent STOP_SENDING with buffered receive bytes, ownership
+and credit preservation on storage refusal, and draining to lower-carrier
+closure. Another test keeps a hundred writes queued while reading the
+reverse direction, checking progress before the write queue drains. These
+use two vendored peers; they are not independent interop.
+
+All 4,340 SDK library tests pass with this adapter on 2026-11-10. Clippy
+with warnings denied passes for the SDK library and tests. Rustdoc builds
+with the pre-existing redundant-link warning in `network/packet.rs`.
+
+`one_datagram_waits_for_its_completion` passes Kani without function stubs
+over eight arbitrary handoff/completion operations and every 64-bit
+completion count. It calls the production `Flight` methods and proves
+single outstanding ownership, rejection without mutation of invalid
+completions, and exact retirement. `LayerFlight_base.cfg` passes safety
+and progress under weak fairness: 65 generated states, 46 distinct,
+depth 17. Removing the gate violates `OneOutstanding`; blocking completion
+on receive input violates the temporal property `Completes`. Run the
+configs as above with `LayerFlight.tla`. Run the harness using
+`cargo kani -p fictionet --lib -Z stubbing --harness
+one_datagram_waits_for_its_completion`, under the same required scope.
+These proofs cover the completion gate, not the entire adapter, scheduling,
+stream protocol, cryptography or allocations. The TLA+ model is not yet
+replayed from production traces.
+
+The adapter is a connection boundary, not a multi-connection listener: a
+server accepts one connection on its lower carrier. ECN and local-address
+metadata are not present in that carrier, and path MTU discovery is disabled.
+Only post-handshake stream data is exposed. Application datagrams, the
+HTTP/3 coordinator and handler integration are still absent. Engine receive
+storage, recovery records, routing and TLS allocations remain uncharged;
+the complete three-layer resource evidence is therefore still outstanding.
+This is not yet the fully verified QUIC and HTTP/3 build-out.
