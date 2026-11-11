@@ -18,8 +18,6 @@ filesystem = ["dep:libc"]
 default = ["proxy"]
 proxy = ["fictionet/web-proxy"]
 raw-ethernet = []
-virtio-net = ["dep:libc", "raw-ethernet"]
-tun = ["dep:libc", "tokio/macros"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2", optional = true }
@@ -46,7 +44,3 @@ fictionet-extras = { path = "../extras" }
 fictionet-test-support = { path = "../tests/support" }
 libc = "0.2"
 futures-util = { version = "0.3", default-features = false }
-
-[[example]]
-name = "raw_world"
-required-features = ["virtio-net"]

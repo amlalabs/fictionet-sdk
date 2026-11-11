@@ -1,27 +1,17 @@
 //! Whole Ethernet frames between a world and the thread that drives a NIC.
 //!
 //! This link carries Ethernet frames, not the IP packets of Fictionet's
-//! `Interface`. Each direction holds at most 64 frames, plus one the
-//! driver thread holds. When the receive queue is full, the thread keeps
-//! reading and counts discarded frames. Drops before the driver receives
-//! a frame are not observable through this device's negotiated features.
+//! `Interface`. Each direction holds at most 64 frames. When the receive
+//! queue is full, the driver keeps reading and counts discarded frames.
+//! [`RawAttachment::in_memory`] gives the driver's side as a [`RawWire`].
 
 use std::io;
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
-use std::thread::{self, JoinHandle};
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
-use std::time::Duration;
 use std::time::SystemTime;
 
 use fictionet::{Cx, Error, Result};
 use tokio::sync::{mpsc, oneshot};
-
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
-use crate::VirtioNet;
 
 const CAPACITY: usize = 64;
 const MAX_FRAME: usize = 2036;
@@ -296,139 +286,6 @@ impl RawSender {
         self.command(fcx, Command::Flush(tx)).await?;
         fcx.race(None, rx).await?.map_err(|_| closed(&self.failure))
     }
-}
-
-/// Owns host polling and the device. Keep it outside `fictionet::run`.
-///
-/// Dropping this handle stops the thread and resets the device, discarding
-/// queued traffic. Call the attachment's `flush` before shutdown when delivery
-/// matters. An idle driver parks between hardware polls.
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
-pub struct RawPump {
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<Result>>,
-}
-
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
-impl RawPump {
-    /// Starts host polling and returns the bounded world attachment.
-    pub fn attach(nic: VirtioNet) -> io::Result<(Self, RawAttachment)> {
-        let (attachment, wire) = RawAttachment::in_memory(nic.mac_address());
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = stop.clone();
-        let thread_failure = attachment.sender.failure.clone();
-        let thread = thread::Builder::new()
-            .name("raw-ethernet".into())
-            .spawn(move || {
-                // Keep channels alive until the failure is published, so waiters see it.
-                let RawWire {
-                    incoming,
-                    mut outgoing,
-                    receive_stats,
-                } = wire;
-                let result = pump(nic, &thread_stop, &incoming, &mut outgoing, &receive_stats);
-                if let Err(error) = &result {
-                    *thread_failure.lock().unwrap() = Some(error.clone());
-                }
-                result
-            })?;
-        Ok((
-            Self {
-                stop,
-                thread: Some(thread),
-            },
-            attachment,
-        ))
-    }
-
-    /// Stops polling, resets the device, and reports any driver or thread error.
-    pub fn shutdown(mut self) -> Result {
-        self.stop_and_join()
-    }
-
-    fn stop_and_join(&mut self) -> Result {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
-            thread
-                .join()
-                .map_err(|_| Error::msg("raw Ethernet host thread panicked"))??;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
-impl Drop for RawPump {
-    fn drop(&mut self) {
-        let _ = self.stop_and_join();
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "virtio-net"))]
-fn pump(
-    mut nic: VirtioNet,
-    stop: &AtomicBool,
-    incoming: &mpsc::Sender<ReceivedFrame>,
-    outgoing: &mut mpsc::Receiver<Command>,
-    receive_stats: &QueueStats,
-) -> Result {
-    let mut buffer = [0u8; MAX_FRAME];
-    let mut pending_tx = None;
-    while !stop.load(Ordering::Acquire) {
-        if incoming.is_closed() {
-            return Ok(());
-        }
-        let mut progress = false;
-        if let Some(len) = nic.receive(&mut buffer)? {
-            let received_at = Some(SystemTime::now());
-            if receive_stats
-                .enqueue(
-                    incoming,
-                    ReceivedFrame {
-                        frame: EthernetFrame(buffer[..len].to_vec()),
-                        received_at,
-                    },
-                )
-                .is_err()
-            {
-                return Ok(());
-            }
-            progress = true;
-        }
-        if pending_tx.is_none() {
-            match outgoing.try_recv() {
-                Ok(command) => pending_tx = Some(command),
-                Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
-                Err(mpsc::error::TryRecvError::Empty) => {}
-            }
-        }
-        if let Some(command) = pending_tx.take() {
-            match command {
-                Command::Frame(frame) => {
-                    if nic.transmit(&frame.0)? {
-                        progress = true;
-                    } else {
-                        pending_tx = Some(Command::Frame(frame));
-                    }
-                }
-                Command::Flush(done) => {
-                    if nic.transmit_idle()? {
-                        let _ = done.send(());
-                        progress = true;
-                    } else {
-                        pending_tx = Some(Command::Flush(done));
-                    }
-                }
-            }
-        } else {
-            nic.transmit_idle()?;
-        }
-        if !progress {
-            thread::park_timeout(Duration::from_millis(1));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
