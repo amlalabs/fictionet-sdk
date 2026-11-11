@@ -861,6 +861,41 @@ fn application_datagrams_are_whole_and_independently_credited() {
 }
 
 #[test]
+fn application_receive_storage_is_charged_before_admission() {
+    let mut pair = Pair::with_datagrams(true);
+    pair.handshake();
+    pair.server
+        .command(MuxCommand::control(ControlCommand::ReceiveDatagrams(1)));
+    // Reserve the layer's wire scratch before exhausting its budget so
+    // this packet reaches the engine's application receive admission.
+    assert!(matches!(
+        pair.server
+            .driver
+            .deliver(DatagramEvent::Datagram(Datagram::new(
+                Chunk::default(),
+                pair.client.address
+            ),))
+            .unwrap(),
+        Admit::Taken
+    ));
+    let budget = pair.server.driver.budget().clone();
+    let held = budget.charge(budget.limit() - budget.used()).unwrap();
+    let first = Chunk::copy_of(pair.client.driver.budget(), b"drop").unwrap();
+    pair.client.command(application_datagram(first, false));
+    pair.drive();
+    assert!(datagram_payloads(&pair.server).is_empty());
+    drop(held);
+    pair.drive();
+    assert!(datagram_payloads(&pair.server).is_empty());
+    let next = Chunk::copy_of(pair.client.driver.budget(), b"keep").unwrap();
+    pair.client.command(application_datagram(next, false));
+    pair.drive();
+    assert_eq!(datagram_payloads(&pair.server), [b"keep".to_vec()]);
+    drop(pair);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn application_send_waits_for_lower_completion_and_keeps_refused_payload() {
     let mut pair = Pair::with_datagrams(true);
     pair.handshake();

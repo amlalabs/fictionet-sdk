@@ -645,3 +645,21 @@ BBR and full stream receive-path proofs.
 All 338 engine library tests and three doctests pass after this storage
 change. Rustdoc builds the engine and SDK, retaining the existing
 redundant-link warning in `network/packet.rs`.
+
+## Layer receive budgeting
+
+`QuicLayer` now supplies its environment budget to the endpoint before
+creating a client or accepting a server connection. Its shared layer
+regression exhausts that budget after reserving the wire scratch, delivers
+a protected application datagram, and checks a local drop without consuming
+receive credit. Releasing the reservation does not resurrect the dropped
+message; a subsequent datagram consumes the still-available credit. Dropping
+the pair returns all adapter and arena charges. The arena remains separate
+from application receive credit and the charged copy returned to the caller.
+
+All 21 isolated peer tests pass, including this regression and the four
+quiche interoperability cases. All 4,348 SDK library tests, 1,413 integration
+tests, the SSH transport test and 302 doctests pass. Clippy with warnings denied and the
+workspace formatting check pass. The existing `quic_sparse_reassembly`
+benchmark runs at sixteen and sixty-four kibibytes; it still measures the
+legacy codec, not the new receive ring or transport throughput.

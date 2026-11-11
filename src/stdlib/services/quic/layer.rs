@@ -253,8 +253,10 @@ impl QuicLayer {
         let channels = Slots::with_budget(streams, env.budget()).ok_or(Error::Budget)?;
         let mut seed = [0; 32];
         env.entropy().fill_random(&mut seed);
+        let mut endpoint = Endpoint::new(config, server, false, Some(seed));
+        endpoint.set_datagram_receive_budget(env.budget());
         Ok(Self {
-            endpoint: Endpoint::new(config, server, false, Some(seed)),
+            endpoint,
             connection: None,
             epoch,
             channels,
