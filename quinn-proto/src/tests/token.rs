@@ -164,10 +164,10 @@ fn oversized_retry_token() {
         let mut retry = Vec::new();
         header.encode(&mut retry);
         retry.resize(retry.len() + token_len, 0);
-        let tag = server_config()
-            .crypto
-            .retry_tag(initial.version, &initial.dst_cid, &retry);
-        retry.extend_from_slice(&tag);
+        let crypto = server_config().crypto;
+        crate::packet::retry::tag_in_place(&mut retry, 0, &initial.dst_cid, |pseudo| {
+            crypto.retry_tag(initial.version, pseudo)
+        });
         let Some(DatagramEvent::ConnectionEvent(_, event)) = endpoint.handle(
             now,
             address,

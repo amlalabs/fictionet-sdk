@@ -12,10 +12,10 @@
 //! The decisions are plain functions of this state so they can be proved
 //! apart from packet processing.
 
-use fictionet_buf::Charge;
+use fictionet_buf::{Budget, Charge};
 
 use crate::{
-    crypto::Keys,
+    crypto::{Keys, UnsupportedVersion},
     packet::{LongHeaderType, LongType},
     transport_parameters::TransportParameters,
     version::{compatible, negotiation_was_genuine, VersionInformation, VersionList},
@@ -67,21 +67,64 @@ pub(super) enum Reaction {
     Fail,
 }
 
+/// A charge for one derivation of Initial keys: the most it holds at once
+/// ([`crate::crypto::Session::initial_keys_charge`]). `None` inside on a
+/// connection without a budget.
+pub(crate) struct KeyCharge {
+    _charge: Option<Charge>,
+}
+
+impl KeyCharge {
+    /// Charges `bytes` to `budget`; `None` when the budget refuses
+    pub(crate) fn take(budget: Option<&Budget>, bytes: usize) -> Option<Self> {
+        match budget {
+            Some(budget) => Some(Self {
+                _charge: Some(budget.charge(bytes)?),
+            }),
+            None => Some(Self { _charge: None }),
+        }
+    }
+}
+
 /// Initial keys of the version other than the connection's current one
 pub(crate) struct OtherInitial {
     pub(super) version: u32,
     pub(super) keys: Keys,
-    /// Pays for the keys' storage while they are retained
-    _charge: Option<Charge>,
+    /// Pays for the keys' storage while they are retained. Fields drop in
+    /// order, so the keys are freed before the charge is released.
+    pub(super) charge: KeyCharge,
 }
 
 impl OtherInitial {
-    pub(crate) fn new(version: u32, keys: Keys, charge: Option<Charge>) -> Self {
-        Self {
+    /// Charges `budget` the `bytes` a derivation holds at most, then derives
+    /// the keys of `version`. `None` when the budget refuses, before
+    /// anything is derived, or when the version has no keys.
+    pub(crate) fn derive(
+        version: u32,
+        budget: Option<&Budget>,
+        bytes: usize,
+        derive: impl FnOnce() -> Result<Keys, UnsupportedVersion>,
+    ) -> Option<Self> {
+        let charge = KeyCharge::take(budget, bytes)?;
+        let keys = derive().ok()?;
+        Some(Self {
             version,
             keys,
-            _charge: charge,
-        }
+            charge,
+        })
+    }
+
+    /// Puts the keys in `slot` in place of the keys there, which are freed
+    /// before the charge is released, and returns their version
+    pub(crate) fn install(self, slot: &mut Option<Keys>) -> u32 {
+        let Self {
+            version,
+            keys,
+            charge,
+        } = self;
+        *slot = Some(keys);
+        drop(charge);
+        version
     }
 }
 
@@ -402,3 +445,7 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/quic/kani/negotiation_storage.rs"]
+mod negotiation_storage_proofs;

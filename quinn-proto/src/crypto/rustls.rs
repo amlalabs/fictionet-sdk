@@ -9,6 +9,7 @@ use rustls::NamedGroup;
 use rustls::{
     self,
     client::danger::ServerCertVerifier,
+    crypto::tls13::OkmBlock,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
     quic::{Connection, HeaderProtectionKey, KeyChange, PacketKey, Secrets, Suite, Version},
     CipherSuite,
@@ -41,7 +42,7 @@ pub struct TlsSession {
     got_handshake_data: bool,
     next_secrets: Option<Secrets>,
     inner: Connection,
-    suite: Suite,
+    suite: InitialSuite,
 }
 
 impl TlsSession {
@@ -64,8 +65,12 @@ impl crypto::Session for TlsSession {
             interpret_version(version)?,
             *dst_cid,
             side,
-            &self.suite,
+            &self.suite.suite,
         ))
+    }
+
+    fn initial_keys_charge(&self) -> usize {
+        self.suite.charge
     }
 
     fn set_negotiated_version(&mut self, version: u32) -> Result<(), UnsupportedVersion> {
@@ -202,14 +207,8 @@ impl crypto::Session for TlsSession {
         })
     }
 
-    fn is_valid_retry(
-        &self,
-        version: u32,
-        orig_dst_cid: &ConnectionId,
-        header: &[u8],
-        payload: &[u8],
-    ) -> bool {
-        is_valid_retry(version, orig_dst_cid, header, payload)
+    fn is_valid_retry(&self, version: u32, pseudo_packet: &mut [u8]) -> bool {
+        is_valid_retry(version, pseudo_packet)
     }
 
     fn export_keying_material(
@@ -327,7 +326,7 @@ pub struct HandshakeData {
 /// [root_certs]: crate::config::ClientConfig::with_root_certificates()
 pub struct QuicClientConfig {
     pub(crate) inner: Arc<rustls::ClientConfig>,
-    initial: Suite,
+    initial: InitialSuite,
 }
 
 impl QuicClientConfig {
@@ -340,6 +339,7 @@ impl QuicClientConfig {
         Self {
             // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
             initial: initial_suite_from_provider(inner.crypto_provider())
+                .map(InitialSuite::new)
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
         }
@@ -353,7 +353,10 @@ impl QuicClientConfig {
         initial: Suite,
     ) -> Result<Self, NoInitialCipherSuite> {
         match initial.suite.common.suite {
-            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self {
+                inner,
+                initial: InitialSuite::new(initial),
+            }),
             _ => Err(NoInitialCipherSuite { specific: true }),
         }
     }
@@ -415,6 +418,7 @@ impl TryFrom<Arc<rustls::ClientConfig>> for QuicClientConfig {
     fn try_from(inner: Arc<rustls::ClientConfig>) -> Result<Self, Self::Error> {
         Ok(Self {
             initial: initial_suite_from_provider(inner.crypto_provider())
+                .map(InitialSuite::new)
                 .ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
         })
@@ -459,7 +463,7 @@ impl std::error::Error for NoInitialCipherSuite {}
 /// [single]: crate::config::ServerConfig::with_single_cert()
 pub struct QuicServerConfig {
     inner: Arc<rustls::ServerConfig>,
-    initial: Suite,
+    initial: InitialSuite,
 }
 
 impl QuicServerConfig {
@@ -471,6 +475,7 @@ impl QuicServerConfig {
         Ok(Self {
             // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
             initial: initial_suite_from_provider(inner.crypto_provider())
+                .map(InitialSuite::new)
                 .expect("no initial cipher suite found"),
             inner: Arc::new(inner),
         })
@@ -484,7 +489,10 @@ impl QuicServerConfig {
         initial: Suite,
     ) -> Result<Self, NoInitialCipherSuite> {
         match initial.suite.common.suite {
-            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self {
+                inner,
+                initial: InitialSuite::new(initial),
+            }),
             _ => Err(NoInitialCipherSuite { specific: true }),
         }
     }
@@ -523,6 +531,7 @@ impl TryFrom<Arc<rustls::ServerConfig>> for QuicServerConfig {
     fn try_from(inner: Arc<rustls::ServerConfig>) -> Result<Self, Self::Error> {
         Ok(Self {
             initial: initial_suite_from_provider(inner.crypto_provider())
+                .map(InitialSuite::new)
                 .ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
         })
@@ -557,29 +566,28 @@ impl crypto::ServerConfig for QuicServerConfig {
         dst_cid: &ConnectionId,
     ) -> Result<Keys, UnsupportedVersion> {
         let version = interpret_version(version)?;
-        Ok(initial_keys(version, *dst_cid, Side::Server, &self.initial))
+        Ok(initial_keys(
+            version,
+            *dst_cid,
+            Side::Server,
+            &self.initial.suite,
+        ))
     }
 
-    fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
+    fn initial_keys_charge(&self) -> usize {
+        self.initial.charge
+    }
+
+    fn retry_tag(&self, version: u32, pseudo_packet: &[u8]) -> [u8; 16] {
         // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
-        retry_tag(version, orig_dst_cid, packet).unwrap()
+        retry_tag(version, pseudo_packet).unwrap()
     }
 }
 
-/// The Retry Integrity Tag of `packet`, a Retry packet without its tag, sent
-/// in answer to a client whose first Initial went to `orig_dst_cid`
-pub(crate) fn retry_tag(
-    version: u32,
-    orig_dst_cid: &ConnectionId,
-    packet: &[u8],
-) -> Option<[u8; 16]> {
+/// The Retry Integrity Tag of a Retry of `version` whose Retry Pseudo-Packet
+/// is `pseudo_packet`
+pub(crate) fn retry_tag(version: u32, pseudo_packet: &[u8]) -> Option<[u8; 16]> {
     let (nonce, key) = interpret_version(version).ok().and_then(retry_integrity)?;
-
-    let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
-    pseudo_packet.push(orig_dst_cid.len() as u8);
-    pseudo_packet.extend_from_slice(orig_dst_cid);
-    pseudo_packet.extend_from_slice(packet);
-
     let nonce = aead::Nonce::assume_unique_for_key(nonce);
     let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
 
@@ -591,35 +599,48 @@ pub(crate) fn retry_tag(
     Some(result)
 }
 
-/// Whether the Retry packet `header` followed by `payload`, its token and
-/// tag, carries a valid tag for `version` and `orig_dst_cid`
-pub(crate) fn is_valid_retry(
-    version: u32,
-    orig_dst_cid: &ConnectionId,
-    header: &[u8],
-    payload: &[u8],
-) -> bool {
+/// Whether `pseudo_packet`, a Retry Pseudo-Packet followed by the Retry's
+/// tag, carries a valid tag for `version`
+pub(crate) fn is_valid_retry(version: u32, pseudo_packet: &mut [u8]) -> bool {
     let Some((nonce, key)) = interpret_version(version).ok().and_then(retry_integrity) else {
         return false;
     };
-    let tag_start = match payload.len().checked_sub(16) {
-        Some(x) => x,
-        None => return false,
+    let Some(tag_start) = pseudo_packet.len().checked_sub(16) else {
+        return false;
     };
-
-    let mut pseudo_packet =
-        Vec::with_capacity(header.len() + payload.len() + orig_dst_cid.len() + 1);
-    pseudo_packet.push(orig_dst_cid.len() as u8);
-    pseudo_packet.extend_from_slice(orig_dst_cid);
-    pseudo_packet.extend_from_slice(header);
-    let tag_start = tag_start + pseudo_packet.len();
-    pseudo_packet.extend_from_slice(payload);
-
     let nonce = aead::Nonce::assume_unique_for_key(nonce);
     let key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key).unwrap());
 
     let (aad, tag) = pseudo_packet.split_at_mut(tag_start);
     key.open_in_place(nonce, aead::Aad::from(aad), tag).is_ok()
+}
+
+/// The initial cipher suite with what a derivation of its Initial keys
+/// holds at most
+#[derive(Clone, Copy)]
+struct InitialSuite {
+    suite: Suite,
+    /// The most heap bytes live at once while [`initial_keys`] derives a set
+    charge: usize,
+}
+
+impl InitialSuite {
+    /// Measures `suite` once, when a configuration is made. Sizes do not
+    /// depend on the version or the connection ID.
+    fn new(suite: Suite) -> Self {
+        // rustls' `Keys::initial` holds the expander of the Initial secret
+        // while each direction's `KeyBuilder` holds the expander of that
+        // direction's secret, so at most two expanders live beside the keys.
+        let keys = initial_keys(Version::V1, ConnectionId::new(&[]), Side::Client, &suite);
+        let hkdf = suite.suite.hkdf_provider;
+        let extracted = hkdf.extract_from_secret(None, &[]);
+        let expanded = hkdf.expander_for_okm(&OkmBlock::new(&[0; 32]));
+        let expander = size_of_val(&*extracted).max(size_of_val(&*expanded));
+        Self {
+            suite,
+            charge: keys.heap_size() + 2 * expander,
+        }
+    }
 }
 
 pub(crate) fn initial_suite_from_provider(
@@ -714,5 +735,51 @@ fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {
         QUIC_V1 | 0xff00_0021..=0xff00_0022 => Ok(Version::V1),
         QUIC_V2 => Ok(Version::V2),
         _ => Err(UnsupportedVersion),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cost::{Charged, Costs, Linear};
+
+    /// Each derivation of Initial keys, in every version, for either side
+    /// and any connection ID length, holds at most what it is charged
+    /// before it starts, the keys included
+    #[test]
+    fn initial_key_derivations_stay_within_their_charge() {
+        let provider = configured_provider();
+        let suite = InitialSuite::new(initial_suite_from_provider(&provider).unwrap());
+        let expander = size_of_val(
+            &*suite
+                .suite
+                .suite
+                .hkdf_provider
+                .extract_from_secret(None, &[]),
+        );
+        let mut all = Costs::new("QUIC Initial keys");
+        for version in [Version::V1Draft, Version::V1, Version::V2] {
+            for side in [Side::Client, Side::Server] {
+                for cid in [&[][..], &[7; 8][..], &[9; 20][..]] {
+                    // A derivation copies nothing of its input. It asks for
+                    // the keys and three expanders: one for the Initial
+                    // secret and one for each direction's, two of them live
+                    // at once.
+                    let linear = Linear {
+                        num: 0,
+                        den: 1,
+                        fixed: suite.charge + expander,
+                    };
+                    let mut costs = Costs::new("QUIC Initial keys");
+                    let keys = costs.step(cid.len(), suite.charge, linear, || Charged {
+                        value: initial_keys(version, ConnectionId::new(cid), side, &suite.suite),
+                        charged: 0,
+                    });
+                    assert!(keys.heap_size() <= suite.charge);
+                    all.absorb(&costs);
+                }
+            }
+        }
+        eprintln!("cost: QUIC Initial keys: {}", all.summary());
     }
 }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::PacketBuffer;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use rand::{
     rngs::{StdRng, SysRng},
     Rng, RngExt, SeedableRng,
@@ -26,8 +26,8 @@ use crate::{
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
-        FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
-        PacketNumber, PartialDecode, ProtectedInitialHeader,
+        retry, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket,
+        PacketDecodeError, PacketNumber, PartialDecode, ProtectedInitialHeader,
     },
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
@@ -221,21 +221,14 @@ impl Endpoint {
                     return None;
                 }
                 trace!("sending version negotiation");
-                // Negotiate versions
-                Header::VersionNegotiate {
-                    random: self.rng.random::<u8>() | 0x40,
-                    src_cid: dst_cid,
-                    dst_cid: src_cid,
-                }
-                .encode(buf);
-                // Grease with a reserved version
-                buf.write::<u32>(match version {
-                    0x0a1a_2a3a => 0x0a1a_2a4a,
-                    _ => 0x0a1a_2a3a,
-                });
-                for &version in &self.config.supported_versions {
-                    buf.write(version);
-                }
+                write_version_negotiation(
+                    buf,
+                    self.rng.random::<u8>(),
+                    &src_cid,
+                    &dst_cid,
+                    version,
+                    &self.config.supported_versions,
+                );
                 return Some(DatagramEvent::Response(Transmit {
                     destination: remote,
                     ecn: None,
@@ -704,13 +697,8 @@ impl Endpoint {
         // Compatible version negotiation (RFC 9368 section 2.3) decides the
         // version before the TLS session answers the ClientHello.
         let original = version;
-        let upgrade = self.compatible_upgrade(
-            &server_config,
-            original,
-            &dst_cid,
-            &incoming.crypto,
-            &incoming.packet.payload,
-        );
+        let upgrade =
+            self.compatible_upgrade(&server_config, original, &dst_cid, &incoming.packet.payload);
         let negotiated = upgrade.as_ref().map_or(original, |upgrade| upgrade.0);
         params.version_information = Some(VersionInformation {
             chosen: negotiated,
@@ -862,22 +850,23 @@ impl Endpoint {
             orig_dst_cid: incoming.packet.header.dst_cid,
             issued: server_config.time_source.now(),
         };
-        let token = Token::new(payload, &mut self.rng)
-            .encode(&*server_config.token_key, incoming.packet.header.version);
-
+        let token_key = &*server_config.token_key;
+        let token = Token::new(payload, &mut self.rng);
+        let version = incoming.packet.header.version;
         let header = Header::Retry {
             src_cid: loc_cid,
             dst_cid: incoming.packet.header.src_cid,
-            version: incoming.packet.header.version,
+            version,
         };
 
+        // The token and the tag are written in place: a Retry allocates
+        // nothing beyond `buf`.
+        let start = buf.len();
         let encode = header.encode(buf);
-        buf.put_slice(&token);
-        buf.extend_from_slice(&server_config.crypto.retry_tag(
-            incoming.packet.header.version,
-            &incoming.packet.header.dst_cid,
-            buf,
-        ));
+        token.encode_into(token_key, version, buf);
+        retry::tag_in_place(buf, start, &incoming.packet.header.dst_cid, |pseudo| {
+            server_config.crypto.retry_tag(version, pseudo)
+        });
         encode.finish(buf, &*incoming.crypto.header.local, None);
 
         Ok(Transmit {
@@ -910,12 +899,15 @@ impl Endpoint {
     /// keys it retains for the client's later Initial packets. `None` keeps
     /// the original version: no compatible offer was found in `payload`, the
     /// decrypted first packet, or the budget refused the retained keys.
+    ///
+    /// The negotiated keys take the place of the original version's keys a
+    /// connection that keeps its version derives; the retained keys are
+    /// charged before they are derived.
     fn compatible_upgrade(
         &self,
         server_config: &ServerConfig,
         original: u32,
         dst_cid: &ConnectionId,
-        original_keys: &Keys,
         payload: &[u8],
     ) -> Option<(u32, Keys, OtherInitial)> {
         let client = client_version_information(payload)?;
@@ -928,20 +920,15 @@ impl Endpoint {
         if negotiated == original {
             return None;
         }
-        let charge = match &self.reassembly_budget {
-            Some(budget) => Some(budget.charge(original_keys.heap_size())?),
-            None => None,
-        };
-        let retained = server_config.crypto.initial_keys(original, dst_cid).ok()?;
-        let keys = server_config
-            .crypto
-            .initial_keys(negotiated, dst_cid)
-            .ok()?;
-        Some((
-            negotiated,
-            keys,
-            OtherInitial::new(original, retained, charge),
-        ))
+        let crypto = &server_config.crypto;
+        let retained = OtherInitial::derive(
+            original,
+            self.reassembly_budget.as_ref(),
+            crypto.initial_keys_charge(),
+            || crypto.initial_keys(original, dst_cid),
+        )?;
+        let keys = crypto.initial_keys(negotiated, dst_cid).ok()?;
+        Some((negotiated, keys, retained))
     }
 
     fn add_connection(
@@ -1496,6 +1483,40 @@ struct FourTuple {
     // A single socket can only listen on a single port, so no need to store it explicitly
     local_ip: Option<IpAddr>,
 }
+
+/// Writes into `buf` a Version Negotiation packet (RFC 9000 section 17.2.1)
+/// answering a packet of the unsupported `version` that came from
+/// `received_src` to `received_dst`: a greasing version, then `supported`
+///
+/// It writes `7 + received_src.len() + received_dst.len() + 4 * (1 +
+/// supported.len())` bytes and allocates nothing when `buf` has that room.
+fn write_version_negotiation(
+    buf: &mut Vec<u8>,
+    random: u8,
+    received_src: &ConnectionId,
+    received_dst: &ConnectionId,
+    version: u32,
+    supported: &[u32],
+) {
+    Header::VersionNegotiate {
+        random: random | 0x40,
+        src_cid: *received_dst,
+        dst_cid: *received_src,
+    }
+    .encode(buf);
+    // Grease with a reserved version
+    buf.write::<u32>(match version {
+        0x0a1a_2a3a => 0x0a1a_2a4a,
+        _ => 0x0a1a_2a3a,
+    });
+    for &version in supported {
+        buf.write(version);
+    }
+}
+
+#[cfg(kani)]
+#[path = "../../verification/quic/kani/version_negotiation.rs"]
+mod version_negotiation_proofs;
 
 #[cfg(test)]
 mod tests {

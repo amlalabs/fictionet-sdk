@@ -9,10 +9,10 @@ use rand::{Rng, RngExt};
 
 use crate::{
     coding::{BufExt, BufMutExt},
-    crypto::{HandshakeTokenKey, HmacKey},
+    crypto::{HandshakeTokenKey, HmacKey, TOKEN_TAG_LEN},
     packet::InitialHeader,
     shared::ConnectionId,
-    Duration, ServerConfig, SystemTime, RESET_TOKEN_SIZE, UNIX_EPOCH,
+    Duration, ServerConfig, SystemTime, MAX_CID_SIZE, RESET_TOKEN_SIZE, UNIX_EPOCH,
 };
 
 /// Responsible for limiting clients' ability to reuse validation tokens
@@ -215,9 +215,23 @@ impl Token {
         }
     }
 
-    /// Encode and encrypt
+    /// The longest encoded token: a Retry token for an IPv6 address and the
+    /// longest connection ID, sealed, then its nonce
+    pub(crate) const MAX_ENCODED: usize =
+        1 + (1 + 16 + 2) + (1 + MAX_CID_SIZE) + 8 + TOKEN_TAG_LEN + size_of::<u128>();
+
+    /// Encode and encrypt into a new buffer
     pub(crate) fn encode(&self, key: &dyn HandshakeTokenKey, version: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(Self::MAX_ENCODED);
+        self.encode_into(key, version, &mut buf);
+        buf
+    }
+
+    /// Encode and encrypt at the end of `buf`, in place: `buf` grows by at
+    /// most [`MAX_ENCODED`](Self::MAX_ENCODED) bytes and nothing else is
+    /// allocated
+    pub(crate) fn encode_into(&self, key: &dyn HandshakeTokenKey, version: u32, buf: &mut Vec<u8>) {
+        let start = buf.len();
 
         // Encode payload
         match self.payload {
@@ -227,23 +241,24 @@ impl Token {
                 issued,
             } => {
                 buf.put_u8(TokenType::Retry as u8);
-                encode_addr(&mut buf, address);
-                orig_dst_cid.encode_long(&mut buf);
-                encode_unix_secs(&mut buf, issued);
+                encode_addr(buf, address);
+                orig_dst_cid.encode_long(buf);
+                encode_unix_secs(buf, issued);
             }
             TokenPayload::Validation { ip, issued } => {
                 buf.put_u8(TokenType::Validation as u8);
-                encode_ip(&mut buf, ip);
-                encode_unix_secs(&mut buf, issued);
+                encode_ip(buf, ip);
+                encode_unix_secs(buf, issued);
             }
         }
 
         // Encrypt
-        let aead_key = key.aead_from_hkdf(&self.nonce.to_le_bytes());
-        aead_key.seal(&mut buf, &version.to_be_bytes()).unwrap();
-        buf.extend(&self.nonce.to_le_bytes());
-
-        buf
+        let nonce = self.nonce.to_le_bytes();
+        let tag = key
+            .seal(&nonce, &mut buf[start..], &version.to_be_bytes())
+            .unwrap();
+        buf.put_slice(&tag);
+        buf.put_slice(&nonce);
     }
 
     /// Decode and decrypt
@@ -256,11 +271,11 @@ impl Token {
 
         let nonce = u128::from_le_bytes(nonce_bytes.try_into().unwrap());
 
-        let aead_key = key.aead_from_hkdf(nonce_bytes);
-        let mut sealed_token = sealed_token.to_vec();
-        let data = aead_key
-            .open(&mut sealed_token, &version.to_be_bytes())
-            .ok()?;
+        // A token longer than any this server seals is not one of its own.
+        let mut storage = [0; Self::MAX_ENCODED - size_of::<u128>()];
+        let sealed = storage.get_mut(..sealed_token.len())?;
+        sealed.copy_from_slice(sealed_token);
+        let data = key.open(nonce_bytes, sealed, &version.to_be_bytes()).ok()?;
 
         // Decode payload
         let mut reader = &data[..];
@@ -455,15 +470,16 @@ mod test {
                 }
 
                 // Tokens issued without version authentication are no longer accepted.
-                let aead = key.aead_from_hkdf(&token.nonce.to_le_bytes());
+                let nonce = token.nonce.to_le_bytes();
                 let mut old = encoded[..encoded.len() - 16].to_vec();
-                let plain = aead
-                    .open(&mut old, &version.to_be_bytes())
+                let mut plain = key
+                    .open(&nonce, &mut old, &version.to_be_bytes())
                     .unwrap()
                     .to_vec();
-                old = plain;
-                aead.seal(&mut old, &[]).unwrap();
-                old.extend_from_slice(&token.nonce.to_le_bytes());
+                let tag = key.seal(&nonce, &mut plain, &[]).unwrap();
+                let mut old = plain;
+                old.extend_from_slice(&tag);
+                old.extend_from_slice(&nonce);
                 assert!(Token::decode(&key, version, &old).is_none());
             }
         }
@@ -544,3 +560,7 @@ mod test {
         assert!(Token::decode(&prk, 1, &invalid_token).is_none());
     }
 }
+
+#[cfg(kani)]
+#[path = "../../verification/quic/kani/token_storage.rs"]
+mod token_storage_proofs;
