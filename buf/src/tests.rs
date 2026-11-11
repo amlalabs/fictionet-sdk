@@ -898,3 +898,23 @@ fn a_view_made_in_a_spare_sees_only_its_own_refusals() {
     drop((held, charge));
     assert_eq!((first.used(), second.used()), (0, 0));
 }
+
+#[test]
+fn backing_payment_follows_views_and_transfers() {
+    let first = Budget::new(4);
+    let second = Budget::new(4);
+    assert!(Chunk::default().is_paid_by(&first));
+    let mut chunk = Chunk::unpaid(b"abcd".to_vec());
+    assert!(!chunk.is_paid_by(&first));
+    assert!(chunk.repay(&first));
+    let view = chunk.slice(1..3);
+    assert!(chunk.is_paid_by(&first));
+    assert!(view.is_paid_by(&first));
+    assert!(!view.is_paid_by(&second));
+    assert!(chunk.repay(&second));
+    assert!(chunk.is_paid_by(&second));
+    assert!(!chunk.is_paid_by(&first));
+    assert!(view.is_paid_by(&first));
+    assert_eq!(first.used(), 4);
+    assert_eq!(second.used(), 4);
+}
