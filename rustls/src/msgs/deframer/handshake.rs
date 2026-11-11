@@ -60,7 +60,7 @@ impl HandshakeDeframer {
                 version: msg.version,
                 size: None,
                 bounds: containing_buffer.locate(msg.payload),
-                cut: true,
+                covers: Covers::Message,
             });
             return;
         }
@@ -243,7 +243,7 @@ fn dissect_first(
         version,
         size: None,
         bounds: containing_buffer.locate(dissect.payload),
-        cut: false,
+        covers: Covers::RestOfRecord,
     });
     first.into_iter().chain(rest)
 }
@@ -280,7 +280,7 @@ impl Iterator for DissectHandshakeIter<'_, '_> {
                 version: self.version,
                 size: None,
                 bounds: bounds.clone(),
-                cut: true,
+                covers: Covers::Message,
             });
         }
 
@@ -302,7 +302,7 @@ impl Iterator for DissectHandshakeIter<'_, '_> {
             version: self.version,
             size: Some(size),
             bounds: bounds.clone(),
-            cut: true,
+            covers: Covers::Message,
         })
     }
 }
@@ -349,7 +349,7 @@ impl Drop for HandshakeIter<'_, '_> {
         self.deframer.spans.drain(..self.index);
         // The rest of a record, once the messages before it are taken, is
         // cut for its next message: it is the last span.
-        if self.deframer.spans.first().is_some_and(|span| !span.cut) {
+        if let Some(Covers::RestOfRecord) = self.deframer.spans.first().map(|span| span.covers) {
             let rest = self.deframer.spans.remove(0);
             let slice = self.containing_buffer.slice();
             let msg = InboundPlainMessage {
@@ -381,10 +381,18 @@ pub(crate) struct FragmentSpan {
     /// bounds of the handshake message, including header
     bounds: Range<usize>,
 
-    /// Whether this is one message's span, or the start of one. `false`
-    /// for the rest of a record not yet cut into messages
+    /// What the bounds cover.
+    covers: Covers,
+}
+
+/// What a [`FragmentSpan`] covers.
+#[derive(Clone, Copy, Debug)]
+enum Covers {
+    /// One handshake message, or the start of one.
+    Message,
+    /// The rest of a record not yet cut into messages
     /// ([`dissect_first`]), which is always the last span.
-    cut: bool,
+    RestOfRecord,
 }
 
 impl FragmentSpan {
