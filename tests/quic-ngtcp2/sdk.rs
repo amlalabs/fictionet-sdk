@@ -450,7 +450,9 @@ impl httpd::Handler for Files {
             .get(request.head.path())
             .map(|bytes| httpd::Body::Full(Chunk::unpaid(bytes.clone())))
             .expect("a known path");
-        httpd::Reply::Now(web::Response::new(body))
+        let mut response = web::Response::new(body);
+        response.fields = web::Fields::unpaid([("server", "fictionet-dynamic-interop")]);
+        httpd::Reply::Now(response)
     }
 }
 

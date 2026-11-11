@@ -42,6 +42,7 @@ unsafe extern "C" {
     fn fn_close(peer: *mut Raw, out: *mut u8, cap: usize, now: u64) -> i64;
     fn fn_peer_close(peer: *mut Raw, code: *mut u64, application: *mut i32) -> i32;
     fn fn_failure(peer: *mut Raw) -> i32;
+    fn fn_stream_bytes(peer: *mut Raw, id: i64, sent: i32, bytes: *mut *const u8, len: *mut usize);
     fn fn_version(peer: *mut Raw) -> u32;
     fn fn_response(
         peer: *mut Raw,
@@ -194,6 +195,18 @@ impl Ngtcp2 {
         (code != 0).then_some(Failure(code))
     }
 
+    /// Application bytes handed to QUIC or received on one stream.
+    pub fn stream_bytes(&self, id: i64, sent: bool) -> &[u8] {
+        let mut bytes = std::ptr::null();
+        let mut len = 0;
+        unsafe { fn_stream_bytes(self.raw.as_ptr(), id, i32::from(sent), &mut bytes, &mut len) };
+        if len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(bytes, len) }
+        }
+    }
+
     /// The close the remote endpoint sent, if it did
     pub fn peer_close(&self) -> Option<Closed> {
         let mut code = 0;
@@ -217,7 +230,7 @@ impl Endpoint for Ngtcp2 {
                 nanos(now),
             )
         };
-        assert_eq!(rv, 0, "ngtcp2 receive failed: {rv}");
+        assert_eq!(rv, 0, "ngtcp2 receive at {now:?} failed: {rv}");
     }
 
     fn transmit(&mut self, now: Duration) -> Option<Vec<u8>> {

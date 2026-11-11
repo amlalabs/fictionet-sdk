@@ -14,6 +14,7 @@
 #include <openssl/x509.h>
 
 #include <netinet/in.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -187,9 +188,15 @@ static int recv_stream_data(ngtcp2_conn *conn, uint32_t flags, int64_t id,
   fn_peer *p = user_data;
   int fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
   if (p->app == APP_H3) {
-    nghttp3_ssize n = nghttp3_conn_read_stream(p->h3, id, data, len, fin);
-    if (n < 0)
+    stream *s = find_stream(p, id, 1);
+    if (!s || append(&s->in, data, len))
       return NGTCP2_ERR_CALLBACK_FAILURE;
+    nghttp3_ssize n = nghttp3_conn_read_stream(p->h3, id, data, len, fin);
+    if (n < 0) {
+      fprintf(stderr, "nghttp3 stream %lld: %s (%ld)\n", (long long)id,
+              nghttp3_strerror((int)n), (long)n);
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     return consumed(p, id, (size_t)n);
   }
   stream *s = find_stream(p, id, 1);
@@ -216,8 +223,13 @@ static int acked(ngtcp2_conn *conn, int64_t id, uint64_t offset, uint64_t len,
   (void)offset;
   (void)stream_user_data;
   fn_peer *p = user_data;
-  if (p->app == APP_H3 && nghttp3_conn_add_ack_offset(p->h3, id, len))
-    return NGTCP2_ERR_CALLBACK_FAILURE;
+  if (p->app == APP_H3) {
+    int rv = nghttp3_conn_add_ack_offset(p->h3, id, len);
+    if (rv) {
+      fprintf(stderr, "nghttp3 ack %lld: %s\n", (long long)id, nghttp3_strerror(rv));
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+  }
   return 0;
 }
 
@@ -232,8 +244,11 @@ static int stream_close(ngtcp2_conn *conn, uint32_t flags, int64_t id,
   if (!(flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET))
     code = NGHTTP3_H3_NO_ERROR;
   int rv = nghttp3_conn_close_stream(p->h3, id, code);
-  if (rv && rv != NGHTTP3_ERR_STREAM_NOT_FOUND)
+  if (rv && rv != NGHTTP3_ERR_STREAM_NOT_FOUND) {
+    fprintf(stderr, "nghttp3 close %lld code %llu flags %u: %s\n", (long long)id,
+            (unsigned long long)code, flags, nghttp3_strerror(rv));
     return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
   return 0;
 }
 
@@ -244,8 +259,11 @@ static int extend_stream(ngtcp2_conn *conn, int64_t id, uint64_t max,
   (void)stream_user_data;
   fn_peer *p = user_data;
   if (p->app == APP_H3) {
-    if (nghttp3_conn_unblock_stream(p->h3, id))
+    int rv = nghttp3_conn_unblock_stream(p->h3, id);
+    if (rv) {
+      fprintf(stderr, "nghttp3 unblock %lld: %s\n", (long long)id, nghttp3_strerror(rv));
       return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     return 0;
   }
   stream *s = find_stream(p, id, 0);
@@ -313,6 +331,8 @@ static int h3_start(fn_peer *p) {
   };
   nghttp3_settings settings;
   nghttp3_settings_default(&settings);
+  settings.qpack_max_dtable_capacity = 4096;
+  settings.qpack_blocked_streams = 16;
   if (nghttp3_conn_client_new(&p->h3, &callbacks, &settings,
                               nghttp3_mem_default(), p))
     return -1;
@@ -345,14 +365,21 @@ static int open_requests(fn_peer *p) {
     r->opened = 1;
     r->stream = id;
     if (p->app == APP_H3) {
-      nghttp3_nv headers[4];
-      const char *names[] = {":method", ":scheme", ":authority", ":path"};
-      const char *values[] = {"GET", "https", "localhost", r->path};
-      for (int h = 0; h < 4; h++)
+      nghttp3_nv headers[11];
+      const char *names[] = {":method", ":scheme", ":authority", ":path",
+                             "accept", "accept-encoding", "user-agent",
+                             "accept-language", "sec-fetch-dest",
+                             "sec-fetch-mode", "sec-fetch-site"};
+      const char *values[] = {"GET", "https", "shop.example.test", r->path,
+                              "*/*", "gzip, deflate, br",
+                              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                              "en-US,en;q=0.9", "script", "no-cors", "same-origin"};
+      for (int h = 0; h < 11; h++)
         headers[h] = (nghttp3_nv){(uint8_t *)names[h], (uint8_t *)values[h],
                                   strlen(names[h]), strlen(values[h]),
                                   NGHTTP3_NV_FLAG_NONE};
-      if (nghttp3_conn_submit_request(p->h3, id, headers, 4, NULL, r))
+      if (nghttp3_conn_submit_request(p->h3, id, headers, 11, NULL, r))
         return -1;
     } else {
       stream *s = find_stream(p, id, 1);
@@ -371,13 +398,17 @@ static int open_requests(fn_peer *p) {
 
 static int handshake_completed(ngtcp2_conn *conn, void *user_data) {
   (void)conn;
-  return open_requests(user_data) ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  int rv = open_requests(user_data);
+  if (rv) fprintf(stderr, "open requests at handshake: %d\n", rv);
+  return rv ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
 }
 
 static int more_streams(ngtcp2_conn *conn, uint64_t max, void *user_data) {
   (void)conn;
   (void)max;
-  return open_requests(user_data) ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  int rv = open_requests(user_data);
+  if (rv) fprintf(stderr, "open requests at stream credit: %d\n", rv);
+  return rv ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
 }
 
 static ngtcp2_callbacks callbacks(int server) {
@@ -812,6 +843,16 @@ long fn_send(fn_peer *p, uint8_t *out, size_t cap, uint64_t now) {
       return failed(p, (int)n);
     if (written >= 0 && id >= 0) {
       if (p->h3) {
+        stream *capture = find_stream(p, id, 1);
+        if (!capture)
+          return failed(p, NGTCP2_ERR_CALLBACK_FAILURE);
+        size_t left = (size_t)written;
+        for (size_t i = 0; i < count && left; i++) {
+          size_t take = vec[i].len < left ? vec[i].len : left;
+          if (append(&capture->out, vec[i].base, take))
+            return failed(p, NGTCP2_ERR_CALLBACK_FAILURE);
+          left -= take;
+        }
         if (nghttp3_conn_add_write_offset(p->h3, id, (size_t)written))
           return failed(p, NGTCP2_ERR_CALLBACK_FAILURE);
       } else if (s) {
@@ -869,6 +910,17 @@ int fn_peer_close(fn_peer *p, uint64_t *code, int *application) {
 }
 
 int fn_failure(fn_peer *p) { return p->failed; }
+
+/* The application bytes handed to or received from QUIC, without replaying
+ * retransmissions. These let the tests establish which QPACK forms the
+ * independent encoder actually used. */
+void fn_stream_bytes(fn_peer *p, int64_t id, int sent, const uint8_t **data,
+                     size_t *len) {
+  stream *s = find_stream(p, id, 0);
+  const buffer *b = s ? (sent ? &s->out : &s->in) : NULL;
+  *data = b ? b->data : NULL;
+  *len = b ? b->len : 0;
+}
 
 
 uint32_t fn_version(fn_peer *p) {
