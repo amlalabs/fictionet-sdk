@@ -199,6 +199,10 @@ impl Ssh {
             "StrictHostKeyChecking=accept-new".into(),
             "-o".into(),
             "ConnectTimeout=10".into(),
+            // Amazon Linux's sshd offers no post-quantum key exchange, and
+            // the client warns about that on every connection.
+            "-o".into(),
+            "LogLevel=ERROR".into(),
         ]
     }
 
@@ -752,7 +756,9 @@ fn status(aws: &Aws, files: &Files) -> Result {
         "Instance {} ({}): {}",
         instance.instance_id, instance.instance_type, instance.state.name
     );
-    for interface in &instance.network_interfaces {
+    let mut interfaces: Vec<_> = instance.network_interfaces.iter().collect();
+    interfaces.sort_by_key(|i| i.attachment.as_ref().map(|a| a.device_index));
+    for interface in interfaces {
         let index = interface.attachment.as_ref().map(|a| a.device_index);
         let role = match index {
             Some(0) => "management",
@@ -781,14 +787,20 @@ fn status(aws: &Aws, files: &Files) -> Result {
     if let Some(data) = &state.data_interface {
         println!("  {}", data_interface_report(&ssh, &data.mac)?);
     }
-    let service = ssh.run(&format!(
-        "systemctl is-active honeypot; cat {} 2>/dev/null; \
-         sudo journalctl -u honeypot -n 5 -o short-iso --no-pager",
+    let active = ssh.run("systemctl is-active honeypot || true")?;
+    println!("  service: {}", active.trim());
+    let commit = ssh.run(&format!(
+        "cat {} 2>/dev/null || true",
         provision::COMMIT_FILE
     ))?;
-    let mut lines = service.lines();
-    println!("  service: {}", lines.next().unwrap_or("unknown"));
-    for line in lines {
+    println!(
+        "  commit on the instance: {}",
+        Some(commit.trim())
+            .filter(|c| !c.is_empty())
+            .unwrap_or("none")
+    );
+    let journal = ssh.run("sudo journalctl -u honeypot -n 5 -o short-iso --no-pager --quiet")?;
+    for line in journal.lines() {
         println!("    {line}");
     }
     Ok(())
