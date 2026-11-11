@@ -716,3 +716,7 @@ fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {
         _ => Err(UnsupportedVersion),
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/quic/kani/version_keys.rs"]
+mod version_keys;
