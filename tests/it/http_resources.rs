@@ -1,8 +1,9 @@
 //! What the HTTP servers copy while a unit arrives in pieces: a request
-//! head, a request body. Each joins its pieces into storage that doubles
-//! when it is full, or grows as far as the budget has room for when it
-//! has no room for that, so the bytes it copies stay linear in what
-//! arrived (verification/http/README.md, "Resource properties"). The
+//! head, a request body. An HTTP/1 head is joined into storage that
+//! doubles when it is full, or grows as far as the budget has room for
+//! when it has no room for that, so the bytes it copies stay linear in
+//! what arrived. An HTTP/2 body is kept in segments that never move
+//! (verification/http/README.md, "Resource properties"). The
 //! bytes asked of the allocator are counted (`common::alloc`); the inputs
 //! are made before the count starts.
 
@@ -10,7 +11,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::layer::{Admit, Budget, Chunk, Driver, Harness, StreamEvent};
+use fictionet::stdlib::layer::{
+    Admit, Budget, ChargedSegments, Chunk, Driver, Harness, StreamEvent,
+};
 use fictionet::stdlib::protocols::{hpack, http2};
 use fictionet::stdlib::services::stack::Polling;
 use fictionet::stdlib::web::httpd::{Http1, Responder};
@@ -171,11 +174,20 @@ fn a_body_in_many_data_frames_is_collected_linearly() {
     // The harness copies the frames into one delivery. Each frame's data,
     // a slice of that delivery, moves into the child's receive window as
     // bytes of its own (`Chunk::move_into_window`): its byte and a
-    // backing. The body is joined within `JOIN_PER` times its bytes.
+    // backing. The body, of no stated length, is kept in segments that
+    // never move: its bytes, a share more in the last segment, and the
+    // segments' places, asked for as they double. The handler takes it
+    // whole, so it is copied once into one chunk of its length.
     // `ANSWER` is the handler's answer, its head block and its frames,
     // once: well under the 64 KiB the connection queues for output.
     const ANSWER: usize = 64 << 10;
-    let bound = frames.len() + FRAMES * (1 + BACKING) + JOIN_PER * FRAMES + ANSWER;
+    let share = (FRAMES / ChargedSegments::SHARE).clamp(
+        ChargedSegments::LEAST_SEGMENT,
+        ChargedSegments::MOST_SEGMENT,
+    );
+    let places = 4 * (FRAMES.div_ceil(ChargedSegments::LEAST_SEGMENT) + 2) * ChargedSegments::PLACE;
+    let body = FRAMES + share + places + FRAMES;
+    let bound = frames.len() + FRAMES * (1 + BACKING) + body + ANSWER;
     assert!(
         stats.bytes_requested <= bound,
         "{} bytes asked for to collect a body of {FRAMES} frames, past {bound}",

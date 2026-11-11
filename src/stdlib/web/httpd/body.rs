@@ -1,4 +1,5 @@
 use crate::stdlib::web::Fields;
+use fictionet::stdlib::layer::ChargedSegments;
 use fictionet::{Budget, Chunk, Error};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -41,6 +42,30 @@ impl Body {
     /// No bytes and no allocation.
     pub fn empty() -> Self {
         Self::Full(Chunk::default())
+    }
+    /// A body received in `segments`, held in full. A body in one segment,
+    /// as every body whose length was known is, is that segment, copied
+    /// nowhere. One in several is copied once into an allocation of
+    /// exactly its length, charged to `budget` before it is made, each
+    /// segment given back as it is copied: a handler reads a body in full
+    /// as one chunk ([`bytes`](Self::bytes)). `None`, with the segments
+    /// dropped, if the budget has no room for that allocation.
+    pub fn from_segments(segments: ChargedSegments, budget: &Budget) -> Option<Self> {
+        let len = segments.len();
+        let mut chunks = segments.into_chunks();
+        let Some(first) = chunks.next() else {
+            return Some(Self::empty());
+        };
+        if chunks.remaining() == 0 {
+            return Some(Self::Full(first));
+        }
+        let mut whole = Chunk::block(budget, 0, len)?;
+        for piece in std::iter::once(first).chain(chunks) {
+            whole
+                .extend_within(&piece)
+                .expect("the block holds the body's length");
+        }
+        Some(Self::Full(whole))
     }
     /// A shared view of a complete body.
     pub fn bytes(&self) -> Option<Chunk> {
