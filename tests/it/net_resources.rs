@@ -433,3 +433,103 @@ mod udp {
         eprintln!("cost: udp budget: {}", costs.summary());
     }
 }
+
+/// DNS queries as a server parses them (`Request::parse`), with records
+/// whose names are compression pointers: two octets on the wire for a
+/// name of up to 255 octets in memory.
+mod dns {
+    use fictionet::stdlib::network::Transport;
+    use fictionet::stdlib::protocols::dns::rr::Record;
+    use fictionet::stdlib::protocols::dns::{Parsed, Request};
+
+    use crate::cost::{Charged, Costs, Linear};
+
+    /// The most a decoded record holds besides its place in its section:
+    /// its name, up to 255 octets and an index of up to 128 label ends.
+    const NAME: usize = 255 + 128;
+
+    /// The fewest octets a record takes on the wire: a compression pointer
+    /// for its name, its type, class, TTL and RDATA length.
+    const WIRE: usize = 12;
+
+    /// What a parse holds at any moment: every record of the message
+    /// decoded, its place in a section that may have doubled (twice a
+    /// `Record`) and its name; and the question, whose name is at most
+    /// [`NAME`] and whose octets the request copies, at most the message.
+    fn holds(len: usize) -> usize {
+        len.div_ceil(WIRE) * (2 * size_of::<Record>() + NAME) + len + 4 * NAME
+    }
+
+    /// What a parse asks for: the records' places in sections that double
+    /// as they grow, each place asked for twice over all the growth, and
+    /// their names; and the question as in [`holds`].
+    const fn asks(len: usize) -> Linear {
+        Linear {
+            num: 4 * size_of::<Record>() + NAME,
+            den: WIRE,
+            fixed: len + 4 * NAME,
+        }
+    }
+
+    /// What a request keeps once parsed: its question's name and octets
+    /// and its header, none of the records.
+    fn keeps(len: usize) -> usize {
+        len + 4 * NAME
+    }
+
+    /// A query for a name of 255 octets, with `records` A records in the
+    /// section at `section` (answer, authority or additional) whose names
+    /// point back at it.
+    fn query(records: usize, section: usize) -> Vec<u8> {
+        let mut counts = [0u16; 3];
+        counts[section] = records as u16;
+        let mut bytes = vec![0x12, 0x34, 0x01, 0x00, 0, 1];
+        for count in counts {
+            bytes.extend_from_slice(&count.to_be_bytes());
+        }
+        for label in [63u8, 63, 63, 61] {
+            bytes.push(label);
+            bytes.extend(std::iter::repeat_n(b'a', label as usize));
+        }
+        bytes.push(0);
+        bytes.extend_from_slice(&[0, 1, 0, 1]);
+        for i in 0..records {
+            bytes.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+            bytes.extend_from_slice(&(i as u32).to_be_bytes());
+        }
+        bytes
+    }
+
+    /// Each query parsed as one costed step, up to a TCP message of 64 KiB:
+    /// within [`holds`] at any moment, within [`asks`], and keeping no more
+    /// than [`keeps`] in the request it makes.
+    #[test]
+    fn queries_full_of_compressed_names_keep_none_of_them() {
+        let mut all = Costs::new("dns queries");
+        for section in 0..3 {
+            for records in [0usize, 1, 10, 100, 1000, 4000] {
+                let bytes = query(records, section);
+                let len = bytes.len();
+                let mut costs = Costs::new(format!("dns query, {records} records"));
+                let parsed = costs.step(len, holds(len), asks(len), || Charged {
+                    value: Request::parse(&bytes, Transport::Tcp),
+                    charged: 0,
+                    moved: 0,
+                });
+                let Parsed::Request(_) = &parsed else {
+                    panic!("{records} records in section {section}: not a request");
+                };
+                // What the step left allocated is the request.
+                let kept = costs.live();
+                assert!(
+                    kept <= keeps(len),
+                    "{records} records in section {section}: the request keeps {kept} \
+                     bytes, past {}",
+                    keeps(len)
+                );
+                all.absorb(&costs);
+            }
+        }
+        eprintln!("cost: dns queries: {}", all.summary());
+    }
+}

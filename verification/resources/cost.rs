@@ -180,6 +180,12 @@ impl Costs {
         done.value
     }
 
+    /// The bytes the session's steps have left allocated, as counted from
+    /// its start: what it holds now.
+    pub fn live(&self) -> usize {
+        usize::try_from(self.live.max(0)).unwrap_or(usize::MAX)
+    }
+
     /// Takes in another session's steps and closest calls, for a summary
     /// over many sessions.
     pub fn absorb(&mut self, other: &Costs) {
