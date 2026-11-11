@@ -111,6 +111,14 @@ impl Responder {
         self
     }
 
+    pub(in super::super) fn shared_http3_profile(
+        mut self,
+        profile: Arc<dyn super::super::Http3Profile>,
+    ) -> Self {
+        self.http3 = profile;
+        self
+    }
+
     /// HTTP/3 over an established QUIC stream carrier, with a handler on each request.
     pub fn http3(&self) -> super::super::Http3Server {
         let mut connection = super::super::Http3::new(self.limits).profile(self.http3.clone());

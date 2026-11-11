@@ -87,8 +87,9 @@
 //! [`Http3Profile`]: the SETTINGS it sends and their order, the
 //! unidirectional streams it opens, reserved frames, and a
 //! [`qpack::Policy`](fictionet::stdlib::protocols::qpack::Policy) for how
-//! it compresses fields. [`Responder::http3_profile`] chooses one for every
-//! connection. The default, [`Http3Standard`], advertises a 4096-byte QPACK
+//! it compresses fields. [`Server::http3_profile`] chooses one for a site
+//! served by [`Server::served_by`], and [`Responder::http3_profile`] for
+//! every connection a responder serves. The default, [`Http3Standard`], advertises a 4096-byte QPACK
 //! table with 16 blocked streams and inserts fields that repeat;
 //! `fictionet_extras::http3` has profiles for Cloudflare and nginx. Each
 //! connection enforces what its profile advertises. Responses reference

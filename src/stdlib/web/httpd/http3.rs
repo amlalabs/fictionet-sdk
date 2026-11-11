@@ -200,6 +200,14 @@ impl Advertised {
     }
 }
 
+impl dyn Profile + '_ {
+    /// The unidirectional streams a connection holds besides requests: the
+    /// peer's control and QPACK streams, and the profile's own.
+    pub fn unidirectional(&self) -> usize {
+        3 + self.streams().len()
+    }
+}
+
 /// The connection's profile.
 fn chosen(profile: &Option<Arc<dyn Profile>>) -> &dyn Profile {
     profile.as_deref().unwrap_or(&Standard)
@@ -415,7 +423,7 @@ impl Http3 {
         let advertised = Advertised::of(&Standard);
         Self {
             limits,
-            channels: Slots::new(streams + 6),
+            channels: Slots::new(streams + (&Standard as &dyn Profile).unidirectional()),
             exchanges: Slots::new(streams),
             initialized: false,
             connected: false,
@@ -464,6 +472,8 @@ impl Http3 {
         self.decoder = qpack::Table::new(advertised.qpack.table_capacity());
         self.qpack = advertised.qpack;
         self.advertised_fields = advertised.fields;
+        let streams = (self.limits.streams as usize).min(4096);
+        self.channels = Slots::new(streams + profile.unidirectional());
         self.profile = Some(profile);
         self
     }
@@ -490,7 +500,8 @@ impl Http3 {
             return true;
         }
         let streams = (self.limits.streams as usize).min(4096);
-        let Some(channels) = Slots::with_budget(streams + 6, budget) else {
+        let unidirectional = chosen(&self.profile).unidirectional();
+        let Some(channels) = Slots::with_budget(streams + unidirectional, budget) else {
             return false;
         };
         let Some(exchanges) = Slots::with_budget(streams, budget) else {

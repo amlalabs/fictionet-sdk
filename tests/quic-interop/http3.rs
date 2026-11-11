@@ -90,7 +90,7 @@ fn is_reserved(id: u64) -> bool {
 }
 
 /// The SETTINGS quiche received, in wire order, match what `profile` lists.
-fn sees_settings(profile: &dyn httpd::Http3Profile, received: &[(u64, u64)]) {
+pub(super) fn sees_settings(profile: &dyn httpd::Http3Profile, received: &[(u64, u64)]) {
     use stdlib::protocols::http3::setting;
     assert_eq!(received.len(), profile.settings().len(), "{received:?}");
     for (listed, &(id, value)) in profile.settings().iter().zip(received) {
