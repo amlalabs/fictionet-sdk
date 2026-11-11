@@ -409,3 +409,7 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(kani)]
+#[path = "../../../verification/quic/kani/version_negotiation.rs"]
+mod version_negotiation;
