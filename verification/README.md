@@ -81,7 +81,11 @@ layers:
    `Begin`. The model threads the store through every allocation and
    free with `Grow` and `Shrink`, in the code's order, and through every
    charge with `Reserve`, `ReserveTo` and `Release`. Then it checks three
-   invariants. `Paid`: no moment held more than was reserved. `WithinLimit`:
+   invariants. `Paid`: no moment held more than was reserved at that
+   moment; `Grow` and `Release` record the shortfall, so a step that moves
+   storage (reserve the new block, grow it, free the old one, release its
+   charge) is judged at each moment, not by its peak against the
+   reservation it ends with. `WithinLimit`:
    the reservation stays within the budget's limit. `Tracks`: the store
    holds what the model's state says, which catches a step that forgot to
    thread it. Add `EXTENDS Resources`, and give TLC
@@ -271,7 +275,45 @@ vendored rustls, each fixed with a costed test that fails before:
   record of 4,000 empty messages held 180,768 bytes against 21,346
   charged. It now cuts a message at a time (6c37525d7).
 
+The HTTP resource properties of 2026-11-10 (`http/README.md`, "Resource
+properties") found two joins that copied everything they held once a
+piece, both fixed in bf20d67f4 with a test on the counting allocator
+that fails before:
+
+- HTTP/1 head assembly, when the budget had no room to double its block,
+  took one of exactly what the delivery needed, so every later byte of a
+  head copied the head: 297 MB asked of the allocator to join 41 KB. It
+  now takes the largest block the budget has room for.
+- `Respond` grew a request body to exactly its length on every DATA
+  frame: 202 MB for 20,000 one-byte frames. It now doubles.
+
+They also found two things reported, not fixed: `ChargedBytes` growth
+holds the old allocation and the new one with only the new one charged,
+and a client that frees its budget a little before each piece can still
+make a tight head copy once a piece (known gaps below).
+
 ## Known gaps
+
+- **`ChargedBytes` grows in place, charging only the growth.**
+  `grow_to` and `grow_within` (`layer/charged.rs`) charge the difference,
+  then reallocate, so for a moment the old allocation and the new one are
+  both live with only the new one charged: up to twice what is charged,
+  for the largest buffers (a 64 MiB HTTP/2 request body growing from
+  32 MiB). HTTP/2 header blocks and request bodies grow this way
+  (`Assembly_block_chargedbytes`, `Assembly_body_chargedbytes` and the
+  Kani harness `a_collected_body_stays_within_its_charge`, in
+  `http/README.md`). Charging the new allocation whole beside the old one
+  changes what every budget must hold while a buffer grows: tried on
+  this branch, it turned three `serve_limits` HTTP/2 tests, whose budgets
+  are sized to the old accounting, from passing to failing. The same
+  holds for `ChargedDeque` and `ChargedVec` places. It is the layer
+  area's call; not changed here.
+- **A budget that frees room in step with the pieces.** A head, header
+  block or body that the budget cannot double takes the largest block
+  that fits. A client whose other connections free a little of the budget
+  before each piece makes each such block a piece larger, so each piece
+  copies the unit again (`Assembly_head_budgetmoves`). With the budget as
+  it is, a unit moves at most once more.
 
 - **Reported, not fixed.** From the models and their audit, each with its
   scenario in the area's README or VERIFICATION: `offer` in `tcp/engine.rs`

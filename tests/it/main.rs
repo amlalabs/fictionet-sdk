@@ -34,6 +34,7 @@ mod http1;
 mod http2_allocations;
 mod http2_grpc;
 mod http2_server;
+mod http_resources;
 mod httpd;
 mod industrial_codec;
 mod interactive_codec;

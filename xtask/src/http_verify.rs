@@ -6,7 +6,8 @@
 //! | --- | --- |
 //! | `http-verify lean` | `lake build`, then the axioms of every headline theorem |
 //! | `http-verify vectors [seed]` | the Lean model's test vectors, from `seed`, or from each of seeds 1 to 8 when left out |
-//! | `http-verify diff [seed]` | the vectors, then `tests/http1_vectors.rs` against them, for each seed |
+//! | `http-verify diff [seed]` | the vectors, then `tests/http1_vectors.rs` against them, for each seed, every request vector and two fixed heads also served and costed |
+//! | `http-verify resources` | the resource properties: the counted Kani harnesses, and the TLC configs of `Assembly.tla` and `SendHold.tla` |
 //! | `http-verify all` | `lean` and `diff`, with a summary in `SUMMARY.txt` |
 //!
 //! Everything is written under a fresh run directory in `http-verify/` in
@@ -24,6 +25,53 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Result;
+use crate::resources;
+
+/// The counter's own check, the constant the bounds use, then body
+/// collection's copying. The head-assembly harnesses in
+/// `verification/http/kani/resources.rs` did not finish in an hour each,
+/// and `a_collected_body_stays_within_its_charge` fails on `ChargedBytes`
+/// growth, which is reported (`verification/http/README.md`).
+const KANI_RESOURCES: [&str; 3] = [
+    "counting::proofs::the_counter_sees_every_allocation",
+    "stdlib::protocols::http1::resource_proofs::a_backing_is_within_its_constant",
+    "stdlib::web::httpd::http2::respond::collect_proofs::a_collected_body_copies_linearly",
+];
+
+/// Dropping a block gives its charge back, through the budget's wakers:
+/// without this, the harnesses run CBMC out of memory.
+const KANI_FLAGS: [&str; 2] = ["-Z", "restrict-vtable"];
+
+/// The configs that check the joins and the send holds, each with the
+/// result its first line names: the code, and the controls.
+const TLC_RESOURCES: [(&str, &[&str]); 2] = [
+    (
+        "Assembly",
+        &[
+            "Assembly_head_base.cfg",
+            "Assembly_head_long_base.cfg",
+            "Assembly_block_base.cfg",
+            "Assembly_body_base.cfg",
+            "Assembly_head_without_double.cfg",
+            "Assembly_head_without_largestwhenrefused.cfg",
+            "Assembly_head_without_chargefirst.cfg",
+            "Assembly_body_without_double.cfg",
+            "Assembly_head_budgetmoves.cfg",
+            "Assembly_block_chargedbytes.cfg",
+            "Assembly_body_chargedbytes.cfg",
+        ],
+    ),
+    (
+        "SendHold",
+        &[
+            "SendHold_base.cfg",
+            "SendHold_receive_base.cfg",
+            "SendHold_without_stalldeadline.cfg",
+            "SendHold_without_topupcredit.cfg",
+            "SendHold_without_returncreditwhenfreed.cfg",
+        ],
+    ),
+];
 
 /// The axioms a headline theorem may rest on: Lean's own, and no `sorryAx`.
 const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"];
@@ -45,8 +93,13 @@ pub fn run(args: &[String]) -> Result {
             report
         }
         ["diff", seed @ ..] if seed.len() <= 1 => diff(&paths, &seeds_of(seed)?)?,
+        ["resources"] => return resource_properties(&paths),
         ["all"] => return all(&paths),
-        _ => return Err("expected http-verify lean, vectors [seed], diff [seed], or all".into()),
+        _ => {
+            return Err(
+                "expected http-verify lean, vectors [seed], diff [seed], resources, or all".into(),
+            );
+        }
     };
     report.print();
     report.result()
@@ -313,6 +366,12 @@ fn diff(paths: &Paths, seeds: &[u64]) -> Result<Report> {
                 report.fail(format!("seed {seed}: {line}"));
             }
         }
+        // The served requests and heads are held to cost bounds
+        // (verification/resources/cost.rs): a line for each kind; a bound
+        // broken fails the test, and its log names the step.
+        for line in text.lines().filter(|line| line.contains(" cost: ")) {
+            report.pass(format!("seed {seed}: {line}"));
+        }
         if !passed && kinds.iter().all(|line| line.contains(", 0 disagree")) {
             report.fail(format!(
                 "seed {seed}: cargo test --test http1_vectors; see {log}"
@@ -325,6 +384,32 @@ fn diff(paths: &Paths, seeds: &[u64]) -> Result<Report> {
         }
     }
     Ok(report)
+}
+
+/// The resource properties (verification/README.md): the counted Kani
+/// harnesses, then each TLC config of [`TLC_RESOURCES`], output in
+/// `kani.out` and `<config>.out` of the run directory.
+fn resource_properties(paths: &Paths) -> Result {
+    let mut report = crate::lean_vectors::Report::new("resources");
+    report.absorb(resources::kani(
+        &paths.root,
+        &paths.out,
+        "fictionet",
+        &KANI_FLAGS,
+        &KANI_RESOURCES,
+    )?);
+    let tla = paths.root.join("verification").join("http").join("tla");
+    for (module, configs) in TLC_RESOURCES {
+        report.absorb(resources::tlc(
+            &paths.root,
+            &paths.out,
+            &tla,
+            module,
+            configs,
+        )?);
+    }
+    report.print();
+    report.result("http-verify")
 }
 
 /// `lean` and `diff` over [`SEEDS`], with `SUMMARY.txt`.

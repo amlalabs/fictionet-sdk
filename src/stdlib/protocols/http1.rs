@@ -588,21 +588,28 @@ impl RequestStream {
         } else {
             // A new block holds twice what is held, up to the limit, so a
             // unit that arrives in many deliveries is copied a few times,
-            // not once a delivery; when the budget has no room for that,
-            // one of just what is needed.
+            // not once a delivery. When the budget has no room for that,
+            // the largest block it has room for, if that holds what is
+            // needed: a block of just what is needed would be full again
+            // at the next delivery, and each would copy everything held.
             let need = self.input.len() + n;
             let want = need.max(2 * self.input.len()).min(self.limit());
-            let block = |size: usize| {
-                if size <= small.slot() {
-                    small.take(budget, 0)
-                } else if size <= large.slot() {
-                    large.take(budget, 0)
-                } else {
-                    fictionet::Chunk::block(budget, 0, size)
-                }
+            let block = if want <= small.slot() {
+                small.take(budget, 0)
+            } else if want <= large.slot() {
+                large.take(budget, 0)
+            } else {
+                fictionet::Chunk::block(budget, 0, want)
             };
-            let Some(mut joined) = block(want).or_else(|| (want > need).then(|| block(need))?)
-            else {
+            let Some(mut joined) = block.or_else(|| {
+                let charge = budget.charge_within(need..=want)?;
+                let bytes = vec![0; charge.bytes()];
+                Some(
+                    fictionet::Chunk::paid(bytes, charge)
+                        .expect("reserved input")
+                        .slice(0..0),
+                )
+            }) else {
                 return 0;
             };
             joined.extend_within(&self.input).expect("reserved input");
@@ -2707,6 +2714,13 @@ mod proofs;
 #[cfg(kani)]
 #[path = "../../../verification/http/kani/smuggling.rs"]
 mod smuggling_proofs;
+
+/// Counted proofs of head assembly's storage and copying (Resource
+/// properties in verification/README.md), run with `cargo kani -Z
+/// stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../verification/http/kani/resources.rs"]
+mod resource_proofs;
 
 #[cfg(test)]
 mod tests {

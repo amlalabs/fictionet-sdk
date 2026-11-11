@@ -280,19 +280,7 @@ impl Respond {
         if len.saturating_add(chunk.len()) > limits.body {
             return self.dispatch(env, Received::TooLarge);
         }
-        let room = match &mut self.body {
-            Some(body) => body.grow_to(len + chunk.len()),
-            None => {
-                self.body = ChargedBytes::with_capacity(env.budget(), chunk.len());
-                self.body.is_some()
-            }
-        };
-        if !room
-            || self
-                .body
-                .as_mut()
-                .is_none_or(|body| body.extend_within(&chunk).is_err())
-        {
+        if !collect_into(&mut self.body, &chunk, limits.body, env.budget()) {
             self.dispatch(env, Received::Budget);
         }
     }
@@ -320,26 +308,31 @@ impl Respond {
                 request,
                 &mut Exchange::new(now, env.entropy(), &responder.conn, responses.clone()),
             ),
-            Received::TooLarge => Reply::Now(text(
-                &responses,
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "The request body is too large.\n",
-            )),
-            Received::Budget => Reply::Now(text(
-                &responses,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The server cannot hold this request now.\n",
-            )),
-            Received::Timeout => Reply::Now(text(
-                &responses,
-                StatusCode::REQUEST_TIMEOUT,
-                "The request body took too long.\n",
-            )),
-            Received::CutOff => Reply::Now(text(
-                &responses,
-                StatusCode::BAD_REQUEST,
-                "The request body was cut off.\n",
-            )),
+            refused => {
+                // Nothing reads a body that was not received whole: its
+                // storage goes before the answer is made, which may need
+                // the room.
+                drop(request);
+                let (status, why) = match refused {
+                    Received::TooLarge => (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "The request body is too large.\n",
+                    ),
+                    Received::Budget => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "The server cannot hold this request now.\n",
+                    ),
+                    Received::Timeout => (
+                        StatusCode::REQUEST_TIMEOUT,
+                        "The request body took too long.\n",
+                    ),
+                    Received::CutOff => {
+                        (StatusCode::BAD_REQUEST, "The request body was cut off.\n")
+                    }
+                    Received::Complete => unreachable!("a whole request goes to the handler"),
+                };
+                Reply::Now(text(&responses, status, why))
+            }
         };
         match reply {
             Reply::Now(response) => self.made(env, response, false),
@@ -724,6 +717,34 @@ impl Job for Work {
     }
 }
 
+/// Joins `piece` to the request body collected in `body`, which with it
+/// is at most `most` bytes, in room charged to `budget` before it is
+/// allocated. Full storage grows to twice its capacity, up to `most`, or
+/// as far as the budget has room for if that is less, so a body that
+/// comes in many pieces is copied a few times, not once a piece. `false`,
+/// with the body as it was, when the budget has no room for the body and
+/// the piece.
+pub(super) fn collect_into(
+    body: &mut Option<ChargedBytes>,
+    piece: &[u8],
+    most: usize,
+    budget: &Budget,
+) -> bool {
+    use fictionet::stdlib::codec::Storage;
+    if body.is_none() {
+        *body = ChargedBytes::with_capacity(budget, piece.len());
+    }
+    let Some(body) = body else {
+        return false;
+    };
+    let need = body.len() + piece.len();
+    let want = need.max(2 * body.capacity()).min(most);
+    if need > body.capacity() && !body.grow_within(need..=want) {
+        return false;
+    }
+    body.extend_within(piece).is_ok()
+}
+
 pub(super) fn response_held(response: &Response) -> usize {
     fields_held(response.fields.len(), response.fields.octets())
 }
@@ -757,3 +778,9 @@ fn over_budget(storage: &super::super::Responses) -> Response {
         "The server cannot hold this response now.\n",
     )
 }
+
+/// Counted proofs of how a request body is collected (Resource properties
+/// in verification/README.md).
+#[cfg(kani)]
+#[path = "../../../../../verification/http/kani/collect.rs"]
+mod collect_proofs;

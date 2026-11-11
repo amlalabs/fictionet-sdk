@@ -31,6 +31,11 @@ cargo kani -p fictionet -Z stubbing --harness length_steps_follow_the_grammar
 # Rust: the table tests and the regressions for the bugs the models found.
 cargo test -p fictionet --test it -- framing_follows connect_success
 cargo test -p fictionet --lib -- a_101_without_an_upgrade_handler_closes
+
+# Resource properties (see "Resource properties" below).
+cargo xtask http-verify resources   # the counted Kani harnesses and the TLC configs
+cargo xtask http-verify diff        # the vectors, each request vector also served and costed
+cargo test -p fictionet --test it http_resources
 ```
 
 Lean 4 v4.35.0 with no Mathlib; TLC 2.19 on JDK 21; Kani 0.68.0 with
@@ -801,3 +806,220 @@ response comparison covers 200 responses with declared framing; HEAD,
 CONNECT, statuses without a body and responses with no framing follow
 other rules, covered by the response proofs above. The lenient decoder
 used for captures is not used by the server and is not checked here.
+
+## Resource properties
+
+The method is in `verification/README.md`, "Resource properties". The
+area has all three layers, over the three places that join a unit that
+arrives in pieces (an HTTP/1 head, an HTTP/2 header block, the request
+body `Respond` collects) and the storage a response and received DATA
+hold within HTTP/2's flow-control windows and the per-stream send
+deadline.
+
+```sh
+cargo xtask http-verify resources   # the Kani harnesses and the TLC configs below
+cargo xtask http-verify diff        # the vectors; every request vector also served and costed
+cargo test -p fictionet --test it http_resources
+```
+
+**What is charged.** Every block an HTTP/1 head is joined in is charged
+to the connection's budget before it is allocated: a pool slot, a block
+of its own (`Chunk::block`), or the largest block the budget has room for
+(`Budget::charge_within`); the first delivery is taken as it came and
+charged its capacity (`Chunk::repay`). An HTTP/2 header block is joined
+in `ChargedBytes` (`HeaderBlocks::join`), and `Respond` collects a body
+in `ChargedBytes` (`collect_into`). A response body goes down in chunks
+its child charged, within the credit the connection gives
+(`SEND_CREDIT`, `more_credit`); received DATA is held within the receive
+window the connection advertised.
+
+**The growth rule.** Each join replaces full storage with storage twice
+as large, up to its limit (the head limit, the block limit, the body
+limit), and when the budget has no room for that, with the largest it has
+room for, if that holds what is needed. A head or header block the
+budget has no room for waits for memory; a body ends with `503`.
+
+### TLA+
+
+`tla/Assembly.tla` is one join, threaded through a store
+(`resources/tla/Resources.tla`) in the code's order: charge the new
+block, allocate it, copy what is held, free the old block, give its
+charge back. A unit of `UnitLimit` comes in pieces of `PieceSizes`; the
+rest of the budget (another of the client's connections) takes and frees
+room between units, and within one when `BudgetMovesInUnit`. `copied`
+counts the bytes moves copy into fresh storage. Invariants:
+`AssemblyPaid` (no moment held more than was reserved then),
+`AssemblyWithinLimit`, `AssemblyTracks`, and `LinearCopy`
+(`copied <= CopyPer * received`), with `CopyPer` 2 for doubling the
+capacity (the capacities moved out of form a doubling series under twice
+the last, which the unit passed) and 3 for doubling what is held, as
+HTTP/1 does (each copy is more than twice the one two moves before).
+
+`tla/SendHold.tla` is two streams' responses and the connection's
+received DATA: the child's chunks queue within its credit, frames go
+within both send windows, the client grants or withholds window at any
+time, a clock ticks only while no stalled stream's deadline has passed
+(as `Http2::deadline` and the runner fire it), and a stream whose queue
+waited `WriteTimeout` with a closed window is reset. Invariants:
+`QueuePaid`, `QueueWithinCredit` (granted and queued at most
+`SendCredit`), `ReceivePaid`, `ReceiveWithinWindow` (what is held and
+what the client may still send at most the window), `QueuesTrack`,
+`ReceiveTracks`, and `HoldBounded` (a stalled queue waited at most
+`WriteTimeout`).
+
+| Config | Result |
+| --- | --- |
+| `Assembly_head_base` | passes: `RequestStream::push`, `UnitLimit` 12, pieces of 1 to 3, budget 24 |
+| `Assembly_head_long_base` | passes: the same a byte a delivery, `UnitLimit` 24, budget 48 |
+| `Assembly_block_base` | passes: `HeaderBlocks::join` with a floor of 2, growth charged whole |
+| `Assembly_body_base` | passes: `collect_into`, a refusal ending the body, growth charged whole |
+| `Assembly_head_without_double` | violates `LinearCopy`: the head assembly before 3271cfe52 |
+| `Assembly_head_without_largestwhenrefused` | violates `LinearCopy`: the head assembly at 3271cfe52, a block of exactly the need when doubling does not fit |
+| `Assembly_head_without_chargefirst` | violates `AssemblyPaid`: a block allocated before it is charged |
+| `Assembly_body_without_double` | violates `LinearCopy`: `Respond::collect` before bf20d67f4 |
+| `Assembly_block_chargedbytes` | violates `AssemblyPaid`, reported: `ChargedBytes` growth as it is |
+| `Assembly_body_chargedbytes` | violates `AssemblyPaid`, reported: the same for the body |
+| `Assembly_head_budgetmoves` | violates `LinearCopy`, reported: a budget that frees room before each piece |
+| `SendHold_base`, `SendHold_receive_base` | pass, depth 23 |
+| `SendHold_without_stalldeadline` | violates `HoldBounded`: no reset on the stall timer |
+| `SendHold_without_topupcredit` | violates `QueueWithinCredit`: credit per frame sent, not topped up to `SEND_CREDIT` |
+| `SendHold_without_returncreditwhenfreed` | violates `ReceiveWithinWindow`: WINDOW_UPDATE for DATA still held |
+
+Each config ran in under 20 seconds on November 10, 2026 (TLC 2.19,
+two workers); the passing ones generated 50,310 to 355,892 states.
+
+`Resources.tla`'s `Paid` used to compare a step's peak with the
+reservation it ended with. A move releases the old block's charge at its
+end, so a paid move failed it; `Paid` now records each moment's
+shortfall in `Grow` and `Release`. `HpackSync`'s five resource configs
+give their stated results with it, with the state counts of before.
+
+### Kani
+
+`kani/collect.rs`, compiled into `respond.rs`, runs `collect_into` on a
+body of eight one-byte pieces, with every allocation counted, under a
+roomy budget and one of 6 bytes, where doubling is refused at 5. The
+pieces are written out, not looped, so the unwinding bound stays at 3,
+which the budget's own loops need. `kani/resources.rs`, compiled into
+`http1.rs`, runs the production `RequestStream::push` on a head of ten
+pieces of 64 bytes, with pools of 4- and 8-byte slots and a 1 KiB head
+limit, under a roomy budget and one of 350 or 500 bytes, where doubling
+is refused past 128 or 256 bytes. All run with `-Z restrict-vtable`: a
+block dropped gives its charge back through the budget's wakers.
+
+| Harness | Bound | Result, November 10, 2026 |
+| --- | --- | --- |
+| `a_collected_body_copies_linearly` | the joins ask for at most `JOIN_PER` (4) times the bytes taken | passes, 105.3 s |
+| `a_backing_is_within_its_constant` | a one-byte chunk asks for at most its byte and `BACKING` (128) | passes, 0.1 s |
+| `the_counter_sees_every_allocation` | the counter's own check | passes, 20.8 s |
+| `a_collected_body_stays_within_its_charge` | the most live at once is at most what was live before and the body's charge at the end | fails, reported: `ChargedBytes` growth (below), 78.3 s |
+| `a_head_in_pieces_within_a_roomy_budget_copies_linearly` | the most live at once is at most what was live once the stream was made, the budget's limit, three backings and a piece; the pushes ask for at most `JOIN_PER` times the bytes taken, both slots and `HEAD_BLOCKS` (8) backings | not finished: still in CBMC's symbolic execution after an hour, at 9.7 GiB |
+| `a_head_in_pieces_within_a_tight_budget_copies_linearly` | the same | not run: it is the roomy harness with a choice of two budgets |
+
+`cargo xtask http-verify resources` runs the three that pass. The head
+harnesses stay in the file. Their first version, twenty 3-byte pieces
+looped with an unwinding bound of 22, ran out of 14 GiB; ten pieces
+written out did not finish in an hour. Each push charges and releases the
+budget, takes from its pools and drops a block, which the HPACK harnesses
+never do. The head assembly's bounds are held by the replay and the test
+instead.
+
+`JOIN_PER` is 4: the blocks a unit moves through form a doubling series
+under twice the last, the last is under twice the unit, and a block the
+budget had no room to double moves at most once more, to the largest
+that fits, also under twice the unit. `HEAD_BLOCKS` is 8: the first
+delivery, both pool slots, the doubling blocks up to the limit, and one
+more.
+
+| Mutation, in a scratch copy | Harness | Failed check |
+| --- | --- | --- |
+| `collect_into` growing to exactly its length and the piece, as `Respond::collect` did before bf20d67f4 | `a_collected_body_copies_linearly` | `collecting the body copied more than its bytes allow` (100.5 s) |
+
+### The replay
+
+`tests/http1_vectors.rs` serves every request vector with the HTTP/1
+server (`Http1` on a `Driver`, answering an empty 200), cut in the random
+pieces the differential replay uses, as one costed step
+(`resources/cost.rs`). The deliveries are made in the step, as the
+transport makes them. The budget is the pools' slots and four times the
+input. The bounds, with their constants in the test:
+
+- **Within the charge**: the most bytes live at once is at most the
+  budget's limit, plus the layer's own state (`LAYER`, 1 KiB), its
+  opening (`OPENING`: the pools' state, the rejected-request record, the
+  dates and the small pool's first slot), a backing for each of eight
+  chunks live at once, and the delivery in hand.
+- **Linear copying**: the bytes asked for are at most 5 times the input
+  (the joins' `JOIN_PER` and the deliveries' own bytes), plus a backing a
+  delivery, the layer and its opening, both head pools' slots (a head may
+  be joined in each however short it is), and for each message three
+  small slots (its field block, a copy of a head refused for its `Host`,
+  the answer's head) and 1 KiB for the answer's body, fields and record.
+
+`heads_a_byte_a_delivery` serves a head of 63,276 bytes, near the 64 KiB
+limit, a byte a delivery, within a roomy budget and one that leaves it no
+room to double past 32 KiB.
+
+`cargo xtask http-verify diff` over seeds 1 to 8 on November 10, 2026:
+every seed passes, 6,066 request cases each, none disagreeing, every
+served case within its bounds. The closest a case came to its charge was
+12,296 of 25,362 bytes; to its linear bound, 12,818 to 25,360 bytes
+against 30,042 to 46,841. The heads came to 99,961 of 103,105 bytes
+charged (the tight budget) and 6,320,262 of 8,445,148 asked.
+
+| Mutation, in a scratch copy | Failed check |
+| --- | --- |
+| `RequestStream::push` before 3271cfe52 | `heads, roomy budget`: 1,877,416,964 bytes asked for 63,276 of input, against 8,445,148; `a_head_trickled_into_a_tight_budget_is_copied_linearly`: 367,825,573 against 145,956 |
+| `RequestStream::push` at 3271cfe52 (a block of exactly the need when doubling does not fit) | `heads, tight budget`: 260,172,451 against 8,445,148; the test: 297,014,677 against 182,948 |
+
+### The bugs, fixed
+
+Both in bf20d67f4, each with a test in `tests/it/http_resources.rs` on
+the counting allocator that fails before its fix:
+
+- **A tight head copied itself once a byte.** When the budget had no room
+  to double a head's block, `RequestStream::push` took one of exactly
+  what the delivery needed, full again at the next delivery. A 58 KB head
+  sent a byte a delivery, with another connection leaving it 96 KiB,
+  asked for 297 MB to join 41 KB
+  (`a_head_trickled_into_a_tight_budget_is_copied_linearly`). It now
+  takes the largest block that fits.
+- **`Respond` grew a body a piece at a time.** `Respond::collect` grew
+  the body to exactly its length on every DATA frame: 20,000 one-byte
+  frames asked for 202 MB
+  (`a_body_in_many_data_frames_is_collected_linearly`). `collect_into`
+  now doubles. The room it holds ahead turned a 413 near a tight budget
+  into a 503 while the answer was made
+  (`serve_limits::http2_has_the_limits_budget_and_seed_of_http1`); a body
+  not received whole is now dropped before its answer is made.
+
+`tests/http1_vectors.rs` had not compiled since the buffers round
+replaced `http1::RequestHead` with `web::Head`; it now uses `Head`.
+
+### Reported, not fixed
+
+- **`ChargedBytes` growth.** `grow_to` and `grow_within` charge only the
+  growth and then reallocate, so the old and new allocations are live at
+  once with only the new charged. Header blocks and collected bodies grow
+  this way (`Assembly_block_chargedbytes`, `Assembly_body_chargedbytes`,
+  `a_collected_body_stays_within_its_charge`). Charging the new
+  allocation whole made three `serve_limits` HTTP/2 tests fail, their
+  budgets sized to the old accounting; the change belongs to
+  `layer/charged.rs` and every budget that holds a growing buffer
+  (`verification/README.md`, known gaps).
+- **A budget that moves with the pieces.** With the largest-that-fits
+  rule, a client whose other connections free a little room before each
+  piece makes each block one piece larger
+  (`Assembly_head_budgetmoves`). With the budget as it stands, a unit
+  moves at most once more.
+
+### What these checks leave out
+
+HTTP/2 has no vectors, so its joins and holds are checked by the models,
+the Kani harness on `collect_into` and the tests, not by a costed
+replay. The Kani harnesses do not reach `HeaderBlocks::join` (its growth
+is `ChargedBytes`', above) or the send queue, which `SendHold.tla`
+models. The send deadline is checked in the model and by
+`a_response_held_back_by_the_clients_window_is_reset_after_the_write_timeout`.
+The replay serves with a handler that allocates nothing; handlers' own
+storage is outside the connection's accounting.
