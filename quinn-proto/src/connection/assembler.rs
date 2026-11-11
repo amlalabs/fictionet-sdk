@@ -896,10 +896,11 @@ mod test {
                 den: 1,
                 fixed: 0,
             },
-            || Charged {
-                value: assembler.insert(0, Bytes::from_static(b"data"), 4),
-                charged: budget.used(),
-                moved: 0,
+            || {
+                Charged::new(
+                    assembler.insert(0, Bytes::from_static(b"data"), 4),
+                    budget.used(),
+                )
             },
         );
         assert!(result.is_err());
@@ -930,11 +931,7 @@ mod test {
                         assembler
                             .insert(offset, Bytes::from_static(b"x"), 1)
                             .unwrap();
-                        Charged {
-                            value: (),
-                            charged: budget.used() - before,
-                            moved: 0,
-                        }
+                        Charged::new((), budget.used() - before)
                     },
                 );
             }
@@ -949,11 +946,7 @@ mod test {
                 },
                 || {
                     assembler.reinit();
-                    Charged {
-                        value: (),
-                        charged: 0,
-                        moved: 0,
-                    }
+                    Charged::new((), 0)
                 },
             );
             assert_eq!(
@@ -995,11 +988,7 @@ mod test {
                     },
                     || {
                         assembler.insert(offset, data, size * 2).unwrap();
-                        Charged {
-                            value: (),
-                            charged: budget.used() - before,
-                            moved: 0,
-                        }
+                        Charged::new((), budget.used() - before)
                     },
                 );
             }
@@ -1016,11 +1005,7 @@ mod test {
                 },
                 || {
                     assembler.defragment();
-                    Charged {
-                        value: (),
-                        charged: 2 * size + Compacted::OVERHEAD,
-                        moved: 0,
-                    }
+                    Charged::new((), 2 * size + Compacted::OVERHEAD)
                 },
             );
             let first = assembler.read(usize::MAX, true).unwrap();
@@ -1059,11 +1044,7 @@ mod test {
             },
             || {
                 assembler.defragment();
-                Charged {
-                    value: (),
-                    charged: 0,
-                    moved: 0,
-                }
+                Charged::new((), 0)
             },
         );
         assert_eq!(assembler.buffered, 5);

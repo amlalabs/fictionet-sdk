@@ -313,11 +313,7 @@ mod tests {
                 || {
                     assert!(buffer.prepare_write());
                     buffer.write(b"x".as_slice().into());
-                    Charged {
-                        value: (),
-                        charged: budget.used() - before,
-                        moved: 0,
-                    }
+                    Charged::new((), budget.used() - before)
                 },
             );
         }
@@ -352,11 +348,7 @@ mod tests {
                 den: 1,
                 fixed: 0,
             },
-            || Charged {
-                value: buffer.prepare_write(),
-                charged: budget.used(),
-                moved: 0,
-            },
+            || Charged::new(buffer.prepare_write(), budget.used()),
         );
         assert!(!admitted);
         assert_eq!(buffer.unacked_segments.capacity(), 0);

@@ -93,10 +93,8 @@ impl Receiving {
     fn open(&mut self, costs: &mut Costs) {
         let charge = self.charge();
         let (budget, pool, capacity) = (self.budget.clone(), self.pool.clone(), self.capacity);
-        let store = costs.step(0, charge, LINEAR, || Charged {
-            value: RxStore::new(capacity, budget, &pool),
-            charged: PLACES,
-            moved: 0,
+        let store = costs.step(0, charge, LINEAR, || {
+            Charged::new(RxStore::new(capacity, budget, &pool), PLACES)
         });
         self.store = Some(store);
     }
@@ -158,14 +156,12 @@ impl Receiving {
                 }
             }
             drop(packet);
-            Charged {
-                value: (),
+            Charged::new(
+                (),
                 // What the step charged: the packet's slot, which the
                 // sender paid for, and what the store made.
-                charged: budget.used().saturating_sub(before.0)
-                    + sender.used().saturating_sub(before.1),
-                moved: 0,
-            }
+                budget.used().saturating_sub(before.0) + sender.used().saturating_sub(before.1),
+            )
         });
     }
 
@@ -179,11 +175,7 @@ impl Receiving {
                 let chunk = store.pop(want).expect("ready bytes");
                 want -= chunk.len();
             }
-            Charged {
-                value: (),
-                charged: 0,
-                moved: 0,
-            }
+            Charged::new((), 0)
         });
     }
 }
@@ -306,10 +298,8 @@ fn sending_small_writes_stays_within_its_charge() {
         let pool = Pool::new(&budget, SLOT, SEGMENTS);
         let mut costs = Costs::amortized(format!("tx, seed {seed}"));
         let charge = |budget: &Budget, app: &Budget| budget.used() + app.used() + FIXED;
-        let mut store = costs.step(0, charge(&budget, &app), LINEAR, || Charged {
-            value: TxStore::new(capacity, budget.clone(), &pool),
-            charged: PLACES,
-            moved: 0,
+        let mut store = costs.step(0, charge(&budget, &app), LINEAR, || {
+            Charged::new(TxStore::new(capacity, budget.clone(), &pool), PLACES)
         });
         for _ in 0..3000 {
             if rng.gen_range(0..3) > 0 {
@@ -323,22 +313,17 @@ fn sending_small_writes_stays_within_its_charge() {
                     let before = (budget.used(), app.used());
                     let write = Chunk::copy_of(&app, &vec![3; len]).unwrap();
                     let _ = store.push(write);
-                    Charged {
-                        value: (),
-                        charged: budget.used().saturating_sub(before.0)
+                    Charged::new(
+                        (),
+                        budget.used().saturating_sub(before.0)
                             + app.used().saturating_sub(before.1),
-                        moved: 0,
-                    }
+                    )
                 });
             } else {
                 let acked = rng.gen_range(0..=store.len());
                 costs.step(0, charge(&budget, &app), LINEAR, || {
                     store.ack(acked);
-                    Charged {
-                        value: (),
-                        charged: 0,
-                        moved: 0,
-                    }
+                    Charged::new((), 0)
                 });
             }
         }

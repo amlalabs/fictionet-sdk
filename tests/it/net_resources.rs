@@ -87,11 +87,7 @@ fn push(costs: &mut Costs, r: &mut Reassembly, f: Frag<'_>, now: Instant) -> &'s
             ),
         };
         drop(intake);
-        Charged {
-            value,
-            charged,
-            moved: 0,
-        }
+        Charged::new(value, charged)
     })
 }
 
@@ -109,11 +105,7 @@ fn expire(costs: &mut Costs, r: &mut Reassembly, now: Instant) {
     };
     costs.step(counted, Reassembly::MOST_HELD, moved, || {
         r.expire(now);
-        Charged {
-            value: (),
-            charged: 0,
-            moved: 0,
-        }
+        Charged::new((), 0)
     });
 }
 
@@ -125,11 +117,7 @@ fn expire_and_take(costs: &mut Costs, r: &mut Reassembly, now: Instant) -> usize
     while costs.step(0, Reassembly::MOST_HELD, REASSEMBLY_STEP, || {
         let first = r.take_expired();
         let charged = first.as_ref().map_or(0, handed_out);
-        Charged {
-            value: first.is_some(),
-            charged,
-            moved: 0,
-        }
+        Charged::new(first.is_some(), charged)
     }) {
         taken += 1;
     }
@@ -360,11 +348,7 @@ mod udp {
         costs.step(input, before + STACK, STEP, || {
             f(h);
             let charged = h.budget.used().saturating_sub(before);
-            Charged {
-                value: (),
-                charged,
-                moved: charged.saturating_sub(kept),
-            }
+            Charged::new((), charged).moved(charged.saturating_sub(kept))
         });
     }
 
@@ -511,10 +495,8 @@ mod dns {
                 let bytes = query(records, section);
                 let len = bytes.len();
                 let mut costs = Costs::new(format!("dns query, {records} records"));
-                let parsed = costs.step(len, holds(len), asks(len), || Charged {
-                    value: Request::parse(&bytes, Transport::Tcp),
-                    charged: 0,
-                    moved: 0,
+                let parsed = costs.step(len, holds(len), asks(len), || {
+                    Charged::new(Request::parse(&bytes, Transport::Tcp), 0)
                 });
                 let Parsed::Request(_) = &parsed else {
                     panic!("{records} records in section {section}: not a request");
@@ -584,12 +566,12 @@ mod cache {
             let budget = Budget::new(64 << 20);
             let mut costs = Costs::amortized(format!("cache, {per} a set"));
             let storage = Cache::storage(limits.max_entries).unwrap();
-            let mut cache = costs.step(storage, 0, STEP, || Charged {
-                value: Cache::new(limits, &budget).expect("room"),
-                charged: budget.used(),
-                // The maps double as they grow into that room: over all their
-                // growth they ask for it twice, once charged and once moved.
-                moved: storage,
+            let mut cache = costs.step(storage, 0, STEP, || {
+                Charged::new(Cache::new(limits, &budget).expect("room"), budget.used())
+                    // The maps double as they grow into that room: over all
+                    // their growth they ask for it twice, once charged and
+                    // once moved.
+                    .moved(storage)
             });
             for i in 0..3000u32 {
                 let before = budget.used();
@@ -608,11 +590,7 @@ mod cache {
                         truncated: false,
                     };
                     cache.insert(Instant::ZERO, offer);
-                    Charged {
-                        value: (),
-                        charged: budget.used().saturating_sub(before),
-                        moved: 0,
-                    }
+                    Charged::new((), budget.used().saturating_sub(before))
                 });
             }
             eprintln!("cost: cache, {per} a set: {}", costs.summary());

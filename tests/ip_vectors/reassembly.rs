@@ -160,22 +160,14 @@ fn reassembly_matches_the_lean_model() {
             if digits.is_empty() {
                 costs.step(r.counted(), Reassembly::MOST_HELD, EXPIRE, || {
                     r.expire(now);
-                    Charged {
-                        value: (),
-                        charged: 0,
-                        moved: 0,
-                    }
+                    Charged::new((), 0)
                 });
             } else {
                 let want = expected(&step["expect"]);
                 let got = costs.step(digits.len() / 2, Reassembly::MOST_HELD, PUSH, || {
                     let intake = r.push(Chunk::unpaid(hex(digits)), now);
                     let value = (!agrees(&intake, &want)).then(|| brief(&intake));
-                    Charged {
-                        value,
-                        charged: handed_out(&intake),
-                        moved: 0,
-                    }
+                    Charged::new(value, handed_out(&intake))
                 });
                 if let Some(got) = got {
                     problems.push(format!("got {got}, the model says {}", brief_want(&want)));
@@ -190,11 +182,7 @@ fn reassembly_matches_the_lean_model() {
                     // only the reassembly's own bytes stay counted.
                     let copy = first.as_deref().map(|f| unmeasured(|| f.to_vec()));
                     drop(first);
-                    Charged {
-                        value: copy,
-                        charged,
-                        moved: 0,
-                    }
+                    Charged::new(copy, charged)
                 });
                 let Some(first) = first else { break };
                 if let Err(e) = check_answer(&first) {

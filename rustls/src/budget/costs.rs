@@ -77,11 +77,7 @@ fn a_hello_joined_from_one_byte_records_is_moved_a_few_times() {
             }
             assert!(acceptor.accept().unwrap().is_none());
         }
-        Charged {
-            value: (),
-            charged: limit.most(),
-            moved: 0,
-        }
+        Charged::new((), limit.most())
     });
     std::println!("cost: {}", costs.summary());
 }
@@ -192,11 +188,7 @@ fn a_hello_is_charged_what_parsing_it_holds() {
                     Err((error, _)) => panic!("{name}: {error:?}"),
                 }
             };
-            Charged {
-                value: accepted,
-                charged: limit.most(),
-                moved: 0,
-            }
+            Charged::new(accepted, limit.most())
         });
         // Held while the world picks: what the hello asked for, read.
         costs.step(
@@ -210,11 +202,7 @@ fn a_hello_is_charged_what_parsing_it_holds() {
             || {
                 let hello = accepted.client_hello();
                 assert!(hello.cipher_suites().len() <= 30_001);
-                Charged {
-                    value: (),
-                    charged: 0,
-                    moved: 0,
-                }
+                Charged::new((), 0)
             },
         );
         std::println!("cost: {name}: {}", costs.summary());
@@ -247,11 +235,7 @@ fn a_record_of_many_messages_is_cut_a_message_at_a_time() {
         acceptor.read_tls(&mut rest).unwrap();
         // The hello is taken, or refused with what follows it.
         assert!(!matches!(acceptor.accept(), Ok(None)));
-        Charged {
-            value: (),
-            charged: limit.most(),
-            moved: 0,
-        }
+        Charged::new((), limit.most())
     });
     std::println!("cost: {}", costs.summary());
 }
@@ -289,11 +273,7 @@ fn session_slots_are_paid_once_and_a_session_costs_at_most_its_copy() {
         },
         || {
             let store = ServerSessionSlots::with_budget(size, limit.clone()).unwrap();
-            Charged {
-                value: store,
-                charged: limit.most(),
-                moved: 0,
-            }
+            Charged::new(store, limit.most())
         },
     );
     let paid = limit.used();
@@ -309,17 +289,18 @@ fn session_slots_are_paid_once_and_a_session_costs_at_most_its_copy() {
         let len = next(SLOT_VALUE + SLOT_KEY);
         let value = alloc::unmeasured(|| Vec::from_iter(core::iter::repeat_n(7, len)));
         let operation = next(3);
-        let held = costs.step(0, STORE + paid, SESSION, || Charged {
-            value: match operation {
-                0 => {
-                    store.put(key, value);
-                    None
-                }
-                1 => store.get(&key),
-                _ => store.take(&key),
-            },
-            charged: 0,
-            moved: 0,
+        let held = costs.step(0, STORE + paid, SESSION, || {
+            Charged::new(
+                match operation {
+                    0 => {
+                        store.put(key, value);
+                        None
+                    }
+                    1 => store.get(&key),
+                    _ => store.take(&key),
+                },
+                0,
+            )
         });
         alloc::unmeasured(|| drop(held));
         assert_eq!(limit.used(), paid, "the store was charged again");

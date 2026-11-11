@@ -453,11 +453,7 @@ fn refused_listener_admission_allocates_nothing() {
             let mut listener = Listener::new(config, epoch, None);
             let result = listener.on_event(&mut env, input).unwrap();
             assert!(matches!(result, Admit::Blocked(_)));
-            Charged {
-                value: (listener, result),
-                charged: budget.used(),
-                moved: 0,
-            }
+            Charged::new((listener, result), budget.used())
         },
     );
     drop((listener, refused));

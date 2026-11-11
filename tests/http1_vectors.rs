@@ -382,11 +382,7 @@ fn served(
         let mut driver = server(head, budget);
         let taken = deliver(&mut driver, chunks(input, ends), eof);
         drop(driver);
-        Charged {
-            value: taken,
-            charged: 0,
-            moved: 0,
-        }
+        Charged::new(taken, 0)
     })
 }
 

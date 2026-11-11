@@ -76,11 +76,7 @@ fn message_fragments_stay_within_their_charge_and_copy_linearly() {
                 den: 1,
                 fixed: 0,
             },
-            || Charged {
-                value: Messages::for_receiver(Side::Client).with_limit(LIMIT),
-                charged: 0,
-                moved: 0,
-            },
+            || Charged::new(Messages::for_receiver(Side::Client).with_limit(LIMIT), 0),
         );
         for bytes in &frames {
             let held = decoder.held();
@@ -94,11 +90,7 @@ fn message_fragments_stay_within_their_charge_and_copy_linearly() {
                 let step = decoder.decode(bytes, false);
                 // What the step hands out is the receiver's.
                 let step = step.map(|step| matches!(step, Step::Item(..)));
-                Charged {
-                    value: step,
-                    charged: payload + LIMIT,
-                    moved: 0,
-                }
+                Charged::new(step, payload + LIMIT)
             });
             assert!(step.is_ok(), "{split:?}: {step:?}");
             assert!(decoder.held() <= LIMIT, "{split:?}: held() past the limit");

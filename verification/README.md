@@ -127,8 +127,10 @@ layers:
    the session replays inside its steps. Make what the caller pays for
    before the step, such as the budget or a block sized to its bound.
    `Costs::held_charge` keeps a charge the way a holder keeps one that it
-   never gives back. A step's `Charged::moved` is what a reallocation
-   moved into storage it charged, allowed in the linear bound only.
+   never gives back. A step returns `Charged::new(value, charged)`, with
+   `charged` the bytes it charged to a budget; `.moved(n)` adds what a
+   reallocation moved into storage it charged, allowed in the linear
+   bound only.
    `Costs::amortized` holds the linear bound over a session's steps
    together, for a holder that copies each byte a bounded number of
    times but not in the step that brought it (a store joining blocks).

@@ -278,11 +278,7 @@ fn costed<T>(
     let value = costs.step(input, held, replaced, || {
         let value = step(server);
         let kept = server.held().saturating_sub(held);
-        Charged {
-            value,
-            charged: own + kept,
-            moved: 0,
-        }
+        Charged::new(value, own + kept)
     });
     assert!(
         server.held() <= server.most_held(),
@@ -312,11 +308,7 @@ fn replay(trace: &str, strict: bool, ext: bool, costs: &mut Costs) -> bool {
         let mut server = Transport::new(host, server_id.clone());
         server.seed([19; 32]).unwrap();
         let charged = server.most_held();
-        Charged {
-            value: server,
-            charged,
-            moved: 0,
-        }
+        Charged::new(server, charged)
     });
     let mut client = Client {
         id: Identification::new("2.0", "client", None).unwrap(),
