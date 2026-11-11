@@ -192,18 +192,20 @@ fn server_initial_matches_rfc9369_a3_and_decodes_at_the_client() {
 #[test]
 fn retry_matches_rfc9369_a4_and_is_bound_to_its_version() {
     let odcid = ConnectionId::new(&ODCID);
-    let (sealed, tag) = RETRY.split_at(RETRY.len() - 16);
-    assert_eq!(retry_tag(QUIC_V2, &odcid, sealed).unwrap(), tag);
+    let mut tagged = RETRY[..RETRY.len() - 16].to_vec();
+    retry::tag_in_place(&mut tagged, 0, &odcid, |pseudo| {
+        retry_tag(QUIC_V2, pseudo).unwrap()
+    });
+    assert_eq!(tagged, RETRY);
 
     let (header, token_and_tag) = RETRY.split_at(15);
-    assert!(is_valid_retry(QUIC_V2, &odcid, header, token_and_tag));
-    assert!(!is_valid_retry(QUIC_V1, &odcid, header, token_and_tag));
-    assert!(!is_valid_retry(
-        QUIC_V2,
-        &ConnectionId::new(&SERVER_CID),
-        header,
-        token_and_tag
-    ));
+    let valid = |version, odcid: &ConnectionId| {
+        let mut pseudo = retry::PseudoPacket::new(None, odcid, header, token_and_tag).unwrap();
+        is_valid_retry(version, pseudo.bytes_mut())
+    };
+    assert!(valid(QUIC_V2, &odcid));
+    assert!(!valid(QUIC_V1, &odcid));
+    assert!(!valid(QUIC_V2, &ConnectionId::new(&SERVER_CID)));
 
     // Type bits 0 are Retry in version 2 and Initial in version 1.
     let decoded = ProtectedHeader::decode(

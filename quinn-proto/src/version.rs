@@ -329,3 +329,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(kani)]
+#[path = "../../verification/quic/kani/version_storage.rs"]
+mod version_storage_proofs;

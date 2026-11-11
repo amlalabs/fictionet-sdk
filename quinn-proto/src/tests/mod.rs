@@ -33,6 +33,7 @@ use util::*;
 
 mod token;
 mod version;
+mod version_budget;
 
 #[test]
 fn tls_checks_authenticated_version_information_in_both_roles() {

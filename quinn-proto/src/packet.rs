@@ -2,6 +2,7 @@ use std::{cmp::Ordering, io, ops::Range, str};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+pub(crate) mod retry;
 #[cfg(all(test, feature = "rustls-ring"))]
 pub(crate) mod rfc9369_vectors;
 mod storage;

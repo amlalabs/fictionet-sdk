@@ -27,7 +27,7 @@ fn version_information_validates_all_versions_and_the_peer_role() {
 }
 
 counted_proof! {
-    #[kani::unwind(4)]
+    #[kani::unwind(10)]
     fn version_information_body_checks_the_connection_without_allocating() {
         let bytes: [u8; 12] = kani::any();
         let connection: u32 = kani::any();
@@ -54,7 +54,7 @@ counted_proof! {
 }
 
 counted_proof! {
-    #[kani::unwind(3)]
+    #[kani::unwind(10)]
     fn version_information_checks_the_connection_without_allocating() {
         let bytes: [u8; 12] = kani::any();
         let connection: u32 = kani::any();

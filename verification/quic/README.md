@@ -1751,3 +1751,218 @@ run, and the code was restored.
 
 All 387 engine library tests pass after the fix. Clippy with warnings
 denied and the formatting check pass on the engine.
+
+## QUIC version two: resource proofs
+
+This section covers what version two and version negotiation hold and
+copy, using the method in
+[`verification/README.md`](../README.md#resource-properties). Every key
+derivation they add is charged to the connection's reassembly budget
+before it starts. A charge is given back only after the storage it paid
+for is freed. A server's Retry and Version Negotiation packets are
+written into its send buffer. Version Information and the version rules
+allocate nothing. When a budget refuses a charge, only the packet that
+needed it is lost, and the attempt goes on. This section replaces the
+Resources notes under [QUIC version two](#quic-version-two).
+
+### What is charged
+
+| Path | Storage | Charge |
+| --- | --- | --- |
+| Client tries an offered version (`prepare_other_initial`) | that version's Initial keys | `initial_keys_charge`, held while the keys are kept |
+| Server upgrades (`Endpoint::compatible_upgrade`) | the original version's Initial keys, kept until a Handshake packet in the new version | `initial_keys_charge`, held while the keys are kept |
+| Client restarts after Version Negotiation (`restart_in_version`) | the new version's Initial keys, beside the old ones | `initial_keys_charge`, until the old keys are freed |
+| Client follows a Retry | the copy the tag is checked over (`packet/retry.rs` `PseudoPacket`), then the new Initial keys | the copy's length, then `initial_keys_charge` |
+| Server sends a Retry (`Endpoint::retry`) | the token and the Retry Pseudo-Packet | none: both are built in the send buffer |
+| Server sends Version Negotiation (`write_version_negotiation`) | the packet | none: it is written in the send buffer |
+| Version Information, first-flight reading, version choice | none | none |
+
+`crypto::Session::initial_keys_charge` and the same method of
+`crypto::ServerConfig` give the most heap a derivation of Initial keys
+holds at once. For rustls this is the four keys and two HKDF expanders:
+rustls' `Keys::initial` holds the expander of the Initial secret while
+each direction's `KeyBuilder` holds one more. `InitialSuite` measures
+both sizes once, when a configuration is made.
+
+`OtherInitial::derive` charges first and derives only after the charge
+is granted. `OtherInitial::install` puts tried keys in place of the
+current ones. It frees the old keys first, then releases the charge.
+The fields of `OtherInitial` drop in order, so its keys are always freed
+before its charge is released.
+
+A refused charge loses only the packet that needed it. A client that
+cannot try an offered version drops that server Initial. The server sends
+it again, and the client tries again once the budget has room. A server
+that cannot pay for the original keys keeps the client's version, as RFC
+9368 allows. When a Version Negotiation packet or a Retry cannot be
+processed for lack of budget, it is treated as lost:
+`Connection::unprocess_packet` takes it out of the count of processed
+packets. Otherwise, under RFC 9000 sections 6.2 and 17.2.5.2, the client
+would ignore every later one.
+
+### Found and fixed
+
+- The charge for another version's keys was `Keys::heap_size`, the size
+  of the keys alone: 1728 bytes with ring. A derivation holds 2032 bytes
+  at its peak, because HKDF expanders are live beside the keys while
+  they are built. The client's tried keys and the server's retained keys
+  were allocated past their charge. The charge is now
+  `initial_keys_charge`: the keys and two expanders, 2096 bytes with ring.
+  The replay below fails with the old charge.
+- `adopt_tried_version` dropped the tried keys' charge before it replaced
+  the original keys. For a moment both sets were held while only one was
+  charged. It now calls `OtherInitial::install`.
+- A restart after Version Negotiation and a followed Retry derived new
+  Initial keys while the old ones were still held, with nothing charged.
+  Both now take a `KeyCharge` first and give it back once the old keys
+  are freed. A refusal ignores the packet.
+- A client checking a Retry copied the whole packet into an uncharged
+  `Vec` (`is_valid_retry`). The copy is now a `PseudoPacket` that is
+  charged before it is allocated. `crypto::Session::is_valid_retry` now
+  takes the Pseudo-Packet.
+- A server Retry allocated its token, the token's boxed AEAD key and a
+  copy of the packet for the tag. Each grew with the input, and none was
+  charged. `Token::encode_into` now seals the token in place in the send
+  buffer. `HandshakeTokenKey::{seal, open}` replace the boxed
+  `AeadKey`, and the token key lives on the stack. `retry::tag_in_place`
+  rotates the Original Destination Connection ID in front of the packet
+  inside the buffer to compute the tag, then rotates it back.
+  `crypto::ServerConfig::retry_tag` takes the Pseudo-Packet. A returned
+  token is opened in a stack buffer of `Token::MAX_ENCODED` bytes. A
+  longer token cannot be one this server sealed, so it is refused before
+  any copy.
+- The counted Kani harnesses for Version Information parsing,
+  `version_information_body_checks_the_connection_without_allocating`
+  and `version_information_checks_the_connection_without_allocating`,
+  failed their unwinding assertions. `VersionList::push` scans the eight
+  known versions, which their bounds of 4 and 3 did not cover. Both
+  bounds are now 10. The correctness harness beside them,
+  `version_information_validates_all_versions_and_the_peer_role`, has the
+  same bound of 4 and is left to the correctness proofs.
+- A token whose issue time overflows `SystemTime` panicked in
+  `Token::decode`. The masking stand-in key in Kani reached it. With the
+  real key, only a token this server sealed gets that far. Decode now
+  refuses such a token, and `a_token_issued_past_the_end_of_time_is_refused`
+  seals one under the real key.
+
+### Kani (`kani/negotiation_storage.rs`, `retry_storage.rs`, `version_negotiation_storage.rs`, `token_storage.rs`, `first_flight_storage.rs`, `version_storage.rs`)
+
+These are counted harnesses (`counted_proof!`), run with `-Z stubbing -Z
+c-ffi -Z mem-predicates -Z restrict-vtable`. Kani cannot run ring, so the
+keys in `negotiation_storage.rs` are fixed 32-byte stand-ins. Each one
+asserts, when it is freed, that its charge is still held. The token key
+in `token_storage.rs` is a masking stand-in for the AEAD that checks its
+tag. The real derivation's peak is bounded by the replay below.
+
+| Harness | States | Verdict | Control (scratch edit), result |
+| --- | --- | --- | --- |
+| `other_initial_keys_are_charged_before_they_are_derived` | with a budget one byte short, nothing is derived or allocated; with room, peak and bytes asked ≤ the charge, and every key is freed while its charge is held | passes | derive before charging: fails ("a key outlived its charge"); `OtherInitial`'s charge field before its keys: fails, same check |
+| `installed_keys_free_the_old_ones_before_the_charge_goes` | `install` frees the replaced keys while the charge is held; peak ≤ two key sets | passes | release the charge first: fails, same check |
+| `a_key_charge_is_all_or_nothing` | a `KeyCharge` holds all of its bytes or none, and returns them | passes | ignore a refusal: fails |
+| `negotiation_decisions_allocate_nothing` | reading a Version Negotiation list, `react`, `admit` and `decodable` ask for 0 bytes | passes | `react` copies the supported list: fails |
+| `a_server_tags_a_retry_in_its_send_buffer` | 0 bytes asked; the tag covers the Pseudo-Packet; the packet is left unchanged, then the tag | passes | copy the packet for the tag: fails |
+| `a_client_copies_a_retry_only_within_its_charge` | a refusal asks for 0 bytes; otherwise peak ≤ the charge and bytes ≤ 1 × Retry + 21 | passes | allocate before charging: fails |
+| `version_negotiation_is_written_in_the_send_buffer` | 0 bytes asked; IDs swapped, a greasing version, then the supported ones | passes | copy the version list: fails |
+| `a_retry_token_is_sealed_in_place` | 0 bytes asked, at most `MAX_ENCODED` bytes of the buffer used, and the token opens again | passes | copy the nonce to the heap: fails |
+| `a_returned_token_never_allocates` | any returned token of up to `MAX_ENCODED + 1` bytes asks for 0 bytes; a longer one is refused | passes | open it in heap storage: fails |
+| `the_transport_parameter_offer_is_read_in_place` | the offer is read with 0 bytes asked and found exactly when valid | passes | the reader allocates: fails |
+| `version_choices_allocate_nothing` | `VersionList::known`, `compatible_with`, `select_compatible` and `negotiation_was_genuine` ask for 0 bytes | passes | `select_compatible` copies its preference: fails |
+| `version_information_is_encoded_in_place` | `TransportParameters::write` with Version Information asks for 0 bytes | passes | copy the available list: fails |
+| `version_information_body_checks_the_connection_without_allocating` (existing, bound raised) | `read_version_information` asks for 0 bytes | passes | allocate in the decoder: fails |
+| `version_information_checks_the_connection_without_allocating` (existing, bound raised) | the same, through `TransportParameters::read_for_version` | no verdict: CBMC ran out of 10 GiB at bound 10 | none |
+| `the_counter_sees_every_allocation` | the counter's own check | passes | none |
+
+Two earlier forms of these harnesses also ran out of 10 GiB, and the
+harnesses above replace them. One was a token round trip with every field
+symbolic. The other was the whole first-flight reader over symbolic CRYPTO
+frames, on a 69-byte ClientHello and on 8 to 24 arbitrary bytes. The
+replay `version::first_flight::tests::the_reader_allocates_nothing_on_any_first_flight`
+costs the whole reader instead. It covers 170 payloads: a whole offer,
+shuffled frames, every truncation and every flipped byte. Each asks for
+0 bytes.
+
+### TLA+ (`tla/VersionResources.tla`)
+
+The model has one client connection and one server connection. Each
+threads a store through `Resources.tla`, in the code's order. The steps
+are: trying an offered version, adopting it, dropping tried keys,
+settling, restarting after Version Negotiation, copying and checking a
+Retry and deriving its keys, a server accepting with or without
+retaining keys, and dropping them. The rest of each connection takes and
+frees budget between steps, so any charge can be refused. `Resources.tla`
+compares a step's peak with what is reserved at the step's end. A charge
+given back after the storage it paid for is freed therefore starts a step
+of its own (`ClientRelease`, `ServerRelease`). A release inside a step
+would hide the storage it paid for. Units are K = 2 (a key set), T = 1
+(the expanders), P = 1 (a Retry copy), with a limit of 5.
+
+| Config | Must | Result |
+| --- | --- | --- |
+| `VersionResources_base` | pass `ClientPaid`, `ServerPaid`, `ClientWithinLimit`, `ServerWithinLimit`, `ClientTracks`, `ServerTracks` | passes, 7,584 distinct states |
+| `_without_chargefirst` | violate `ClientPaid`: keys derived, then the budget refuses | violated by `ClientTry` |
+| `_without_coverderivation` | violate `ClientPaid`: the charge is the keys' size alone (the bug fixed above) | violated by `ClientTry` |
+| `_without_freefirst` | violate `ServerPaid`: the charge is released before the keys are freed | violated by `ServerDrop` |
+| `_without_chargerederive` | violate `ClientPaid`: a restart derives beside the old keys uncharged | violated by `ClientRestart` |
+| `_without_chargeretrycopy` | violate `ClientPaid`: the Retry copy is uncharged | violated by `ClientRetryCopy` |
+| `_without_honorrefusal` | violate `ClientWithinLimit`: a charge goes on past a refusal | violated by `ClientTry` |
+| `_reaches_refusal` | violate `NeverRefused` | violated |
+| `_reaches_upgrade` | violate `NeverUpgradedWithRetry`: a client follows a Retry and adopts version 2 while a server retains keys | violated |
+| `_reaches_restart` | violate `NeverRestartedAfterRefusal` | violated |
+
+### Replays and tests
+
+- `crypto::rustls::tests::initial_key_derivations_stay_within_their_charge`
+  covers 18 real derivations through the counting allocator: drafts,
+  version 1 and version 2, both sides, and connection IDs of 0, 8 and 20
+  bytes. Each holds at most its charge. Each asks for at most the charge
+  plus one expander, since three expanders are made but only two live at
+  once. Closest: 2032 of 2096 bytes held, 2280 of 2280 bytes asked for.
+- `tests::version_budget::a_server_retry_allocates_nothing_beyond_its_buffer`
+  costs `Endpoint::retry` for versions 1 and 2 with nothing allowed. It
+  passes: 0 bytes asked for.
+- `tests::version_budget` also runs two engines with a budget that has
+  room for everything but one charge: one byte short of
+  `initial_keys_charge`, or no room at all for the Retry copy. A server
+  that cannot pay for retained keys completes in version 1. A client that
+  cannot try version 2 holds nothing more and stays in version 1. Once
+  the budget frees, the server's next Initial completes the handshake in
+  version 2. A client that cannot restart ignores Version Negotiation,
+  then restarts on the next one. A client that cannot check or follow a
+  Retry discards it, then follows the next one. All five pass.
+- `packet::retry::tests` checks the Pseudo-Packet layout and its charge.
+  The RFC 9369 Appendix A.4 Retry vector now runs through
+  `tag_in_place` and `PseudoPacket`.
+
+Scratch controls for the replays and tests, each reverted:
+
+- Charging the keys' size alone (`initial_keys_charge` without the
+  expanders) fails `initial_key_derivations_stay_within_their_charge`:
+  2032 bytes held against a charge of 1728.
+- Making `unprocess_packet` do nothing fails the Version Negotiation and
+  Retry budget tests. The client ignores every later packet.
+- Copying the packet for the server's tag fails
+  `a_server_retry_allocates_nothing_beyond_its_buffer`.
+- Ignoring a refused `KeyCharge` fails the four budget tests that need a
+  refusal.
+- The old decode of a token's time fails
+  `a_token_issued_past_the_end_of_time_is_refused`: it panics.
+- In `VersionResources.tla`, each `_without_` config above is a control,
+  and each violates the invariant it names.
+
+### Not covered
+
+- A restart after Version Negotiation starts a new TLS session. The TLS
+  session is outside the budget on every path, version 1 included.
+  `initial_keys_charge` covers only the Initial keys.
+- `initial_keys_charge` is measured from the rustls provider's types.
+  That two expanders at most are live comes from reading rustls'
+  `Keys::initial` and `KeyBuilder`. The replay confirms it for ring.
+- The Kani harnesses use stand-in keys and a stand-in token AEAD. The
+  real derivation is bounded only by the replay.
+- `cargo xtask quic-verify resources` runs the harnesses that passed
+  above and the ten configs. Its Kani step runs in a 16 GiB scope, as for
+  HPACK. The verdicts recorded here come from the same harnesses and
+  flags, run one at a time in a 10 GiB scope, and from TLC run by hand on
+  each config. The command itself has not been run end to end.
+- `version_information_checks_the_connection_without_allocating` has no
+  verdict, and `quic-verify` leaves it out.

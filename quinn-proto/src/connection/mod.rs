@@ -23,8 +23,8 @@ use crate::{
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
-        FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, LongType, Packet,
-        PacketNumber, PartialDecode, SpaceId,
+        retry::PseudoPacket, FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket,
+        LongType, Packet, PacketNumber, PartialDecode, SpaceId,
     },
     range_set::ArrayRangeSet,
     shared::{
@@ -61,6 +61,7 @@ mod packet_crypto;
 use packet_crypto::{PrevCrypto, ZeroRttCrypto};
 
 mod negotiation;
+use negotiation::KeyCharge;
 use negotiation::{Admission, LongKind, Reaction};
 pub(crate) use negotiation::{Negotiation, OtherInitial};
 
@@ -2361,9 +2362,17 @@ impl Connection {
         self.retry_src_cid.unwrap_or(self.initial_dst_cid)
     }
 
+    /// Treat the Retry or Version Negotiation packet being handled as lost:
+    /// the budget could not pay to process it. A client discards these
+    /// only after it processed another packet (RFC 9000 sections 6.2 and
+    /// 17.2.5.2), so a later one is still processed.
+    fn unprocess_packet(&mut self) {
+        self.total_authed_packets -= 1;
+    }
+
     /// Hold a client's Initial keys for `version`, which the server may have
-    /// switched to, charging their storage first. Returns false, dropping the
-    /// packet, when the budget refuses them.
+    /// switched to, charging their derivation first. Returns false, dropping
+    /// the packet, when the budget refuses them.
     fn prepare_other_initial(&mut self, version: u32) -> bool {
         if self
             .negotiation
@@ -2373,29 +2382,23 @@ impl Connection {
         {
             return true;
         }
-        let Some(current) = self.spaces[SpaceId::Initial].crypto.as_ref() else {
+        if self.spaces[SpaceId::Initial].crypto.is_none() {
             return false;
-        };
-        let charge = match &self.reassembly_budget {
-            Some(budget) => match budget.charge(current.heap_size()) {
-                Some(charge) => Some(charge),
-                None => {
-                    debug!("no budget for the Initial keys of another version");
-                    return false;
-                }
-            },
-            None => None,
-        };
+        }
         // Release the previous candidate before deriving another.
         self.negotiation.other = None;
-        let Ok(keys) = self
-            .crypto
-            .initial_keys(version, &self.initial_key_cid(), Side::Client)
-        else {
-            return false;
-        };
-        self.negotiation.other = Some(OtherInitial::new(version, keys, charge));
-        true
+        let cid = self.initial_key_cid();
+        let crypto = &self.crypto;
+        self.negotiation.other = OtherInitial::derive(
+            version,
+            self.reassembly_budget.as_ref(),
+            crypto.initial_keys_charge(),
+            || crypto.initial_keys(version, &cid, Side::Client),
+        );
+        if self.negotiation.other.is_none() {
+            debug!("no budget for the Initial keys of another version");
+        }
+        self.negotiation.other.is_some()
     }
 
     /// Adopt the version of a server Initial that authenticated under the
@@ -2405,22 +2408,39 @@ impl Connection {
         if admission != Admission::Try {
             return Ok(());
         }
-        let Some(OtherInitial { version, keys, .. }) = self.negotiation.other.take() else {
+        let Some(other) = self.negotiation.other.take() else {
             unreachable!("a tried packet has tried keys");
         };
-        self.crypto
-            .set_negotiated_version(version)
-            .map_err(|_| TransportError::INTERNAL_ERROR("TLS refused the negotiated version"))?;
+        if self.crypto.set_negotiated_version(other.version).is_err() {
+            return Err(TransportError::INTERNAL_ERROR(
+                "TLS refused the negotiated version",
+            ));
+        }
+        // The tried keys take the place of the original ones, which are freed
+        // before the tried keys' charge is released.
+        let version = other.install(&mut self.spaces[SpaceId::Initial].crypto);
         debug!(version, "the server negotiated a compatible version");
         self.version = version;
         self.negotiation.settled = true;
-        self.spaces[SpaceId::Initial].crypto = Some(keys);
         Ok(())
     }
 
     /// Start a new first flight in `version` after a Version Negotiation
     /// packet (RFC 9368 section 2.1). Nothing sent so far belongs to it.
+    /// When the budget refuses the new Initial keys, the packet is ignored
+    /// and the attempt goes on in its version.
     fn restart_in_version(&mut self, now: Instant, version: u32) -> Result<(), ConnectionError> {
+        // Tried keys are of no use to a new first flight; they go first.
+        self.negotiation.other = None;
+        // The new keys are derived while the old ones are held.
+        let Some(charge) = KeyCharge::take(
+            self.reassembly_budget.as_ref(),
+            self.crypto.initial_keys_charge(),
+        ) else {
+            debug!("no budget to start again after Version Negotiation");
+            self.unprocess_packet();
+            return Ok(());
+        };
         let negotiation = Negotiation::client(
             version,
             self.negotiation.preference,
@@ -2456,6 +2476,7 @@ impl Connection {
             next_packet_number,
             ..PacketSpace::new(now)
         };
+        drop(charge);
         if self.zero_rtt_enabled {
             // 0-RTT of the abandoned attempt was never read.
             self.zero_rtt_enabled = false;
@@ -2703,25 +2724,48 @@ impl Connection {
                     return Err(TransportError::PROTOCOL_VIOLATION("client sent Retry").into());
                 }
 
-                if self.total_authed_packets > 1
-                            || packet.payload.len() <= 16 // token + 16 byte tag
-                            || !self.crypto.is_valid_retry(
-                                version,
-                                &self.rem_cids.active(),
-                                &packet.header_data,
-                                &packet.payload,
-                            )
-                {
+                // - After the client has received and processed an Initial or Retry
+                //   packet from the server, it MUST discard any subsequent Retry
+                //   packets that it receives.
+                // - A client MUST discard a Retry packet with a zero-length Retry Token
+                //   field.
+                if self.total_authed_packets > 1 || packet.payload.len() <= 16 {
                     trace!("discarding invalid Retry");
-                    // - After the client has received and processed an Initial or Retry
-                    //   packet from the server, it MUST discard any subsequent Retry
-                    //   packets that it receives.
-                    // - A client MUST discard a Retry packet with a zero-length Retry Token
-                    //   field.
-                    // - Clients MUST discard Retry packets that have a Retry Integrity Tag
-                    //   that cannot be validated
                     return Ok(());
                 }
+                // - Clients MUST discard Retry packets that have a Retry Integrity Tag
+                //   that cannot be validated
+                //
+                // The tag covers a copy of the packet, which is charged first. A
+                // Retry the budget cannot pay for is discarded like a lost one.
+                let Some(mut pseudo) = PseudoPacket::new(
+                    self.reassembly_budget.as_ref(),
+                    &self.rem_cids.active(),
+                    &packet.header_data,
+                    &packet.payload,
+                ) else {
+                    debug!("no budget to check a Retry");
+                    self.unprocess_packet();
+                    return Ok(());
+                };
+                if !self.crypto.is_valid_retry(version, pseudo.bytes_mut()) {
+                    trace!("discarding invalid Retry");
+                    return Ok(());
+                }
+                drop(pseudo);
+                // A Retry answers the original version; keys tried for another
+                // are of no use, and go first.
+                self.negotiation.other = None;
+                // The Initial keys for the new connection ID are derived while
+                // the old ones are held.
+                let Some(charge) = KeyCharge::take(
+                    self.reassembly_budget.as_ref(),
+                    self.crypto.initial_keys_charge(),
+                ) else {
+                    debug!("no budget for the Initial keys after a Retry");
+                    self.unprocess_packet();
+                    return Ok(());
+                };
 
                 trace!("retrying with CID {}", rem_cid);
                 let client_hello = state.client_hello.take().unwrap();
@@ -2734,7 +2778,6 @@ impl Connection {
                     self.on_packet_acked(now, info);
                 };
 
-                self.negotiation.other = None;
                 let keys = self
                     .crypto
                     .initial_keys(self.version, &rem_cid, self.side.side())
@@ -2748,6 +2791,7 @@ impl Connection {
                     crypto_offset: client_hello.len() as u64,
                     ..PacketSpace::new(now)
                 };
+                drop(charge);
                 self.spaces[SpaceId::Initial]
                     .pending
                     .crypto
