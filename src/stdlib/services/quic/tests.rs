@@ -97,6 +97,9 @@ struct Peer {
     driver: Driver<QuicLayer>,
     address: SocketAddr,
     events: Vec<Event>,
+    /// The first byte and version of each long header datagram this peer
+    /// sent, in order
+    long_headers: Vec<(u8, u32)>,
 }
 
 impl Peer {
@@ -145,16 +148,59 @@ impl Pair {
     fn with_datagrams(datagrams: bool) -> Self {
         let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(7)));
         let (client, server, endpoint) = configs(entropy.clone(), datagrams);
+        Self::build(
+            entropy,
+            client,
+            server,
+            endpoint.clone(),
+            endpoint,
+            AddressValidation::Accept,
+        )
+    }
+
+    /// A pair whose client offers `preferred` with a first flight in
+    /// `version`, and whose server accepts `server_versions`, most
+    /// preferred first
+    fn versions(
+        version: u32,
+        preferred: &[u32],
+        server_versions: &[u32],
+        validation: AddressValidation,
+    ) -> Self {
+        let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(7)));
+        let (mut client, server, endpoint) = configs(entropy.clone(), false);
+        client
+            .version(version)
+            .preferred_versions(VersionList::new(preferred).unwrap());
+        let mut server_endpoint = (*endpoint).clone();
+        server_endpoint.supported_versions(server_versions.to_vec());
+        Self::build(
+            entropy,
+            client,
+            server,
+            endpoint,
+            Arc::new(server_endpoint),
+            validation,
+        )
+    }
+
+    fn build(
+        entropy: Arc<dyn Entropy>,
+        client: ClientConfig,
+        server: ServerConfig,
+        client_endpoint: Arc<EndpointConfig>,
+        server_endpoint: Arc<EndpointConfig>,
+        validation: AddressValidation,
+    ) -> Self {
         let epoch = std::time::Instant::now();
         let address: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-        let make = |server, client: Option<ClientConfig>| {
+        let make = |endpoint: Arc<EndpointConfig>, server, client: Option<ClientConfig>| {
             let budget = Budget::new(8 << 20);
             let mut observe = Observations::new(0);
             let mut env = Env::new(Instant::ZERO, entropy.as_ref(), &budget, &mut observe);
-            let mut layer = QuicLayer::new(&mut env, endpoint.clone(), server, epoch, 16, |_| {
-                0u32.into()
-            })
-            .unwrap();
+            let mut layer = QuicLayer::new(&mut env, endpoint, server, epoch, 16, |_| 0u32.into())
+                .unwrap()
+                .with_address_validation(validation);
             if let Some(client) = client {
                 layer
                     .connect(&mut env, client, address, "localhost")
@@ -164,14 +210,16 @@ impl Pair {
         };
         Self {
             client: Peer {
-                driver: make(None, Some(client)),
+                driver: make(client_endpoint, None, Some(client)),
                 address: "127.0.0.1:4444".parse().unwrap(),
                 events: Vec::new(),
+                long_headers: Vec::new(),
             },
             server: Peer {
-                driver: make(Some(Arc::new(server)), None),
+                driver: make(server_endpoint, Some(Arc::new(server)), None),
                 address,
                 events: Vec::new(),
+                long_headers: Vec::new(),
             },
         }
     }
@@ -185,6 +233,12 @@ impl Pair {
         };
         assert!(datagram.wants_completion());
         assert_eq!(*datagram.meta(), to.address);
+        if let [first, a, b, c, d, ..] = *datagram.payload()
+            && first & 0x80 != 0
+        {
+            from.long_headers
+                .push((first, u32::from_be_bytes([a, b, c, d])));
+        }
         if !drop {
             let (payload, _) = datagram.into_parts();
             assert!(matches!(
@@ -1130,3 +1184,5 @@ fn required_stream_exhaustion_closes_with_the_callers_error() {
     assert!(pair.server.events.iter().any(|event| matches!(event,
         MuxEvent::Control(ControlEvent::Lost(quinn_proto::ConnectionError::ApplicationClosed(error))) if error.error_code == code)));
 }
+
+mod versions;
