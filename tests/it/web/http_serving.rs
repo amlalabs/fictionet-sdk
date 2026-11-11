@@ -1132,3 +1132,93 @@ async fn forwarding_bypasses_a_world_host_at_the_upstream_address() {
     server.abort();
     result.unwrap();
 }
+
+/// A site that serves HTTP/3 says so in its HTTPS responses, over HTTP/1.1
+/// and HTTP/2, as real sites do. One left without HTTP/3, or whose
+/// certificate is picked later than a QUIC handshake can wait, says
+/// nothing, and neither does plain HTTP.
+#[test]
+fn https_responses_advertise_http3_when_the_site_serves_it() {
+    use fictionet::stdlib::web::httpd;
+    use fictionet::stdlib::world::net::{Host, Net};
+    run_world::world(Duration::from_secs(60), |fcx| async move {
+        let date = SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000);
+        let certs = certs(&fcx, &["h3.test", "tcp.test", "later.test"]);
+        let roots = Arc::new(certs.roots);
+        let key = Arc::new(tls::CertifiedKey {
+            chain: certs.chain,
+            key: certs.key,
+        });
+        let page = || {
+            httpd::Server::new(fictionet_test_support::handler(
+                |_: &mut httpd::Exchange<'_>, request: Request<Bytes>| {
+                    let mut response = Response::new(Bytes::from_static(b"page"));
+                    if request.uri().path() == "/own" {
+                        response
+                            .headers_mut()
+                            .insert("alt-svc", http::HeaderValue::from_static("clear"));
+                    }
+                    response
+                },
+            ))
+        };
+        let h3: IpAddr = "203.0.113.20".parse()?;
+        let tcp_only: IpAddr = "203.0.113.21".parse()?;
+        let later: IpAddr = "203.0.113.22".parse()?;
+        let (now, without, picked_later) = (key.clone(), key.clone(), key.clone());
+        let (attacher, attachments) = fictionet::attachments();
+        Net::new(fictionet_extras::network::cdn_pools())
+            .add_host(
+                page()
+                    .tls_with(move |_| now.clone())
+                    .plain_http()
+                    .served_by(Host::new("h3").dns_name("h3.test").at(h3)),
+            )
+            .add_host(
+                page()
+                    .tls_with(move |_| without.clone())
+                    .without_http3()
+                    .served_by(Host::new("tcp").dns_name("tcp.test").at(tcp_only)),
+            )
+            .add_host(
+                page()
+                    .tls_when(move |_| std::future::ready(picked_later.clone()))
+                    .served_by(Host::new("later").dns_name("later.test").at(later)),
+            )
+            .start(&fcx, attachments)?;
+        let m = default_machine(&fcx, &attacher);
+        for (addr, name, advertised) in [
+            (h3, "h3.test", true),
+            (tcp_only, "tcp.test", false),
+            (later, "later.test", false),
+        ] {
+            for h2 in [false, true] {
+                let tcp = m.tcp.connect(&fcx, SocketAddr::new(addr, 443)).await?;
+                let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
+                let conn = TlsClient::new(&fcx, tcp, &roots, name, alpn, date)?;
+                let mut client = Client::new(&fcx, conn, h2).await;
+                let got = client.get("https", name, "/").await;
+                assert_eq!(got.status, StatusCode::OK);
+                assert_eq!(
+                    got.headers.get("alt-svc").map(|v| v.to_str().unwrap()),
+                    advertised.then_some(r#"h3=":443"; ma=86400"#),
+                    "{name}, h2 {h2}"
+                );
+                // A handler's own Alt-Svc is the only one sent.
+                let got = client.get("https", name, "/own").await;
+                assert_eq!(
+                    got.headers.get_all("alt-svc").iter().collect::<Vec<_>>(),
+                    ["clear"],
+                    "{name}, h2 {h2}"
+                );
+            }
+        }
+        for h2 in [false, true] {
+            let mut plain = plain_client(&fcx, &m, h3, h2).await;
+            let got = plain.get("http", "h3.test", "/").await;
+            assert_eq!(got.status, StatusCode::OK);
+            assert_eq!(got.headers.get("alt-svc"), None, "h2 {h2}");
+        }
+        Ok(())
+    });
+}

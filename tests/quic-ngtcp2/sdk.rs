@@ -454,34 +454,52 @@ impl httpd::Handler for Files {
     }
 }
 
-type H3Stack = Chain<QuicLayer, httpd::Http3Server>;
-
-/// The SDK's HTTP/3 server over its QUIC layer, serving `files`
+/// The SDK's HTTP/3 listener, serving `files` on every connection
 pub struct SdkH3 {
-    sdk: Sdk<H3Stack>,
-    worker: Polling<<H3Stack as Layer>::Work>,
+    sdk: Sdk<httpd::Http3Listener>,
+    worker: Polling<<httpd::Http3Listener as Layer>::Work>,
+    /// The versions of the connections it has held
+    versions: std::collections::BTreeSet<u32>,
 }
+
+/// Connections the listener holds at once, draining ones included
+const CONNECTIONS: usize = 64;
+/// What one connection may hold: HTTP/3's codec scratch, its streams, and
+/// the files in flight
+const CONNECTION_BUDGET: usize = 16 << 20;
 
 impl SdkH3 {
     pub fn server(versions: Versions<'_>, files: &BTreeMap<String, Vec<u8>>, seed: u64) -> Self {
         let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(seed)));
         let (_, server, endpoint) = configs(entropy.clone(), b"h3", versions);
-        let budget = Budget::new(64 << 20);
-        let mut observations = Observations::new(0);
-        let mut env = Env::new(Instant::ZERO, entropy.as_ref(), &budget, &mut observations);
-        let quic = layer(&mut env, endpoint, Some(server), AddressValidation::Accept);
-        let responder = httpd::Responder::new(Files(files.clone()));
+        let listener = Listener::new(
+            ListenerConfig {
+                endpoint,
+                server: Arc::new(server),
+                connections: CONNECTIONS,
+                // The configured bidirectional and unidirectional streams,
+                // and the server's own three.
+                streams: 100 + 8 + 3,
+                connection_budget: CONNECTION_BUDGET,
+                validation: AddressValidation::Accept,
+                cancel: |_| 0x10cu32.into(),
+            },
+            std::time::Instant::now(),
+            Some(SERVER.parse().unwrap()),
+        );
+        let stack = httpd::Responder::new(Files(files.clone())).http3_listener(listener);
         Self {
             sdk: Sdk {
                 driver: Driver::new(
-                    Chain::new(quic, responder.http3()),
+                    stack,
                     entropy,
-                    budget,
+                    Budget::new(CONNECTIONS * CONNECTION_BUDGET + (16 << 20)),
                     Instant::ZERO,
                 ),
                 remote: CLIENT.parse().unwrap(),
             },
             worker: Polling::new(),
+            versions: Default::default(),
         }
     }
 }
@@ -496,6 +514,8 @@ impl Endpoint for SdkH3 {
         loop {
             let mut moved = self.sdk.driver.run().unwrap();
             moved |= self.worker.work(&mut self.sdk.driver).unwrap();
+            self.versions
+                .extend(self.sdk.driver.layer().lower().versions());
             if let Some(datagram) = self.sdk.take() {
                 return Some(datagram);
             }
@@ -509,7 +529,12 @@ impl Endpoint for SdkH3 {
         self.sdk.timer()
     }
 
+    /// The one version of every connection it has held; none if they
+    /// differ
     fn version(&self) -> Option<u32> {
-        self.sdk.driver.layer().lower().version()
+        match self.versions.iter().collect::<Vec<_>>().as_slice() {
+            [version] => Some(**version),
+            _ => None,
+        }
     }
 }

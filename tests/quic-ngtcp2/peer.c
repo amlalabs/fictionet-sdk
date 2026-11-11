@@ -730,6 +730,25 @@ int fn_recv(fn_peer *p, const uint8_t *pkt, size_t len, uint64_t now) {
   return rv ? failed(p, rv) : 0;
 }
 
+/* Whether `pkt` is for this client: its destination connection ID is one
+ * the client issued and has not retired. Client IDs are 17 bytes long. */
+int fn_owns(fn_peer *p, const uint8_t *pkt, size_t len) {
+  ngtcp2_version_cid vc;
+  if (!p->conn || ngtcp2_pkt_decode_version_cid(&vc, pkt, len, 17) != 0)
+    return 0;
+  size_t n = ngtcp2_conn_get_scid2(p->conn, NULL);
+  ngtcp2_cid *scids = calloc(n, sizeof(*scids));
+  if (!scids)
+    return 0;
+  ngtcp2_conn_get_scid2(p->conn, scids);
+  int owns = 0;
+  for (size_t i = 0; i < n && !owns; i++)
+    owns = scids[i].datalen == vc.dcidlen &&
+           memcmp(scids[i].data, vc.dcid, vc.dcidlen) == 0;
+  free(scids);
+  return owns;
+}
+
 /* Write at most one datagram into `out`. Returns its length, 0 when there
  * is nothing to send now, or a negative ngtcp2 error. */
 long fn_send(fn_peer *p, uint8_t *out, size_t cap, uint64_t now) {
