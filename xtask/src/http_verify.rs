@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Result;
+use crate::lean_vectors::Report;
 use crate::resources;
 
 /// The counter's own check, the constant the bounds use, then body
@@ -98,7 +99,7 @@ pub fn run(args: &[String]) -> Result {
         }
     };
     report.print();
-    report.result()
+    report.result("http-verify")
 }
 
 /// The seed given, or [`SEEDS`].
@@ -148,60 +149,6 @@ impl Paths {
 
     fn vectors(&self, seed: u64) -> PathBuf {
         self.out.join("vectors").join(seed.to_string())
-    }
-}
-
-/// What one step found: a line per check, and whether every check passed.
-struct Report {
-    step: &'static str,
-    lines: Vec<String>,
-    failures: usize,
-}
-
-impl Report {
-    fn new(step: &'static str) -> Report {
-        Report {
-            step,
-            lines: Vec::new(),
-            failures: 0,
-        }
-    }
-
-    fn pass(&mut self, line: String) {
-        self.lines.push(line);
-    }
-
-    fn fail(&mut self, line: String) {
-        self.lines.push(format!("FAILED: {line}"));
-        self.failures += 1;
-    }
-
-    fn heading(&self) -> String {
-        if self.failures == 0 {
-            format!("{}: passed", self.step)
-        } else {
-            format!("{}: {} failed", self.step, self.failures)
-        }
-    }
-
-    fn print(&self) {
-        for line in &self.lines {
-            println!("{line}");
-        }
-        println!("{}", self.heading());
-    }
-
-    fn absorb(&mut self, other: Report) {
-        self.lines.extend(other.lines);
-        self.failures += other.failures;
-    }
-
-    fn result(&self) -> Result {
-        if self.failures == 0 {
-            Ok(())
-        } else {
-            Err(format!("http-verify {}: {} failed", self.step, self.failures).into())
-        }
     }
 }
 
@@ -365,8 +312,9 @@ fn diff(paths: &Paths, seeds: &[u64]) -> Result<Report> {
         // The served requests and heads are held to cost bounds
         // (verification/resources/cost.rs): a line for each kind; a bound
         // broken fails the test, and its log names the step.
-        for line in text.lines().filter(|line| line.contains(" cost: ")) {
-            report.pass(format!("seed {seed}: {line}"));
+        let costed = resources::costs(&mut report, &format!("seed {seed}"), &text);
+        if passed && costed == 0 {
+            report.fail(format!("seed {seed}: no session was costed; see {log}"));
         }
         if !passed && kinds.iter().all(|line| line.contains(", 0 disagree")) {
             report.fail(format!(
@@ -386,7 +334,7 @@ fn diff(paths: &Paths, seeds: &[u64]) -> Result<Report> {
 /// harnesses, then each TLC config of [`TLC_RESOURCES`], output in
 /// `kani.out` and `<config>.out` of the run directory.
 fn resource_properties(paths: &Paths) -> Result {
-    let mut report = crate::lean_vectors::Report::new("resources");
+    let mut report = Report::new("resources");
     report.absorb(resources::kani(
         &paths.root,
         &paths.out,

@@ -6,7 +6,7 @@
 //! | Command | Does |
 //! | --- | --- |
 //! | `layer-verify trace` | runs `route_trace` in the library's tests, which logs every step the real `Chain`, `Switch` and `Driver` take under abstract layers for each seed, then replays each log against the model with `RouteTrace.tla` |
-//! | `layer-verify resources` | the Kani harnesses in [`KANI_RESOURCES`] with every allocation counted, TLC on the configs in [`TLC_RESOURCES`], and the costed replays: the SSH coverage traces and the tests in [`COSTED_TESTS`] |
+//! | `layer-verify resources` | the Kani harnesses in [`KANI_RESOURCES`] with every allocation counted, TLC on the configs in [`TLC_RESOURCES`], and the costed replays: the SSH coverage traces and the tests in [`REPLAYS`] |
 //!
 //! Everything is written under a fresh run directory in `layer-verify/`
 //! in Cargo's target directory
@@ -22,8 +22,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::Result;
-use crate::lean_vectors::{Report, scoped};
-use crate::resources;
+use crate::lean_vectors::Report;
+use crate::resources::{self, Replay, Target};
 
 /// The counted Kani harnesses: the counter itself, the charged containers
 /// growing through a reallocation, the report store, a WebSocket message
@@ -87,9 +87,27 @@ const TLC_RESOURCES: [(&str, &str, &[&str]); 4] = [
     ),
 ];
 
-/// The costed tests of `tests/it`: queued packets against what their
-/// queues count, and WebSocket messages in fragments, each step costed.
-const COSTED_TESTS: [&str; 2] = ["world_memory::", "websocket_costs::"];
+/// The costed replays: the SSH coverage traces on the production
+/// transport, and in `tests/it` queued packets against what their queues
+/// count and WebSocket messages in fragments.
+const REPLAYS: [Replay; 2] = [
+    Replay {
+        name: "ssh-replay",
+        package: "fictionet",
+        features: &["tokio"],
+        targets: &[Target::Lib],
+        filters: &[
+            "stdlib::protocols::ssh::transport::replay::transport_traces_replay_on_the_production_transport",
+        ],
+    },
+    Replay {
+        name: "costed-tests",
+        package: "fictionet",
+        features: &["tokio"],
+        targets: &[Target::Test("it")],
+        filters: &["world_memory::", "websocket_costs::"],
+    },
+];
 
 /// Runs `layer-verify` with the arguments after it.
 pub fn run(args: &[String]) -> Result {
@@ -127,51 +145,8 @@ fn resources() -> Result {
             configs,
         )?);
     }
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let replays: [(&str, Vec<&str>); 2] = [
-        (
-            "ssh-replay",
-            vec![
-                "--lib",
-                "--",
-                "--nocapture",
-                "--exact",
-                "stdlib::protocols::ssh::transport::replay::transport_traces_replay_on_the_production_transport",
-            ],
-        ),
-        (
-            "costed-tests",
-            [
-                vec!["--test", "it", "--", "--nocapture"],
-                COSTED_TESTS.to_vec(),
-            ]
-            .concat(),
-        ),
-    ];
-    for (name, args) in replays {
-        let (text, ok) = crate::lean_vectors::logged(
-            scoped(&cargo, "14G")
-                .args(["test", "-p", "fictionet", "--features", "tokio"])
-                .args(&args)
-                .current_dir(&paths.root),
-            &paths.out.join(format!("{name}.out")),
-        )?;
-        let costs: Vec<&str> = text.lines().filter(|l| l.starts_with("cost:")).collect();
-        if ok && !costs.is_empty() {
-            for line in costs {
-                report.pass(format!("{name}: {line}"));
-            }
-            if name == "costed-tests" {
-                report.pass(format!(
-                    "{name}: {}",
-                    text.lines()
-                        .find(|l| l.starts_with("test result:"))
-                        .unwrap_or("no result line")
-                ));
-            }
-        } else {
-            report.fail(format!("{name}: failed; see {name}.out"));
-        }
+    for replay in &REPLAYS {
+        report.absorb(resources::replay(&paths.root, &paths.out, replay)?);
     }
     report.print();
     report.result("layer-verify")
