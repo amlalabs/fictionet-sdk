@@ -556,6 +556,9 @@ fn verify(directory: &Path) -> Result {
             e["trap"]["kind"] == "probe"
                 && e["trap"]["probe"] == "host_check"
                 && e["trap"]["end"] == "answered"
+                && e["trap"]["elapsed_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms >= 2000)
         })
         .count()
         != 4

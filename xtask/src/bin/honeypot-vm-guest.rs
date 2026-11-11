@@ -519,7 +519,9 @@ fn trap_request(port: u16, method: &str, path: &str, headers: &str, body: &str) 
     )?;
     let mut first = [0];
     stream.read_exact(&mut first)?;
-    if path == "/retry" && started.elapsed() < Duration::from_secs(150) {
+    // The client and service use independent guest clocks. Exact durations are
+    // checked against service-clock evidence after both guests stop.
+    if path == "/retry" && started.elapsed() < Duration::from_secs(149) {
         return Err("held retry sent bytes before its silent interval ended".into());
     }
     let mut response = first.to_vec();
@@ -823,9 +825,9 @@ fn fleet() -> Result<Value> {
     })?;
     for (path, elapsed) in &results {
         let minimum = if *path == "/retry" || *path == "/logs/follow" {
-            150000
+            149000
         } else {
-            2000
+            1900
         };
         if *elapsed < minimum {
             return Err(format!("probe answered early: {path} after {elapsed} ms").into());
