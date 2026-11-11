@@ -25,6 +25,7 @@ use fictionet::stdlib::web::Head;
 use fictionet::time::Instant;
 use fictionet::{Cx, Error};
 
+use super::AltSvc;
 use super::handlers::status_only;
 use super::http2::{Http2Server, Responder};
 use super::response::{Asked, Dates, ResponsePolicy, response_held};
@@ -476,6 +477,7 @@ impl Http1 {
             env.budget(),
             self.output_pools.as_ref().expect("open pools").0.clone(),
         );
+        let mut alt_svc = None;
         let reply = if self.too_big {
             Reply::Now(status_only(StatusCode::PAYLOAD_TOO_LARGE))
         } else if lacks_host {
@@ -497,10 +499,10 @@ impl Http1 {
                 Reply::Now(status_only(StatusCode::BAD_REQUEST))
             }
         } else {
-            self.handler.call(
-                request,
-                &mut Exchange::new(now, env.entropy(), &self.conn, responses),
-            )
+            let mut exchange = Exchange::new(now, env.entropy(), &self.conn, responses);
+            let reply = self.handler.call(request, &mut exchange);
+            alt_svc = exchange.advertised();
+            reply
         };
         let stage = match reply {
             Reply::Now(mut response) => {
@@ -528,6 +530,7 @@ impl Http1 {
             delivery,
             version,
             wants,
+            alt_svc,
             close: !keep_alive || lacks_host,
             then,
             chunked: false,
@@ -697,9 +700,13 @@ impl Http1 {
             // with nothing to take it over, the connection closes.
             r.close = true;
         }
-        let policy = ResponsePolicy::new(&parts, body.remaining(), r.wants, || {
-            self.dates.at(env.now())
-        });
+        let policy = ResponsePolicy::new(
+            &parts,
+            body.remaining(),
+            r.wants,
+            || self.dates.at(env.now()),
+            r.alt_svc,
+        );
         let Some(bound) = head_bound(&parts, &policy) else {
             return self.over_budget(env);
         };
@@ -798,6 +805,8 @@ struct Responding {
     delivery: Option<(Delivery, Charge)>,
     version: Version,
     wants: Asked,
+    /// What the response advertises, as the handler's exchange said.
+    alt_svc: Option<AltSvc>,
     close: bool,
     /// Why the connection closes after it, if it does.
     then: Closing,
@@ -1306,14 +1315,17 @@ fn head_bound(parts: &Response, policy: &ResponsePolicy) -> Option<usize> {
         .date
         .as_ref()
         .map_or(0, |date| b"Date: ".len() + date.len() + 2);
-    parts
-        .fields
-        .iter()
-        .try_fold(fixed.checked_add(date)?, |n, (name, value)| {
+    let alt_svc = policy
+        .alt_svc
+        .map_or(0, |alt_svc| b"Alt-Svc: ".len() + alt_svc.value().len() + 2);
+    parts.fields.iter().try_fold(
+        fixed.checked_add(date)?.checked_add(alt_svc)?,
+        |n, (name, value)| {
             n.checked_add(name.len())?
                 .checked_add(value.len())?
                 .checked_add(4)
-        })
+        },
+    )
 }
 
 /// Writes a response head. Returns whether the connection must close
@@ -1367,6 +1379,11 @@ fn encode(
         out.write_all(date.as_bytes())?;
         out.write_all(b"\r\n")?;
     }
+    if let Some(alt_svc) = policy.alt_svc {
+        out.write_all(b"Alt-Svc: ")?;
+        out.write_all(alt_svc.value().as_bytes())?;
+        out.write_all(b"\r\n")?;
+    }
     match policy.len {
         Some(n) => write!(out, "Content-Length: {n}\r\n")?,
         None if policy.bodiless => {}
@@ -1408,7 +1425,7 @@ fn simple_output(
     date: Option<HeaderValue>,
 ) -> Option<ChargedBytes> {
     let parts = status_only(status);
-    let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || date);
+    let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || date, None);
     let mut out = ChargedBytes::with_capacity(env.budget(), head_bound(&parts, &policy)?)?;
     out.fill(|out| encode(out, version, &parts, &policy, true))
         .ok()?;

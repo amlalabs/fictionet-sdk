@@ -7,7 +7,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use fictionet::Error;
 use fictionet::time::Instant;
 
-use super::{BadGateway, text};
+use super::{AltSvc, BadGateway, text};
 
 /// Owned HTTP head storage. `http` hides allocation capacities, so charge
 /// string lengths and the header map's capacity, including shared values
@@ -83,15 +83,18 @@ pub(super) struct ResponsePolicy {
     pub(super) bodiless: bool,
     pub(super) len: Option<u64>,
     pub(super) date: Option<HeaderValue>,
+    pub(super) alt_svc: Option<AltSvc>,
 }
 
 impl ResponsePolicy {
-    /// `date` makes the `Date` header, if the handler set none.
+    /// `date` makes the `Date` header, and `alt_svc` is advertised, if the
+    /// handler set neither field.
     pub(super) fn new(
         parts: &Response,
         len: Option<u64>,
         asked: Asked,
         date: impl FnOnce() -> Option<HeaderValue>,
+        alt_svc: Option<AltSvc>,
     ) -> Self {
         let no_body = parts.status.is_informational()
             || parts.status == StatusCode::NO_CONTENT
@@ -118,6 +121,7 @@ impl ResponsePolicy {
             } else {
                 date()
             },
+            alt_svc: alt_svc.filter(|_| parts.fields.field(b"alt-svc").is_none()),
         }
     }
 }
@@ -251,10 +255,16 @@ mod tests {
             crate::stdlib::web::Fields::unpaid([("date", b"Sun, 06 Nov 1994 08:49:37 GMT")]);
         let parts = response;
         let mut made = false;
-        let policy = ResponsePolicy::new(&parts, Some(0), Asked::Body, || {
-            made = true;
-            date_header(Some(SystemTime::UNIX_EPOCH), Instant::ZERO)
-        });
+        let policy = ResponsePolicy::new(
+            &parts,
+            Some(0),
+            Asked::Body,
+            || {
+                made = true;
+                date_header(Some(SystemTime::UNIX_EPOCH), Instant::ZERO)
+            },
+            None,
+        );
         assert!(!made);
         assert!(policy.date.is_none());
     }
