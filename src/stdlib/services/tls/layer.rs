@@ -31,11 +31,6 @@ const HEADER: usize = 5;
 /// section 6.2.3); TLS 1.3 allows less, 2^14 + 256 (RFC 8446 section 5.2).
 /// rustls refuses a header that says more.
 const BODY: usize = (1 << 14) + 2048;
-/// The most input held while a handshake message is joined: the records
-/// joined so far and the one arriving, headers included. rustls's buffered
-/// reader holds no more (`MAX_HANDSHAKE_SIZE`), and a message whose parts
-/// need more fails the connection.
-const JOINED: usize = 0xffff;
 /// The room kept from the first byte for the buffer the connection's final
 /// alert goes down in: a fatal alert or a `close_notify` record, or the
 /// acceptor's alert, all well under it.
@@ -263,6 +258,16 @@ impl Block {
 }
 
 impl TlsLayer {
+    /// The most input one record takes: its header and the most its body
+    /// may be.
+    pub const RECORD: usize = HEADER + BODY;
+
+    /// The most input held while a handshake message is joined: the records
+    /// joined so far and the one arriving, headers included. rustls's
+    /// buffered reader holds no more (`MAX_HANDSHAKE_SIZE`), and a message
+    /// whose parts need more fails the connection.
+    pub const JOINED: usize = 0xffff;
+
     /// Serves `config` to every client. Waits for a ClientHello without
     /// allocating rustls state yet.
     pub fn new(config: Arc<ServerConfig>) -> Self {
@@ -663,7 +668,7 @@ impl TlsLayer {
     /// Takes `chunk` in as input: whole records are processed where they
     /// lie, and bytes that continue a record held are joined to it in one
     /// buffer, paid for first, up to the end of that record. A handshake
-    /// message whose parts need more than [`JOINED`] bytes fails the
+    /// message whose parts need more than [`Self::JOINED`] bytes fails the
     /// connection. Returns what is left of the chunk, which waits, or
     /// `None` once all of it is taken.
     fn take_input(
@@ -725,7 +730,8 @@ enum Joined {
     /// nothing was taken.
     Unpaid,
     /// The parts of the handshake message being joined would need more
-    /// than [`JOINED`]: nothing was taken, and the connection fails.
+    /// than [`TlsLayer::JOINED`]: nothing was taken, and the connection
+    /// fails.
     Outgrew,
 }
 
@@ -735,8 +741,9 @@ enum Joined {
 /// place when the buffer has room. Otherwise they go with what is held
 /// into a new buffer, paid for first while the old one is still held, with
 /// room for the whole record arriving and, while a message is being
-/// joined, for twice what is held, up to [`JOINED`]: joining a message from
-/// many records copies what is held a few times, not once a record.
+/// joined, for twice what is held, up to [`TlsLayer::JOINED`]: joining a
+/// message from many records copies what is held a few times, not once a
+/// record.
 fn join(
     input: &mut Chunk,
     chunk: &mut Chunk,
@@ -744,14 +751,14 @@ fn join(
     budget: &Budget,
 ) -> Result<Joined, HandshakeError> {
     let end = record_end(input, joined);
-    if joined != 0 && end > JOINED {
+    if joined != 0 && end > TlsLayer::JOINED {
         return Ok(Joined::Outgrew);
     }
     let take = end.saturating_sub(input.len()).min(chunk.len());
     if input.extend_within(&chunk[..take]).is_err() {
         let room = match joined {
             0 => end,
-            _ => end.max(input.len() * 2).min(JOINED),
+            _ => end.max(input.len() * 2).min(TlsLayer::JOINED),
         };
         let Some(mut bytes) = Chunk::block(budget, 0, room) else {
             return Ok(Joined::Unpaid);
