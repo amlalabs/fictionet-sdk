@@ -75,6 +75,7 @@ pub fn run(args: &[String]) -> Result {
                 &project.root,
                 &project.out,
                 "fictionet",
+                &[],
                 &KANI_RESOURCES,
             )?);
             report.absorb(resources::tlc(
