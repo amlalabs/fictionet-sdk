@@ -324,7 +324,7 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
+        } else if (self.cwnd < target_window) || (self.acked_bytes < self.init_cwnd) {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -658,6 +658,20 @@ const DRAIN_TO_TARGET: bool = true;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_stops_growing_at_its_target_after_the_initial_window() {
+        let mut rng = Pcg32::from_seed([0; 16]);
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200, &mut rng);
+        bbr.acked_bytes = bbr.init_cwnd;
+        let target = bbr.get_target_cwnd(bbr.cwnd_gain);
+        assert_eq!(bbr.cwnd, target);
+        bbr.calculate_cwnd(1200, 0);
+        assert_eq!(bbr.cwnd, target);
+        bbr.cwnd -= 1200;
+        bbr.calculate_cwnd(1200, 0);
+        assert_eq!(bbr.cwnd, target);
+    }
 
     #[test]
     fn pacing_cycles_follow_the_supplied_entropy() {

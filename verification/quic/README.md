@@ -1352,3 +1352,40 @@ the existing redundant-link warning in `network/packet.rs`. The existing
 it measures wire copying, not reassembly throughput. All Cargo, Kani and
 TLC commands ran under the required memory-limited scope with Cargo targets
 outside the worktree.
+
+## BBR bandwidth sampling and startup growth
+
+The bandwidth sampler now feeds lower non-application-limited samples to
+its windowed filter, so an old high estimate can expire. Application-limited
+samples may raise that estimate but cannot lower it. Previously the guard
+prevented both downward aging and every application-limited update. Startup
+now compares the congestion window, in bytes, with the target window;
+previously it compared the dimensionless gain instead, continuing growth
+after the target and initial window were satisfied. These rules follow the
+[reference BBR sender](https://github.com/google/quiche/blob/main/quiche/quic/core/congestion_control/bbr_sender.cc).
+They are BBR algorithm properties, not a claim of RFC recovery conformance.
+
+Bandwidth conversion now multiplies and divides in full-width intermediate
+arithmetic and saturates rates above the output type's maximum. Previously
+large byte counts overflowed and long durations were truncated before
+division. Four regressions failed on the old code and pass after these
+changes. All 361 engine tests passed at this step.
+
+Kani passes `bbr_bandwidth_samples_expire_without_allocating` over arbitrary
+full-width old and new samples and either application-limited flag. The
+production sampler and filter run under the shared counting allocator;
+peak and requested allocations are both bounded by zero. Kani also passes
+`bbr_bandwidth_conversion_saturates_unrepresentable_rates` over every byte
+count at a one-nanosecond interval, and
+`bbr_startup_respects_its_target_window` over arbitrary valid windows in the
+32-bit range and 16-bit acknowledged byte counts, after the initial window
+has been acknowledged and with no bandwidth estimate yet. There are no
+production stubs in these proofs. They do not prove the complete controller,
+packet sampling accuracy, recovery state machine or pacing cycle.
+
+The separate full-width rate harness retains assertions for one second,
+zero time and the maximum duration. CaDiCaL timed out after five minutes
+without a verdict. The older entropy proof remains open. Run the new
+harnesses with `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
+-Z c-ffi -Z mem-predicates -Z restrict-vtable --harness bbr_bandwidth_
+--harness bbr_startup_respects_its_target_window` under the required scope.

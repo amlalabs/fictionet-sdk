@@ -40,3 +40,17 @@ fn bbr_uses_supplied_entropy() {
     assert_eq!(entropy.consumed, seed.len());
     assert_eq!(bbr.random_number_generator, expected);
 }
+
+#[kani::proof]
+#[kani::unwind(17)]
+fn bbr_startup_respects_its_target_window() {
+    let mut rng = Pcg32::from_seed([0; 16]);
+    let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1200, &mut rng);
+    let window = u64::from(kani::any::<u32>());
+    kani::assume(window >= bbr.init_cwnd);
+    bbr.cwnd = window;
+    bbr.acked_bytes = bbr.init_cwnd;
+    bbr.calculate_cwnd(u64::from(kani::any::<u16>()), 0);
+    assert_eq!(bbr.cwnd, window);
+    std::mem::forget(bbr);
+}
