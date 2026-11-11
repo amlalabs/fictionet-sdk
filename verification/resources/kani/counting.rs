@@ -156,8 +156,10 @@ pub(crate) use counted_proof;
 mod proofs {
     use super::{counted_proof, measure};
     use std::alloc::Layout;
+    use std::boxed::Box;
     use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::vec::Vec;
 
     counted_proof! {
         /// The counter sees what `Box`, `Vec` (grown, so reallocated, and

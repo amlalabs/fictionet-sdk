@@ -139,7 +139,10 @@ Wire the layers into the area's verify command with `xtask/src/resources.rs`.
 `resources::tlc` runs the named configs and checks each against its first
 line (`\* Must pass` or `\* Must violate <invariant>`). HPACK's is
 `cargo xtask hpack-verify resources`. Its replay costs run in
-`hpack-verify diff`.
+`hpack-verify diff`. TLS's, `cargo xtask tls-verify resources`, runs
+its costed replays too, and its harnesses with `-Z restrict-vtable`
+(`resources::kani`'s flags), which resolves a call through a trait
+object to the types that implement it.
 
 ## What the models found in the code
 
@@ -247,6 +250,26 @@ order stands and the model now takes it; `decodeBlock_ok_iff` proves the
 model's two readings accept the same blocks. All eight seeds of
 `hpack-verify diff` pass.
 
+The TLS resource properties of 2026-11-10 (`tls/README.md`, "Resource
+properties"; `cargo xtask tls-verify resources`) found three more in the
+vendored rustls, each fixed with a costed test that fails before:
+
+- rustls's read buffer, which reads every ClientHello through the
+  Acceptor, grew to exactly the record arriving, so a hello sent a byte a
+  record was moved once a record: 600,410,229 bytes asked of the allocator
+  for 60,018 read, the layer's bug of the security review on the buffered
+  path. It also held the old and the new allocation with only the new
+  charged. It now doubles, charged in full while the old one is held
+  (3675b51f1).
+- Parsing a handshake message charged nothing, and a hello parses into up
+  to 15.7 times its size in the replays: 590,984 bytes held uncharged by
+  the `Accepted` the layer keeps while the world picks a config. Room for
+  what parsing allocates is now charged before a message is taken
+  (db6df25cc).
+- The handshake deframer cut a whole record into one span a message: a
+  record of 4,000 empty messages held 180,768 bytes against 21,346
+  charged. It now cuts a message at a time (6c37525d7).
+
 ## Known gaps
 
 - **Reported, not fixed.** From the models and their audit, each with its
@@ -281,6 +304,12 @@ model's two readings accept the same blocks. All eight seeds of
   `std::task::Waker`'s vtable is plain function pointers, which CBMC lets
   call every function of their type; `Driver` and those two harnesses
   hold one (`layer/VERIFICATION.md`, "Kani after the buffers round").
+- **TLS allocations a client sets that stay uncharged between steps.**
+  With a config that asks for client certificates, TLS 1.2 keeps every
+  handshake message in `HandshakeHash`'s `client_auth` buffer until the
+  client's CertificateVerify, and TLS 1.3 keeps the client's chain until
+  the next message; each is at most one 64 KiB message. rustls's QUIC path
+  has no budget; the SDK makes no rustls QUIC connection (`tls/README.md`).
 - **Kani in the audited areas was read, not rerun**, except where an
   area's README gives a date for its last run.
 - **The trace check covers data only.** `RouteTrace.tla` replays bytes

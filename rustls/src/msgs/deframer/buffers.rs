@@ -459,3 +459,10 @@ impl<'a> DeframerSliceBuffer<'a> {
         &mut self.buf[self.discard..]
     }
 }
+
+/// Bounded proofs that the read buffer holds no more than it is charged
+/// and moves what it holds a few times as a message is joined, with every
+/// allocation counted, run with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(all(kani, feature = "std"))]
+#[path = "../../../../verification/tls/kani/deframer.rs"]
+mod resource_proofs;

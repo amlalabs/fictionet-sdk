@@ -690,34 +690,16 @@ impl TlsLayer {
                 self.pump(budget)?;
                 return Ok(None);
             };
-            let end = record_end(input, joined);
-            if joined != 0 && end > JOINED {
-                self.fail(HandshakeError::Failed(
-                    "a handshake message outgrew the most a message may be joined in".into(),
-                ));
-                continue;
+            match join(input, &mut chunk, joined, budget)? {
+                Joined::Took => {}
+                Joined::Unpaid => return Ok(Some(chunk)),
+                Joined::Outgrew => {
+                    self.fail(HandshakeError::Failed(
+                        "a handshake message outgrew the most a message may be joined in".into(),
+                    ));
+                    continue;
+                }
             }
-            let take = end.saturating_sub(input.len()).min(chunk.len());
-            // The rest of a record goes in after what is held, in place
-            // when the buffer has room. A new buffer has room for the
-            // whole record arriving, and while a message is being joined
-            // for twice what is held, so that joining a message from many
-            // records copies what is held a few times, not once a record.
-            if input.extend_within(&chunk[..take]).is_err() {
-                let room = match joined {
-                    0 => end,
-                    _ => end.max(input.len() * 2).min(JOINED),
-                };
-                let Some(mut bytes) = Chunk::block(budget, 0, room) else {
-                    return Ok(Some(chunk));
-                };
-                bytes
-                    .extend_within(input)
-                    .and_then(|()| bytes.extend_within(&chunk[..take]))
-                    .map_err(|_| HandshakeError::Failed("a record outgrew its buffer".into()))?;
-                *input = bytes;
-            }
-            chunk.advance(take);
             self.pump(budget)?;
         }
     }
@@ -733,6 +715,55 @@ impl TlsLayer {
             self.plaintext_completion = None;
         }
     }
+}
+
+/// What [`join`] did with the start of a chunk.
+enum Joined {
+    /// It took the bytes, up to the end of the record arriving.
+    Took,
+    /// The input held needs a larger buffer and the budget has no room:
+    /// nothing was taken.
+    Unpaid,
+    /// The parts of the handshake message being joined would need more
+    /// than [`JOINED`]: nothing was taken, and the connection fails.
+    Outgrew,
+}
+
+/// Takes the start of `chunk` into `input`, the bytes held, up to the end
+/// of the record arriving after `joined` bytes of them, which rustls is
+/// joining as a handshake message. The bytes go in after what is held, in
+/// place when the buffer has room. Otherwise they go with what is held
+/// into a new buffer, paid for first while the old one is still held, with
+/// room for the whole record arriving and, while a message is being
+/// joined, for twice what is held, up to [`JOINED`]: joining a message from
+/// many records copies what is held a few times, not once a record.
+fn join(
+    input: &mut Chunk,
+    chunk: &mut Chunk,
+    joined: usize,
+    budget: &Budget,
+) -> Result<Joined, HandshakeError> {
+    let end = record_end(input, joined);
+    if joined != 0 && end > JOINED {
+        return Ok(Joined::Outgrew);
+    }
+    let take = end.saturating_sub(input.len()).min(chunk.len());
+    if input.extend_within(&chunk[..take]).is_err() {
+        let room = match joined {
+            0 => end,
+            _ => end.max(input.len() * 2).min(JOINED),
+        };
+        let Some(mut bytes) = Chunk::block(budget, 0, room) else {
+            return Ok(Joined::Unpaid);
+        };
+        bytes
+            .extend_within(input)
+            .and_then(|()| bytes.extend_within(&chunk[..take]))
+            .map_err(|_| HandshakeError::Failed("a record outgrew its buffer".into()))?;
+        *input = bytes;
+    }
+    chunk.advance(take);
+    Ok(Joined::Took)
 }
 
 /// Where the record arriving after `joined` bytes of `input` ends, or its
@@ -1132,6 +1163,13 @@ impl Layer for TlsLayer {
 #[cfg(kani)]
 #[path = "../../../../verification/tls/kani/LayerProof.rs"]
 mod proofs;
+
+/// Bounded proofs that the input joined for a handshake message stays
+/// within its budget and is moved a few times, with every allocation
+/// counted, run with `cargo kani -Z stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../../verification/tls/kani/join.rs"]
+mod resource_proofs;
 
 impl super::Negotiation for TlsLayer {
     fn handshake(&self) -> super::Handshake<'_> {

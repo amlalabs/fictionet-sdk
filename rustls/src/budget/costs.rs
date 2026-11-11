@@ -251,3 +251,72 @@ fn a_record_of_many_messages_is_cut_a_message_at_a_time() {
     });
     std::println!("cost: {}", costs.summary());
 }
+
+/// The session slots a config keeps: made and paid for once, for a size
+/// the config sets, and then a session stored, found or taken costs at
+/// most the copy of its encoding handed back, whoever sends it. Seeded
+/// sessions, some too large to keep, over a store of four slots, each
+/// operation a step.
+#[test]
+fn session_slots_are_paid_once_and_a_session_costs_at_most_its_copy() {
+    use crate::server::{ServerSessionSlots, StoresServerSessions, SLOT_KEY, SLOT_VALUE};
+
+    /// The store's own allocation, beside its slots, which its budget
+    /// does not pay for: two reference counts, the lock and what the slots
+    /// keep of their vectors (three, with a clock), 256 bytes at most.
+    const STORE: usize = 256;
+    /// A session stored allocates nothing: it is copied into its slot. One
+    /// found or taken is copied out, at most a slot's encoding.
+    const SESSION: Linear = Linear {
+        num: 0,
+        den: 1,
+        fixed: SLOT_VALUE,
+    };
+    let size = 4;
+    let limit = Limit::new(1 << 20);
+    let mut costs = Costs::new("session slots");
+    let store = costs.step(
+        0,
+        STORE,
+        Linear {
+            num: 0,
+            den: 1,
+            fixed: STORE,
+        },
+        || {
+            let store = ServerSessionSlots::with_budget(size, limit.clone()).unwrap();
+            Charged {
+                value: store,
+                charged: limit.most(),
+            }
+        },
+    );
+    let paid = limit.used();
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |below: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % below as u64) as usize
+    };
+    for _ in 0..200 {
+        let key = alloc::unmeasured(|| Vec::from([next(6) as u8; 8]));
+        let len = next(SLOT_VALUE + SLOT_KEY);
+        let value = alloc::unmeasured(|| Vec::from_iter(core::iter::repeat_n(7, len)));
+        let operation = next(3);
+        let held = costs.step(0, STORE + paid, SESSION, || Charged {
+            value: match operation {
+                0 => {
+                    store.put(key, value);
+                    None
+                }
+                1 => store.get(&key),
+                _ => store.take(&key),
+            },
+            charged: 0,
+        });
+        alloc::unmeasured(|| drop(held));
+        assert_eq!(limit.used(), paid, "the store was charged again");
+    }
+    std::println!("cost: {}", costs.summary());
+}
