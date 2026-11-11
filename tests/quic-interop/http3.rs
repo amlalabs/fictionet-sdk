@@ -283,6 +283,7 @@ fn http3_connection_storage_is_reserved_before_growth() {
                 Charged {
                     value: h3,
                     charged: budget.used(),
+                    moved: 0,
                 }
             },
         );

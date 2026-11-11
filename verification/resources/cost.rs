@@ -114,10 +114,10 @@ impl Costs {
     /// each byte a bounded number of times but not in the step it came
     /// in, as a store that joins blocks to free places does. The charge
     /// still holds at every step.
-    pub fn amortized(session: impl Into<String>) -> Costs {
-        Costs {
+    pub(crate) fn amortized(session: impl Into<String>) -> Self {
+        Self {
             amortized: true,
-            ..Costs::new(session)
+            ..Self::new(session)
         }
     }
 
@@ -184,7 +184,7 @@ impl Costs {
 
     /// The bytes the session's steps have left allocated, as counted from
     /// its start: what it holds now.
-    pub fn live(&self) -> usize {
+    pub(crate) fn live(&self) -> usize {
         usize::try_from(self.live.max(0)).unwrap_or(usize::MAX)
     }
 

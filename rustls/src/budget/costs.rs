@@ -80,6 +80,7 @@ fn a_hello_joined_from_one_byte_records_is_moved_a_few_times() {
         Charged {
             value: (),
             charged: limit.most(),
+            moved: 0,
         }
     });
     std::println!("cost: {}", costs.summary());
@@ -194,6 +195,7 @@ fn a_hello_is_charged_what_parsing_it_holds() {
             Charged {
                 value: accepted,
                 charged: limit.most(),
+                moved: 0,
             }
         });
         // Held while the world picks: what the hello asked for, read.
@@ -211,6 +213,7 @@ fn a_hello_is_charged_what_parsing_it_holds() {
                 Charged {
                     value: (),
                     charged: 0,
+                    moved: 0,
                 }
             },
         );
@@ -247,6 +250,7 @@ fn a_record_of_many_messages_is_cut_a_message_at_a_time() {
         Charged {
             value: (),
             charged: limit.most(),
+            moved: 0,
         }
     });
     std::println!("cost: {}", costs.summary());
@@ -288,6 +292,7 @@ fn session_slots_are_paid_once_and_a_session_costs_at_most_its_copy() {
             Charged {
                 value: store,
                 charged: limit.most(),
+                moved: 0,
             }
         },
     );
@@ -314,6 +319,7 @@ fn session_slots_are_paid_once_and_a_session_costs_at_most_its_copy() {
                 _ => store.take(&key),
             },
             charged: 0,
+            moved: 0,
         });
         alloc::unmeasured(|| drop(held));
         assert_eq!(limit.used(), paid, "the store was charged again");

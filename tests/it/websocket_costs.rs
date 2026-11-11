@@ -11,7 +11,7 @@
 //! while the old one is live. The step may ask for no more than its
 //! payload and the limit.
 
-use crate::cost::{Charged, Costs, Linear};
+use crate::common::cost::{Charged, Costs, Linear};
 use fictionet::stdlib::codec::{Decode, Side, Step};
 use fictionet::stdlib::protocols::websocket::Messages;
 

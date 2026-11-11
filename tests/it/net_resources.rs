@@ -14,7 +14,7 @@ use fictionet::stdlib::network::ip::{self, Fields, Intake, Reassembly};
 use fictionet::time::{Duration, Instant};
 use fictionet::{Chunk, Packet};
 
-use crate::cost::{Charged, Costs, Linear};
+use crate::common::cost::{Charged, Costs, Linear};
 
 /// An IPv4 fragment from `src` with identification `id`: `data` at
 /// `offset` bytes, with "more fragments" set when `more`.
@@ -270,7 +270,7 @@ mod udp {
     use fictionet::time::Instant;
     use fictionet::{Chunk, Packet, Seed, SeededEntropy};
 
-    use crate::cost::{Charged, Costs, Linear};
+    use crate::common::cost::{Charged, Costs, Linear};
 
     type Stack = Chain<IpLayer, UdpLayer>;
     type Command = MuxCommand<Datagrams<SocketAddr>, Messages<UdpNotice, UdpControl>>;
@@ -442,7 +442,7 @@ mod dns {
     use fictionet::stdlib::protocols::dns::rr::Record;
     use fictionet::stdlib::protocols::dns::{Parsed, Request};
 
-    use crate::cost::{Charged, Costs, Linear};
+    use crate::common::cost::{Charged, Costs, Linear};
 
     /// The most a decoded record holds besides its place in its section:
     /// its name, up to 255 octets and an index of up to 128 label ends.
@@ -546,7 +546,7 @@ mod cache {
     use fictionet::stdlib::services::dns::resolver::{Cache, Limits, Offer, Rank};
     use fictionet::time::{Duration, Instant};
 
-    use crate::cost::{Charged, Costs, Linear};
+    use crate::common::cost::{Charged, Costs, Linear};
 
     /// A step's linear bound, over the session ([`Costs::amortized`]): an
     /// offer's records are built in the step ([`built`], its input). The

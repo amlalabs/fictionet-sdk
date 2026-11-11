@@ -377,6 +377,7 @@ mod tests {
                 .pop_chunk(limit)
                 .unwrap(),
                 charged: 0,
+                moved: 0,
             });
             assert_eq!(taken.0.len(), limit);
             assert_eq!(budget.used(), capacity);
@@ -391,6 +392,7 @@ mod tests {
             }
             .pop_chunk(4),
             charged: 0,
+            moved: 0,
         });
         assert!(matches!(taken, Err(WriteError::Budget)));
         assert_eq!(&chunk[..], b"abcd");

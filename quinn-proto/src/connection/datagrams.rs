@@ -524,6 +524,7 @@ mod tests {
                     Charged {
                         value: (),
                         charged: 0,
+                        moved: 0,
                     }
                 },
             );
@@ -560,6 +561,7 @@ mod tests {
         assert!(!costs.step(4, 0, zero, || Charged {
             value: incoming.push(b"kept", window),
             charged: 0,
+            moved: 0,
         }));
         assert!(incoming.is_empty());
         assert_eq!(incoming.bytes.capacity(), 0);
@@ -598,6 +600,7 @@ mod tests {
                     Charged {
                         value: (),
                         charged: 0,
+                        moved: 0,
                     }
                 },
             );
@@ -663,6 +666,7 @@ mod tests {
             let accepted = costs.step(size, 0, linear, || Charged {
                 value: state.chunk.admit(&mut source, &budget),
                 charged: 0,
+                moved: 0,
             });
             assert!(accepted);
             assert!(source.is_empty());
@@ -691,6 +695,7 @@ mod tests {
         let accepted = costs.step(4, 0, linear, || Charged {
             value: slot.admit(&mut source, &unavailable),
             charged: 0,
+            moved: 0,
         });
         assert!(!accepted);
         assert_eq!(source.as_ptr(), pointer);

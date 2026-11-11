@@ -281,6 +281,7 @@ fn costed<T>(
         Charged {
             value,
             charged: own + kept,
+            moved: 0,
         }
     });
     assert!(
@@ -314,6 +315,7 @@ fn replay(trace: &str, strict: bool, ext: bool, costs: &mut Costs) -> bool {
         Charged {
             value: server,
             charged,
+            moved: 0,
         }
     });
     let mut client = Client {

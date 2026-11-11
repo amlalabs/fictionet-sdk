@@ -914,6 +914,7 @@ mod test {
                 Charged {
                     value: (),
                     charged: 0,
+                    moved: 0,
                 }
             });
         }
@@ -926,6 +927,7 @@ mod test {
             Charged {
                 value: (),
                 charged: 0,
+                moved: 0,
             }
         });
         eprintln!("cost: version information: {}", costs.summary());

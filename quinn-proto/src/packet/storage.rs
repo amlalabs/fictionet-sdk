@@ -157,6 +157,7 @@ mod tests {
                     Charged {
                         value: packet,
                         charged: budget.used(),
+                        moved: 0,
                     }
                 },
             );
@@ -174,6 +175,7 @@ mod tests {
                     Charged {
                         value: tail,
                         charged: budget.used() - before,
+                        moved: 0,
                     }
                 },
             );
@@ -188,6 +190,7 @@ mod tests {
                 || Charged {
                     value: (packet.freeze(), tail.freeze()),
                     charged: 0,
+                    moved: 0,
                 },
             );
             assert_eq!(&head[..], &input[..len / 2]);
@@ -204,6 +207,7 @@ mod tests {
                 || Charged {
                     value: (tail.clone(), tail.slice(..)),
                     charged: 0,
+                    moved: 0,
                 },
             );
             drop(head);
@@ -236,6 +240,7 @@ mod tests {
                 || Charged {
                     value: PacketBuffer::copy_from(&budget, &input),
                     charged: budget.used(),
+                    moved: 0,
                 },
             );
             assert!(packet.is_none());
@@ -269,6 +274,7 @@ mod tests {
                     Charged {
                         value: (),
                         charged: 0,
+                        moved: 0,
                     }
                 },
             );

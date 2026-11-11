@@ -47,8 +47,7 @@ pub(crate) fn pair_with_guard(guard: Option<Box<dyn Send>>) -> (End, End) {
 /// slot is written and its share of the block of slots it sits in, at most
 /// two words. So a flood of tiny packets is bounded by what it keeps alive
 /// too.
-pub const PACKET_COST: usize =
-    crate::Chunk::HEADER + size_of::<Packet>() + 2 * size_of::<usize>();
+pub const PACKET_COST: usize = crate::Chunk::HEADER + size_of::<Packet>() + 2 * size_of::<usize>();
 
 /// Makes a [`pair`] whose queues each hold at most `limit` bytes, counting
 /// each packet's allocated capacity plus [`PACKET_COST`]. A packet sent

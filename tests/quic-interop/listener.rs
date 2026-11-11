@@ -320,6 +320,7 @@ fn refused_listener_admission_allocates_nothing() {
             Charged {
                 value: (listener, result),
                 charged: budget.used(),
+                moved: 0,
             }
         },
     );
