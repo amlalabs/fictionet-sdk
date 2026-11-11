@@ -419,7 +419,7 @@ harnesses do. One harness at a time, under a 14 GiB scope, on November
 
 | Harness | Bound | Result |
 | --- | --- | --- |
-| `the_counter_sees_every_allocation`, in smoltcp | the stubs see every allocation | successful, 13.4 s |
+| `the_counter_sees_every_allocation`, in `fictionet` and in smoltcp | the stubs see every allocation | successful (13.4 s in smoltcp) |
 | `the_first_datagram_is_paid_before_it_is_kept` | the most live at once is at most what the budget was charged after the step and the budget's own state; the step asks for no more than it charged | successful, 36.1 s |
 | `a_second_datagram_is_paid_before_it_is_kept` | the same, into a place already paid for | successful, 90.0 s |
 | `a_third_datagram_is_paid_before_it_is_kept` | the same | **does not fit**: out of memory at 14 GiB (51,913 VCCs) |
@@ -427,8 +427,9 @@ harnesses do. One harness at a time, under a 14 GiB scope, on November
 | `a_segment_into_an_empty_store_is_paid_for` and the two across waiting pieces | the most live at once is at most what the budget was charged and `PLACES`, besides the budget's and pool's state | **do not fit**: the first ran past 25 minutes; `insert` keeps 64 pieces in an array, so it unwinds 66; the other two, larger, were not run |
 | `a_first_short_write_is_paid_for`, `a_third_short_write_is_paid_for` | the same, for the send store | **do not fit**: the first ran past 25 minutes at unwind 8; the third was not run |
 
-`ip-verify resources` runs the three that finish and the counter's own
-check in `fictionet`. The harnesses that do not fit stay in their files,
+`ip-verify resources` runs the two UDP harnesses that finish and the
+counter's own check in both crates; on November 10 it passed in full, with
+`Holding.tla`'s five configs and every costed session. The harnesses that do not fit stay in their files,
 so a lighter shape can take their place; the costed sessions check the
 same bounds on the same code.
 
