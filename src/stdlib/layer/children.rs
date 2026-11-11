@@ -268,11 +268,22 @@ impl<B: Layer, K: Port> Places<B, K> {
             return false;
         };
         let wanted = self.kids.len() + 1;
-        let Some(more) = charge_places(charge, self.count, wanted, limit, Self::place_bytes())
-        else {
+        // Each table moves to a larger allocation, one at a time, its old
+        // one live beside the new until it has: at most what the places
+        // are charged now, charged again for that moment.
+        let moving = charge.bytes();
+        let Some((more, moving)) = charge_places(
+            charge,
+            self.count,
+            wanted,
+            limit,
+            Self::place_bytes(),
+            moving,
+        ) else {
             return false;
         };
         self.grow_to(self.count + more);
+        drop(moving);
         true
     }
 
@@ -295,13 +306,25 @@ impl<B: Layer, K: Port> Places<B, K> {
     /// idle connection holds the same whatever it held before: its queues
     /// and those places, so one with a few children at a time never gives
     /// places back to take them again. Closing commands still queued keep
-    /// their places until the mux takes them.
+    /// their places until the mux takes them. The tables move to smaller
+    /// allocations, so this waits for a moment the budget has room for
+    /// both.
     fn release(&mut self) {
         let count = FLOOR.max(self.down.len().saturating_sub(QUEUE));
         if !self.kids.is_empty() || count >= self.count {
             return;
         }
         let Some(charge) = &mut self.charge else {
+            return;
+        };
+        // Each table is made anew before the old one goes, and the command
+        // queue and the spares move to smaller allocations: the new tables
+        // are charged for that moment, and with no room for them now, the
+        // places stay.
+        let Some(moving) = charge
+            .budget()
+            .try_charge(Self::queue_bytes() + count * Self::place_bytes())
+        else {
             return;
         };
         self.kids = Slab::with_capacity(count);
@@ -315,6 +338,7 @@ impl<B: Layer, K: Port> Places<B, K> {
         self.spares = spares;
         self.count = count;
         charge.shrink_to(Self::queue_bytes() + count * Self::place_bytes());
+        drop(moving);
     }
 }
 
@@ -3281,11 +3305,13 @@ mod tests {
             let _ = driver.deliver(MuxEvent::Opened(child, (), 8)).unwrap();
         }
         assert_eq!(held(&driver), FLOOR);
-        // Room for one more place and the child's window, not for twice
-        // the places.
+        // Room for one more place, the tables again while they move to
+        // larger allocations, and the child's window, not for twice the
+        // places.
         let window = <StreamEvent as Credited>::receive_bytes(8).unwrap();
+        let moving = Places::<Reader, Top>::queue_bytes() + FLOOR * place;
         let other = budget
-            .charge(budget.limit() - budget.used() - place - window)
+            .charge(budget.limit() - budget.used() - place - moving - window)
             .unwrap();
         let child = slots.insert(()).unwrap();
         let id = child.id();
