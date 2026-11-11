@@ -87,6 +87,9 @@ impl<C: Fn() -> SystemTime> Layer for TimeServer<C> {
         event: DatagramEvent<SocketAddr>,
     ) -> Result<Admit<DatagramEvent<SocketAddr>>, Infallible> {
         let datagram = match event {
+            // Send completions must be taken even while a reply is
+            // pending; this server does not track them.
+            DatagramEvent::Sent(_) => return Ok(Admit::Taken),
             DatagramEvent::Datagram(d) if self.reply.is_some() => {
                 return Ok(Admit::Blocked(DatagramEvent::Datagram(d)));
             }
