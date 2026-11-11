@@ -844,3 +844,16 @@ and the installed Z3 solver. CBMC exited during SSA conversion with an
 internal `map::at` error, before a solver verdict. An equivalent spelling
 using plain boolean assertions had the same result and was reverted. This
 is a tool failure, not a production counterexample or a completed proof.
+
+## Finished stream retirement
+
+The connection adapter now retires a stream slot after both directions have
+ended and its pending write and directional-stop notifications have been
+handed up. The engine continues to own any retransmission state. Retirement
+emits `MuxEvent::Closed` without resetting a finished stream.
+
+The protected-peer regression serves thirty-two streams through sixteen
+adapter slots, checks receive-end and write-completion ordering before
+closure, and checks that no reset was emitted. Removing retirement makes
+the test fail at its first missing closure; restoring it passes. The TLS
+fixture now accepts an ALPN value for the HTTP/3 interoperability tests.

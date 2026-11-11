@@ -402,6 +402,16 @@ impl QuicLayer {
                 return true;
             }
         }
+        if channel.receive_done
+            && channel.send_done
+            && channel.written == 0
+            && channel.stopped.is_none()
+            && self.up.is_none()
+        {
+            self.channels.remove(id);
+            self.up = Some(MuxEvent::Closed(id));
+            return true;
+        }
         false
     }
 

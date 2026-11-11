@@ -29,6 +29,14 @@ fn configs(
     entropy: Arc<dyn Entropy>,
     datagrams: bool,
 ) -> (ClientConfig, ServerConfig, Arc<EndpointConfig>) {
+    configs_with_protocol(entropy, datagrams, b"fictionet-test")
+}
+
+fn configs_with_protocol(
+    entropy: Arc<dyn Entropy>,
+    datagrams: bool,
+    protocol: &[u8],
+) -> (ClientConfig, ServerConfig, Arc<EndpointConfig>) {
     let cert = rustls::pki_types::CertificateDer::from(
         include_bytes!("../../../../tests/it/fixtures/tls/p256.cert.der").to_vec(),
     );
@@ -51,7 +59,7 @@ fn configs(
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .unwrap();
-    client.alpn_protocols = vec![b"fictionet-test".to_vec()];
+    client.alpn_protocols = vec![protocol.to_vec()];
     server.alpn_protocols = client.alpn_protocols.clone();
     let mut transport = quinn_proto::TransportConfig::default();
     transport
@@ -286,6 +294,61 @@ fn protected_streams_run_over_the_datagram_carrier() {
     pair.server.command(server.send(StreamCommand::End));
     pair.drive();
     assert!(pair.client.events.iter().any(|event| matches!(event, MuxEvent::Child(id, StreamEvent::Data(data)) if *id == client.id() && data.as_ref() == b"world")));
+}
+
+#[test]
+fn finished_streams_release_adapter_slots_after_events() {
+    let mut pair = Pair::new();
+    pair.handshake();
+    for _ in 0..32 {
+        pair.client
+            .command(MuxCommand::control(ControlCommand::Open(Dir::Bi)));
+        pair.drive();
+        let (client, _) = pair.client.opened();
+        pair.client.command(client.grant(1));
+        pair.client.command(client.send(StreamCommand::End));
+        pair.drive();
+        let (server, _) = pair.server.opened();
+        pair.server.command(server.grant(1));
+        pair.server.command(server.send(StreamCommand::Write(
+            Chunk::copy_of(pair.server.driver.budget(), b"x").unwrap(),
+        )));
+        pair.server.command(server.send(StreamCommand::End));
+        pair.drive();
+        for (peer, child) in [(&pair.client, &client), (&pair.server, &server)] {
+            let ended = peer
+                .events
+                .iter()
+                .position(
+                    |e| matches!(e, MuxEvent::Child(id, StreamEvent::Ended) if *id == child.id()),
+                )
+                .unwrap();
+            let closed = peer
+                .events
+                .iter()
+                .position(|e| matches!(e, MuxEvent::Closed(id) if *id == child.id()))
+                .unwrap();
+            assert!(ended < closed);
+            assert!(!peer.events.iter().any(|e| matches!(e, MuxEvent::Child(id, StreamEvent::ReceiveReset(_) | StreamEvent::SendStopped(_)) if *id == child.id())));
+        }
+        let written = pair
+            .server
+            .events
+            .iter()
+            .position(
+                |e| matches!(e, MuxEvent::Child(id, StreamEvent::Written(1)) if *id == server.id()),
+            )
+            .unwrap();
+        let closed = pair
+            .server
+            .events
+            .iter()
+            .position(|e| matches!(e, MuxEvent::Closed(id) if *id == server.id()))
+            .unwrap();
+        assert!(written < closed);
+        pair.client.events.clear();
+        pair.server.events.clear();
+    }
 }
 
 #[test]
