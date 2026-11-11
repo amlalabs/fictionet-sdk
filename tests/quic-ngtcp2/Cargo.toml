@@ -1,0 +1,21 @@
+[package]
+name = "fictionet-quic-ngtcp2"
+version = "0.0.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+path = "lib.rs"
+doctest = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+fictionet = { path = "../.." }
+quinn-proto = { package = "fictionet-quinn-proto", path = "../../quinn-proto", default-features = false, features = ["rustls-ring"] }
+rustls = { package = "fictionet-rustls", path = "../../rustls", default-features = false, features = ["std", "ring"] }
+ring = "0.17"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

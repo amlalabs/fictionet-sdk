@@ -17,17 +17,19 @@ use crate::lean_vectors::{Report, logged, scoped};
 /// The Kani harnesses `harnesses` of `package`'s library, with the
 /// allocation functions stubbed by their counting ones (`-Z stubbing`) and
 /// `malloc` under them (`-Z c-ffi`), which tell a live allocation from a dangling pointer (`-Z mem-predicates`), and the area's own `unstable` features (`-Z restrict-vtable` where harnesses call through `dyn`). Each harness must report
-/// `VERIFICATION:- SUCCESSFUL`.
+/// `VERIFICATION:- SUCCESSFUL`. Kani runs in a scope of `memory` (a
+/// systemd `MemoryMax`, such as `10G`).
 pub fn kani(
     root: &Path,
     out: &Path,
     package: &str,
     unstable: &[&str],
     harnesses: &[&str],
+    memory: &str,
 ) -> Result<Report> {
     let mut report = Report::new("kani");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = scoped(cargo, "16G");
+    let mut command = scoped(cargo, memory);
     command.args([
         "kani",
         "-p",

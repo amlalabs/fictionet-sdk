@@ -23,7 +23,7 @@ counted_proof! {
                 available: client,
                 unknown_available: false,
             };
-            let _ = negotiation_was_genuine(&offered, &server, negotiated);
+            let _ = negotiation_was_genuine(&offered, &server, original, negotiated);
         });
         assert!(cost.requested <= 0);
         assert!(cost.peak <= 0);

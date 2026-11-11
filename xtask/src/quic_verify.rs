@@ -23,6 +23,9 @@ const PACKAGE: &str = "fictionet-quinn-proto";
 /// The harnesses call key and token traits through `dyn`.
 const UNSTABLE: [&str; 1] = ["restrict-vtable"];
 
+/// Each harness fits in 10 GiB, the cap on this workstation's jobs.
+const KANI_MEMORY: &str = "10G";
+
 /// The counter's own check, then every storage of version negotiation:
 /// key derivations charged first, Retry and Version Negotiation packets
 /// and tokens in the send buffer, a client's Retry copy within its charge,
@@ -72,6 +75,7 @@ pub fn run(args: &[String]) -> Result {
                 PACKAGE,
                 &UNSTABLE,
                 &KANI_RESOURCES,
+                KANI_MEMORY,
             )?);
             report.absorb(resources::tlc(
                 &root,

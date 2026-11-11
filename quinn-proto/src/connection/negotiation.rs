@@ -144,8 +144,10 @@ pub(crate) struct Negotiation {
     /// of an offered version a server Initial may use.
     pub(super) other: Option<OtherInitial>,
     /// Client: its transport parameters, carrying this first flight's
-    /// Version Information, sent again after Version Negotiation
-    client_params: Option<TransportParameters>,
+    /// Version Information, sent again after Version Negotiation. Server:
+    /// its transport parameters until it has chosen the version, which its
+    /// Version Information then names.
+    params: Option<TransportParameters>,
 }
 
 impl Negotiation {
@@ -170,29 +172,42 @@ impl Negotiation {
             settled: false,
             reacted,
             other: None,
-            client_params: Some(params),
+            params: Some(params),
         }
     }
 
     /// A client's transport parameters for its first flight
     pub(crate) fn client_params(&self) -> &TransportParameters {
-        self.client_params
+        self.params
             .as_ref()
             .expect("only clients send their first flight")
     }
 
-    /// A server answering a first flight in `original`, holding the keys of
-    /// that version when it negotiated another
-    pub(crate) fn server(original: u32, other: Option<OtherInitial>) -> Self {
+    /// A server answering a first flight in `original` with `params`. It
+    /// chooses the version once the client's offer has arrived (RFC 9368
+    /// section 2.3), before its TLS session reads the ClientHello.
+    pub(crate) fn server(original: u32, params: TransportParameters) -> Self {
         Self {
             original,
             preference: VersionList::EMPTY,
             offered: VersionList::EMPTY,
             settled: true,
             reacted: false,
-            other,
-            client_params: None,
+            other: None,
+            params: Some(params),
         }
+    }
+
+    /// Server: whether it still waits for the client's offer
+    pub(super) fn choosing(&self, side: Side) -> bool {
+        side.is_server() && self.params.is_some()
+    }
+
+    /// Server: stop waiting, taking the transport parameters to send
+    pub(super) fn chose(&mut self) -> TransportParameters {
+        self.params
+            .take()
+            .expect("a server chooses its version once")
     }
 
     /// The versions packet headers may carry right now
@@ -380,7 +395,7 @@ mod tests {
 
     #[test]
     fn a_server_keeps_original_initials_and_zero_rtt_and_negotiated_handshakes() {
-        let server = Negotiation::server(QUIC_V1, None);
+        let server = Negotiation::server(QUIC_V1, TransportParameters::default());
         let admit = |kind, version| server.admit(Side::Server, QUIC_V2, kind, version);
         assert_eq!(admit(LongKind::Initial, QUIC_V2), Admission::Current);
         // Without retained keys an original Initial cannot be read.

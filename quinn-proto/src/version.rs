@@ -16,7 +16,7 @@
 use std::fmt;
 
 mod first_flight;
-pub(crate) use first_flight::client_version_information;
+pub(crate) use first_flight::{client_offer, Offer, Received};
 
 /// QUIC version 1 ([RFC 9000](https://www.rfc-editor.org/rfc/rfc9000.html))
 pub const QUIC_V1: u32 = 0x0000_0001;

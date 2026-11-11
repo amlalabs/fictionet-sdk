@@ -199,7 +199,7 @@ counted_proof! {
             }
             let _ = client.admit(Side::Client, QUIC_V1, kind, version);
             let _ = client.decodable(Side::Client, QUIC_V1);
-            let server = Negotiation::server(QUIC_V1, None);
+            let server = Negotiation::server(QUIC_V1, TransportParameters::default());
             let _ = server.admit(Side::Server, version, kind, QUIC_V1);
         });
         assert!(cost.requested <= 0);

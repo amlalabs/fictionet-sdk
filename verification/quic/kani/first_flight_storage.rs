@@ -1,8 +1,8 @@
 //! Storage of the first-flight reader (RFC 9368 section 2.3): a server
 //! reads the client's Version Information from the transport parameters in
-//! place. The whole reader, CRYPTO frames and ClientHello included, is
+//! place. The whole reader, pieces of the crypto stream and ClientHello included, is
 //! costed by the replay `the_reader_allocates_nothing_on_any_first_flight`
-//! below it; CBMC ran out of 10 GiB on it under symbolic frames.
+//! below it; CBMC ran out of 10 GiB on it under a symbolic ClientHello.
 use super::*;
 use crate::counting::{counted_proof, measure};
 
@@ -18,7 +18,7 @@ counted_proof! {
         params[..3].copy_from_slice(&[0x01, 1, 0x05]);
         params[3..5].copy_from_slice(&[0x11, 12]);
         params[5..].copy_from_slice(&body);
-        let (offer, cost) = measure(|| transport_parameter(Cursor::contiguous(&params)));
+        let (offer, cost) = measure(|| transport_parameter(Cursor::new(&params[..])));
         assert!(cost.requested <= 0);
         assert!(cost.peak <= 0);
         let word = |i: usize| u32::from_be_bytes(body[i..i + 4].try_into().unwrap());

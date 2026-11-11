@@ -2,7 +2,7 @@ use super::*;
 use crate::counting::{counted_proof, measure};
 
 #[kani::proof]
-#[kani::unwind(4)]
+#[kani::unwind(10)]
 fn version_information_validates_all_versions_and_the_peer_role() {
     let chosen: u32 = kani::any();
     let first: u32 = kani::any();

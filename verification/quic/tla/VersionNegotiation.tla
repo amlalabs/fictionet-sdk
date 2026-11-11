@@ -9,7 +9,7 @@
      (connection/negotiation.rs), which offers the preferred versions its
      first flight converts to.
    - ServerRecvInitial: Endpoint::handle_buffer (Version Negotiation for an
-     unsupported version), Endpoint::accept and compatible_upgrade with
+     unsupported version), Endpoint::accept and Connection::choose_version with
      version::select_compatible.
    - ClientRecvVN: Negotiation::react and Connection::restart_in_version.
    - ClientRecvInitial: Negotiation::admit (Current or Try) and

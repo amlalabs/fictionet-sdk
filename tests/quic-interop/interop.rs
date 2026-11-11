@@ -53,9 +53,13 @@ pub(super) fn configuration() -> quiche::Config {
 }
 
 fn exchange(sdk_client: bool, datagrams: bool) {
+    exchange_in(Pair::with_datagrams(datagrams), sdk_client, datagrams);
+}
+
+/// Run the exchange over `pair`, returning the SDK side's settled version
+fn exchange_in(pair: Pair, sdk_client: bool, datagrams: bool) -> Option<u32> {
     const REQUEST: &[u8] = b"request over independent QUIC";
     const RESPONSE: &[u8] = b"response over independent QUIC";
-    let pair = Pair::with_datagrams(datagrams);
     let (mut sdk, other) = if sdk_client {
         (pair.client, pair.server.address)
     } else {
@@ -219,6 +223,7 @@ fn exchange(sdk_client: bool, datagrams: bool) {
     assert_eq!(stock.application_proto(), b"fictionet-test");
     assert_eq!(sdk_received, if sdk_client { RESPONSE } else { REQUEST });
     assert_eq!(stock_received, if sdk_client { REQUEST } else { RESPONSE });
+    sdk.driver.layer().version()
 }
 
 #[test]
@@ -239,4 +244,32 @@ fn client_exchanges_application_datagrams_with_quiche() {
 #[test]
 fn server_exchanges_application_datagrams_with_quiche() {
     exchange(false, true);
+}
+
+// quiche 0.30.1 speaks only version 1 (`quiche::version_is_supported`), so
+// it cannot run version 2. A version 2 capable SDK endpoint must still
+// interoperate with it in version 1.
+
+#[test]
+fn a_client_offering_version_2_keeps_version_1_with_quiche() {
+    let pair = Pair::versions(
+        QUIC_V1,
+        &[QUIC_V2, QUIC_V1],
+        &[QUIC_V2, QUIC_V1],
+        AddressValidation::Accept,
+    );
+    assert_eq!(exchange_in(pair, true, false), Some(QUIC_V1));
+}
+
+#[test]
+fn a_server_preferring_version_2_keeps_version_1_with_quiche() {
+    // quiche sends no Version Information, so the whole ClientHello
+    // arrives without an offer and the server keeps the client's version.
+    let pair = Pair::versions(
+        QUIC_V1,
+        &[QUIC_V2, QUIC_V1],
+        &[QUIC_V2, QUIC_V1],
+        AddressValidation::Accept,
+    );
+    assert_eq!(exchange_in(pair, false, false), Some(QUIC_V1));
 }

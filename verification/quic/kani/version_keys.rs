@@ -413,8 +413,13 @@ fn retry_integrity_and_type_bits_follow_the_version() {
 fn a_retry_in_an_unknown_version_is_never_valid() {
     let version: u32 = kani::any();
     kani::assume(!is_known(version));
-    let cid = ConnectionId::new(&CID);
-    let payload = [0; 24];
-    assert!(!is_valid_retry(version, &cid, &[0xf0], &payload));
-    assert!(retry_tag(version, &cid, &[0xf0]).is_none());
+    // A Retry Pseudo-Packet: the Original Destination Connection ID with
+    // its length, a first byte and a tag's worth of anything.
+    let mut pseudo_packet = [0; 1 + CID.len() + 1 + 16];
+    pseudo_packet[0] = CID.len() as u8;
+    pseudo_packet[1..=CID.len()].copy_from_slice(&CID);
+    pseudo_packet[CID.len() + 1] = 0xf0;
+    let tag_start = pseudo_packet.len() - 16;
+    assert!(retry_tag(version, &pseudo_packet[..tag_start]).is_none());
+    assert!(!is_valid_retry(version, &mut pseudo_packet));
 }

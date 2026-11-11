@@ -22,7 +22,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
-    connection::{Connection, ConnectionError, Negotiation, OtherInitial, SideArgs},
+    connection::{Connection, ConnectionError, Negotiation, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
@@ -35,7 +35,7 @@ use crate::{
     },
     token::{IncomingToken, InvalidRetryTokenError, Token, TokenPayload},
     transport_parameters::{PreferredAddress, TransportParameters},
-    version::{client_version_information, select_compatible, VersionInformation, VersionList},
+    version::{VersionInformation, VersionList},
     Duration, Instant, ResetToken, Side, Transmit, TransportConfig, TransportError, INITIAL_MTU,
     MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE,
 };
@@ -694,41 +694,22 @@ impl Endpoint {
             });
         }
 
-        // Compatible version negotiation (RFC 9368 section 2.3) decides the
-        // version before the TLS session answers the ClientHello.
-        let original = version;
-        let upgrade =
-            self.compatible_upgrade(&server_config, original, &dst_cid, &incoming.packet.payload);
-        let negotiated = upgrade.as_ref().map_or(original, |upgrade| upgrade.0);
+        // The connection starts in the client's version. It may move to a
+        // compatible one once the client's offer arrives, before its TLS
+        // session reads the ClientHello (RFC 9368 section 2.3).
         params.version_information = Some(VersionInformation {
-            chosen: negotiated,
+            chosen: version,
             available: VersionList::known(self.config.supported_versions.iter().copied()),
             unknown_available: false,
         });
-        let mut tls = server_config
-            .crypto
-            .clone()
-            .start_session(original, &params);
-        let (initial_keys, other) = match upgrade {
-            Some((_, keys, other)) if tls.set_negotiated_version(negotiated).is_ok() => {
-                (keys, Some(other))
-            }
-            _ => {
-                let Ok(keys) = server_config.crypto.initial_keys(original, &dst_cid) else {
-                    unreachable!("the first packet was read with this version");
-                };
-                (keys, None)
-            }
-        };
-        let negotiated = if other.is_some() {
-            negotiated
-        } else {
-            original
+        let tls = server_config.crypto.clone().start_session(version, &params);
+        let Ok(initial_keys) = server_config.crypto.initial_keys(version, &dst_cid) else {
+            unreachable!("the first packet was read with this version");
         };
         let transport_config = server_config.transport.clone();
         let mut conn = self.add_connection(
             ch,
-            negotiated,
+            version,
             dst_cid,
             loc_cid,
             src_cid,
@@ -742,7 +723,7 @@ impl Endpoint {
                 pref_addr_cid,
                 path_validated: remote_address_validated,
             },
-            Negotiation::server(original, other),
+            Negotiation::server(version, params),
         );
         self.index.insert_initial(dst_cid, ch);
 
@@ -892,43 +873,6 @@ impl Endpoint {
         self.index.remove_initial(incoming.packet.header.dst_cid);
         let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
-    }
-
-    /// The version a server switches a client's first flight in `original` to,
-    /// with the connection's Initial keys in that version and the original
-    /// keys it retains for the client's later Initial packets. `None` keeps
-    /// the original version: no compatible offer was found in `payload`, the
-    /// decrypted first packet, or the budget refused the retained keys.
-    ///
-    /// The negotiated keys take the place of the original version's keys a
-    /// connection that keeps its version derives; the retained keys are
-    /// charged before they are derived.
-    fn compatible_upgrade(
-        &self,
-        server_config: &ServerConfig,
-        original: u32,
-        dst_cid: &ConnectionId,
-        payload: &[u8],
-    ) -> Option<(u32, Keys, OtherInitial)> {
-        let client = client_version_information(payload)?;
-        if client.chosen != original {
-            // Validation of the transport parameters closes the connection.
-            return None;
-        }
-        let negotiated =
-            select_compatible(original, &self.config.supported_versions, &client.available);
-        if negotiated == original {
-            return None;
-        }
-        let crypto = &server_config.crypto;
-        let retained = OtherInitial::derive(
-            original,
-            self.reassembly_budget.as_ref(),
-            crypto.initial_keys_charge(),
-            || crypto.initial_keys(original, dst_cid),
-        )?;
-        let keys = crypto.initial_keys(negotiated, dst_cid).ok()?;
-        Some((negotiated, keys, retained))
     }
 
     fn add_connection(

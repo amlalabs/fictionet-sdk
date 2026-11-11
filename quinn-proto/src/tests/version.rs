@@ -117,6 +117,50 @@ fn a_server_preferring_version_2_upgrades_a_version_1_first_flight() {
 }
 
 #[test]
+fn a_server_reads_an_offer_spread_over_reordered_initial_packets() {
+    // A large ClientHello, here from many application protocols, spans two
+    // Initial packets (RFC 9001 section 4.3). The second arrives first, so
+    // the server's first packet holds no start of the ClientHello; it reads
+    // the offer once the other arrives, before its TLS session answers.
+    let _guard = subscribe();
+    let protocols: Vec<Vec<u8>> = (0..40u8).map(|n| vec![b'a' + n % 26; 40]).collect();
+    let mut server_endpoint = EndpointConfig::default();
+    server_endpoint.supported_versions(vec![QUIC_V2, QUIC_V1]);
+    let client = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let server = Endpoint::new(
+        Arc::new(server_endpoint),
+        Some(Arc::new(ServerConfig::with_crypto(Arc::new(
+            server_crypto_with_alpn(protocols.clone()),
+        )))),
+        true,
+        None,
+    );
+    let mut pair = Pair::new_from_endpoint(client, server);
+    let mut config = ClientConfig::new(Arc::new(client_crypto_with_alpn(protocols)));
+    config
+        .version(QUIC_V1)
+        .preferred_versions(VersionList::new(&[QUIC_V2, QUIC_V1]).unwrap());
+    let client_ch = pair.begin_connect(config);
+    pair.drive_client();
+    assert_eq!(
+        pair.server.inbound.len(),
+        2,
+        "the first flight is two datagrams"
+    );
+    pair.server.inbound.swap(0, 1);
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    pair.finish_connect(client_ch, server_ch);
+    assert_versions(&mut pair, client_ch, server_ch, QUIC_V2);
+    exchange(&mut pair, client_ch, server_ch);
+    let server = sent_by(&pair, Side::Server);
+    assert!(
+        server.iter().all(|&version| version == QUIC_V2),
+        "{server:x?}"
+    );
+}
+
+#[test]
 fn a_server_keeps_version_1_unless_the_client_offers_version_2() {
     let _guard = subscribe();
     let mut pair = pair_with_server_versions(&[QUIC_V2, QUIC_V1]);

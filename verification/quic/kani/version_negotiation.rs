@@ -261,7 +261,11 @@ fn admitted_only_in_its_version(kind: LongKind) {
     // only an offered version's.
     let other_version = if server { original } else { kani::any() };
     kani::assume(server || offered.contains(other_version));
-    let other = kani::any::<bool>().then(|| OtherInitial::new(other_version, keys(), None));
+    let other = kani::any::<bool>().then(|| OtherInitial {
+        version: other_version,
+        keys: keys(),
+        charge: KeyCharge { _charge: None },
+    });
     let negotiation = Negotiation {
         original,
         preference: offered,
@@ -269,7 +273,7 @@ fn admitted_only_in_its_version(kind: LongKind) {
         settled: server || settled,
         reacted: kani::any(),
         other,
-        client_params: None,
+        params: None,
     };
     let version: u32 = kani::any();
     let admission = negotiation.admit(side, current, kind, version);
