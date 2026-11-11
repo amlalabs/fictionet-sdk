@@ -1,22 +1,22 @@
-//! Reading the client's Version Information from its first Initial packet
+//! Reading the client's Version Information from its first flight
 //!
 //! A server choosing a compatible version must know the client's Available
 //! Versions before its TLS session answers the ClientHello, since the
 //! server's own Version Information goes in that answer and names the
-//! negotiated version. This reads the decrypted payload of the client's
-//! first Initial packet in place: its CRYPTO frames, the ClientHello they
-//! carry, the QUIC transport parameters extension and the Version
-//! Information parameter. Nothing is copied or allocated.
+//! negotiated version. This reads the client's Initial crypto stream as it
+//! has arrived so far, across however many packets and CRYPTO frames carry
+//! it: the ClientHello, the QUIC transport parameters extension and the
+//! Version Information parameter. Nothing is copied or allocated.
 //!
-//! When the ClientHello does not fit in that packet, or anything about it
-//! is unexpected, there is no answer and the server keeps the client's
-//! version, which RFC 9368 permits. The TLS session and the transport
-//! parameter decoder still check the whole ClientHello afterwards.
+//! Clients may split the ClientHello over several packets, and some leave
+//! part of it for a later packet on purpose. So the reader distinguishes an
+//! offer still arriving from a ClientHello that has fully arrived without
+//! one. A ClientHello without a readable offer, or anything unexpected
+//! about it, makes the server keep the client's version, which RFC 9368
+//! permits. The TLS session and the transport parameter decoder still check
+//! the whole ClientHello afterwards.
 
 use super::{VersionInformation, VersionList};
-
-/// CRYPTO frames read from one packet; more leave the first flight unread
-const MAX_CRYPTO_FRAMES: usize = 8;
 
 /// TLS HandshakeType client_hello (RFC 8446 section 4)
 const CLIENT_HELLO: u8 = 1;
@@ -27,11 +27,46 @@ const QUIC_TRANSPORT_PARAMETERS: u16 = 0x39;
 /// The Version Information transport parameter (RFC 9368 section 3)
 const VERSION_INFORMATION: u64 = 0x11;
 
-/// The client's Version Information, when the decrypted Initial `payload`
-/// holds the whole ClientHello and the ClientHello carries one
-pub(crate) fn client_version_information(payload: &[u8]) -> Option<VersionInformation> {
-    let crypto = CryptoData::read(payload)?;
-    let mut hello = crypto.cursor(0);
+/// The client's Initial crypto stream as received so far
+pub(crate) trait Received {
+    /// The stream byte at `position`, if it has arrived
+    fn byte(&self, position: u64) -> Option<u8>;
+    /// How many bytes from the start of the stream have all arrived
+    fn prefix(&self) -> u64;
+}
+
+/// What the received part of a first flight says about the client's offer
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// The client's Version Information
+    Found(VersionInformation),
+    /// More of the ClientHello must arrive before the offer can be read
+    Arriving,
+    /// The stream does not start with a ClientHello, or the whole
+    /// ClientHello arrived without a well-formed offer
+    Absent,
+}
+
+/// The client's offer in the `received` part of its Initial crypto stream
+pub(crate) fn client_offer<R: Received + ?Sized>(received: &R) -> Offer {
+    if let Some(info) = client_version_information(received) {
+        return Offer::Found(info);
+    }
+    let mut header = Cursor::new(received);
+    match header.u8() {
+        None => Offer::Arriving,
+        Some(CLIENT_HELLO) => match header.u24() {
+            Some(len) if received.prefix() >= 4 + len => Offer::Absent,
+            _ => Offer::Arriving,
+        },
+        Some(_) => Offer::Absent,
+    }
+}
+
+/// The client's Version Information, when the received bytes it depends on
+/// have arrived and the ClientHello carries one
+fn client_version_information<R: Received + ?Sized>(received: &R) -> Option<VersionInformation> {
+    let mut hello = Cursor::new(received);
     if hello.u8()? != CLIENT_HELLO {
         return None;
     }
@@ -58,7 +93,9 @@ pub(crate) fn client_version_information(payload: &[u8]) -> Option<VersionInform
 }
 
 /// Find and read Version Information among transport parameters
-fn transport_parameter(mut params: Cursor<'_>) -> Option<VersionInformation> {
+fn transport_parameter<R: Received + ?Sized>(
+    mut params: Cursor<'_, R>,
+) -> Option<VersionInformation> {
     while !params.is_empty() {
         let id = params.var()?;
         let len = params.var()?;
@@ -72,7 +109,9 @@ fn transport_parameter(mut params: Cursor<'_>) -> Option<VersionInformation> {
 
 /// Version Information as a client sends it (RFC 9368 section 4): nonzero
 /// entries in whole words, with the Chosen Version among the available ones
-fn version_information(mut body: Cursor<'_>) -> Option<VersionInformation> {
+fn version_information<R: Received + ?Sized>(
+    mut body: Cursor<'_, R>,
+) -> Option<VersionInformation> {
     let chosen = body.u32()?;
     let mut available = VersionList::EMPTY;
     let mut unknown_available = false;
@@ -92,95 +131,39 @@ fn version_information(mut body: Cursor<'_>) -> Option<VersionInformation> {
     })
 }
 
-/// The CRYPTO frames of one Initial packet, by stream offset
-struct CryptoData<'a> {
-    frames: [(u64, &'a [u8]); MAX_CRYPTO_FRAMES],
-    count: usize,
-}
-
-impl<'a> CryptoData<'a> {
-    /// Collect the CRYPTO frames of an Initial packet payload. Initial
-    /// packets carry only PADDING, PING, ACK, CRYPTO and CONNECTION_CLOSE
-    /// (RFC 9000 section 12.4); any other frame leaves the payload unread.
-    fn read(payload: &'a [u8]) -> Option<Self> {
-        let mut data = Self {
-            frames: [(0, &[]); MAX_CRYPTO_FRAMES],
-            count: 0,
-        };
-        let mut r = Cursor::contiguous(payload);
-        while !r.is_empty() {
-            match r.var()? {
-                0x00 | 0x01 => {}
-                ty @ (0x02 | 0x03) => {
-                    r.var()?; // largest acknowledged
-                    r.var()?; // delay
-                    let ranges = r.var()?;
-                    r.var()?; // first range
-                    for _ in 0..ranges {
-                        r.var()?;
-                        r.var()?;
-                    }
-                    if ty == 0x03 {
-                        for _ in 0..3 {
-                            r.var()?;
-                        }
-                    }
-                }
-                0x06 => {
-                    let offset = r.var()?;
-                    let len = r.var()?;
-                    let bytes = r.slice(len)?;
-                    if data.count == MAX_CRYPTO_FRAMES {
-                        return None;
-                    }
-                    data.frames[data.count] = (offset, bytes);
-                    data.count += 1;
-                }
-                _ => return None,
-            }
-        }
-        Some(data)
-    }
-
-    fn cursor(&self, position: u64) -> Cursor<'_> {
-        Cursor {
-            source: Source::Crypto(self),
-            position,
-            end: u64::MAX,
-        }
-    }
-
-    /// The stream byte at `position`, if a frame carries it
+/// A contiguous stream that has wholly arrived
+impl Received for [u8] {
     fn byte(&self, position: u64) -> Option<u8> {
-        self.frames[..self.count]
-            .iter()
-            .find_map(|&(offset, bytes)| {
-                let index = position.checked_sub(offset)?;
-                bytes.get(usize::try_from(index).ok()?).copied()
-            })
+        self.get(usize::try_from(position).ok()?).copied()
+    }
+
+    fn prefix(&self) -> u64 {
+        self.len() as u64
     }
 }
 
-#[derive(Clone, Copy)]
-enum Source<'a> {
-    Contiguous(&'a [u8]),
-    Crypto(&'a CryptoData<'a>),
-}
-
-/// A bounded reader over a source, failing at the bound or a missing byte
-#[derive(Clone, Copy)]
-struct Cursor<'a> {
-    source: Source<'a>,
+/// A bounded reader over received bytes, failing at the bound or a missing
+/// byte
+struct Cursor<'a, R: Received + ?Sized> {
+    received: &'a R,
     position: u64,
     end: u64,
 }
 
-impl<'a> Cursor<'a> {
-    fn contiguous(bytes: &'a [u8]) -> Self {
+impl<R: Received + ?Sized> Clone for Cursor<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R: Received + ?Sized> Copy for Cursor<'_, R> {}
+
+impl<'a, R: Received + ?Sized> Cursor<'a, R> {
+    fn new(received: &'a R) -> Self {
         Self {
-            source: Source::Contiguous(bytes),
+            received,
             position: 0,
-            end: bytes.len() as u64,
+            end: u64::MAX,
         }
     }
 
@@ -207,10 +190,7 @@ impl<'a> Cursor<'a> {
         if self.is_empty() {
             return None;
         }
-        let byte = match self.source {
-            Source::Contiguous(bytes) => *bytes.get(usize::try_from(self.position).ok()?)?,
-            Source::Crypto(data) => data.byte(self.position)?,
-        };
+        let byte = self.received.byte(self.position)?;
         self.position += 1;
         Some(byte)
     }
@@ -245,16 +225,6 @@ impl<'a> Cursor<'a> {
         }
         Some(value)
     }
-
-    /// The next `len` bytes of a contiguous source
-    fn slice(&mut self, len: u64) -> Option<&'a [u8]> {
-        let Source::Contiguous(bytes) = self.source else {
-            return None;
-        };
-        let start = usize::try_from(self.position).ok()?;
-        let range = self.limit(len)?;
-        bytes.get(start..usize::try_from(range.end).ok()?)
-    }
 }
 
 #[cfg(test)]
@@ -264,6 +234,33 @@ mod tests {
         coding::BufMutExt,
         version::{QUIC_V1, QUIC_V2},
     };
+
+    /// Pieces of a stream by offset, in the order they arrived
+    struct Pieces<'a>(Vec<(u64, &'a [u8])>);
+
+    impl Received for Pieces<'_> {
+        fn byte(&self, position: u64) -> Option<u8> {
+            self.0.iter().find_map(|&(offset, bytes)| {
+                bytes
+                    .get(usize::try_from(position.checked_sub(offset)?).ok()?)
+                    .copied()
+            })
+        }
+
+        fn prefix(&self) -> u64 {
+            let mut end = 0;
+            while let Some(next) = self
+                .0
+                .iter()
+                .filter(|&&(offset, _)| offset <= end)
+                .map(|&(offset, bytes)| offset + bytes.len() as u64)
+                .find(|&next| next > end)
+            {
+                end = next;
+            }
+            end
+        }
+    }
 
     /// A ClientHello carrying `params` as its QUIC transport parameters,
     /// after another extension
@@ -300,72 +297,87 @@ mod tests {
         params
     }
 
-    fn crypto_frame(offset: u64, data: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::new();
-        frame.write_var(0x06);
-        frame.write_var(offset);
-        frame.write_var(data.len() as u64);
-        frame.extend_from_slice(data);
-        frame
+    fn found(offer: Offer) -> VersionInformation {
+        match offer {
+            Offer::Found(info) => info,
+            other => panic!("no offer: {other:?}"),
+        }
     }
 
     #[test]
-    fn reads_the_client_offer_from_one_crypto_frame_and_padding() {
+    fn reads_the_client_offer_from_a_whole_hello() {
         let hello = client_hello(&params(QUIC_V1, &[QUIC_V2, 0x1a2a_3a4a, QUIC_V1]));
-        let mut payload = crypto_frame(0, &hello);
-        payload.resize(1162, 0);
-        let info = client_version_information(&payload).unwrap();
+        let info = found(client_offer(hello.as_slice()));
         assert_eq!(info.chosen, QUIC_V1);
         assert_eq!(info.available.as_slice(), &[QUIC_V2, QUIC_V1]);
         assert!(info.unknown_available);
     }
 
     #[test]
-    fn reads_shuffled_crypto_frames_around_ping_and_ack() {
+    fn reads_an_offer_from_shuffled_pieces_across_packets() {
         let hello = client_hello(&params(QUIC_V1, &[QUIC_V1, QUIC_V2]));
         let (a, rest) = hello.split_at(40);
         let (b, c) = rest.split_at(17);
-        let mut payload = vec![0x01];
-        payload.extend(crypto_frame(57, c));
-        payload.extend([0x02, 0x05, 0x00, 0x01, 0x00, 0x01, 0x01]);
-        payload.extend(crypto_frame(0, a));
-        payload.extend([0x00, 0x00]);
-        payload.extend(crypto_frame(40, b));
-        let info = client_version_information(&payload).unwrap();
+        let pieces = Pieces(vec![(57, c), (0, a), (40, b)]);
+        assert_eq!(pieces.prefix(), hello.len() as u64);
+        let info = found(client_offer(&pieces));
         assert_eq!(info.available.as_slice(), &[QUIC_V1, QUIC_V2]);
     }
 
     #[test]
-    fn a_hello_that_is_incomplete_or_malformed_gives_no_offer() {
+    fn an_offer_is_read_while_another_part_of_the_hello_is_missing() {
+        // As ngtcp2 does, the first packet leaves out some bytes of the
+        // ClientHello before the transport parameters.
         let hello = client_hello(&params(QUIC_V1, &[QUIC_V2, QUIC_V1]));
-        // A gap: the last byte belongs to a later packet.
-        assert!(client_version_information(&crypto_frame(0, &hello[..hello.len() - 1])).is_none());
+        let pieces = Pieces(vec![(0, &hello[..8]), (16, &hello[16..])]);
+        assert_eq!(pieces.prefix(), 8);
+        assert_eq!(found(client_offer(&pieces)).chosen, QUIC_V1);
+    }
+
+    #[test]
+    fn an_incomplete_hello_without_its_offer_is_still_arriving() {
+        let hello = client_hello(&params(QUIC_V1, &[QUIC_V2, QUIC_V1]));
+        assert_eq!(client_offer(&hello[..hello.len() - 1]), Offer::Arriving);
+        assert_eq!(client_offer(&hello[..2]), Offer::Arriving);
+        assert_eq!(client_offer(&[] as &[u8]), Offer::Arriving);
+        // The offer's bytes arrive after the rest.
+        let split = hello.len() - 3;
+        let pieces = Pieces(vec![(0, &hello[..split])]);
+        assert_eq!(client_offer(&pieces), Offer::Arriving);
+        let pieces = Pieces(vec![(0, &hello[..split]), (split as u64, &hello[split..])]);
+        assert_eq!(found(client_offer(&pieces)).chosen, QUIC_V1);
+    }
+
+    #[test]
+    fn a_whole_hello_without_a_valid_offer_has_none() {
         // The client's Chosen Version must be among its available versions.
         let missing = client_hello(&params(QUIC_V1, &[QUIC_V2]));
-        assert!(client_version_information(&crypto_frame(0, &missing)).is_none());
+        assert_eq!(client_offer(missing.as_slice()), Offer::Absent);
         let zero = client_hello(&params(QUIC_V1, &[QUIC_V1, 0]));
-        assert!(client_version_information(&crypto_frame(0, &zero)).is_none());
+        assert_eq!(client_offer(zero.as_slice()), Offer::Absent);
         let none = client_hello(&[0x04, 0x02, 0x43, 0xe8]);
-        assert!(client_version_information(&crypto_frame(0, &none)).is_none());
-        // A STREAM frame cannot appear in an Initial packet.
-        let mut stream = crypto_frame(0, &hello);
-        stream.extend([0x08, 0x00, 0x00]);
-        assert!(client_version_information(&stream).is_none());
+        assert_eq!(client_offer(none.as_slice()), Offer::Absent);
         // A transport parameter extension longer than its ClientHello.
+        let hello = client_hello(&params(QUIC_V1, &[QUIC_V2, QUIC_V1]));
         let mut long = hello.clone();
         let at = long.len() - params(QUIC_V1, &[QUIC_V2, QUIC_V1]).len() - 2;
         long[at..at + 2].copy_from_slice(&0xffffu16.to_be_bytes());
-        assert!(client_version_information(&crypto_frame(0, &long)).is_none());
+        assert_eq!(client_offer(long.as_slice()), Offer::Absent);
+        // Not a ClientHello at all.
+        assert_eq!(client_offer(&[2u8, 0, 0, 0] as &[u8]), Offer::Absent);
     }
 
     #[cfg(feature = "rustls-ring")]
     #[test]
     fn the_rfc9369_sample_client_hello_has_parameters_but_no_offer() {
         // RFC 9369 Appendix A.2: its transport parameters lack Version
-        // Information, so the server keeps the client's version.
-        let mut payload = crate::packet::rfc9369_vectors::CLIENT_CRYPTO.to_vec();
-        payload.resize(1162, 0);
-        assert!(CryptoData::read(&payload).is_some());
-        assert!(client_version_information(&payload).is_none());
+        // Information, so the server keeps the client's version. The sample
+        // is one CRYPTO frame at offset 0 with a two-byte length.
+        let frame = &crate::packet::rfc9369_vectors::CLIENT_CRYPTO;
+        assert_eq!(frame[..2], [0x06, 0x00]);
+        let len = usize::from(u16::from_be_bytes([frame[2], frame[3]]) & 0x3fff);
+        let hello = &frame[4..4 + len];
+        assert_eq!(hello[0], CLIENT_HELLO);
+        assert_eq!(client_offer(hello), Offer::Absent);
     }
 }

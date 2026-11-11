@@ -33,6 +33,7 @@ use crate::{
     },
     token::{ResetToken, Token, TokenPayload},
     transport_parameters::TransportParameters,
+    version::{client_offer, select_compatible, Offer},
     Dir, Duration, EndpointConfig, Frame, Instant, Side, StreamId, TokenStore, Transmit,
     TransportError, TransportErrorCode, VarInt, MAX_CID_SIZE, MAX_STREAM_COUNT, MIN_INITIAL_SIZE,
     TIMER_GRANULARITY,
@@ -2169,7 +2170,8 @@ impl Connection {
             ));
         }
 
-        let space = &mut self.spaces[space];
+        let id = space;
+        let space = &mut self.spaces[id];
         let max = end.saturating_sub(space.crypto_stream.bytes_read());
         if max > self.config.crypto_buffer_size as u64 {
             return Err(TransportError::CRYPTO_BUFFER_EXCEEDED(""));
@@ -2183,6 +2185,14 @@ impl Connection {
             .insert(crypto.offset, crypto.data.clone(), payload_len)
             .map_err(|_| TransportError::INTERNAL_ERROR("crypto receive storage exhausted"))?;
 
+        // A server's TLS session reads nothing until the version is chosen.
+        if id == SpaceId::Initial
+            && self.negotiation.choosing(self.side.side())
+            && !self.choose_version()
+        {
+            return Ok(());
+        }
+        let space = &mut self.spaces[id];
         while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
             if self.crypto.read_handshake(&chunk.bytes)? {
@@ -2359,6 +2369,91 @@ impl Connection {
     /// The connection ID the current Initial keys derive from
     fn initial_key_cid(&self) -> ConnectionId {
         self.retry_src_cid.unwrap_or(self.initial_dst_cid)
+    }
+
+    /// A server's choice of version from the client's offer in the Initial
+    /// crypto stream, made before its TLS session reads the ClientHello
+    /// (RFC 9368 section 2.3). Returns false while the offer is still
+    /// arriving: the stream stays buffered, within the crypto buffer limit,
+    /// until more of it arrives. A client may split its ClientHello over
+    /// several packets and leave gaps on purpose, so the offer is read from
+    /// whatever has arrived, in place.
+    fn choose_version(&mut self) -> bool {
+        let original = self.negotiation.original;
+        let stream = &self.spaces[SpaceId::Initial].crypto_stream;
+        // Reading a byte looks at each buffered piece; past this many, the
+        // server keeps the client's version.
+        let offer = if stream.pieces() > MAX_OFFER_PIECES {
+            Offer::Absent
+        } else {
+            client_offer(stream)
+        };
+        let negotiated = match offer {
+            Offer::Arriving => return false,
+            Offer::Absent => original,
+            // The transport parameter decoder rejects a Chosen Version that
+            // is not the first flight's.
+            Offer::Found(client) if client.chosen != original => original,
+            Offer::Found(client) => select_compatible(
+                original,
+                &self.endpoint_config.supported_versions,
+                &client.available,
+            ),
+        };
+        let params = self.negotiation.chose();
+        if negotiated != original {
+            self.switch_server_version(negotiated, params);
+        }
+        true
+    }
+
+    /// Move a server whose TLS session has read nothing to `negotiated`:
+    /// Initial keys and a TLS session in that version, whose Version
+    /// Information names it, and the original keys kept for the client's
+    /// remaining Initial packets. Their storage is charged before the new
+    /// keys are derived; without budget the server stays in its version.
+    fn switch_server_version(&mut self, negotiated: u32, mut params: TransportParameters) {
+        let ConnectionSide::Server { ref server_config } = self.side else {
+            unreachable!("only servers choose a version");
+        };
+        let original = self.negotiation.original;
+        let Some(current) = self.spaces[SpaceId::Initial].crypto.as_ref() else {
+            return;
+        };
+        let charge = match &self.reassembly_budget {
+            Some(budget) => match budget.charge(current.heap_size()) {
+                Some(charge) => Some(charge),
+                None => {
+                    debug!("no budget to keep the original Initial keys");
+                    return;
+                }
+            },
+            None => None,
+        };
+        let Ok(keys) = self
+            .crypto
+            .initial_keys(negotiated, &self.initial_dst_cid, Side::Server)
+        else {
+            return;
+        };
+        if let Some(info) = params.version_information.as_mut() {
+            info.chosen = negotiated;
+        }
+        let mut tls = server_config
+            .crypto
+            .clone()
+            .start_session(original, &params);
+        if tls.set_negotiated_version(negotiated).is_err() {
+            return;
+        }
+        debug!(negotiated, "compatible version negotiation");
+        self.crypto = tls;
+        let retained = self.spaces[SpaceId::Initial]
+            .crypto
+            .replace(keys)
+            .expect("the server has Initial keys");
+        self.negotiation.other = Some(OtherInitial::new(original, retained, charge));
+        self.version = negotiated;
     }
 
     /// Hold a client's Initial keys for `version`, which the server may have
@@ -4332,6 +4427,11 @@ const MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE: usize =
 ///
 /// Chosen arbitrarily, intended to be large enough to prevent spurious connection loss.
 const KEY_UPDATE_MARGIN: u64 = 10_000;
+
+/// The most separately received pieces of a client's Initial crypto stream
+/// a server reads the client's version offer from. ngtcp2 splits its
+/// ClientHello into a dozen CRYPTO frames over two packets.
+const MAX_OFFER_PIECES: usize = 64;
 
 #[derive(Default)]
 struct SentFrames {
