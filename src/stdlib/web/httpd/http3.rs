@@ -1022,7 +1022,8 @@ impl Layer for Http3 {
             && self.qpack.table_capacity() != 0
             && channel.request.is_some()
             && !channel.cancelled
-            && (channel.reset.is_some() || (channel.lost || channel.stop_sent) && !channel.input_done)
+            && (channel.reset.is_some()
+                || (channel.lost || channel.stop_sent) && !channel.input_done)
         {
             if self.decoder_output.is_some() {
                 self.scan = self.scan.saturating_sub(1);

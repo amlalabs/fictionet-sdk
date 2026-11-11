@@ -65,3 +65,32 @@ allocation, byte-accurate `VecDeque` layouts, header semantics, or liveness.
 Production `held` and `most_held` bounds, allocator replays, malformed-wire
 tests and HTTP/3 interoperability are complementary evidence. In particular,
 wire table size includes 32 bytes per entry but is not an allocation bound.
+
+Evidence from 11 November 2026: all four base models passed and all twenty
+negative controls violated their named invariants. The bases explored 320
+states for synchronization, 3328 for storage, 109 for table allocation, and
+130 for feedback. The allocator replay passed seven tests, costing 1134
+decoder steps and 1028 encoder/reference steps. Those steps include a
+capacity fall that retains slots and the encoder's literal fallback when
+1024 sections await acknowledgment. This is finite model and concrete
+allocator evidence; no Kani result is claimed.
+
+The independent suites passed 45 quiche tests and 14 ngtcp2 tests. Quiche
+0.30.1 has a static-only HTTP/3 QPACK codec, so its dynamic cases use raw
+RFC sections over its QUIC transport. Nghttp3 1.18.0 over ngtcp2 1.25.0
+generated dynamic requests and decoded dynamic responses: nineteen of
+twenty sections in each direction. The twenty browser requests used 1940
+QPACK bytes including insertions and feedback, versus 3820 with the SDK's
+static encoder. The synthetic response replay used 1451 versus 4540 bytes.
+These measurements exclude HTTP/3 envelopes and transport overhead.
+
+Interop exposed and now tests coalesced stream input: a QUIC delivery can
+include a stream-type prefix and more data than the prefix decoder's
+sixteen-byte input limit. The HTTP/3 connection retains the charged
+remainder through partial admission, decodes, then admits the rest. A
+separate connection unit test covers coalesced control and both QPACK
+instruction streams.
+
+The SDK's `qpack` unit-test filter passed 33 tests and `http3` passed 68;
+the filters overlap. Clippy with warnings denied passed for the SDK,
+xtask, and both interoperability crates including their tests.
