@@ -47,25 +47,11 @@ use crate::counting::{counted_proof, measure, so_far};
 /// of 32 to 40 octets, with a fifth inserted.
 const CAP: usize = 200;
 
-/// The octets of the longest static name, `access-control-allow-origin`,
-/// which `the_longest_static_name_is_counted` checks against the table. A
-/// constant, so the step harnesses need not unwind the table.
-const LONGEST_STATIC_NAME: usize = 27;
-
 /// The most a step allocates for a name beyond the octets it reads: the
-/// shared name's header, padded, and a static name it copies.
+/// shared name's header, padded, and a static name it copies. Both are
+/// constants, so the step harnesses need not unwind the table.
 fn name_copy() -> usize {
-    size_of::<[usize; 2]>() + align_of::<usize>() - 1 + LONGEST_STATIC_NAME
-}
-
-#[kani::proof]
-#[kani::unwind(62)]
-fn the_longest_static_name_is_counted() {
-    assert!(
-        STATIC_TABLE
-            .iter()
-            .all(|(name, _)| name.len() <= LONGEST_STATIC_NAME)
-    );
+    NAME_HEADER + LONGEST_STATIC_NAME
 }
 
 /// The new entry's name, when a literal, and its value.

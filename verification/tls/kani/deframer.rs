@@ -44,10 +44,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use super::*;
 use crate::budget::{BufferBudget, Paid};
 use crate::counting::{counted_proof, measure};
+use crate::msgs::message::HEADER_SIZE;
 use crate::sync::Arc;
-
-/// A record's header.
-const HEADER: usize = 5;
 
 /// The body each record here declares.
 const DECLARED: usize = 1;
@@ -81,7 +79,7 @@ impl BufferBudget for Room {
 /// Sizes a buffer paid from a budget of one of a few limits for `N`
 /// one-byte records joined as a message, and checks the bounds.
 fn joins<const N: usize>() {
-    let record = HEADER + DECLARED;
+    let record = HEADER_SIZE + DECLARED;
     let limit = match kani::any::<u8>() % 4 {
         0 => 1 << 16,
         1 => record * N / 2,
@@ -103,7 +101,7 @@ fn joins<const N: usize>() {
                 0 => MAX_WIRE_SIZE,
                 _ => MAX_HANDSHAKE_SIZE,
             };
-            for end in [record * i + HEADER, record * (i + 1)] {
+            for end in [record * i + HEADER_SIZE, record * (i + 1)] {
                 if !buffer.resize(end, most) {
                     break 'records;
                 }
@@ -119,7 +117,7 @@ fn joins<const N: usize>() {
         "the buffer held more than its charge"
     );
     assert!(
-        cost.requested <= 4 * sized + 2 * (HEADER + DECLARED),
+        cost.requested <= 4 * sized + 2 * (HEADER_SIZE + DECLARED),
         "the buffer copied what it held once a record"
     );
 }

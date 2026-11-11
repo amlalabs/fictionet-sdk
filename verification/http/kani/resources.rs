@@ -46,11 +46,6 @@ const LARGE: usize = 8;
 /// The head limit, which is the decoder's capacity here.
 const LIMIT: usize = 1024;
 
-/// A chunk's shared backing, at most: two reference counts, its vector,
-/// its reservation, what it holds and its pool's handle.
-/// `a_backing_is_within_its_constant` checks it.
-const BACKING: usize = 128;
-
 /// The blocks a unit is joined in come to less than this many times its
 /// bytes: a block is replaced only when full, by one at least twice what
 /// it held and at most twice what it must hold, so the blocks form a
@@ -72,12 +67,12 @@ const PIECE: usize = 64;
 
 counted_proof! {
     /// A one-byte chunk allocates its byte and its backing, and the
-    /// backing is within `BACKING`.
+    /// backing is within [`Chunk::HEADER`](fictionet::Chunk::HEADER).
     #[kani::unwind(4)]
     fn a_backing_is_within_its_constant() {
         let (chunk, cost) = measure(|| fictionet::Chunk::unpaid(vec![0u8]));
         std::mem::forget(chunk);
-        assert!(cost.requested <= 1 + BACKING);
+        assert!(cost.requested <= 1 + fictionet::Chunk::HEADER);
     }
 }
 
@@ -125,11 +120,11 @@ fn join(limit: usize) {
         (base, taken, asked)
     });
     assert!(
-        cost.peak <= base + limit + 3 * BACKING + PIECE,
+        cost.peak <= base + limit + 3 * fictionet::Chunk::HEADER + PIECE,
         "the head held more than its budget pays for"
     );
     assert!(
-        asked <= JOIN_PER * taken + SMALL + LARGE + HEAD_BLOCKS * BACKING,
+        asked <= JOIN_PER * taken + SMALL + LARGE + HEAD_BLOCKS * fictionet::Chunk::HEADER,
         "joining the head copied more than its input and constants"
     );
 }

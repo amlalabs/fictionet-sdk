@@ -24,11 +24,9 @@ const SEEDS: std::ops::RangeInclusive<u64> = 1..=8;
 
 const COMMAND: &str = "hpack-verify";
 
-/// The counter's own check, the constant the bounds use, then each table
-/// insertion within its charge.
-const KANI_RESOURCES: [&str; 10] = [
+/// The counter's own check, then each table insertion within its charge.
+const KANI_RESOURCES: [&str; 9] = [
     "counting::proofs::the_counter_sees_every_allocation",
-    "stdlib::protocols::hpack::resource_proofs::the_longest_static_name_is_counted",
     "stdlib::protocols::hpack::resource_proofs::decoding_a_literal_name_stays_within_its_charge",
     "stdlib::protocols::hpack::resource_proofs::decoding_a_dynamic_name_stays_within_its_charge",
     "stdlib::protocols::hpack::resource_proofs::decoding_a_static_name_stays_within_its_charge",

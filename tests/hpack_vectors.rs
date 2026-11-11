@@ -17,16 +17,12 @@ mod cost;
 use cost::{Charged, Costs, Linear};
 use fictionet::stdlib::protocols::fields::Fields;
 use fictionet::stdlib::protocols::hpack::{
-    Block, DynamicTable, Encoder, Error, Field, MAX_DECODED, STATIC_TABLE, Table,
+    Block, DynamicTable, Encoder, Error, Field, LONGEST_STATIC_NAME, MAX_DECODED, NAME_HEADER,
+    Table,
 };
 use fictionet::stdlib::protocols::{huffman, prefix_int};
 use fictionet::{Budget, Chunk};
 use serde_json::Value;
-
-/// What a name copied into a table entry takes beyond its octets: the
-/// shared allocation's header, two `usize` counts, padded to their
-/// alignment.
-const NAME_HEADER: usize = 2 * size_of::<usize>() + align_of::<usize>() - 1;
 
 /// The entry slots' share of `DynamicTable::most_held(capacity)`. A step
 /// that inserts may double the slots, and the doublings within one block
@@ -44,9 +40,8 @@ fn slots(capacity: usize) -> usize {
 /// slots may double, at most twice their share of `most_held` over the
 /// block, at the larger of the settings limit and the capacity.
 fn decoding(table: &Table) -> Linear {
-    let longest_static = STATIC_TABLE.iter().map(|(n, _)| n.len()).max().unwrap();
     Linear {
-        num: 8 * 2 + 5 * (NAME_HEADER + longest_static),
+        num: 8 * 2 + 5 * (NAME_HEADER + LONGEST_STATIC_NAME),
         den: 5 * 2,
         fixed: 2 * slots(table.settings_limit().max(table.table_capacity())),
     }

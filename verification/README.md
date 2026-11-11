@@ -123,7 +123,10 @@ layers:
    Include both with `#[path]` in the replay's test binary, and run each
    step through `Costs::step(input, charge, linear, ...)`. The step fails
    if the bytes live at once (counted from the session's start) pass the
-   charge, or if the bytes asked for pass the `Linear` bound. Build what
+   charge, or if the bytes asked for pass the `Linear` bound. On a
+   reallocation the replay allocator moves the bytes live by the change
+   in size, so a replay never sees the old and new allocations live at
+   once; the Kani counting allocator does. Build what
    the session replays inside its steps. Make what the caller pays for
    before the step, such as the budget or a block sized to its bound.
    `Costs::held_charge` keeps a charge the way a holder keeps one that it

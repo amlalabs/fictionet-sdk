@@ -314,7 +314,7 @@ pub(crate) fn chain_bytes(chain: &[pki_types::CertificateDer<'_>], ocsp: Option<
 ///   is held beside the new: three times in all.
 /// - Fixed: each list's first allocation holds four elements whatever
 ///   its length, and a hello's extensions are boxed.
-pub(crate) fn parse_room(len: usize) -> usize {
+pub const fn parse_room(len: usize) -> usize {
     /// A vector and the byte it holds, for two bytes on the wire.
     const ELEMENT: usize = size_of::<Vec<u8>>() + 1;
     /// The lists a ClientHello parses into, the message with the most:
@@ -330,6 +330,12 @@ pub(crate) fn parse_room(len: usize) -> usize {
         LISTS * 4 * LARGEST + size_of::<crate::msgs::handshake::ClientExtensions<'static>>();
     FIXED + len * 3 * ELEMENT / 2
 }
+
+/// What the deframer's spans of a handshake message take while it is
+/// joined from records, which no charge counts: the part joined so far
+/// and the record arriving, coalesced at once, in the first capacity a
+/// vector of them takes (four, for elements this small).
+pub const JOINING_SPANS: usize = 4 * size_of::<crate::msgs::deframer::handshake::FragmentSpan>();
 
 /// The most records one message received after the handshake makes: a
 /// close_notify when the peer's records use up the read keys, a key update,

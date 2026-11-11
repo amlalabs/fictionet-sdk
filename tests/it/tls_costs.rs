@@ -29,22 +29,11 @@ use crate::common::cost::{Charged, Costs, Linear};
 
 type Server = Harness<tls::TlsLayer>;
 
-/// A record's header: its type, version and length.
-const HEADER: usize = 5;
-/// The most a record's body may be (RFC 5246 section 6.2.3): a record
-/// arriving is given a buffer this large once its header says so.
-const BODY: usize = (1 << 14) + 2048;
-/// The most input the layer holds while a handshake message is joined
-/// (`JOINED` in layer.rs, rustls's `MAX_HANDSHAKE_SIZE`).
-const JOINED: usize = 0xffff;
 /// What the budget does not count by design: the shared backing around
-/// the bytes of a chunk (its vector, what pays for it, what it holds and
-/// its pool, behind two reference counts), for the at most two chunks the
-/// layer holds each way and the one being delivered, 128 bytes at most
-/// each; and rustls's spans of the handshake message it joins, at most
-/// four of a version, an optional size and a range, 48 bytes at most
-/// each.
-const HEADERS: usize = 5 * 128 + 4 * 48;
+/// the bytes of a chunk ([`Chunk::HEADER`]), for the at most two chunks
+/// the layer holds each way and the one being delivered; and rustls's
+/// spans of the handshake message it joins.
+const HEADERS: usize = 5 * Chunk::HEADER + rustls::budget::JOINING_SPANS;
 
 /// Records arriving in chunks cut anywhere. Records whole in a chunk are
 /// decrypted where they lie and go up as slices of it, and a record that
@@ -53,7 +42,7 @@ const HEADERS: usize = 5 * 128 + 4 * 48;
 const CHUNKS: Linear = Linear {
     num: 0,
     den: 1,
-    fixed: HEADER + BODY + HEADERS,
+    fixed: tls::TlsLayer::RECORD + HEADERS,
 };
 
 /// A handshake message joined from many records, one step for all of
@@ -65,7 +54,7 @@ const CHUNKS: Linear = Linear {
 const JOINING: Linear = Linear {
     num: 4,
     den: 1,
-    fixed: 2 * (HEADER + BODY) + HEADERS,
+    fixed: 2 * tls::TlsLayer::RECORD + HEADERS,
 };
 
 /// A hello read from records into the acceptor and taken, in halves of a
@@ -81,18 +70,14 @@ const JOINING: Linear = Linear {
 ///
 /// Fixed: a record's buffer before its body arrives and a growth from it,
 /// what the budget does not count, each list's first four elements and
-/// the boxed extensions ([`PARSE_FIXED`]), and the `Hello`'s own fields
-/// ([`HELLO_FIXED`]).
+/// the boxed extensions (the fixed part of rustls's
+/// [`parse_room`](rustls::budget::parse_room)), and the `Hello`'s own
+/// fields ([`HELLO_FIXED`]).
 const ACCEPTING: Linear = Linear {
     num: 8 + 100 + 25,
     den: 2,
-    fixed: 2 * (HEADER + BODY) + HEADERS + PARSE_FIXED + HELLO_FIXED,
+    fixed: 2 * tls::TlsLayer::RECORD + HEADERS + rustls::budget::parse_room(0) + HELLO_FIXED,
 };
-
-/// The fixed part of rustls's `parse_room`: sixteen lists of four key
-/// shares (40 bytes at most each) and the hello's boxed extensions (2 KiB
-/// at most).
-const PARSE_FIXED: usize = 16 * 4 * 40 + (2 << 10);
 
 /// The layer's `Hello` beside the bytes it copies, and the harness and
 /// layer the hello step makes: their fields, and the vector of protocols'
@@ -256,7 +241,7 @@ fn records_in_seeded_chunks_cost_at_most_a_record() {
 const JOINING_STEP: Linear = Linear {
     num: 0,
     den: 1,
-    fixed: 2 * JOINED + HEADER + BODY + HEADERS,
+    fixed: 2 * tls::TlsLayer::JOINED + tls::TlsLayer::RECORD + HEADERS,
 };
 
 /// A server that took a TLS 1.2 client's hello and sent its flight, on
@@ -283,7 +268,7 @@ fn joining(fcx: &Cx, budget: &Budget) -> (Server, Vec<Chunk>) {
         .into_iter()
         .chain(size.to_be_bytes()[1..].iter().copied())
         .chain(std::iter::repeat(7))
-        .take(JOINED / 6 - 1)
+        .take(tls::TlsLayer::JOINED / 6 - 1)
         .map(|byte| chunk(&[22, 3, 3, 0, 1, byte]))
         .collect();
     (server, records)
