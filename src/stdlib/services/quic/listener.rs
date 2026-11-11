@@ -144,6 +144,7 @@ impl Listener {
         );
         endpoint.set_datagram_receive_budget(env.budget());
         endpoint.set_reassembly_budget(env.budget());
+        endpoint.set_send_buffer_budget(env.budget());
         self.sessions = sessions;
         self.endpoint = Some(endpoint);
         self.initialized = true;

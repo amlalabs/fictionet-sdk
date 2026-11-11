@@ -52,6 +52,7 @@ pub struct Endpoint {
     server_config: Option<Arc<ServerConfig>>,
     datagram_receive_budget: Option<fictionet_buf::Budget>,
     reassembly_budget: Option<fictionet_buf::Budget>,
+    send_buffer_budget: Option<fictionet_buf::Budget>,
     /// Whether the underlying UDP socket promises not to fragment packets
     allow_mtud: bool,
     /// Time at which a stateless reset was most recently sent
@@ -93,6 +94,7 @@ impl Endpoint {
             server_config,
             datagram_receive_budget: None,
             reassembly_budget: None,
+            send_buffer_budget: None,
             allow_mtud,
             last_stateless_reset: None,
             incoming_buffers: Slab::new(),
@@ -112,6 +114,13 @@ impl Endpoint {
     /// Unordered-read range sets and other engine metadata are not covered.
     pub fn set_reassembly_budget(&mut self, budget: &fictionet_buf::Budget) {
         self.reassembly_budget = Some(budget.clone());
+    }
+
+    /// Reserve application stream send descriptors before accepting writes on
+    /// future connections. Payloads still need `SendStream::write_chunk`;
+    /// acknowledgment ranges, loss records and CRYPTO queues are not covered.
+    pub fn set_send_buffer_budget(&mut self, budget: &fictionet_buf::Budget) {
+        self.send_buffer_budget = Some(budget.clone());
     }
 
     /// Replace the server configuration, affecting new incoming connections only
@@ -881,6 +890,7 @@ impl Endpoint {
             side_args,
             self.datagram_receive_budget.as_ref(),
             self.reassembly_budget.as_ref(),
+            self.send_buffer_budget.as_ref(),
         );
 
         let mut cids_issued = 0;

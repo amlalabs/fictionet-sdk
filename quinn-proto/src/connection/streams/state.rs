@@ -69,6 +69,7 @@ impl StreamRecv {
 pub struct StreamsState {
     pub(super) side: Side,
     pub(crate) reassembly_budget: Option<fictionet_buf::Budget>,
+    pub(crate) send_buffer_budget: Option<fictionet_buf::Budget>,
     // Set of streams that are currently open, or could be immediately opened by the peer
     pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
     pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
@@ -157,6 +158,7 @@ impl StreamsState {
         let mut this = Self {
             side,
             reassembly_budget: None,
+            send_buffer_budget: None,
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
             free_recv: Vec::new(),

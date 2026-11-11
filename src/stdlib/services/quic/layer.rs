@@ -264,6 +264,7 @@ impl QuicLayer {
         let mut endpoint = Endpoint::new(config, server, false, Some(seed));
         endpoint.set_datagram_receive_budget(env.budget());
         endpoint.set_reassembly_budget(env.budget());
+        endpoint.set_send_buffer_budget(env.budget());
         Ok(Self::with_channels(Some(endpoint), epoch, channels, cancel))
     }
 

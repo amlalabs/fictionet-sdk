@@ -1389,3 +1389,49 @@ without a verdict. The older entropy proof remains open. Run the new
 harnesses with `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
 -Z c-ffi -Z mem-predicates -Z restrict-vtable --harness bbr_bandwidth_
 --harness bbr_startup_respects_its_target_window` under the required scope.
+
+## Reserved application send descriptors
+
+`Endpoint::set_send_buffer_budget` now installs a reservation source for
+application-stream send descriptors on future connections. Both datagram
+adapters use their existing budget. `Send::write` reserves descriptor growth
+before asking its source for bytes, so refusal preserves the source, offset
+and flow-control accounting. Empty writes and writes blocked by peer flow
+control need no descriptor allocation. The protected-peer regression
+exhausts this budget, checks that refusal retains the original charged
+backing and then completes the transfer after the reservation is released.
+
+The deque retains capacity and its charge after acknowledgments. Geometric
+growth keeps the allocation history reserved, less than twice the current
+capacity, covering both old and new allocations during replacement. Reset
+and stream retirement release descriptors before their charge. The resource
+replay measures each of sixty-four descriptor insertions; each allocation
+and replacement copy must fit the newly acquired reservation, with no
+additional per-input or fixed allowance. Reuse after acknowledgments and
+release on reset are checked separately. ACK-range allocation itself is
+outside this replay and remains unbudgeted.
+
+Kani passes `send_descriptors_refuse_before_allocating` and
+`send_empty_descriptors_fit_their_reservation`, using the shared counting
+stubs and no production stubs. The latter covers initial capacity and its
+reuse before an insertion; its fixed allocation bound is four descriptors
+and its per-input coefficient is zero. The allocator sanity harness passes.
+The broader `send_descriptors_fit_their_reservation`, including insertion
+and payload lookup, was terminated during propositional conversion without
+a verdict. Its assertions remain in place. Run these with the usual scoped
+`cargo kani -p fictionet-quinn-proto --lib -Z stubbing -Z c-ffi
+-Z mem-predicates -Z restrict-vtable` and the named harnesses.
+
+`SendDescriptors.tla` models the deque's capacity, entries, growth history,
+acknowledgment and disposal in descriptor units using `Resources`. The base
+passes with 85 generated states, 19 distinct states and depth nine. Omitting
+growth reservation or returning it on ACK while capacity remains each
+violates `DescriptorsPaid`. This model does not cover payload ownership,
+range trees, sent packets or production trace replay.
+
+This extends the resource boundary; it is not whole-engine budgeting.
+Stream records and maps, ACK and retransmission ranges, packet recovery
+records, CRYPTO send queues, TLS, endpoint routing, and control progress
+under budget exhaustion remain outside it. Legacy byte payload APIs are
+still uncharged. All 364 engine tests and the existing 31 layer/independent
+peer tests pass with these changes.

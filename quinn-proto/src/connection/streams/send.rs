@@ -77,6 +77,12 @@ impl Send {
 
         let mut result = Written::default();
         loop {
+            if limit != 0 && !source.is_empty() && !self.pending.prepare_write() {
+                if result.bytes != 0 {
+                    break;
+                }
+                return Err(WriteError::Budget);
+            }
             let (chunk, chunks_consumed) = match source.pop_chunk(limit) {
                 Ok(chunk) => chunk,
                 Err(_) if result.bytes != 0 => break,
@@ -179,6 +185,10 @@ impl<'a> BytesArray<'a> {
 }
 
 impl BytesSource for BytesArray<'_> {
+    fn is_empty(&self) -> bool {
+        self.chunks[self.consumed..].iter().all(Bytes::is_empty)
+    }
+
     fn pop_chunk(&mut self, limit: usize) -> Result<(Segment, usize), WriteError> {
         // The loop exists to skip empty chunks while still marking them as
         // consumed
@@ -224,6 +234,10 @@ impl<'a> ByteSlice<'a> {
 }
 
 impl BytesSource for ByteSlice<'_> {
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     fn pop_chunk(&mut self, limit: usize) -> Result<(Segment, usize), WriteError> {
         let limit = limit.min(self.data.len());
         if limit == 0 {
@@ -244,6 +258,10 @@ pub(super) struct ChunkSource<'a> {
 }
 
 impl BytesSource for ChunkSource<'_> {
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     fn pop_chunk(&mut self, limit: usize) -> Result<(Segment, usize), WriteError> {
         let len = limit.min(self.data.len());
         if len == 0 {
@@ -266,6 +284,8 @@ impl BytesSource for ChunkSource<'_> {
 /// The purpose of this data type is to defer conversion as long as possible,
 /// so that no heap allocation is required in case no data is writable.
 pub(super) trait BytesSource {
+    fn is_empty(&self) -> bool;
+
     /// Returns the next chunk from the source of owned chunks.
     ///
     /// This method will consume parts of the source.

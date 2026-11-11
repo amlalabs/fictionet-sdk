@@ -267,6 +267,7 @@ impl Connection {
         side_args: SideArgs,
         datagram_receive_budget: Option<&fictionet_buf::Budget>,
         reassembly_budget: Option<&fictionet_buf::Budget>,
+        send_buffer_budget: Option<&fictionet_buf::Budget>,
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
@@ -370,6 +371,7 @@ impl Connection {
             version,
         };
         this.streams.reassembly_budget = reassembly_budget.cloned();
+        this.streams.send_buffer_budget = send_buffer_budget.cloned();
         if path_validated {
             this.on_path_validated();
         }

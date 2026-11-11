@@ -291,6 +291,9 @@ impl<'a> SendStream<'a> {
         }
 
         let was_pending = stream.is_pending();
+        stream
+            .pending
+            .set_budget(self.state.send_buffer_budget.as_ref());
         let written = match stream.write(source, limit) {
             Ok(written) => written,
             Err(WriteError::Blocked) => {
