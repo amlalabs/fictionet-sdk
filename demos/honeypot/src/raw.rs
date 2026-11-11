@@ -1,4 +1,5 @@
 //! Complete Ethernet frames reach this world before any protocol parsing.
+//! Enabled company applications have separate IPv4 endpoints on this link.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -85,6 +86,7 @@ impl Capture {
 /// discovery for it, the frame log, and the card's transmit queue.
 struct Link {
     host: Host,
+    company: Vec<(std::net::Ipv4Addr, Host)>,
     capture: Capture,
     sender: RawSender,
     /// The task that waits for the host's timers. It is woken after every
@@ -106,6 +108,11 @@ impl Link {
     fn transmit(&mut self, fcx: &Cx) -> fictionet::Result {
         while let Some(frame) = self.host.transmit(fcx.now()) {
             self.put(fcx, frame)?;
+        }
+        for index in 0..self.company.len() {
+            while let Some(frame) = self.company[index].1.transmit(fcx.now()) {
+                self.put(fcx, frame)?;
+            }
         }
         self.wake_timer();
         Ok(())
@@ -185,6 +192,29 @@ pub fn start_raw(
     raw_log: Box<dyn Write + Send>,
 ) -> fictionet::Result<Honeypot> {
     let host = host(config, raw.mac_address(), fcx.now())?;
+    let mut company = Vec::new();
+    for address in config
+        .ports
+        .iter()
+        .filter_map(|p| crate::company_host(p.service).map(|(_, ip)| ip))
+    {
+        if company.iter().any(|(ip, _)| *ip == address) {
+            continue;
+        }
+        let endpoint = Host::new(
+            host::Config {
+                mac: raw.mac_address(),
+                mtu: MTU,
+                ipv4: Some(Ipv4Config {
+                    address,
+                    gateway: config.gateway,
+                }),
+                ipv6: None,
+            },
+            fcx.now(),
+        )?;
+        company.push((address, endpoint));
+    }
     let receive_stats = raw.receive_stats();
     let transmit_stats = raw.transmit_stats();
     let (sender, mut receiver) = raw.split();
@@ -193,6 +223,7 @@ pub fn start_raw(
     let honeypot = crate::start(fcx, config, clock, sinks, attachments)?;
     let link = Arc::new(Mutex::new(Link {
         host,
+        company,
         capture: Capture {
             writer: Sink::new(raw_log),
             lost: 0,
@@ -222,6 +253,11 @@ pub fn start_raw(
             if let Received::World(packet) = link.host.receive(fcx.now(), &bytes) {
                 incoming_end.lock().send(Packet::new(packet.to_vec()));
             }
+            for (_, host) in &mut link.company {
+                if let Received::World(packet) = host.receive(fcx.now(), &bytes) {
+                    incoming_end.lock().send(Packet::new(packet.to_vec()));
+                }
+            }
             link.transmit(&fcx)?;
         }
     });
@@ -235,6 +271,9 @@ pub fn start_raw(
                 let deadline = link
                     .host
                     .poll_at()
+                    .into_iter()
+                    .chain(link.company.iter().filter_map(|(_, host)| host.poll_at()))
+                    .min()
                     .unwrap_or(Instant::from_since_start(Duration::MAX));
                 timer.poll_until(cx, deadline)
             })
@@ -246,7 +285,17 @@ pub fn start_raw(
         loop {
             let packet = std::future::poll_fn(|cx| end.lock().poll_recv(&fcx, cx)).await?;
             let mut link = link.lock();
-            if let Ok(frame) = link.host.send(fcx.now(), &packet) {
+            let source =
+                fictionet::stdlib::network::ip::Header::parse_whole(&packet).map(|h| h.src);
+            let host = match link
+                .company
+                .iter()
+                .position(|(ip, _)| Some((*ip).into()) == source)
+            {
+                Some(index) => &mut link.company[index].1,
+                None => &mut link.host,
+            };
+            if let Ok(frame) = host.send(fcx.now(), &packet) {
                 link.put(&fcx, frame)?;
             }
             link.wake_timer();

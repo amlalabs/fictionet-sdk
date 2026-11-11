@@ -16,9 +16,14 @@
 //! answers, takes and refuses it ([`fictionet_extras::linux::mptcp`]). The internet reaches the
 //! host through an attachment called [`INTERNET`], which carries both
 //! families and is routed at [`Config::internet`] with `Net::route`, and
-//! reaches nothing else: its packets for any other address are logged and
-//! dropped. Sandboxes attached under any other name join the network as
+//! reaches the primary host and enabled private company hosts; packets for
+//! other addresses are logged and dropped. Sandboxes attached under any other name join the network as
 //! usual, and reach the host through its router.
+//!
+//! Optional MCP, A2A and fleet applications share their gateway ports with
+//! private DNS-named HTTP/TLS hosts ([`traps`], [`company_host`]). Network facts
+//! include DNS questions, ClientHello bytes and both-direction TCP behavior
+//! ([`network_observe`]); inference reads the evidence offline ([`inference`]).
 //!
 //! Every packet that crosses any attachment, both ways, goes to a pcapng
 //! file, and a typed [`Observation`](observe::Observation) per SYN,
@@ -60,9 +65,12 @@ use fictionet::{Attachment, Attachments, Cx, End, Interface};
 
 pub mod config;
 pub mod evidence;
+pub mod inference;
+pub mod network_observe;
 pub mod observe;
 pub mod services;
 pub mod ssh;
+pub mod traps;
 
 #[cfg(all(feature = "raw-ethernet", not(target_arch = "wasm32")))]
 pub mod raw;
@@ -131,6 +139,7 @@ pub fn network(
         None => server.ipv4_only(),
     };
     let connections = Arc::new(AtomicUsize::new(0));
+    let mut company = Vec::new();
     for port in &config.ports {
         let timestamp = {
             let fcx = fcx.clone();
@@ -163,6 +172,17 @@ pub fn network(
                 },
                 timestamp,
             )),
+            Service::Mcp | Service::A2a | Service::Fleet => {
+                let trap = company
+                    .iter()
+                    .find(|(service, _)| *service == port.service)
+                    .map(|(_, trap): &(Service, traps::Trap)| trap.clone())
+                    .unwrap_or_else(|| traps::Trap::new(port.service, observer.clone()));
+                if !company.iter().any(|(service, _)| *service == port.service) {
+                    company.push((port.service, trap.clone()));
+                }
+                Box::new(fictionet_extras::linux::with_ipv4_options(trap, timestamp))
+            }
         };
         server = server.port_server(
             port.number,
@@ -174,13 +194,86 @@ pub fn network(
         );
     }
 
-    let net = Net::new(Pools::NONE)
+    if !company.is_empty() {
+        use fictionet::stdlib::services::dns::{
+            authority::{ServerConfig, Zones},
+            zone::{Zone, ZoneData},
+        };
+        use fictionet::stdlib::world::net::dns::Authoritative;
+        let mut zone = format!(
+            "$ORIGIN northbank.internal.\n$TTL 300\n@ SOA ns hostmaster 1 3600 600 86400 300\n@ NS ns\nns A {}\n",
+            config.address
+        );
+        for (service, _) in &company {
+            let (name, address) = company_host(*service).expect("trap service");
+            zone.push_str(&format!("{name}. A {address}\n"));
+        }
+        let zone = Zone::from_master(&zone, None).expect("fixed company zone");
+        server = server.program(Authoritative::new(
+            Zones::new(vec![Arc::new(zone) as Arc<dyn ZoneData>]),
+            ServerConfig::generic(),
+        ));
+    }
+    let mut net = Net::new(Pools::NONE)
         .egress(fictionet_extras::network::corporate_egress)
         .add_host(server)
         .route(INTERNET, config.internet.ipv4);
+    if !company.is_empty() {
+        use fictionet::stdlib::{
+            protocols::x509::{Time, Validity},
+            services::ca::Ca,
+        };
+        let ca = Ca::new(fcx, "Northbank Internal Issuing CA").expect("world CA");
+        for (service, trap) in company {
+            let (name, address) = company_host(service).expect("trap service");
+            let leaf = ca
+                .issue(
+                    fcx,
+                    &[name],
+                    Validity {
+                        not_before: Time::from_unix(
+                            clock.unix_secs(fcx.now()).saturating_sub(86400) as i64,
+                        )
+                        .expect("clock"),
+                        not_after: Time::from_unix(
+                            (clock.unix_secs(fcx.now()) + 31_536_000) as i64,
+                        )
+                        .expect("clock"),
+                    },
+                )
+                .expect("company certificate");
+            let key = leaf.certified_key();
+            let bounded = |trap| Bounded {
+                inner: Box::new(trap),
+                connections: connections.clone(),
+                observer: observer.clone(),
+            };
+            net = net.add_host(
+                Host::new(name)
+                    .at(address)
+                    .ipv4_only()
+                    .dns_name(name)
+                    .tcp_options(fictionet_extras::linux::tcp())
+                    .icmp_options(fictionet_extras::linux::icmp(fcx))
+                    .udp_settings(fictionet_extras::linux::udp())
+                    .port_server(80, bounded(trap.clone()))
+                    .tls_accept(443, name, move |_| key.clone(), bounded(trap)),
+            );
+        }
+    }
     match config.address_v6 {
         Some(_) => net.route(INTERNET, config.internet.ipv6),
         None => net,
+    }
+}
+
+/// Stable private addresses of the company's application hosts.
+pub fn company_host(service: Service) -> Option<(&'static str, Ipv4Addr)> {
+    match service {
+        Service::Mcp => Some(("deploy.northbank.internal", Ipv4Addr::new(10, 44, 0, 11))),
+        Service::A2a => Some(("change.northbank.internal", Ipv4Addr::new(10, 44, 0, 12))),
+        Service::Fleet => Some(("fleet.northbank.internal", Ipv4Addr::new(10, 44, 0, 13))),
+        _ => None,
     }
 }
 
@@ -292,6 +385,11 @@ pub fn start(
         }
     });
     let (address, address_v6) = (config.address, config.address_v6);
+    let company_addresses: Vec<_> = config
+        .ports
+        .iter()
+        .filter_map(|p| company_host(p.service).map(|(_, ip)| ip))
+        .collect();
     fcx.spawn(move |fcx| async move {
         loop {
             let sandbox = attachments.next(&fcx).await?;
@@ -301,7 +399,7 @@ pub fn start(
                 continue;
             };
             let route = if sandbox.name() == INTERNET {
-                Route::Server(address, address_v6)
+                Route::Server(address, address_v6, company_addresses.clone())
             } else {
                 Route::All
             };
@@ -317,17 +415,18 @@ enum Route {
     /// A sandbox's own: every packet, whatever the destination.
     All,
     /// The internet's: only packets for the server's IPv4 address, or its
-    /// IPv6 address when it has one. The internet reaches the server and
-    /// nothing else in the world.
-    Server(Ipv4Addr, Option<Ipv6Addr>),
+    /// IPv6 address when it has one, plus enabled private company hosts.
+    Server(Ipv4Addr, Option<Ipv6Addr>, Vec<Ipv4Addr>),
 }
 
 impl Route {
     fn goes_on(&self, packet: &[u8]) -> bool {
         match (self, ip::destination(packet)) {
             (Route::All, _) => true,
-            (Route::Server(address, _), Some(IpAddr::V4(dst))) => dst == *address,
-            (Route::Server(_, address_v6), Some(IpAddr::V6(dst))) => *address_v6 == Some(dst),
+            (Route::Server(address, _, company), Some(IpAddr::V4(dst))) => {
+                dst == *address || company.contains(&dst)
+            }
+            (Route::Server(_, address_v6, _), Some(IpAddr::V6(dst))) => *address_v6 == Some(dst),
             (Route::Server(..), None) => false,
         }
     }

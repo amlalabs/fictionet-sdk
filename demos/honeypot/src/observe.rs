@@ -110,6 +110,23 @@ pub enum Direction {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Observation {
+    /// Application gate input, including refused attempts.
+    Trap {
+        at_us: u64,
+        src: SocketAddr,
+        dst: SocketAddr,
+        session: String,
+        trap: crate::traps::TrapEvent,
+    },
+    /// Transport facts independent of application interpretation.
+    Network {
+        at_us: u64,
+        attachment: Arc<str>,
+        direction: Direction,
+        src: SocketAddr,
+        dst: SocketAddr,
+        fact: crate::network_observe::Fact,
+    },
     /// A readable literal zero port on an original incoming IP packet.
     PortZero {
         /// Time at the world attachment, not a hardware arrival timestamp.
@@ -1035,6 +1052,7 @@ pub struct Observer {
     probe_expiry: Option<Instant>,
     capture_generation: u64,
     restricted_evidence: bool,
+    network: crate::network_observe::Observer,
 }
 
 impl Observer {
@@ -1068,6 +1086,7 @@ impl Observer {
             probe_expiry: None,
             capture_generation: 0,
             restricted_evidence: false,
+            network: Default::default(),
         })
     }
 
@@ -1168,7 +1187,13 @@ impl Observer {
         reassembled: bool,
     ) {
         let coverage = (!reassembled).then_some(self.capturing);
-        let observations = self.observe(attachment, direction, packet, now, coverage);
+        let mut observations = self.observe(attachment, direction, packet, now, coverage);
+        observations.extend(self.network.packet(
+            attachment,
+            direction,
+            packet,
+            self.clock.micros(now),
+        ));
         let capture = (!reassembled && self.capture_packet > 0).then_some(self.capture_packet);
         self.write_packet_observations(
             self.clock.micros(now),
@@ -1179,6 +1204,28 @@ impl Observer {
             } else {
                 "attachment_ip"
             }),
+        );
+    }
+
+    /// Record a gate input through the same bounded evidence queue as packets.
+    pub fn trap(
+        &mut self,
+        now: Instant,
+        src: SocketAddr,
+        dst: SocketAddr,
+        session: String,
+        trap: crate::traps::TrapEvent,
+    ) {
+        let at_us = self.clock.micros(now);
+        self.write_observations(
+            at_us,
+            vec![Observation::Trap {
+                at_us,
+                src,
+                dst,
+                session,
+                trap,
+            }],
         );
     }
 
