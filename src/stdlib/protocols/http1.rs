@@ -2712,6 +2712,13 @@ mod proofs;
 #[path = "../../../verification/http/kani/smuggling.rs"]
 mod smuggling_proofs;
 
+/// Counted proofs of head assembly's storage and copying (Resource
+/// properties in verification/README.md), run with `cargo kani -Z
+/// stubbing -Z c-ffi -Z mem-predicates`.
+#[cfg(kani)]
+#[path = "../../../verification/http/kani/resources.rs"]
+mod resource_proofs;
+
 #[cfg(test)]
 mod tests {
     use super::*;

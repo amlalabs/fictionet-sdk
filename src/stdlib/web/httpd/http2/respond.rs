@@ -760,3 +760,9 @@ fn over_budget(storage: &super::super::Responses) -> Response {
         "The server cannot hold this response now.\n",
     )
 }
+
+/// Counted proofs of how a request body is collected (Resource properties
+/// in verification/README.md).
+#[cfg(kani)]
+#[path = "../../../../../verification/http/kani/collect.rs"]
+mod collect_proofs;
