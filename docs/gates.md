@@ -114,8 +114,8 @@ xtask compilation coverage. To run a particular test, `cargo test` still works.
 ## Lightweight xtask
 
 Verification and gate orchestration now build xtask with only the standard
-library. SDK, demo, image and capture dependencies are behind `host-tools`;
-`rawnic` also enables that feature. This removes an entire SDK/demo build from
+library. SDK, demo, image and capture dependencies are behind `host-tools`.
+This removes an entire SDK/demo build from
 cold proof-tool startup and prevents xtask from enabling SDK web features in
 otherwise minimal commands. Host tools remain available through
 `cargo xtask-host`, and the all-features matrix continues to check them.

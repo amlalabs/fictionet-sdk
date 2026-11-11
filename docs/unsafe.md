@@ -20,7 +20,6 @@ golden/layout fixtures, extras, both example worlds, smoltcp, the search app and
 the nuclear world. Rustls already forbids it and is unchanged. Core and host
 libraries, CLI, demo kit, search world, honeypot and xtask reject unsafe by default
 in their crate roots, with commented exceptions at host or memory boundaries.
-The guest-only xtask binary necessarily contains privileged setup calls.
 Crates retaining unsafe deny `unsafe_op_in_unsafe_fn` and
 `clippy::undocumented_unsafe_blocks`. The core library applies the latter in its
 manifest so integration tests and benchmarks are covered too.
@@ -106,36 +105,6 @@ argument sizes are the critical obligations.
 | `demos/honeypot/src/deploy.rs:320`, `demos/honeypot/src/deploy.rs:359` | Wrap once in `effective_uid`: geteuid takes no pointers or mutable Rust storage. The state directory and secret-file permission checks remain unchanged. |
 | `demos/honeypot/src/evidence.rs:1366`, `demos/honeypot/src/evidence.rs:1378` | Keep test-only: initialized rlimit output/input, getrlimit success checked before reuse, valid SIG_IGN sentinel. Test runs in a dedicated child so its limits and signal disposition cannot affect other tests. Restored limit precedes recovery writes. |
 
-## Development tooling and guest entry point
-
-Guest code is inventoried by inspection and compilation only. No XDP, AF_XDP,
-VFIO device opening, raw guest exercise, VM launch or privileged network setup
-was run on this host.
-
-| Original site | Verdict and invariant |
-| --- | --- |
-| `xtask/src/ssh_connect.rs:57`, `xtask/src/ssh_connect.rs:239` | Keep: AsyncFd takes the OwnedFd/File by value; the number remains stable through deregistration. Caller sets nonblocking first. stdin is duplicated, so ownership is independent even though status flags share its open-file description. |
-| `xtask/src/rawnic_world.rs:242`, `xtask/src/rawnic_world.rs:247` | Keep guest-only: inotify_init1 takes scalar flags, checks failure, transfers one fresh descriptor into File. |
-| `xtask/src/rawnic_world.rs:249` | Keep: static terminated watch path and open inotify descriptor; no retained Rust pointer. |
-| `xtask/src/rawnic_world.rs:304` | Keep: scalar kill on the still-unreaped child after try_wait; preserves graceful SIGTERM rather than changing to Child::kill's SIGKILL. |
-| `xtask/src/rawnic_world.rs:368` | Keep private ioctl wrapper: all call sites pass the complete initialized 40-byte ifreq and use only TUNSETIFF, SIOCSIFMTU, SIOCGIFFLAGS or SIOCSIFFLAGS, whose payloads fit it. Not a public arbitrary-ioctl API. |
-| `xtask/src/rawnic_world.rs:376` | Keep: CStr guarantees termination for if_nametoindex. |
-| `xtask/src/rawnic_world.rs:394`, `xtask/src/rawnic_world.rs:405` | Keep: AF_PACKET datagram socket requires FFI; success checked before File takes unique ownership. |
-| `xtask/src/rawnic_world.rs:407`, `xtask/src/rawnic_world.rs:412` | Keep: zero-valid sockaddr_ll, initialized family/protocol/index, correct struct length for bind. |
-| `xtask/src/rawnic_world.rs:424` | Keep: setsockopt borrows one initialized integer with its exact size. |
-| `xtask/src/rawnic_world.rs:440` | Keep: expected packet and sockaddr_ll remain readable at exact lengths through sendto. |
-| `xtask/src/rawnic_world.rs:454` | Keep: AsyncFd owns a nonblocking File and cannot change its descriptor during registration. |
-| `xtask/src/rawnic_world.rs:506`, `xtask/src/rawnic_world.rs:543` | Keep: TUNSETPERSIST takes an integer, not a pointer; correct owned guest-only device and scalar values one/zero. |
-| `xtask/src/egress.rs:326` | Keep: zero-valid libc ifreq then initialized terminated interface name and address union member. |
-| `xtask/src/egress.rs:340` | Remove: construct sockaddr's port/address bytes directly instead of transmuting sockaddr_in. The four IPv4 octets occupy data bytes two through five, after the zero port. |
-| `xtask/src/egress.rs:342` | Keep: only SIOCSIFADDR and SIOCSIFNETMASK are passed, with initialized complete request and live control socket. |
-| `xtask/src/bin/rawnic-guest.rs:15` | Keep in private mount helper: terminated source/target/type strings, null optional data, zero flags. Only proc, sysfs and devtmpfs calls. |
-| `xtask/src/bin/rawnic-guest.rs:53` | Keep: init_module receives readable owned image bytes with exact length and terminated empty parameters. Called only after PID/QEMU/command-line gating. |
-| `xtask/src/bin/rawnic-guest.rs:69` | Keep: zero is a valid ifreq representation and supplies termination after the loopback name. |
-| `xtask/src/bin/rawnic-guest.rs:73`, `xtask/src/bin/rawnic-guest.rs:76`, `xtask/src/bin/rawnic-guest.rs:79` | Keep: get-flags writes the complete request, success gates reading its union member, and set-flags receives initialized flags on a live socket. |
-| `xtask/src/bin/rawnic-guest.rs:145` | Keep guest-only: ioperm gates the x86 output instruction; register-only asm does not touch Rust memory. Explicit marked guest exits through its configured test port. Never exercised by this audit. |
-| `xtask/src/bin/rawnic-guest.rs:152` | Keep guest-only: reboot takes a scalar command and no pointers, guarded by successful guest identification. |
-
 ## Root tests and shared benchmark support
 
 | Original site | Verdict and invariant |
@@ -206,14 +175,6 @@ validation is claimed.
 
 | Original site | Verdict and invariant |
 | --- | --- |
-| `host/src/tun.rs:110` | Keep: AsyncFd owns its O_NONBLOCK File with an unchanging descriptor until deregistration. The pinned Tokio's deprecated safe new is not an appropriate replacement. |
-| `host/src/tun.rs:174` | Keep private wrapper: all callers select matching TUN/interface commands with a complete initialized ifreq byte buffer; no arbitrary external request enters it. Kernel byte copies do not create misaligned Rust references. |
-| `host/src/virtio.rs:91` | Keep private VFIO wrapper: callers pass scalar constants for API/extension/IOMMU/reset, initialized repr(C) structures for status/info/region/map/unmap, a live descriptor pointer for set-container, or a terminated CString for device lookup. Request/payload pairing remains a manual private invariant. |
-| `host/src/virtio.rs:151` | Keep and harden: mmap failure checked; a successful null address is now unmapped before returning an error. |
-| `host/src/virtio.rs:173`, `host/src/virtio.rs:185` | Unsound safe abstraction, fixed: generic T: Copy permits invalid bool/reference bit patterns, and offset addition could overflow. Replace with integer-width read/write methods, checked bounds and actual pointer alignment. Current callers previously used only unsigned integers; no invalid-type production call was found. Preserve volatile register access widths. |
-| `host/src/virtio.rs:197` | Keep: Mapping uniquely owns the original mapping and unmaps it once. |
-| `host/src/virtio.rs:291` | Keep Send, not Sync: mappings/descriptors have no thread affinity; mutable queue API serializes driver accesses. Hardware concurrency is governed by volatile integer access, descriptor ownership and fences. This is a QEMU-gated x86 driver, not a proof against arbitrary malicious hardware. |
-| `host/src/virtio.rs:356` | Keep: device-fd ioctl success checked before File adopts unique ownership. |
 | `host/src/tests.rs:137` | Keep test-only: scalar listen changes the backlog on a live TcpListener. Scoped unsafe exception for the unanswered fixture. |
 
 The new `host/src/filesystem.rs` owns the two statvfs unsafe operations formerly
@@ -248,9 +209,8 @@ They identify new unsafe blocks separately from the removed or moved sites above
 | `cli/src/linux.rs:147`, `cli/src/linux.rs:153` | Wrap: read/write derive pointers and lengths from exclusive/shared byte slices and preserve syscall results. |
 | `cli/src/linux.rs:164` | Wrap: write_packet constructs two live iovecs and performs one writev. |
 | `host/src/filesystem.rs:11`, `host/src/filesystem.rs:15` | Wrap: checked statvfs success precedes initialization assertion on aligned output storage. |
-| `host/src/virtio.rs:148`, `host/src/virtio.rs:155`, `host/src/virtio.rs:210` | Keep corrected typed boundary: unsigned integer-only volatile access after checked range and actual pointer alignment. Macro expansions provide reads/writes for u8/u16/u32; only a write is needed for u64. |
-| `host/src/virtio.rs:185`, `src/stdlib/network/tcp/engine.rs:577` | Keep defensive cleanup: successful null mappings are unmapped rather than leaking or constructing invalid Rust slices. |
-| `demos/honeypot/src/deploy.rs:307` | Wrap: effective_uid owns the scalar-only geteuid call formerly repeated in permission checks. |
+| `src/stdlib/network/tcp/engine.rs:577` | Keep defensive cleanup: successful null mappings are unmapped rather than leaking or constructing invalid Rust slices. |
+| `demos/honeypot/src/deploy.rs:184` | Wrap: effective_uid owns the scalar-only geteuid call formerly repeated in permission checks. |
 
 ## Validation
 

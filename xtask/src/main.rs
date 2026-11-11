@@ -7,8 +7,6 @@
 mod capture;
 mod dns_verify;
 mod gate;
-#[cfg(feature = "host-tools")]
-mod honeypot_vm;
 mod hpack_verify;
 mod http_verify;
 #[cfg(feature = "host-tools")]
@@ -18,15 +16,9 @@ mod layer_verify;
 mod lean_vectors;
 mod mptcp_verify;
 mod quic_verify;
-#[cfg(feature = "host-tools")]
-mod rawnic;
 mod resources;
 #[cfg(feature = "shibboleth")]
 mod shibboleth_infer;
-#[cfg(feature = "host-tools")]
-// This module owns the host syscall boundary.
-#[allow(unsafe_code)]
-mod ssh_connect;
 mod tcp_rfc_verify;
 mod tls_verify;
 mod tls_verify_handshake;
@@ -85,14 +77,7 @@ fn main() -> Result {
     }
     if !matches!(
         task.as_str(),
-        "ssh-connect"
-            | "rawnic"
-            | "egress"
-            | "honeypot-vm"
-            | "search-web"
-            | "search-requisites"
-            | "search-capture"
-            | "search-image"
+        "search-web" | "search-requisites" | "search-capture" | "search-image"
     ) {
         return Err(format!("unknown task: {task}").into());
     }
@@ -114,22 +99,7 @@ fn main() -> Result {
 
 #[cfg(feature = "host-tools")]
 async fn host(task: &str, mut args: impl Iterator<Item = String>) -> Result {
-    if task == "ssh-connect" {
-        return ssh_connect::run(&args.collect::<Vec<_>>()).await;
-    }
     let downloads = PathBuf::from(args.next().ok_or("missing downloads directory")?);
-    if task == "honeypot-vm" {
-        if args.next().is_some() {
-            return Err("unexpected argument".into());
-        }
-        return honeypot_vm::run(downloads);
-    }
-    if task == "rawnic" || task == "egress" {
-        if args.next().is_some() {
-            return Err("unexpected argument".into());
-        }
-        return rawnic::run(downloads, task == "egress");
-    }
     if task == "search-web" {
         let step = match args.next().as_deref() {
             None => web::Step::All,

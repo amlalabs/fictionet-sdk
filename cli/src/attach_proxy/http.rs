@@ -428,8 +428,8 @@ mod tests {
         }
     }
 
-    /// Port 0 is a literal wire port, as it is for the world's listeners,
-    /// `ssh-connect` and a TUN sandbox: the door passes it on in both forms.
+    /// Port 0 is a literal wire port, as it is for the world's listeners
+    /// and a TUN sandbox: the door passes it on in both forms.
     #[test]
     fn port_zero_targets_are_literal() {
         let r = parse("CONNECT 203.0.113.30:0 HTTP/1.1\r\nHost: 203.0.113.30:0\r\n\r\n").unwrap();

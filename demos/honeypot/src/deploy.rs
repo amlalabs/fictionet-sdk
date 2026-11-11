@@ -1,4 +1,4 @@
-//! Executable configuration and protected persistent sensor state.
+//! Executable options and protected persistent sensor state.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -11,48 +11,23 @@ use honeypot_world::Args;
 use honeypot_world::config::{Flag, SshAuth};
 use serde_json::{Value, json};
 
-pub const HELP: &str = "honeypot run [--config FILE] [--dry-run] --backend world|tun|vfio\n\
+pub const HELP: &str = "honeypot run [OPTIONS]\n\
   --state-dir PATH        Protected persistent identity, key, and run evidence\n\
-  --world unix:PATH       World socket (world backend only)\n\
-  --tun NAME             TUN interface (tun backend only)\n\
-  --tun-mode existing|create   Existing persistent TUN by default\n\
-  --device PCI           Prepared virtio-net PCI address (vfio backend only)\n\
-  --address IPV4 [--address-v6 IPV6]   Address delivered inside the guest\n\
-  --gateway IPV4 [--gateway-v6 IPV6]   VFIO gateways\n\
+  --address IPV4 [--address-v6 IPV6]   The server's addresses on the link\n\
+  --gateway IPV4 [--gateway-v6 IPV6]   The link's gateways\n\
   --ssh PORT [--http PORT] [--http-profile caddy|nginx]\n\
   --mcp PORT --a2a PORT --fleet PORT   Northbank simulated company services\n\
   --ssh-auth accept|reject|password:VALUE\n\
   --metrics IP:PORT       Explicit management Prometheus listener\n\
   --queue-bytes N --max-record-bytes N --rotate-bytes N --retain-files N\n\
   --restricted-evidence  Retain exact decrypted SSH bytes in protected files\n\
-  --version              Build and compiled backends\n\
-Configuration is a JSON object with the same option names, without --.\n\
-Repeated service and internet options use arrays. CLI options replace file options.\n\
-XDP, AF_XDP and direct ENA ownership are not implemented.\n";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Backend {
-    World,
-    Tun { name: String, create: bool },
-    Vfio { device: String },
-}
-
-impl Backend {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::World => "world",
-            Self::Tun { .. } => "tun",
-            Self::Vfio { .. } => "vfio",
-        }
-    }
-}
+  --version              Build version\n\
+This build has no packet path: run checks its options, then refuses to start.\n";
 
 pub struct Options {
-    pub backend: Backend,
     pub args: Args,
     pub state_dir: PathBuf,
     pub metrics: Option<SocketAddr>,
-    pub dry_run: bool,
     pub restricted_evidence: bool,
     pub queue_bytes: usize,
     pub max_record_bytes: usize,
@@ -66,134 +41,31 @@ impl Options {
         if args.first().is_some_and(|v| v == "run") {
             args.remove(0);
         }
-        let mut cli: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut values: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut it = args.into_iter();
         while let Some(flag) = it.next() {
             let key = flag.strip_prefix("--").ok_or_else(|| {
                 fictionet::Error::msg(format!("expected an option, got {flag:?}"))
             })?;
-            let value = if matches!(key, "dry-run" | "restricted-evidence") {
+            let value = if key == "restricted-evidence" {
                 "true".into()
             } else {
                 it.next()
                     .filter(|v| !v.starts_with("--"))
                     .ok_or_else(|| fictionet::Error::msg(format!("{flag} needs a value")))?
             };
-            let values = cli.entry(key.to_owned()).or_default();
-            if !values.is_empty()
+            let entries = values.entry(key.to_owned()).or_default();
+            if !entries.is_empty()
                 && !matches!(key, "ssh" | "http" | "mcp" | "a2a" | "fleet" | "internet")
             {
                 return Err(fictionet::Error::msg(format!("duplicate option {flag}")));
             }
-            values.push(value);
+            entries.push(value);
         }
-        let mut values = BTreeMap::new();
-        if let Some(config) = cli.remove("config") {
-            let file = File::open(&config[0])?;
-            let object: BTreeMap<String, Value> = serde_json::from_reader(file)?;
-            for (key, value) in object {
-                let items = match value {
-                    Value::Array(items) => items,
-                    other => vec![other],
-                };
-                if items.is_empty()
-                    || (items.len() > 1
-                        && !matches!(
-                            key.as_str(),
-                            "ssh" | "http" | "mcp" | "a2a" | "fleet" | "internet"
-                        ))
-                {
-                    return Err(fictionet::Error::msg(format!(
-                        "invalid configuration value for {key}"
-                    )));
-                }
-                let items = items
-                    .into_iter()
-                    .map(|item| match item {
-                        Value::String(v) => Ok(v),
-                        Value::Number(v) => Ok(v.to_string()),
-                        Value::Bool(v) => Ok(v.to_string()),
-                        _ => Err(fictionet::Error::msg(format!(
-                            "invalid configuration value for {key}"
-                        ))),
-                    })
-                    .collect::<fictionet::Result<Vec<_>>>()?;
-                values.insert(key, items);
-            }
-        }
-        values.extend(cli);
         Self::resolve(values)
     }
 
     fn resolve(mut values: BTreeMap<String, Vec<String>>) -> fictionet::Result<Self> {
-        let backend = take(&mut values, "backend").unwrap_or_else(|| "world".into());
-        let tun = take(&mut values, "tun");
-        let tun_mode = take(&mut values, "tun-mode");
-        let device = take(&mut values, "device");
-        let invalid_backend_flags = match backend.as_str() {
-            "world" => {
-                tun.is_some()
-                    || tun_mode.is_some()
-                    || device.is_some()
-                    || values.contains_key("gateway")
-                    || values.contains_key("gateway-v6")
-            }
-            "tun" => {
-                device.is_some()
-                    || values.contains_key("world")
-                    || values.contains_key("gateway")
-                    || values.contains_key("gateway-v6")
-            }
-            "vfio" => tun.is_some() || tun_mode.is_some() || values.contains_key("world"),
-            "xdp" | "af-xdp" | "ena" => {
-                return Err(fictionet::Error::msg(
-                    "XDP, AF_XDP and direct ENA ownership are not implemented; no backend was attached",
-                ));
-            }
-            _ => return Err(fictionet::Error::msg("backend must be world, tun or vfio")),
-        };
-        if invalid_backend_flags {
-            return Err(fictionet::Error::msg(
-                "options from different packet backends cannot be combined",
-            ));
-        }
-        let backend = match backend.as_str() {
-            "world" => Backend::World,
-            "tun" => {
-                if !cfg!(target_os = "linux") {
-                    return Err(fictionet::Error::msg("TUN requires Linux"));
-                }
-                let name =
-                    tun.ok_or_else(|| fictionet::Error::msg("tun backend requires --tun NAME"))?;
-                if name.is_empty()
-                    || name.len() >= 16
-                    || name
-                        .bytes()
-                        .any(|b| !(b.is_ascii_alphanumeric() || b"_.-".contains(&b)))
-                {
-                    return Err(fictionet::Error::msg("invalid TUN interface name"));
-                }
-                let create = match tun_mode.as_deref().unwrap_or("existing") {
-                    "existing" => false,
-                    "create" => true,
-                    _ => return Err(fictionet::Error::msg("tun-mode must be existing or create")),
-                };
-                Backend::Tun { name, create }
-            }
-            "vfio" => {
-                if !cfg!(all(target_os = "linux", feature = "raw-virtio")) {
-                    return Err(fictionet::Error::msg(
-                        "VFIO virtio-net is unavailable in this build",
-                    ));
-                }
-                let device = device
-                    .ok_or_else(|| fictionet::Error::msg("vfio backend requires --device PCI"))?;
-                #[cfg(all(target_os = "linux", feature = "raw-virtio"))]
-                let _: fictionet_host::PciAddress = device.parse()?;
-                Backend::Vfio { device }
-            }
-            _ => unreachable!(),
-        };
         let state_dir = take(&mut values, "state-dir")
             .unwrap_or_else(|| "honeypot-state".into())
             .into();
@@ -205,7 +77,6 @@ impl Options {
                 "metrics requires an explicit nonzero port",
             ));
         }
-        let dry_run = boolean(&mut values, "dry-run")?;
         let restricted_evidence = boolean(&mut values, "restricted-evidence")?;
         let queue_bytes = number(&mut values, "queue-bytes", 8 * 1024 * 1024)?;
         let max_record_bytes = number(&mut values, "max-record-bytes", 1024 * 1024)?;
@@ -223,10 +94,8 @@ impl Options {
         let mut persona = Vec::new();
         for (key, entries) in values {
             let flag = format!("--{key}");
-            if matches!(key.as_str(), "log" | "pcap") || Flag::parse(&flag).is_none() {
-                return Err(fictionet::Error::msg(format!(
-                    "unsupported option {flag}; evidence files belong to --state-dir"
-                )));
+            if Flag::parse(&flag).is_none() {
+                return Err(fictionet::Error::msg(format!("unknown option {flag}")));
             }
             for value in entries {
                 persona.extend([flag.clone(), value]);
@@ -255,11 +124,9 @@ impl Options {
             ));
         }
         Ok(Self {
-            backend,
             args,
             state_dir,
             metrics,
-            dry_run,
             restricted_evidence,
             queue_bytes,
             max_record_bytes,
@@ -270,7 +137,7 @@ impl Options {
 
     pub fn summary(&self) -> Value {
         json!({
-            "event": "configuration", "backend": self.backend.name(), "build": env!("CARGO_PKG_VERSION"),
+            "event": "configuration", "build": env!("CARGO_PKG_VERSION"),
             "address": self.args.config.address, "address_v6": self.args.config.address_v6,
             "persona": "Ubuntu 24.04 / Linux 6.8", "http_profile": format!("{:?}", self.args.config.http_profile),
             "listeners": self.args.config.ports.iter().map(|port| json!({"port": port.number, "service": format!("{:?}", port.service).to_lowercase()})).collect::<Vec<_>>(),
@@ -278,24 +145,13 @@ impl Options {
             "ssh_auth": match self.args.config.ssh_auth { SshAuth::Reject => "reject", SshAuth::AnyCredentials => "accept", SshAuth::PasswordOrPublicKey(_) => "configured_password_or_signed_public_key" },
             "internet_ipv4": self.args.config.internet.ipv4.to_string(), "internet_ipv6": self.args.config.internet.ipv6.to_string(),
             "burst_window_ms": self.args.config.burst.window.as_millis(), "burst_syns": self.args.config.burst.syns,
-            "capture_boundary": if matches!(self.backend, Backend::Vfio { .. }) { "ethernet_and_derived_ip" } else { "ip" },
+            "gateway": self.args.config.gateway, "gateway_v6": format!("{:?}", self.args.config.gateway_v6),
             "observations": ["mptcp", "ipv4_options", "ssh", "port_zero", "trap", "tcp_wire", "dns_wire", "tls_client_hello"],
             "state_dir": self.state_dir, "metrics": self.metrics, "restricted_evidence": self.restricted_evidence,
             "queue_bytes": self.queue_bytes, "max_record_bytes": self.max_record_bytes,
             "rotate_bytes": self.rotate_bytes, "retain_files_per_stream": self.retain_files, "observation_state_limit_per_map": honeypot_world::observe::STATE_LIMIT,
             "connection_limit": honeypot_world::CONNECTION_LIMIT,
-            "public_reachability": "not_tested", "dry_run": self.dry_run,
-            "attachment": match &self.backend {
-                Backend::World => json!({"world": self.args.world.to_string()}),
-                Backend::Tun {name, create} => json!({"tun": name, "mode": if *create {"create"} else {"existing"}, "mtu": 1500}),
-                Backend::Vfio {device} => json!({"device": device, "gateway": self.args.config.gateway, "gateway_v6": format!("{:?}", self.args.config.gateway_v6)}),
-            },
-            "prerequisites": match self.backend {
-                Backend::World => "Writable parent directory for the world socket; clients attach separately",
-                Backend::Tun {create: false, ..} => "Prepared Linux guest; persistent, up, single-queue TUN with MTU 1500 and no packet-info or virtio headers; accessible sysfs; current network namespace; owner permissions; forwarding and decoy destination routes provisioned externally",
-                Backend::Tun {create: true, ..} => "Prepared Linux guest; /dev/net/tun, CAP_NET_ADMIN, and writable per-interface IPv6 addr_gen_mode/autoconf/accept_ra sysctls under /proc/sys/net/ipv6/conf; unused name; kernel address autoconfiguration is suppressed before this ephemeral interface is brought up; forwarding and decoy destination routes provisioned externally",
-                Backend::Vfio {..} => "Prepared QEMU guest with fictionet.rawnic=1, real IOMMU, isolated VFIO group and dedicated modern virtio-net device already bound to vfio-pci; separate management interface",
-            }
+            "public_reachability": "not_tested",
         })
     }
 }
@@ -418,27 +274,42 @@ mod tests {
     }
 
     #[test]
-    fn validates_backend_ownership_without_opening_devices() {
-        assert!(
-            options("run --backend tun --tun hp0 --dry-run")
-                .unwrap()
-                .dry_run
-        );
+    fn rejects_conflicting_and_unknown_options() {
+        assert!(options("run --ssh 22 --gateway 192.0.2.1").is_ok());
         for line in [
-            "--backend tun",
-            "--backend tun --tun hp0 --world unix:/tmp/world",
-            "--backend world --device 0000:00:03.0",
-            "--backend world --gateway 1.2.3.4",
-            "--backend tun --tun hp0 --tun-mode auto",
-            "--backend xdp",
-            "--backend ena",
             "--ssh 0",
             "--ssh 22 --http 22",
             "--queue-bytes 1",
-            "--backend world --backend tun",
+            "--metrics 127.0.0.1:0",
+            "--state-dir a --state-dir b",
+            "--ssh 53 --mcp 8081",
+            "--address 10.44.0.11 --mcp 8081",
+            "--unknown 1",
         ] {
             assert!(options(line).is_err(), "{line}");
         }
+    }
+
+    #[test]
+    fn summary_leaves_out_the_ssh_password_and_parsing_writes_nothing() {
+        let state = std::env::temp_dir().join(format!(
+            "honeypot-options-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let options = Options::parse([
+            "run".into(),
+            "--state-dir".into(),
+            state.to_str().unwrap().into(),
+            "--ssh-auth".into(),
+            "password:private-value".into(),
+        ])
+        .unwrap();
+        assert!(!options.summary().to_string().contains("private-value"));
+        assert!(!state.exists());
     }
 
     #[test]
@@ -466,54 +337,6 @@ mod tests {
         )
         .unwrap();
         assert!(State::open(&directory).is_err());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn file_configuration_and_cli_share_validation() {
-        let directory = std::env::temp_dir().join(format!(
-            "honeypot-config-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&directory).unwrap();
-        let file = directory.join("sensor.json");
-        let state = directory.join("state");
-        fs::write(
-            &file,
-            serde_json::to_vec(&json!({
-                "backend": "tun", "tun": "hp0", "ssh": [22, 2222],
-                "state-dir": state, "ssh-auth": "password:private-value",
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let options = Options::parse([
-            "run".into(),
-            "--config".into(),
-            file.to_str().unwrap().into(),
-            "--ssh".into(),
-            "2223".into(),
-            "--dry-run".into(),
-        ])
-        .unwrap();
-        assert_eq!(
-            options.backend,
-            Backend::Tun {
-                name: "hp0".into(),
-                create: false
-            }
-        );
-        assert_eq!(options.args.config.ports.len(), 1);
-        assert_eq!(options.args.config.ports[0].number, 2223);
-        assert!(options.dry_run);
-        assert!(!options.summary().to_string().contains("private-value"));
-        assert!(!state.exists());
-        fs::write(&file, r#"{"backend":"world","tun":"hp0"}"#).unwrap();
-        assert!(Options::parse(["--config".into(), file.to_str().unwrap().into()]).is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 }

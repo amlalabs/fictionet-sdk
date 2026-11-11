@@ -72,9 +72,7 @@ pub mod services;
 pub mod ssh;
 pub mod traps;
 
-#[cfg(all(feature = "raw-ethernet", not(target_arch = "wasm32")))]
 pub mod raw;
-#[cfg(all(feature = "raw-ethernet", not(target_arch = "wasm32")))]
 pub use raw::start_raw;
 
 pub use config::{Args, Config, HttpProfile, Port, Service};
