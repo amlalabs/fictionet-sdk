@@ -183,6 +183,12 @@ documented direct invocation instead. `CARGO_BUILD_JOBS=8` controls compilation;
 it does not make eight solvers safe. Harnesses observed at 9–10GB leave little
 headroom even in the 12GB scope. An OOM remains a failed run.
 
+This command and every area's `resources` command first take one of the
+work slice's Kani slots (`xtask/src/kani_slot.rs`): its `MemoryHigh` divided
+by the run's memory cap, shared by every worktree. A run waits while all are
+taken. Past `MemoryHigh` the kernel reclaims from every process in the slice
+at once, and a CBMC process then does its own work at a few percent of a core.
+
 Do not mix expected-failure ablations into a passing group or interpret an
 arbitrary nonzero exit as an expected counterexample. Retain their documented
 individual classification and property checks. The grouped command propagates

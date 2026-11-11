@@ -14,6 +14,7 @@ mod http_verify;
 #[cfg(feature = "host-tools")]
 mod image;
 mod ip_verify;
+mod kani_slot;
 mod layer_verify;
 mod lean_vectors;
 mod mptcp_verify;
