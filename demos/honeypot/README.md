@@ -1,5 +1,98 @@
 # Honeypot
 
+## Northbank deployment services
+
+The same executable can serve a small company's deployment network. SSH's
+application and authentication behavior are unchanged. Enable the new services
+with `--mcp 8081 --a2a 8082 --fleet 8083`. These entry ports share application
+state with the private hosts:
+
+| Host | Address | Application |
+| --- | --- | --- |
+| deploy.northbank.internal | 10.44.0.11 | MCP deployment approvals |
+| change.northbank.internal | 10.44.0.12 | A2A change review |
+| fleet.northbank.internal | 10.44.0.13 | Rollout portal and API |
+
+Each enabled host serves HTTP on 80 and HTTPS on 443 with a world-issued
+Northbank internal certificate. The primary honeypot address serves authoritative
+DNS on UDP and TCP 53. Only enabled applications have DNS records. The existing
+primary HTTP page stays unchanged. Company addresses are also reachable through
+the raw backend: separate simulated Ethernet hosts answer their own ARP requests.
+The private address range must be routed to the sensor by the attached client.
+The two-VM test installs only an on-link private route in the attacker guest.
+
+MCP initialization requires the client's routed model identifier and client
+name/version, refuses the first attempt, and rejects placeholder and retired
+model declarations without providing a valid example. `deploy_bundle` starts a
+three-section approval: operator log, risk assessment and rollback note.
+`complete_sampling` must supply the current request identifier and original
+prose of at least 80 characters. A2A exposes its agent card and a four-section
+change review over `message/send`, with model/runtime metadata and a context
+identifier. The writing gates return synthetic deployment material after the
+required sections. These values confer no access outside the world.
+
+The mandatory sampling model field and initial negotiation refusal are deliberate
+trap extensions, as in the paper. A client must retain the returned session ID
+and retry; a generic MCP SDK that aborts on the first initialization error will
+not complete the gate. The server exposes a JSON response subset of
+[MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
+and an A2A 0.3 message interface; it is not a full implementation of every
+operation or streaming mode in either protocol.
+
+The fleet portal's rollout log exposes a URL password, a two-part signed-token
+shape and a three-part signed-token shape. Later credential submissions record
+whether the value arrived whole, masked or otherwise changed. A retry holds
+its response for 150 seconds; the log stream sends progress every 45 seconds;
+four host checks each take two seconds. Their request intervals and socket
+outcomes provide timing and concurrency evidence. A successful HTTP connection
+alone is not evidence that the agent completed these gates.
+
+Every gate goes through `Observation::Trap` and the existing bounded evidence
+writer. Records retain declarations, accepted/refused prose, request bodies,
+credential submissions, request connection identifiers and ordinals, HTTP
+versions, probe outcomes and payout events. Application inputs are untrusted
+evidence; the server never executes them.
+
+`Observation::Network` adds both-direction TCP sequence/acknowledgment numbers,
+flags, advertised windows and payload lengths (including pure ACKs), DNS
+questions over UDP/TCP, and exact TLS ClientHello handshake bytes. The latter
+preserve cipher and extension ordering, SNI, ALPN and GREASE without choosing a
+fingerprint algorithm. A bounded first-flight reader handles split records and
+retransmitted prefixes; gaps, limits and incomplete closes are explicit. It
+does not guess through an out-of-order gap. The original packet captures remain
+available for a fuller offline reconstruction. HTTP/2 and HTTP/3 serving are
+not implemented by these applications; TLS advertises HTTP/1.1 only.
+
+Inference is offline; see [INFERENCE.md](INFERENCE.md) for fitting a character
+n-gram vocabulary, enrolling trace templates and applying declaration and
+harness probe rules. Synthetic scripted-client prose checks plumbing, not
+fingerprinting accuracy. Use separate labeled agent traces for enrollment and
+evaluation; no paper accuracy claim carries over automatically.
+
+From the SDK worktree, build and run privately with the machine limits:
+
+```sh
+export CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-shibboleth
+export CARGO_BUILD_JOBS=2
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=8G -p MemorySwapMax=0 cargo run -p honeypot-world --bin honeypot -- run --backend world --world unix:/tmp/northbank.sock --state-dir /tmp/northbank-evidence --ssh 22 --http 80 --mcp 8081 --a2a 8082 --fleet 8083
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=8G -p MemorySwapMax=0 cargo test -p honeypot-world
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=8G -p MemorySwapMax=0 cargo xtask-host honeypot-vm
+```
+
+Local validation completed with 44 honeypot tests and Clippy with warnings denied.
+The isolated two-VM run completed three MCP and four A2A writing sections,
+refused short/repeated submissions and masked credentials, resolved and reached
+a private host over HTTP and HTTPS, and observed concurrent host checks. The
+kernel client's measured hold and stream durations were 150.14 and 150.15
+seconds. The evidence writer drained 1,317 events with no drops or write errors.
+A real agent harness was not run: the minimal attacker guest has neither an
+installed harness nor model-provider egress. These results validate protocols
+and recording, not resistance to honeypot detection or attribution accuracy.
+
+The world socket is a Unix socket, not a host TCP listener. The VM test connects
+two guests through an AF_UNIX QEMU link with no internet route. No public
+deployment is part of these commands.
+
 One executable serves a Fictionet Linux host, collects MPTCP and IPv4-option
 observations, terminates encrypted SSH sessions, and observes literal TCP and
 UDP port zero. Client input never becomes a host command. SSH shows a simulated

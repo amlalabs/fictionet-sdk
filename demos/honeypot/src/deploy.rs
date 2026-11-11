@@ -20,6 +20,7 @@ pub const HELP: &str = "honeypot run [--config FILE] [--dry-run] --backend world
   --address IPV4 [--address-v6 IPV6]   Address delivered inside the guest\n\
   --gateway IPV4 [--gateway-v6 IPV6]   VFIO gateways\n\
   --ssh PORT [--http PORT] [--http-profile caddy|nginx]\n\
+  --mcp PORT --a2a PORT --fleet PORT   Northbank simulated company services\n\
   --ssh-auth accept|reject|password:VALUE\n\
   --metrics IP:PORT       Explicit management Prometheus listener\n\
   --queue-bytes N --max-record-bytes N --rotate-bytes N --retain-files N\n\
@@ -79,7 +80,9 @@ impl Options {
                     .ok_or_else(|| fictionet::Error::msg(format!("{flag} needs a value")))?
             };
             let values = cli.entry(key.to_owned()).or_default();
-            if !values.is_empty() && !matches!(key, "ssh" | "http" | "internet") {
+            if !values.is_empty()
+                && !matches!(key, "ssh" | "http" | "mcp" | "a2a" | "fleet" | "internet")
+            {
                 return Err(fictionet::Error::msg(format!("duplicate option {flag}")));
             }
             values.push(value);
@@ -94,7 +97,11 @@ impl Options {
                     other => vec![other],
                 };
                 if items.is_empty()
-                    || (items.len() > 1 && !matches!(key.as_str(), "ssh" | "http" | "internet"))
+                    || (items.len() > 1
+                        && !matches!(
+                            key.as_str(),
+                            "ssh" | "http" | "mcp" | "a2a" | "fleet" | "internet"
+                        ))
                 {
                     return Err(fictionet::Error::msg(format!(
                         "invalid configuration value for {key}"
@@ -234,6 +241,19 @@ impl Options {
                 ));
             }
         }
+        let company: Vec<_> = args
+            .config
+            .ports
+            .iter()
+            .filter_map(|p| honeypot_world::company_host(p.service))
+            .collect();
+        if !company.is_empty()
+            && (ports.contains(&53) || company.iter().any(|(_, ip)| *ip == args.config.address))
+        {
+            return Err(fictionet::Error::msg(
+                "Company services reserve DNS port 53 and separate private host addresses",
+            ));
+        }
         Ok(Self {
             backend,
             args,
@@ -254,11 +274,12 @@ impl Options {
             "address": self.args.config.address, "address_v6": self.args.config.address_v6,
             "persona": "Ubuntu 24.04 / Linux 6.8", "http_profile": format!("{:?}", self.args.config.http_profile),
             "listeners": self.args.config.ports.iter().map(|port| json!({"port": port.number, "service": format!("{:?}", port.service).to_lowercase()})).collect::<Vec<_>>(),
+            "company_hosts": self.args.config.ports.iter().filter_map(|p|honeypot_world::company_host(p.service)).map(|(name,address)|json!({"name":name,"address":address,"http":80,"https":443})).collect::<Vec<_>>(),
             "ssh_auth": match self.args.config.ssh_auth { SshAuth::Reject => "reject", SshAuth::AnyCredentials => "accept", SshAuth::PasswordOrPublicKey(_) => "configured_password_or_signed_public_key" },
             "internet_ipv4": self.args.config.internet.ipv4.to_string(), "internet_ipv6": self.args.config.internet.ipv6.to_string(),
             "burst_window_ms": self.args.config.burst.window.as_millis(), "burst_syns": self.args.config.burst.syns,
             "capture_boundary": if matches!(self.backend, Backend::Vfio { .. }) { "ethernet_and_derived_ip" } else { "ip" },
-            "observations": ["mptcp", "ipv4_options", "ssh", "port_zero"],
+            "observations": ["mptcp", "ipv4_options", "ssh", "port_zero", "trap", "tcp_wire", "dns_wire", "tls_client_hello"],
             "state_dir": self.state_dir, "metrics": self.metrics, "restricted_evidence": self.restricted_evidence,
             "queue_bytes": self.queue_bytes, "max_record_bytes": self.max_record_bytes,
             "rotate_bytes": self.rotate_bytes, "retain_files_per_stream": self.retain_files, "observation_state_limit_per_map": honeypot_world::observe::STATE_LIMIT,

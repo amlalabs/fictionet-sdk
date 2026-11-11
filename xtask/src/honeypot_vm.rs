@@ -486,6 +486,88 @@ fn verify(directory: &Path) -> Result {
             .ok_or_else(|| format!("missing semantic {kind} event").into())
     };
     let client_text = client.to_string();
+    if probes["private_hosts"]["http_status"] != 200 || probes["private_hosts"]["tls_status"] != 200
+    {
+        return Err("private HTTP and TLS traversal missing".into());
+    }
+    find("network", &|e| {
+        e["fact"]["kind"] == "dns"
+            && e["fact"]["name"] == "change.northbank.internal."
+            && e["fact"]["tcp"] == false
+    })?;
+    find("network", &|e| {
+        e["fact"]["kind"] == "tls_client_hello" && e["dst"] == "10.44.0.12:443"
+    })?;
+    let traps: Vec<_> = events
+        .iter()
+        .map(|e| &e["event"])
+        .filter(|e| e["event"] == "trap")
+        .collect();
+    let count = |kind: &str, accepted: bool| {
+        traps
+            .iter()
+            .filter(|e| e["trap"]["kind"] == kind && e["trap"]["accepted"] == accepted)
+            .count()
+    };
+    if probes["reviews"]["mcp_completions"] != 3
+        || probes["reviews"]["a2a_sections"] != 4
+        || count("prose", true) != 7
+        || count("prose", false) != 5
+        || count("declaration", false) == 0
+    {
+        return Err("trap review evidence does not match scripted approvals and refusals".into());
+    }
+    for payout in ["deploy_bundle", "change_review", "fleet_bundle"] {
+        find("trap", &|e| {
+            e["trap"]["kind"] == "payout" && e["trap"]["payout"] == payout
+        })?;
+    }
+    for shape in ["url_password", "two_part", "three_part"] {
+        find("trap", &|e| {
+            e["trap"]["kind"] == "credential"
+                && e["trap"]["shape"] == shape
+                && e["trap"]["form"] == "whole"
+        })?;
+    }
+    find("trap", &|e| {
+        e["trap"]["kind"] == "credential" && e["trap"]["form"] == "ascii_ellipsis"
+    })?;
+    for probe in ["hold", "trickle"] {
+        find("trap", &|e| {
+            e["trap"]["kind"] == "probe"
+                && e["trap"]["probe"] == probe
+                && e["trap"]["end"] == "answered"
+                && e["trap"]["elapsed_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms >= 150000)
+        })?;
+    }
+    find("trap", &|e| {
+        e["trap"]["kind"] == "probe"
+            && e["trap"]["probe"] == "hold"
+            && e["trap"]["end"] == "peer_closed"
+            && e["trap"]["elapsed_ms"]
+                .as_u64()
+                .is_some_and(|ms| ms < 150000)
+    })?;
+    if traps
+        .iter()
+        .filter(|e| {
+            e["trap"]["kind"] == "probe"
+                && e["trap"]["probe"] == "host_check"
+                && e["trap"]["end"] == "answered"
+                && e["trap"]["elapsed_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms >= 2000)
+        })
+        .count()
+        != 4
+    {
+        return Err("missing completed concurrent host checks".into());
+    }
+    find("trap", &|e| {
+        e["trap"]["kind"] == "request" && e["trap"]["active"].as_u64().is_some_and(|n| n >= 4)
+    })?;
     let has_key = |e: &Value, sender: u64, receiver: Option<u64>| {
         e["mptcp"].as_array().is_some_and(|options| {
             options.iter().any(|o| {
@@ -652,7 +734,8 @@ pub fn run(directory: PathBuf) -> Result {
     let sensor_archive = archive(&directory, &target, false)?;
     let attacker_archive = archive(&directory, &target, true)?;
     let mut sensor = start(&directory, &sensor_archive, false)?;
-    let deadline = Instant::now() + Duration::from_secs(180);
+    // The fleet protocol includes a silent response held for 150 seconds.
+    let deadline = Instant::now() + Duration::from_secs(420);
     wait_until(&mut sensor, deadline, || {
         Ok(directory.join("link.sock").exists())
     })?;

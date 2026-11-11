@@ -128,6 +128,12 @@ pub enum Service {
     Ssh,
     /// The configured HTTP profile's default page.
     Http,
+    /// MCP deployment approval service.
+    Mcp,
+    /// A2A change review desk.
+    A2a,
+    /// Fleet rollout runtime probes.
+    Fleet,
 }
 
 /// The packaged HTTP server whose behavior is exposed to clients.
@@ -256,6 +262,12 @@ pub enum Flag {
     Http,
     /// `--http-profile`: [`Config::http_profile`].
     HttpProfile,
+    /// MCP service port.
+    Mcp,
+    /// A2A service port.
+    A2a,
+    /// Fleet service port.
+    Fleet,
     /// `--burst-window-ms`: [`Burst::window`].
     BurstWindowMs,
     /// `--burst-syns`: [`Burst::syns`].
@@ -264,7 +276,7 @@ pub enum Flag {
 
 impl Flag {
     /// Every flag.
-    pub const ALL: [Flag; 14] = [
+    pub const ALL: [Flag; 17] = [
         Flag::World,
         Flag::Log,
         Flag::Pcap,
@@ -277,6 +289,9 @@ impl Flag {
         Flag::SshAuth,
         Flag::Http,
         Flag::HttpProfile,
+        Flag::Mcp,
+        Flag::A2a,
+        Flag::Fleet,
         Flag::BurstWindowMs,
         Flag::BurstSyns,
     ];
@@ -296,6 +311,9 @@ impl Flag {
             Flag::SshAuth => "--ssh-auth",
             Flag::Http => "--http",
             Flag::HttpProfile => "--http-profile",
+            Flag::Mcp => "--mcp",
+            Flag::A2a => "--a2a",
+            Flag::Fleet => "--fleet",
             Flag::BurstWindowMs => "--burst-window-ms",
             Flag::BurstSyns => "--burst-syns",
         }
@@ -319,11 +337,13 @@ impl Args {
                 ..Config::default()
             },
         };
+        let mut baseline_ports = false;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             let Some(flag) = Flag::parse(&arg) else {
                 return Err(ArgsError::Unknown(arg));
             };
+            baseline_ports |= matches!(flag, Flag::Ssh | Flag::Http);
             let value = args.next().ok_or(ArgsError::Missing(flag))?;
             let bad = || ArgsError::Bad {
                 flag,
@@ -362,6 +382,14 @@ impl Args {
                     number: value.parse().map_err(|_| bad())?,
                     service: Service::Http,
                 }),
+                Flag::Mcp | Flag::A2a | Flag::Fleet => config.ports.push(Port {
+                    number: value.parse().map_err(|_| bad())?,
+                    service: match flag {
+                        Flag::Mcp => Service::Mcp,
+                        Flag::A2a => Service::A2a,
+                        _ => Service::Fleet,
+                    },
+                }),
                 Flag::HttpProfile => {
                     config.http_profile = match value.as_str() {
                         "caddy" => HttpProfile::Caddy,
@@ -378,8 +406,8 @@ impl Args {
                 },
             }
         }
-        if parsed.config.ports.is_empty() {
-            parsed.config.ports = Config::default().ports;
+        if !baseline_ports {
+            parsed.config.ports.extend(Config::default().ports);
         }
         Ok(parsed)
     }

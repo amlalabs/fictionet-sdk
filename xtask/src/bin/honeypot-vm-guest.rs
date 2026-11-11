@@ -141,7 +141,28 @@ fn network() -> Result {
             return Err(io::Error::last_os_error().into());
         }
     }
-    interface_up("eth0")
+    interface_up("eth0")?;
+    // This on-link route reaches only the private simulated hosts on the data NIC.
+    // SAFETY: a zeroed rtentry has valid null pointers and scalar fields.
+    let mut route: libc::rtentry = unsafe { std::mem::zeroed() };
+    for (field, address) in [
+        (&mut route.rt_dst, Ipv4Addr::new(10, 44, 0, 0)),
+        (&mut route.rt_genmask, Ipv4Addr::new(255, 255, 255, 0)),
+    ] {
+        field.sa_family = libc::AF_INET as libc::sa_family_t;
+        for (byte, octet) in field.sa_data[2..6].iter_mut().zip(address.octets()) {
+            *byte = octet as libc::c_char;
+        }
+    }
+    route.rt_gateway.sa_family = libc::AF_INET as libc::sa_family_t;
+    route.rt_flags = libc::RTF_UP;
+    let device = CString::new("eth0")?;
+    route.rt_dev = device.as_ptr().cast_mut();
+    // SAFETY: the control socket, route and its device name remain live during ioctl.
+    if unsafe { libc::ioctl(control.as_raw_fd(), libc::SIOCADDRT, &route) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 fn isolation(attacker: bool) -> Result {
@@ -177,11 +198,15 @@ fn isolation(attacker: bool) -> Result {
         .map(|line| line.split_whitespace().collect::<Vec<_>>())
         .collect();
     if (attacker
-        && (rows.len() != 1
-            || rows[0][0] != "eth0"
-            || rows[0][1] != "000200C0"
-            || rows[0][2] != "00000000"
-            || rows[0][7] != "00FFFFFF"))
+        && (rows.len() != 2
+            || !["000200C0", "00002C0A"].iter().all(|destination| {
+                rows.iter().any(|row| {
+                    row[0] == "eth0"
+                        && row[1] == *destination
+                        && row[2] == "00000000"
+                        && row[7] == "00FFFFFF"
+                })
+            })))
         || (!attacker && !rows.is_empty())
     {
         return Err(format!("unexpected guest routes: {routes}").into());
@@ -251,11 +276,21 @@ fn sensor() -> Result {
             "192.0.2.1",
             "--state-dir",
             "/share/state",
+            "--ssh",
+            "22",
+            "--http",
+            "80",
+            "--mcp",
+            "8081",
+            "--a2a",
+            "8082",
+            "--fleet",
+            "8083",
         ])
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(150);
+    let deadline = Instant::now() + Duration::from_secs(360);
     loop {
         if let Some(status) = child.try_wait()? {
             return Err(format!("honeypot exited before stop: {status}").into());
@@ -309,11 +344,15 @@ fn socket(protocol: libc::c_int) -> Result<TcpStream> {
 }
 
 fn connect(stream: &TcpStream, port: u16) -> io::Result<()> {
+    connect_address(stream, SENSOR, port)
+}
+
+fn connect_address(stream: &TcpStream, destination: Ipv4Addr, port: u16) -> io::Result<()> {
     let address = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: port.to_be(),
         sin_addr: libc::in_addr {
-            s_addr: u32::from_ne_bytes(SENSOR.octets()),
+            s_addr: u32::from_ne_bytes(destination.octets()),
         },
         sin_zero: [0; 8],
     };
@@ -468,6 +507,337 @@ fn ssh() -> Result {
     Ok(())
 }
 
+fn trap_request(port: u16, method: &str, path: &str, headers: &str, body: &str) -> Result<String> {
+    let started = Instant::now();
+    let mut stream = socket(libc::IPPROTO_TCP)?;
+    connect(&stream, port)?;
+    stream.set_read_timeout(Some(Duration::from_secs(170)))?;
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: 192.0.2.2\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+        body.len()
+    )?;
+    let mut first = [0];
+    stream.read_exact(&mut first)?;
+    // The client and service use independent guest clocks. Exact durations are
+    // checked against service-clock evidence after both guests stop.
+    if path == "/retry" && started.elapsed() < Duration::from_secs(149) {
+        return Err("held retry sent bytes before its silent interval ended".into());
+    }
+    let mut response = first.to_vec();
+    stream.take(1024 * 1024 - 1).read_to_end(&mut response)?;
+    if response.len() == 1024 * 1024 {
+        return Err("trap response exceeded bound".into());
+    }
+    Ok(String::from_utf8(response)?)
+}
+
+fn trap_json(response: &str) -> Result<Value> {
+    let (_, body) = response.split_once("\r\n\r\n").ok_or("missing HTTP head")?;
+    Ok(serde_json::from_str(body)?)
+}
+
+fn trap_rpc(
+    port: u16,
+    path: &str,
+    headers: &str,
+    method: &str,
+    params: Value,
+) -> Result<(String, Value)> {
+    let response = trap_request(
+        port,
+        "POST",
+        path,
+        headers,
+        &json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}).to_string(),
+    )?;
+    let value = trap_json(&response)?;
+    Ok((response, value))
+}
+
+fn declarations() -> Result<String> {
+    let params = json!({"capabilities":{"sampling":{"model":"laboratory/protocol-model-9"}},
+        "clientInfo":{"name":"scripted-kernel-client","version":"1"}, "protocolVersion":"2025-03-26"});
+    let (first, rejected) = trap_rpc(8081, "/mcp", "", "initialize", params.clone())?;
+    if rejected["error"].is_null() {
+        return Err("first MCP declaration bypassed retry gate".into());
+    }
+    let session = first
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("mcp-session-id")
+                .then(|| value.trim().to_owned())
+        })
+        .ok_or("MCP rejection omitted session identifier")?;
+    let headers = format!("Mcp-Session-Id: {session}\r\n");
+    let (_, accepted) = trap_rpc(8081, "/mcp", &headers, "initialize", params)?;
+    if !accepted["error"].is_null() || accepted["result"].is_null() {
+        return Err("second MCP declaration did not open session".into());
+    }
+    Ok(headers)
+}
+
+fn trap_reviews() -> Result<Value> {
+    let headers = declarations()?;
+    let (_, mut reply) = trap_rpc(
+        8081,
+        "/mcp",
+        &headers,
+        "tools/call",
+        json!({"name":"deploy_bundle","arguments":{"site":"alpha"}}),
+    )?;
+    let mut previous = String::new();
+    for stage in 0..3 {
+        let request = reply["result"]["sampling"]["request"]
+            .as_str()
+            .ok_or("missing sampling request")?
+            .to_owned();
+        let arguments = |text: &str| json!({"name":"complete_sampling","arguments":{"request":request,"model":"laboratory/protocol-model-9","content":{"text":text}}});
+        let (_, short) = trap_rpc(8081, "/mcp", &headers, "tools/call", arguments("short"))?;
+        if short["error"].is_null() {
+            return Err("short approval bypassed prose gate".into());
+        }
+        if !previous.is_empty() {
+            let (_, repeated) =
+                trap_rpc(8081, "/mcp", &headers, "tools/call", arguments(&previous))?;
+            if repeated["error"].is_null() {
+                return Err("repeated approval bypassed prose gate".into());
+            }
+        }
+        previous = format!(
+            "Deployment section {stage}: the operator will verify the edge host, notify the control room, preserve the previous release and document the result before closing the change window."
+        );
+        (_, reply) = trap_rpc(8081, "/mcp", &headers, "tools/call", arguments(&previous))?;
+        if !reply["error"].is_null() {
+            return Err("original approval was refused".into());
+        }
+    }
+    if !reply["result"]["sampling"].is_null() || reply["result"]["content"].as_array().is_none() {
+        return Err("MCP payout missing".into());
+    }
+    let card = trap_json(&trap_request(
+        8082,
+        "GET",
+        "/.well-known/agent-card.json",
+        "",
+        "",
+    )?)?;
+    if card["skills"].as_array().is_none() {
+        return Err("A2A card missing skills".into());
+    }
+    let mut headers = String::new();
+    for stage in 0..4 {
+        let text = format!(
+            "Review section {stage}: the engineer will confirm the maintenance window and gateway readiness, keep a verified backout copy, notify the affected operators and record the deployment outcome."
+        );
+        let (response, reply) = trap_rpc(
+            8082,
+            "/a2a",
+            &headers,
+            "message/send",
+            json!({"message":{"metadata":{"model":"laboratory/protocol-model-9","runtime":"scripted-kernel-client"},"parts":[{"kind":"text","text":text}]}}),
+        )?;
+        if !reply["error"].is_null() {
+            return Err("A2A review refused".into());
+        }
+        let session = response
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("x-session-id")
+                    .then(|| value.trim())
+            })
+            .ok_or("A2A session missing")?;
+        headers = format!("X-Session-Id: {session}\r\n");
+        if stage == 3
+            && !reply["result"]["parts"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Approved")
+        {
+            return Err("A2A payout missing".into());
+        }
+    }
+    Ok(json!({"mcp_completions":3,"a2a_sections":4,"short_refused":3,"repeated_refused":2}))
+}
+
+fn private_hosts() -> Result<Value> {
+    let dns = UdpSocket::bind((ATTACKER, 0))?;
+    dns.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut query = vec![0x43, 0x19, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in ["change", "northbank", "internal"] {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, 1, 0, 1]);
+    dns.send_to(&query, (SENSOR, 53))?;
+    let mut answer = [0; 2048];
+    let (count, source) = dns.recv_from(&mut answer)?;
+    if source != SocketAddr::from((SENSOR, 53))
+        || count < 12
+        || answer[..2] != query[..2]
+        || answer[2] & 0x80 == 0
+        || answer[3] & 15 != 0
+        || u16::from_be_bytes([answer[6], answer[7]]) == 0
+        || !answer[..count]
+            .windows(4)
+            .any(|bytes| bytes == [10, 44, 0, 12])
+    {
+        return Err("private DNS answer did not resolve the change desk".into());
+    }
+    let mut stream = socket(libc::IPPROTO_TCP)?;
+    connect_address(&stream, Ipv4Addr::new(10, 44, 0, 12), 80)?;
+    stream.write_all(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: change.northbank.internal\r\nConnection: close\r\n\r\n")?;
+    let mut response = String::new();
+    stream.take(65536).read_to_string(&mut response)?;
+    if !response.starts_with("HTTP/1.1 200") || trap_json(&response)?["skills"].as_array().is_none()
+    {
+        return Err("private change desk did not serve its agent card".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .resolve(
+                "change.northbank.internal",
+                SocketAddr::from((Ipv4Addr::new(10, 44, 0, 12), 443)),
+            )
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(15))
+            .build()?
+            .get("https://change.northbank.internal/.well-known/agent-card.json")
+            .send()
+            .await?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err::<(), Box<dyn std::error::Error>>(
+                "private TLS change desk refused request".into(),
+            );
+        }
+        let card: Value = serde_json::from_str(&response.text().await?)?;
+        if card["skills"].as_array().is_none() {
+            return Err("private TLS agent card missing skills".into());
+        }
+        Ok(())
+    })?;
+    Ok(
+        json!({"dns":"change.northbank.internal","address":"10.44.0.12","http_status":200,"tls_status":200}),
+    )
+}
+
+fn fleet() -> Result<Value> {
+    let logs = trap_json(&trap_request(8083, "GET", "/logs", "", "")?)?;
+    let environment = logs["environment"]
+        .as_str()
+        .ok_or("fleet environment missing")?;
+    let mut credentials = Vec::new();
+    for line in environment.lines() {
+        let (name, value) = line.split_once('=').ok_or("invalid fleet environment")?;
+        let credential = if name == "DEPLOY_URL" {
+            value
+                .split_once("https://deploy:")
+                .and_then(|(_, v)| v.split_once('@'))
+                .map(|(v, _)| v)
+                .ok_or("missing URL password")?
+        } else {
+            value
+        };
+        let response = trap_request(
+            8083,
+            "GET",
+            "/bundle",
+            &format!("Authorization: Bearer {credential}\r\n"),
+            "",
+        )?;
+        if !response.starts_with("HTTP/1.1 200")
+            || trap_json(&response)?["deploy_key"].as_str().is_none()
+        {
+            return Err("intact fleet credential refused".into());
+        }
+        credentials.push(credential.to_owned());
+    }
+    if credentials.len() != 3 {
+        return Err("expected three credential shapes".into());
+    }
+    let credential = &credentials[0];
+    let masked = format!(
+        "{}...{}",
+        &credential[..6],
+        &credential[credential.len() - 4..]
+    );
+    if !trap_request(
+        8083,
+        "GET",
+        "/bundle",
+        &format!("Authorization: Bearer {masked}\r\n"),
+        "",
+    )?
+    .starts_with("HTTP/1.1 401")
+    {
+        return Err("masked credential authorized".into());
+    }
+    let headers = format!("Authorization: Bearer {credential}\r\n");
+    let mut abandoned = socket(libc::IPPROTO_TCP)?;
+    connect(&abandoned, 8083)?;
+    write!(
+        abandoned,
+        "POST /retry HTTP/1.1\r\nHost: 192.0.2.2\r\nContent-Length: 0\r\n{headers}\r\n"
+    )?;
+    abandoned.shutdown(std::net::Shutdown::Both)?;
+    drop(abandoned);
+    let started = Instant::now();
+    let results = std::thread::scope(|scope| {
+        let mut jobs = Vec::new();
+        for (method, path) in [
+            ("POST", "/retry"),
+            ("GET", "/logs/follow"),
+            ("GET", "/hosts/alpha/check"),
+            ("GET", "/hosts/beta/check"),
+            ("GET", "/hosts/gamma/check"),
+            ("GET", "/hosts/delta/check"),
+        ] {
+            let headers = &headers;
+            jobs.push(scope.spawn(move || {
+                let start = Instant::now();
+                let response =
+                    trap_request(8083, method, path, headers, "").map_err(|e| e.to_string())?;
+                if !response.starts_with("HTTP/1.1 200") {
+                    return Err(format!("probe refused: {path}"));
+                }
+                if path == "/logs/follow"
+                    && (!response.contains("\"elapsed\":45")
+                        || !response.contains("\"elapsed\":90"))
+                {
+                    return Err("trickle stream omitted ticks".to_owned());
+                }
+                Ok::<_, String>((path, start.elapsed().as_millis() as u64))
+            }));
+        }
+        jobs.into_iter()
+            .map(|job| {
+                job.join()
+                    .map_err(|_| "fleet probe thread panicked".to_owned())?
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()
+    })?;
+    for (path, elapsed) in &results {
+        let minimum = if *path == "/retry" || *path == "/logs/follow" {
+            149000
+        } else {
+            1900
+        };
+        if *elapsed < minimum {
+            return Err(format!("probe answered early: {path} after {elapsed} ms").into());
+        }
+    }
+    Ok(
+        json!({"credential_shapes":credentials.len(),"masked_refused":true,"probes":results,"elapsed_ms":started.elapsed().as_millis()}),
+    )
+}
+
 fn attacker() -> Result {
     network()?;
     isolation(true)?;
@@ -477,6 +847,9 @@ fn attacker() -> Result {
     }
     let mptcp = mptcp()?;
     ssh()?;
+    let private_hosts = private_hosts()?;
+    let reviews = trap_reviews()?;
+    let fleet = fleet()?;
     let zero = socket(libc::IPPROTO_TCP)?;
     let error = connect(&zero, 0)
         .err()
@@ -486,7 +859,7 @@ fn attacker() -> Result {
     }
     let report = json!({"mptcp": mptcp, "port_zero": {"destination": "192.0.2.2:0",
         "protocol": libc::IPPROTO_TCP, "errno": libc::ECONNREFUSED},
-        "ssh": {"exit_code": 255, "sent_input_bytes": SSH_COMMAND.len()}});
+        "ssh": {"exit_code": 255, "sent_input_bytes": SSH_COMMAND.len()}, "reviews":reviews,"fleet":fleet,"private_hosts":private_hosts});
     fs::write("/share/probes.json", serde_json::to_vec_pretty(&report)?)?;
     isolation(true)?;
     Ok(())
