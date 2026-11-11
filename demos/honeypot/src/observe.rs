@@ -33,11 +33,16 @@
 //! ([`Observation::Answer`]), with their options. The SYN-ACKs the world
 //! sends again, until the handshake completes, are in the capture only.
 //!
-//! The executable uses the bounded writer in [`crate::evidence`] to keep disk
-//! I/O outside the world. Rejected admission is counted, and the next line
-//! accepted after capture recovers reports it ([`Observation::Lost`]). The
-//! worker separately counts persistence failures. Embedded callers supplying
-//! their own [`Sinks`] must ensure those writers do not block.
+//! The observer hands each observation, as a typed value, and each packet's
+//! pcapng block to an [`EventSink`]. It never serializes or writes a file:
+//! the bounded writer in [`crate::evidence`] does, on its own thread.
+//! Rejected admission is counted, and the next observation accepted after
+//! capture recovers reports it ([`Observation::Lost`]). The writer
+//! separately counts persistence failures.
+//!
+//! Without restricted evidence, a segment's payload is logged as its
+//! length only ([`Payload`]), and SSH facts are redacted
+//! ([`fictionet_extras::ssh::honeypot::Record::redacted`]).
 //!
 //! Each option list is logged twice over: every option with its bytes, in
 //! order ([`Opt`]), and the MPTCP ones decoded with every field the stdlib
@@ -65,7 +70,7 @@
 //! the window; each line's timestamp gives longer gaps.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Waker};
@@ -78,11 +83,15 @@ use fictionet::stdlib::pcap;
 use fictionet::stdlib::protocols::mptcp::{self, AddAddr, Capable, Dss, Join, Keys, Mapping};
 use fictionet::stdlib::protocols::mptcp::{MptcpOption, Sequence};
 use fictionet::time::Instant;
-use serde::{Serialize, Serializer};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::Clock;
 use crate::config::Burst;
+use crate::evidence::EventSink;
+use crate::record::{Observed, Packet, PacketSource, Provenance};
 use fictionet_extras::linux::mptcp::Tokens;
+use fictionet_extras::ssh::honeypot::Record as SshRecord;
 
 const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;
@@ -95,7 +104,7 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(63);
 pub const STATE_LIMIT: usize = 4096;
 
 /// Which way a packet crosses an attachment, logged as `in` or `out`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// From the sandbox (or the internet) into the world.
@@ -104,10 +113,19 @@ pub enum Direction {
     Out,
 }
 
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Direction::In => "in",
+            Direction::Out => "out",
+        })
+    }
+}
+
 /// One event, as a line of the log. Times are microseconds since the Unix
 /// epoch. `attachment` names the attachment the packet crossed:
 /// `internet` for the route, or a sandbox's name.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Observation {
     /// Application gate input, including refused attempts.
@@ -127,6 +145,8 @@ pub enum Observation {
         dst: SocketAddr,
         fact: crate::network_observe::Fact,
     },
+    /// An SSH protocol fact, redacted unless evidence is restricted.
+    Ssh { at_us: u64, ssh: SshRecord },
     /// A readable literal zero port on an original incoming IP packet.
     PortZero {
         /// Time at the world attachment, not a hardware arrival timestamp.
@@ -153,7 +173,7 @@ pub enum Observation {
         /// Time of the rejected admission.
         at_us: u64,
         /// The bounded collection whose admission was rejected.
-        collection: &'static str,
+        collection: Collection,
         /// Maximum retained entries.
         limit: usize,
     },
@@ -183,8 +203,8 @@ pub enum Observation {
         /// Its MPTCP options, decoded.
         mptcp: Vec<Mptcp>,
         /// Its payload, when it carried one.
-        #[serde(skip_serializing_if = "Hex::is_empty")]
-        payload: Hex,
+        #[serde(flatten)]
+        payload: Option<Payload>,
         /// Microseconds since this source's previous SYN, if that was
         /// within the burst window.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,7 +233,8 @@ pub enum Observation {
         /// Its MPTCP options, decoded.
         mptcp: Vec<Mptcp>,
         /// Its payload.
-        payload: Hex,
+        #[serde(flatten)]
+        payload: Payload,
     },
     /// A RST from the world, or the SYN-ACK that first answers a SYN.
     Answer {
@@ -308,8 +329,43 @@ pub enum Observation {
     },
 }
 
+/// A bounded collection of the observer's correlation state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Collection {
+    /// Open connections across every service.
+    Connections,
+    /// Option-bearing and MP_CAPABLE connection attempts.
+    Probes,
+    /// SYNs in the burst window and SYNs awaiting an answer.
+    Syns,
+}
+
+/// A segment's payload: its bytes with restricted evidence, otherwise only
+/// its length.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Payload {
+    /// The bytes, logged as `payload`.
+    #[serde(rename = "payload")]
+    Kept(Hex),
+    /// How many bytes, logged as `payload_bytes`.
+    #[serde(rename = "payload_bytes")]
+    Counted(usize),
+}
+
+impl Payload {
+    /// `bytes` kept whole when `restricted`, otherwise counted.
+    fn new(bytes: &[u8], restricted: bool) -> Payload {
+        if restricted {
+            Payload::Kept(Hex(bytes.to_vec()))
+        } else {
+            Payload::Counted(bytes.len())
+        }
+    }
+}
+
 /// The observed progress of an option-bearing connection attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestPhase {
     /// No matching SYN-ACK was observed; this may be off-target traffic.
@@ -321,7 +377,7 @@ pub enum RequestPhase {
 }
 
 /// Why a no-data observation ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeEnd {
     /// Either side sent FIN or RST.
@@ -331,7 +387,7 @@ pub enum ProbeEnd {
 }
 
 /// A decoded IPv4 option, retaining opaque bytes when decoding is impossible.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Ipv4Opt {
     /// End of the option list.
@@ -368,7 +424,7 @@ pub enum Ipv4Opt {
 }
 
 /// The entry format selected by the IPv4 Timestamp flag.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "format", content = "entries", rename_all = "snake_case")]
 pub enum Timestamp {
     /// Milliseconds since midnight UTC.
@@ -436,7 +492,7 @@ impl From<Ipv4Option> for Ipv4Opt {
 }
 
 /// What the SYNs of a burst carried.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BurstKind {
     /// Any SYN.
@@ -446,7 +502,7 @@ pub enum BurstKind {
 }
 
 /// Why a segment's options could not all be read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OptionsFault {
     /// The header length does not fit the segment.
@@ -456,7 +512,7 @@ pub enum OptionsFault {
 }
 
 /// One TCP option, as logged.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Opt {
     /// No-Operation.
@@ -519,7 +575,7 @@ impl From<&TcpOption> for Opt {
 
 /// One MPTCP option (RFC 8684), as logged, with every field the stdlib
 /// codec reads. Keys, tokens and HMACs are in hex.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub enum Mptcp {
     /// MP_CAPABLE. Which of the keys and data parameters are there says
@@ -641,7 +697,7 @@ pub enum Mptcp {
 
 /// A DSS sequence number with the size it was sent at: the stdlib codec's
 /// [`Sequence`], as logged, such as `{"short": 5}`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Seq {
     /// 4 octets.
@@ -660,7 +716,7 @@ impl From<Sequence> for Seq {
 }
 
 /// A DSS data sequence mapping, as logged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DssMapping {
     /// The data sequence number of the first byte, with its size.
     pub data_sequence_number: Seq,
@@ -675,7 +731,7 @@ pub struct DssMapping {
 
 /// Why an MPTCP option could not be read: the stdlib codec's
 /// [`mptcp::Error`], as logged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "fault", rename_all = "snake_case")]
 pub enum MptcpFault {
     /// No subtype.
@@ -843,17 +899,39 @@ impl Mptcp {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Hex(pub Vec<u8>);
 
-impl Hex {
-    /// Whether there are no bytes.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+impl fmt::Display for Hex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
     }
 }
 
 impl Serialize for Hex {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&fictionet::stdlib::dissect::hex(&self.0))
+        s.collect_str(self)
     }
+}
+
+impl<'de> Deserialize<'de> for Hex {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(D::Error::custom("expected pairs of hex digits"));
+        }
+        (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).map_err(D::Error::custom))
+            .collect::<Result<_, _>>()
+            .map(Hex)
+    }
+}
+
+/// Exactly `digits` lowercase hex digits.
+fn fixed_hex<'de, D: Deserializer<'de>>(d: D, digits: usize) -> Result<u64, D::Error> {
+    let text = String::deserialize(d)?;
+    if text.len() != digits || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(D::Error::custom(format!("expected {digits} hex digits")));
+    }
+    u64::from_str_radix(&text, 16).map_err(D::Error::custom)
 }
 
 /// An MPTCP key, logged as 16 hex digits.
@@ -862,7 +940,13 @@ pub struct Key(pub u64);
 
 impl Serialize for Key {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{:016x}", self.0))
+        s.collect_str(&format_args!("{:016x}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Key {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        fixed_hex(d, 16).map(Key)
     }
 }
 
@@ -872,7 +956,13 @@ pub struct Token(pub u32);
 
 impl Serialize for Token {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{:08x}", self.0))
+        s.collect_str(&format_args!("{:08x}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Token {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        fixed_hex(d, 8).map(|token| Token(token as u32))
     }
 }
 
@@ -880,79 +970,44 @@ impl Serialize for Token {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Flags(pub u8);
 
-impl Serialize for Flags {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        const NAMES: [&str; 8] = ["FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"];
-        let set: Vec<&str> = NAMES
+impl Flags {
+    /// Each flag's name, by bit.
+    const NAMES: [&str; 8] = ["FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"];
+}
+
+impl fmt::Display for Flags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut set = Self::NAMES
             .iter()
             .enumerate()
             .filter(|(bit, _)| self.0 & (1 << bit) != 0)
-            .map(|(_, name)| *name)
-            .collect();
-        s.serialize_str(&set.join("|"))
+            .map(|(_, name)| *name);
+        if let Some(first) = set.next() {
+            f.write_str(first)?;
+        }
+        set.try_for_each(|name| write!(f, "|{name}"))
     }
 }
 
-/// Where the observer writes. Custom writers execute on the world thread;
-/// use [`crate::evidence::Writer`] for bounded asynchronous file persistence.
-pub struct Sinks {
-    /// Observations, one JSON object per line.
-    pub log: Box<dyn Write + Send>,
-    /// Every packet, as pcapng.
-    pub pcap: Box<dyn Write + Send>,
+impl Serialize for Flags {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
 }
 
-/// One file the observer writes, a record at a time: a pcapng block, or a
-/// line of the log. A record the file refuses is lost. One it takes only
-/// part of is finished before the next record, so the file never holds
-/// part of one record followed by another.
-pub(super) struct Sink {
-    out: Box<dyn Write + Send>,
-    /// The rest of a record the file took only part of.
-    torn: Vec<u8>,
-}
-
-impl Sink {
-    pub(super) fn new(out: Box<dyn Write + Send>) -> Sink {
-        Sink {
-            out,
-            torn: Vec::new(),
-        }
-    }
-
-    /// Writes `record`, after the rest of a torn one. Returns whether the
-    /// file took it: all of it, or a part whose rest comes first next time.
-    pub(super) fn put(&mut self, record: &[u8]) -> bool {
-        if !self.torn.is_empty() {
-            let torn = std::mem::take(&mut self.torn);
-            let wrote = self.write(&torn);
-            if wrote < torn.len() {
-                self.torn = torn[wrote..].to_vec();
-                return false;
-            }
-        }
-        let wrote = self.write(record);
-        if wrote == 0 {
-            return false;
-        }
-        self.torn = record[wrote..].to_vec();
-        // A writer that keeps what it could not write yet, as a BufWriter
-        // does, writes it with a later record.
-        self.out.flush().is_ok()
-    }
-
-    /// Writes as much of `bytes` as the file takes. Returns how much.
-    fn write(&mut self, bytes: &[u8]) -> usize {
-        let mut wrote = 0;
-        while wrote < bytes.len() {
-            match self.out.write(&bytes[wrote..]) {
-                Ok(0) => break,
-                Ok(n) => wrote += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        wrote
+impl<'de> Deserialize<'de> for Flags {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        text.split('|')
+            .filter(|name| !name.is_empty())
+            .try_fold(0, |flags, name| {
+                let bit = Self::NAMES
+                    .iter()
+                    .position(|known| *known == name)
+                    .ok_or_else(|| D::Error::custom(format!("unknown TCP flag {name}")))?;
+                Ok(flags | 1 << bit)
+            })
+            .map(Flags)
     }
 }
 
@@ -1029,10 +1084,9 @@ struct Source {
     flagged_joins: bool,
 }
 
-/// Writes the packet log and the observations. See the [module docs](self).
+/// Makes the observations and the packet capture. See the [module docs](self).
 pub struct Observer {
-    log: Sink,
-    pcap: Sink,
+    events: EventSink,
     /// Whether the capture took the last packet.
     capturing: bool,
     lost: Lost,
@@ -1056,21 +1110,11 @@ pub struct Observer {
 }
 
 impl Observer {
-    /// Starts the pcapng file in `sinks`. `tokens` says which MP_JOIN
-    /// tokens name an open connection.
-    pub fn new(
-        mut sinks: Sinks,
-        clock: Clock,
-        burst: Burst,
-        tokens: Arc<Tokens>,
-    ) -> io::Result<Observer> {
-        let mut header = Vec::new();
-        pcap::start(&mut header, &[]);
-        sinks.pcap.write_all(&header)?;
-        sinks.pcap.flush()?;
-        Ok(Observer {
-            log: Sink::new(sinks.log),
-            pcap: Sink::new(sinks.pcap),
+    /// An observer that hands what it sees to `events`. `tokens` says which
+    /// MP_JOIN tokens name an open connection.
+    pub fn new(events: EventSink, clock: Clock, burst: Burst, tokens: Arc<Tokens>) -> Observer {
+        Observer {
+            events,
             capturing: true,
             lost: Lost::default(),
             clock,
@@ -1087,7 +1131,7 @@ impl Observer {
             capture_generation: 0,
             restricted_evidence: false,
             network: Default::default(),
-        })
+        }
     }
 
     pub(crate) fn restricted_evidence(&mut self, enabled: bool) {
@@ -1099,7 +1143,7 @@ impl Observer {
             self.clock.micros(now),
             vec![Observation::StateLimit {
                 at_us: self.clock.micros(now),
-                collection: "connections",
+                collection: Collection::Connections,
                 limit: crate::CONNECTION_LIMIT,
             }],
         );
@@ -1110,8 +1154,8 @@ impl Observer {
         self.sources.len()
     }
 
-    /// Writes `packet`, which crossed `attachment` at `now`, to the packet
-    /// log as it is. Any bytes may come here.
+    /// Captures `packet`, which crossed `attachment` at `now`, as it is.
+    /// Any bytes may come here.
     pub fn crossed(
         &mut self,
         attachment: &Arc<str>,
@@ -1122,21 +1166,23 @@ impl Observer {
         let at_us = self.clock.micros(now);
         self.capture_packet += 1;
         let mut block = Vec::with_capacity(packet.len() + 64);
-        let way = match direction {
-            Direction::In => "in",
-            Direction::Out => "out",
-        };
+        // The comment is for people reading the capture; the writer takes
+        // the ordinal and direction from the typed packet.
         pcap::packet(
             &mut block,
             at_us,
             packet.len(),
             packet,
             Some(&format!(
-                "{attachment} {way} packet={}",
+                "{attachment} {direction} packet={}",
                 self.capture_packet
             )),
         );
-        self.capturing = self.pcap.put(&block);
+        self.capturing = self.events.packet(Packet {
+            ordinal: self.capture_packet,
+            direction,
+            block,
+        });
         if !self.capturing {
             self.lost.packets += 1;
             self.capture_generation = self.capture_generation.saturating_add(1);
@@ -1154,7 +1200,7 @@ impl Observer {
         }
     }
 
-    /// Writes what `packet` shows: a whole packet, as the world takes it
+    /// Observes what `packet` shows: a whole packet, as the world takes it
     /// in, that crossed `attachment` at `now`. Any bytes may come here.
     pub fn whole(
         &mut self,
@@ -1194,17 +1240,16 @@ impl Observer {
             packet,
             self.clock.micros(now),
         ));
-        let capture = (!reassembled && self.capture_packet > 0).then_some(self.capture_packet);
-        self.write_packet_observations(
-            self.clock.micros(now),
-            observations,
-            capture,
-            Some(if reassembled {
-                "reassembled_ip"
+        let source = PacketSource {
+            capture_packet: (!reassembled && self.capture_packet > 0)
+                .then_some(self.capture_packet),
+            packet_provenance: if reassembled {
+                Provenance::ReassembledIp
             } else {
-                "attachment_ip"
-            }),
-        );
+                Provenance::AttachmentIp
+            },
+        };
+        self.write_packet_observations(self.clock.micros(now), observations, Some(source));
     }
 
     /// Record a gate input through the same bounded evidence queue as packets.
@@ -1229,56 +1274,34 @@ impl Observer {
         );
     }
 
-    /// Write an SSH transcript fact through the packet log's record sink.
-    /// Failed writes join the same loss counters as packet observations.
+    /// Record an SSH fact through the same bounded evidence queue as
+    /// packets. One the codec cannot write back is counted as lost.
     pub fn ssh(
         &mut self,
         context: &fictionet::stdlib::services::ssh::Context<'_>,
         event: &fictionet::stdlib::services::ssh::Event,
     ) {
-        #[derive(Serialize)]
-        struct Ssh {
-            event: &'static str,
-            at_us: u64,
-            ssh: fictionet_extras::ssh::honeypot::Record,
-        }
         let at_us = self.clock.micros(context.now);
-        self.write_observations(at_us, Vec::new());
         let ssh = if self.restricted_evidence {
-            fictionet_extras::ssh::honeypot::Record::new(context, event, Instant::ZERO)
+            SshRecord::new(context, event, Instant::ZERO)
         } else {
-            fictionet_extras::ssh::honeypot::Record::redacted(context, event, Instant::ZERO)
+            SshRecord::redacted(context, event, Instant::ZERO)
         };
-        let Ok(ssh) = ssh else {
-            self.lost.observations += 1;
-            return;
-        };
-        let record = Ssh {
-            event: "ssh",
-            at_us,
-            ssh,
-        };
-        match serde_json::to_vec(&record) {
-            Ok(mut line) => {
-                line.push(b'\n');
-                if !self.log.put(&line) {
-                    self.lost.observations += 1;
-                }
-            }
+        match ssh {
+            Ok(ssh) => self.write_observations(at_us, vec![Observation::Ssh { at_us, ssh }]),
             Err(_) => self.lost.observations += 1,
         }
     }
 
     fn write_observations(&mut self, at_us: u64, observations: Vec<Observation>) {
-        self.write_packet_observations(at_us, observations, None, None);
+        self.write_packet_observations(at_us, observations, None);
     }
 
     fn write_packet_observations(
         &mut self,
         at_us: u64,
         mut observations: Vec<Observation>,
-        capture_packet: Option<u64>,
-        packet_provenance: Option<&str>,
+        packet: Option<PacketSource>,
     ) {
         if self.lost != Lost::default() && self.capturing {
             let lost = Observation::Lost {
@@ -1290,35 +1313,28 @@ impl Observer {
             self.lost = Lost::default();
         }
         for observation in observations {
-            #[derive(Serialize)]
-            struct Record<'a> {
-                #[serde(flatten)]
-                observation: &'a Observation,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                capture_packet: Option<u64>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                packet_provenance: Option<&'a str>,
-            }
-            let record = Record {
-                observation: &observation,
-                capture_packet,
-                packet_provenance,
+            // A lost report that is refused is still owed: it goes on the
+            // next observation taken.
+            let owed = match observation {
+                Observation::Lost {
+                    packets,
+                    observations,
+                    ..
+                } => Lost {
+                    packets,
+                    observations,
+                },
+                _ => Lost {
+                    packets: 0,
+                    observations: 1,
+                },
             };
-            let mut line = serde_json::to_vec(&record).expect("observations are plain data");
-            line.push(b'\n');
-            if !self.log.put(&line) {
-                match observation {
-                    // Still owed: it goes on the next line taken.
-                    Observation::Lost {
-                        packets,
-                        observations,
-                        ..
-                    } => {
-                        self.lost.packets += packets;
-                        self.lost.observations += observations;
-                    }
-                    _ => self.lost.observations += 1,
-                }
+            if !self.events.observation(Observed {
+                observation,
+                packet,
+            }) {
+                self.lost.packets += owed.packets;
+                self.lost.observations += owed.observations;
             }
         }
     }
@@ -1400,11 +1416,7 @@ impl Observer {
             && ip::Header::parse_whole(packet).is_some()
             && (20..=t.len()).contains(&offset);
         let opening = flags & (SYN | ACK | RST | FIN) == SYN;
-        let payload = Hex(t
-            .get(offset..)
-            .filter(|_| offset >= 20)
-            .unwrap_or_default()
-            .to_vec());
+        let payload: &[u8] = t.get(offset..).filter(|_| offset >= 20).unwrap_or_default();
         let ack = u32::from_be_bytes([t[8], t[9], t[10], t[11]]);
         let mut signals = Vec::new();
         let key = Attempt {
@@ -1535,7 +1547,7 @@ impl Observer {
                     if (has_options || capable) && self.probes.len() >= STATE_LIMIT {
                         signals.push(Observation::StateLimit {
                             at_us,
-                            collection: "probes",
+                            collection: Collection::Probes,
                             limit: STATE_LIMIT,
                         });
                     } else if has_options || capable {
@@ -1578,7 +1590,8 @@ impl Observer {
                 options,
                 options_fault,
                 mptcp,
-                payload,
+                payload: (!payload.is_empty())
+                    .then(|| Payload::new(payload, self.restricted_evidence)),
                 gap_us,
             }];
             out.extend(bursts.into_iter().map(|(kind, syns)| Observation::Burst {
@@ -1604,7 +1617,7 @@ impl Observer {
             options,
             options_fault,
             mptcp,
-            payload,
+            payload: Payload::new(payload, self.restricted_evidence),
         });
         signals
     }
@@ -1713,7 +1726,7 @@ impl Observer {
                 self.clock.micros(now),
                 vec![Observation::StateLimit {
                     at_us: self.clock.micros(now),
-                    collection: "syns",
+                    collection: Collection::Syns,
                     limit: STATE_LIMIT,
                 }],
             );
@@ -1926,16 +1939,7 @@ mod tests {
 
     #[test]
     fn detector_population_stays_bounded_and_expires() {
-        let mut observer = Observer::new(
-            Sinks {
-                log: Box::new(io::sink()),
-                pcap: Box::new(io::sink()),
-            },
-            Clock::at_unix_secs(0),
-            Burst::default(),
-            Arc::new(Tokens::default()),
-        )
-        .unwrap();
+        let mut observer = observer();
         for port in 0..STATE_LIMIT + 100 {
             observer.syn(
                 "192.0.2.1".parse().unwrap(),
@@ -1982,16 +1986,7 @@ mod tests {
 
     #[test]
     fn probe_correlation_keeps_sequence_and_attachment_boundaries() {
-        let mut observer = Observer::new(
-            Sinks {
-                log: Box::new(io::sink()),
-                pcap: Box::new(io::sink()),
-            },
-            Clock::at_unix_secs(0),
-            Burst::default(),
-            Arc::new(Tokens::default()),
-        )
-        .unwrap();
+        let mut observer = observer();
         let attachment = Arc::from("internet");
         let packet = probe_packet(123);
         observer.observe(
@@ -2046,16 +2041,7 @@ mod tests {
 
     #[test]
     fn negative_observations_preserve_unknown_or_lost_capture_coverage() {
-        let mut observer = Observer::new(
-            Sinks {
-                log: Box::new(io::sink()),
-                pcap: Box::new(io::sink()),
-            },
-            Clock::at_unix_secs(0),
-            Burst::default(),
-            Arc::new(Tokens::default()),
-        )
-        .unwrap();
+        let mut observer = observer();
         let attachment = Arc::from("internet");
         observer.observe(
             &attachment,
@@ -2090,17 +2076,82 @@ mod tests {
         ));
     }
 
+    fn observer() -> Observer {
+        Observer::new(
+            EventSink::detached(),
+            Clock::at_unix_secs(0),
+            Burst::default(),
+            Arc::new(Tokens::default()),
+        )
+    }
+
     #[test]
-    fn sink_reports_flush_failure() {
-        struct RefusesFlush;
-        impl Write for RefusesFlush {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::other("storage unavailable"))
+    fn segment_payloads_are_kept_only_with_restricted_evidence() {
+        let mut syn = probe_packet(7);
+        syn.extend_from_slice(b"early data");
+        let length = syn.len() as u16;
+        syn[2..4].copy_from_slice(&length.to_be_bytes());
+        ip::set_header_checksum(&mut syn[..24]);
+        syn[40..42].fill(0);
+        let sum = ip::transport_checksum(
+            "192.0.2.1".parse().unwrap(),
+            "192.0.2.2".parse().unwrap(),
+            protocol::TCP,
+            &syn[24..],
+        );
+        syn[40..42].copy_from_slice(&sum.to_be_bytes());
+        for restricted in [false, true] {
+            let mut observer = observer();
+            observer.restricted_evidence(restricted);
+            let observations = observer.observe(
+                &Arc::from("internet"),
+                Direction::In,
+                &syn,
+                Instant::ZERO,
+                Some(true),
+            );
+            let Some(Observation::Syn { payload, .. }) = observations.first() else {
+                panic!("a SYN observation, not {observations:?}");
+            };
+            let line = serde_json::to_value(&observations[0]).unwrap();
+            if restricted {
+                assert_eq!(payload, &Some(Payload::Kept(Hex(b"early data".to_vec()))));
+                assert_eq!(line["payload"], "6561726c792064617461");
+                assert!(line.get("payload_bytes").is_none());
+            } else {
+                assert_eq!(payload, &Some(Payload::Counted(10)));
+                assert_eq!(line["payload_bytes"], 10);
+                assert!(line.get("payload").is_none());
             }
         }
-        assert!(!Sink::new(Box::new(RefusesFlush)).put(b"record\n"));
+    }
+
+    #[test]
+    fn text_forms_read_back() {
+        for flags in [0, SYN, SYN | ACK, 0xff] {
+            let text = serde_json::to_value(Flags(flags)).unwrap();
+            assert_eq!(serde_json::from_value::<Flags>(text).unwrap(), Flags(flags));
+        }
+        assert_eq!(serde_json::to_value(Flags(SYN | ACK)).unwrap(), "SYN|ACK");
+        let key = serde_json::to_value(Key(0x0102_0304_0506_0708)).unwrap();
+        assert_eq!(key, "0102030405060708");
+        assert_eq!(
+            serde_json::from_value::<Key>(key).unwrap().0,
+            0x0102_0304_0506_0708
+        );
+        let token = serde_json::to_value(Token(0xab)).unwrap();
+        assert_eq!(token, "000000ab");
+        assert_eq!(serde_json::from_value::<Token>(token).unwrap().0, 0xab);
+        let hex = serde_json::to_value(Hex(vec![0, 0xff, 0x10])).unwrap();
+        assert_eq!(hex, "00ff10");
+        assert_eq!(
+            serde_json::from_value::<Hex>(hex).unwrap().0,
+            [0, 0xff, 0x10]
+        );
+        for bad in ["0", "zz", "+f", "a\u{e9}0", "SYN|BOGUS"] {
+            assert!(serde_json::from_value::<Hex>(bad.into()).is_err());
+            assert!(serde_json::from_value::<Flags>(bad.into()).is_err());
+        }
+        assert!(serde_json::from_value::<Token>("abc".into()).is_err());
     }
 }

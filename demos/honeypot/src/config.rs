@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use fictionet::stdlib::network::ethernet::host::Ipv6Gateway;
 use fictionet::stdlib::network::route::Prefix;
+use serde::{Deserialize, Serialize};
 
 /// The server's IPv4 address when none is given: in TEST-NET-3
 /// ([RFC 5737](https://www.rfc-editor.org/rfc/rfc5737)).
@@ -119,7 +120,8 @@ pub struct Port {
 }
 
 /// What a port serves once a connection is open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Service {
     /// A simulated SSH server with authentication and session hooks.
     Ssh,
@@ -134,7 +136,7 @@ pub enum Service {
 }
 
 /// The packaged HTTP server whose behavior is exposed to clients.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HttpProfile {
     /// Official Caddy with its packaged site and default MPTCP listener.
     #[default]

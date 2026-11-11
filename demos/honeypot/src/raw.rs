@@ -1,7 +1,6 @@
 //! Complete Ethernet frames reach this world before any protocol parsing.
 //! Enabled company applications have separate IPv4 endpoints on this link.
 
-use std::io::Write;
 use std::sync::Arc;
 use std::task::Waker;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,35 +11,23 @@ use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Interface, Packet};
 use fictionet_host::raw::{EthernetFrame, QueueStats, RawAttachment, RawSender};
-use serde::Serialize;
 
-use crate::observe::{Direction, Hex, Sink, Sinks};
+use crate::evidence::EventSink;
+use crate::observe::Direction;
+use crate::record::{Frame, TimestampSource};
 use crate::{Clock, Config, Honeypot, INTERNET};
 
 /// The largest IP packet one Ethernet frame carries.
 const MTU: u16 = 1500;
 
 struct Capture {
-    writer: Sink,
+    events: EventSink,
     lost: u64,
     clock: Clock,
     receive_stats: QueueStats,
     transmit_stats: QueueStats,
     reported_queue_dropped: u64,
     reported_tx_queue_dropped: u64,
-}
-
-#[derive(Serialize)]
-struct FrameRecord {
-    at_us: u64,
-    received_at_us: Option<u64>,
-    timestamp_source: &'static str,
-    direction: Direction,
-    bytes: Hex,
-    lost: u64,
-    rx_queue_dropped: u64,
-    tx_queue_dropped: u64,
-    nic_rx_dropped: Option<u64>,
 }
 
 impl Capture {
@@ -53,26 +40,25 @@ impl Capture {
     ) {
         let queue_dropped = self.receive_stats.queue_dropped();
         let tx_queue_dropped = self.transmit_stats.queue_dropped();
-        let record = FrameRecord {
+        let frame = Frame {
             at_us: self.clock.micros(fcx.now()),
             received_at_us: received_at
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_micros().min(u64::MAX as u128) as u64),
             timestamp_source: if received_at.is_some() {
-                "host_system_time"
+                TimestampSource::HostSystemTime
             } else {
-                "world_clock"
+                TimestampSource::WorldClock
             },
             direction,
-            bytes: Hex(bytes),
             lost: self.lost,
             rx_queue_dropped: queue_dropped.saturating_sub(self.reported_queue_dropped),
             tx_queue_dropped: tx_queue_dropped.saturating_sub(self.reported_tx_queue_dropped),
             nic_rx_dropped: None,
+            length: bytes.len(),
+            bytes,
         };
-        let mut line = serde_json::to_vec(&record).expect("a frame record is serializable");
-        line.push(b'\n');
-        if self.writer.put(&line) {
+        if self.events.frame(frame) {
             self.lost = 0;
             self.reported_queue_dropped = queue_dropped;
             self.reported_tx_queue_dropped = tx_queue_dropped;
@@ -149,17 +135,17 @@ fn host(config: &Config, mac: Mac, now: Instant) -> fictionet::Result<Host> {
 
 /// Starts the existing honeypot behind a complete Ethernet attachment.
 ///
-/// `raw_log` receives every frame reaching the world, both ways, including
-/// malformed headers, VLAN tags, unknown EtherTypes and Ethernet padding,
-/// as hexadecimal JSON lines before parsing. `lost` counts refused log records and
-/// `rx_queue_dropped` and `tx_queue_dropped` count frames the full host
-/// queues discarded, all since the last accepted record. `nic_rx_dropped`
-/// is null because device and backend losses are unavailable, not zero. Partial records
-/// are completed before the next one. `sinks`
-/// retain the existing IP capture and TCP option observations.
-/// `received_at_us` preserves backend receipt time from the host system clock
-/// before queueing, when available; `at_us` is world processing time. Neither
-/// clock represents a hardware timestamp or independently observed transmission.
+/// `events` receives every frame reaching the world, both ways, before
+/// parsing, as a [`Frame`]: malformed headers, VLAN tags, unknown
+/// EtherTypes and Ethernet padding included. `lost` counts frames `events`
+/// refused, and `rx_queue_dropped` and `tx_queue_dropped` count frames the
+/// full host queues discarded, all since the last frame it took.
+/// `nic_rx_dropped` is `None` because device and backend losses are
+/// unavailable, not zero. `events` also receives the IP capture and the
+/// observations, as [`crate::start`] gives them. `received_at_us` preserves
+/// backend receipt time from the host system clock before queueing, when
+/// available; `at_us` is world processing time. Neither clock represents a
+/// hardware timestamp or independently observed transmission.
 ///
 /// The link-layer work is done by an
 /// [`ethernet::Host`](fictionet::stdlib::network::ethernet::Host), as a
@@ -187,9 +173,8 @@ pub fn start_raw(
     fcx: &Cx,
     config: &Config,
     clock: Clock,
-    sinks: Sinks,
+    events: EventSink,
     raw: RawAttachment,
-    raw_log: Box<dyn Write + Send>,
 ) -> fictionet::Result<Honeypot> {
     let host = host(config, raw.mac_address(), fcx.now())?;
     let mut company = Vec::new();
@@ -220,12 +205,12 @@ pub fn start_raw(
     let (sender, mut receiver) = raw.split();
     let (attacher, attachments) = fictionet::attachments();
     let end = Arc::new(Mutex::new(attacher.attach(INTERNET)?));
-    let honeypot = crate::start(fcx, config, clock, sinks, attachments)?;
+    let honeypot = crate::start(fcx, config, clock, events.clone(), attachments)?;
     let link = Arc::new(Mutex::new(Link {
         host,
         company,
         capture: Capture {
-            writer: Sink::new(raw_log),
+            events,
             lost: 0,
             clock,
             receive_stats,

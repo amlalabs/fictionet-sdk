@@ -2,12 +2,18 @@ use fictionet::Cx;
 use fictionet::stdlib::network::ConnectionExt;
 use fictionet_test_support::sandbox::{Machine, machine};
 use fictionet_test_support::world::world;
-use honeypot_world::observe::Sinks;
+use honeypot_world::observe::Observation;
+use honeypot_world::record::{Observed, Record};
+use honeypot_world::traps::{ProbeEnd, ProbeKind, TrapEvent};
 use honeypot_world::{Args, Clock, INTERNET, start};
 use serde_json::{Value, json};
-use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
+
+#[path = "common/capture.rs"]
+mod capture;
+
+use capture::Evidence;
 
 async fn request(
     fcx: &Cx,
@@ -69,14 +75,12 @@ fn virtual_network_serves_protocol_gates_and_exact_hold_duration() {
                 .unwrap()
                 .config;
         let (attach, attachments) = fictionet::attachments();
+        let evidence = Evidence::new();
         start(
             &fcx,
             &config,
             Clock::at_unix_secs(0),
-            Sinks {
-                log: Box::new(io::sink()),
-                pcap: Box::new(io::sink()),
-            },
+            evidence.sink(),
             attachments,
         )?;
         let client = machine(&fcx, attach.attach(INTERNET)?, Ipv4Addr::new(192, 0, 2, 5));
@@ -159,6 +163,38 @@ fn virtual_network_serves_protocol_gates_and_exact_hold_duration() {
         assert!(
             fcx.now().since_start().saturating_sub(before.since_start())
                 >= Duration::from_secs(150)
+        );
+        // Every line of the log reads back as a typed record, and the
+        // gates the client passed are in it.
+        let lines = evidence.finish().lines();
+        let traps: Vec<_> = lines
+            .iter()
+            .filter_map(|line| match &line.event.record {
+                Record::Observation(Observed {
+                    observation: Observation::Trap { trap, .. },
+                    ..
+                }) => Some(trap),
+                _ => None,
+            })
+            .collect();
+        assert!(traps.iter().any(|trap| matches!(
+            trap,
+            TrapEvent::Declaration { model, accepted: true, .. }
+                if model == "laboratory/protocol-model-9"
+        )));
+        assert!(traps.iter().any(|trap| matches!(
+            trap,
+            TrapEvent::Credential { offered, .. } if *offered == credential
+        )));
+        assert!(traps.iter().any(|trap| matches!(
+            trap,
+            TrapEvent::Probe { probe: ProbeKind::Hold, end: ProbeEnd::Answered, elapsed_ms }
+                if *elapsed_ms >= 150_000
+        )));
+        assert!(
+            traps
+                .iter()
+                .any(|trap| matches!(trap, TrapEvent::Payout { .. }))
         );
         Ok(())
     });

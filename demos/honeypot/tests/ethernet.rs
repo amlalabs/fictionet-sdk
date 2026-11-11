@@ -21,8 +21,8 @@ mod initiated;
 #[path = "common/port_zero.rs"]
 mod port_zero;
 
-use capture::{Capture, config, sinks};
-use port_zero::{Probe, lines};
+use capture::{Evidence, Written, config, packet_at, packets};
+use port_zero::Probe;
 
 const CLIENT_MAC: Mac = [0x02, 0, 0, 0, 0, 2];
 const SERVER_MAC: Mac = [0x02, 0, 0, 0, 0, 1];
@@ -85,26 +85,33 @@ async fn card(
     }
 }
 
-fn unhex(text: &str) -> Vec<u8> {
-    (0..text.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
-        .collect()
-}
-
-/// Checks the server's frame log: the ARP exchanges both ways, each probe
-/// in an inbound IPv4 frame, in order, and no frame lost or dropped.
-fn check_frames(frames: &Capture, probes: &[Vec<u8>]) {
-    let records = lines(frames);
+/// Checks the server's frames: each `ethernet_capture` line points at its
+/// frame in the Ethernet capture, the ARP exchanges went both ways, each
+/// probe arrived in an inbound IPv4 frame, in order, and no frame was lost
+/// or dropped.
+fn check_frames(written: &Written, probes: &[Vec<u8>]) {
+    let capture = written.ethernet();
     let mut arp = Vec::new();
     let mut inbound_ipv4 = Vec::new();
-    for record in &records {
-        assert_eq!(record["lost"], 0);
-        assert_eq!(record["rx_queue_dropped"], 0);
-        assert_eq!(record["tx_queue_dropped"], 0);
-        let bytes = unhex(record["bytes"].as_str().unwrap());
+    let lines: Vec<_> = written
+        .events()
+        .into_iter()
+        .filter(|event| event["event"] == "ethernet_capture")
+        .collect();
+    assert_eq!(lines.len(), packets(&capture).len(), "a line per frame");
+    for line in &lines {
+        assert_eq!(line["lost"], 0);
+        assert_eq!(line["rx_queue_dropped"], 0);
+        assert_eq!(line["tx_queue_dropped"], 0);
+        assert_eq!(line["capture"]["available"], true);
+        let bytes = packet_at(
+            &capture,
+            line["capture"]["offset"].as_u64().unwrap() as usize,
+        );
+        assert_eq!(line["length"], bytes.len());
         let frame = Frame::parse(&bytes).expect("an Ethernet frame");
-        let inbound = record["direction"] == "in";
+        let inbound = line["direction"] == "in";
+        assert_eq!(line["capture"]["direction"], line["direction"]);
         match frame.ethertype {
             frame::ARP => {
                 let packet = arp::Packet::receive(frame.payload).expect("an ARP packet");
@@ -138,21 +145,21 @@ fn port_zero_probes_through_ethernet() {
         let (server_raw, server_wire) = RawAttachment::in_memory(SERVER_MAC);
         let queues = [server_raw.receive_stats(), server_raw.transmit_stats()];
         fcx.spawn(move |fcx| link(fcx, client_wire, server_wire));
-        let (log, pcap, frames) = (Capture::default(), Capture::default(), Capture::default());
+        let evidence = Evidence::new();
         let server = start_raw(
             &fcx,
             &config(port_zero::PEER, port_zero::CLIENT),
             Clock::starting_now(),
-            sinks(&log, &pcap),
+            evidence.sink(),
             server_raw,
-            Box::new(frames.clone()),
         )?;
         let (end, relay) = fictionet::pair();
         fcx.spawn(move |fcx| card(fcx, client_raw, relay, port_zero::CLIENT, port_zero::PEER));
         let mut probe = Probe::new(&server, end).await?;
         probe.run(&fcx).await?;
-        probe.check(&log, &pcap);
-        check_frames(&frames, &probe.sent);
+        let written = evidence.finish();
+        probe.check(&written);
+        check_frames(&written, &probe.sent);
         assert!(queues.iter().all(|queue| queue.queue_dropped() == 0));
         Ok(())
     });
@@ -164,25 +171,24 @@ fn initiated_traffic_through_ethernet() {
         let (client_raw, client_wire) = RawAttachment::in_memory(CLIENT_MAC);
         let (server_raw, server_wire) = RawAttachment::in_memory(SERVER_MAC);
         fcx.spawn(move |fcx| link(fcx, client_wire, server_wire));
-        let pcap = Capture::default();
+        let (client_evidence, remote_evidence) = (Evidence::new(), Evidence::new());
         let client = start_raw(
             &fcx,
             &config(initiated::CLIENT, initiated::PEER),
             Clock::starting_now(),
-            sinks(&Capture::default(), &pcap),
+            client_evidence.sink(),
             client_raw,
-            Box::new(std::io::sink()),
         )?;
         let remote = start_raw(
             &fcx,
             &config(initiated::PEER, initiated::CLIENT),
             Clock::starting_now(),
-            sinks(&Capture::default(), &Capture::default()),
+            remote_evidence.sink(),
             server_raw,
-            Box::new(std::io::sink()),
         )?;
         initiated::exchanges(&fcx, &client, &remote).await?;
-        initiated::check(&pcap);
+        initiated::check(&client_evidence.finish());
+        remote_evidence.finish();
         Ok(())
     });
 }

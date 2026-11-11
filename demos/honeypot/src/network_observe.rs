@@ -4,11 +4,11 @@ use fictionet::stdlib::{
     network::ip::{self, protocol},
     protocols::dns,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 /// Facts retained independently of successful application requests.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fact {
     /// Every valid TCP segment, including pure ACKs during held requests.
@@ -35,7 +35,7 @@ pub enum Fact {
 }
 
 /// Why stream interpretation stopped; raw packets are still retained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Incomplete {
     Gap,
