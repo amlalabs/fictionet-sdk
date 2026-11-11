@@ -41,8 +41,8 @@ const SCRATCH: usize = 2 * wire::MAX_FRAME
 /// and above it the same [`HttpExchange`] children as HTTP/2.
 /// [`super::Responder::http3`] supplies the SDK's handler children.
 ///
-/// QPACK advertises zero dynamic capacity and zero blocked streams. Static
-/// references, literals and Huffman strings work in both directions. Server
+/// QPACK accepts dynamic references within [`qpack::Settings`]. Responses
+/// reference only acknowledged inserts, so they never block on QPACK. Server
 /// push and extended CONNECT are not enabled. The peer must allow at least
 /// three unidirectional streams for the control and QPACK streams.
 ///
@@ -60,6 +60,11 @@ pub struct Http3 {
     critical: Critical,
     decoder: qpack::Table,
     encoder: qpack::Encoder,
+    qpack: qpack::Settings,
+    decoder_charge: Option<Charge>,
+    encoder_charge: Option<Charge>,
+    decoder_output: Option<Chunk>,
+    encoder_output: Option<Chunk>,
     peer_fields: u64,
     up: Option<Up>,
     close: Option<u64>,
@@ -122,6 +127,9 @@ struct Channel {
     critical: bool,
     input: Reader,
     request: Option<wire::RequestStream>,
+    peer_encoder: bool,
+    blocked: Option<(qpack::BlockedSection, Charge)>,
+    cancelled: bool,
     exchange: Option<ChildId>,
     pending: Option<ExchangeEvent>,
     input_done: bool,
@@ -166,6 +174,9 @@ impl Channel {
             critical: local.is_some(),
             input: codec::Stream::in_storage(decoder, 0, ChargedBytes::new(budget)),
             request,
+            peer_encoder: false,
+            blocked: None,
+            cancelled: false,
             exchange: None,
             pending: None,
             input_done: stream.local,
@@ -221,8 +232,13 @@ impl Http3 {
             local_opened: 0,
             opening: false,
             critical: Critical::default(),
-            decoder: qpack::Table::new(0),
+            decoder: qpack::Table::new(qpack::Settings::default().table_capacity()),
             encoder: qpack::Encoder::new(0, wire::MAX_FIELD_SECTION_SIZE),
+            qpack: qpack::Settings::default(),
+            decoder_charge: None,
+            encoder_charge: None,
+            decoder_output: None,
+            encoder_output: None,
             peer_fields: u64::MAX,
             up: None,
             close: None,
@@ -242,6 +258,17 @@ impl Http3 {
     /// Dates response heads from the world's clock.
     pub fn date(mut self, start: SystemTime) -> Self {
         self.dates = Dates::new(Some(start));
+        self
+    }
+
+    /// Chooses the QPACK limits advertised by this connection before it opens.
+    pub fn qpack(mut self, settings: qpack::Settings) -> Self {
+        assert!(
+            !self.initialized,
+            "QPACK settings follow connection creation"
+        );
+        self.qpack = settings;
+        self.decoder = qpack::Table::new(settings.table_capacity());
         self
     }
 
@@ -274,9 +301,13 @@ impl Http3 {
         let Some(dates) = budget.charge(self.dates.held()) else {
             return false;
         };
+        let Some(decoder) = budget.charge(self.decoder.most_held()) else {
+            return false;
+        };
         self.channels = channels;
         self.exchanges = exchanges;
         self.dates_charge = Some(dates);
+        self.decoder_charge = Some(decoder);
         self.initialized = true;
         true
     }
@@ -348,6 +379,7 @@ impl Http3 {
                     Ok(critical) => self.channels.get_mut(id).unwrap().critical = critical,
                 }
                 let channel = self.channels.get_mut(id).unwrap();
+                channel.peer_encoder = header == wire::StreamHeader::QpackEncoder;
                 // The prefix decoder ends before handing its buffered suffix on.
                 let _ = channel.input.next();
                 let empty = codec::Stream::in_storage(
@@ -362,6 +394,8 @@ impl Http3 {
             wire::StreamItem::EncoderInstruction(instruction) => {
                 if self.decoder.apply(instruction).is_err() {
                     self.fail(code::QPACK_ENCODER_STREAM_ERROR);
+                } else if let Some(increment) = self.decoder.take_increment() {
+                    self.feedback(env.budget(), increment);
                 }
             }
             wire::StreamItem::DecoderInstruction(instruction) => {
@@ -377,6 +411,29 @@ impl Http3 {
                             self.peer_fields = settings
                                 .get(wire::setting::MAX_FIELD_SECTION_SIZE)
                                 .unwrap_or(u64::MAX);
+                            let mut encoder = qpack::Encoder::new(
+                                settings
+                                    .get(wire::setting::QPACK_MAX_TABLE_CAPACITY)
+                                    .unwrap_or(0),
+                                self.peer_fields,
+                            );
+                            let Some(charge) = env.budget().charge(encoder.most_held()) else {
+                                self.fail(code::EXCESSIVE_LOAD);
+                                return;
+                            };
+                            if encoder.table().max_capacity() != 0 {
+                                let instruction = encoder
+                                    .set_capacity(encoder.table().max_capacity())
+                                    .unwrap();
+                                self.encoder_output =
+                                    encode(env.budget(), &instruction, qpack::MAX_INTEGER_BYTES);
+                                if self.encoder_output.is_none() {
+                                    self.fail(code::EXCESSIVE_LOAD);
+                                    return;
+                                }
+                            }
+                            self.encoder = encoder;
+                            self.encoder_charge = Some(charge);
                         }
                         // No push was promised, so no push can be cancelled.
                         wire::Frame::CancelPush(_) => self.fail(code::ID_ERROR),
@@ -384,97 +441,143 @@ impl Http3 {
                     }
                     return;
                 };
-                let event = match request.step(&frame, &self.decoder) {
+                let result = request.step(&frame, &self.decoder);
+                self.request_result(env, id, result);
+            }
+        }
+    }
+
+    fn feedback(&mut self, budget: &Budget, instruction: qpack::DecoderInstruction) {
+        // Reading and resuming pause while this slot is occupied. Never lose
+        // an ack: decoding has already advanced the table's reported count.
+        assert!(self.decoder_output.is_none());
+        self.decoder_output = encode(budget, &instruction, qpack::MAX_INTEGER_BYTES);
+        if self.decoder_output.is_none() {
+            self.fail(code::EXCESSIVE_LOAD);
+        }
+    }
+
+    fn request_result(
+        &mut self,
+        env: &mut Env<'_, ()>,
+        id: ChildId,
+        result: Result<wire::RequestResult, wire::Error>,
+    ) {
+        let event = match result {
+            Err(error) => {
+                self.error(id, error);
+                return;
+            }
+            Ok(wire::RequestResult::Blocked(section)) => {
+                let (count, bytes) = self
+                    .channels
+                    .ids()
+                    .filter_map(|id| self.channels.get(id)?.blocked.as_ref())
+                    .fold((0, 0), |(count, bytes), (s, _)| {
+                        // An insert can make a retained section ready before
+                        // the fair stream scan resumes it. It no longer counts
+                        // against SETTINGS_QPACK_BLOCKED_STREAMS.
+                        (
+                            count
+                                + usize::from(
+                                    s.required_insert_count() > self.decoder.insert_count(),
+                                ),
+                            bytes + s.held(),
+                        )
+                    });
+                if count >= self.qpack.blocked_streams() {
+                    self.fail(code::QPACK_DECOMPRESSION_FAILED);
+                    return;
+                }
+                if section.held() > qpack::MAX_BLOCKED_BYTES.saturating_sub(bytes) {
+                    self.fail(code::EXCESSIVE_LOAD);
+                    return;
+                }
+                let Some(charge) = env.budget().charge(section.held()) else {
+                    self.fail(code::EXCESSIVE_LOAD);
+                    return;
+                };
+                self.channels.get_mut(id).unwrap().blocked = Some((section, charge));
+                return;
+            }
+            Ok(wire::RequestResult::Event { event, ack }) => {
+                if let Some(ack) = ack {
+                    self.feedback(env.budget(), ack);
+                }
+                match event {
+                    Ok(event) => event,
                     Err(error) => {
                         self.error(id, error);
                         return;
                     }
-                    Ok(wire::RequestResult::Blocked(_)) => {
-                        self.fail(code::QPACK_DECOMPRESSION_FAILED);
-                        return;
-                    }
-                    Ok(wire::RequestResult::Event { event, ack }) => {
-                        // Zero capacity cannot produce a dynamic reference or acknowledgement.
-                        if ack.is_some() {
-                            self.fail(code::QPACK_DECOMPRESSION_FAILED);
-                            return;
-                        }
-                        match event {
-                            Ok(event) => event,
-                            Err(error) => {
-                                self.error(id, error);
-                                return;
-                            }
-                        }
-                    }
-                };
-                match event {
-                    wire::Event::Headers(head) => {
-                        if head
-                            .fields
-                            .iter()
-                            .filter(|f| !f.name.starts_with(b":"))
-                            .count()
-                            > self.limits.head.headers
-                        {
-                            self.channels
-                                .get_mut(id)
-                                .unwrap()
-                                .cancel(code::EXCESSIVE_LOAD);
-                            return;
-                        }
-                        let Some(fields) = Self::fields(env.budget(), head) else {
-                            self.channels
-                                .get_mut(id)
-                                .unwrap()
-                                .cancel(code::EXCESSIVE_LOAD);
-                            return;
-                        };
-                        let length = fields
-                            .get(b"content-length")
-                            .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok());
-                        let channel = self.channels.get_mut(id).unwrap();
-                        if self.shutdown.is_some_and(|cutoff| channel.stream >= cutoff) {
-                            channel.cancel(code::REQUEST_REJECTED);
-                            return;
-                        }
-                        let Ok(child) = self.exchanges.insert(id) else {
-                            channel.cancel(code::REQUEST_REJECTED);
-                            return;
-                        };
-                        channel.exchange = Some(child.id());
-                        channel.head_deadline = None;
-                        channel.app_due = WINDOW;
-                        self.next_request = self.next_request.max(channel.stream + 4);
-                        self.up = Some(MuxEvent::Opened(
-                            child,
-                            Opening {
-                                head: RequestHead::http3(fields, length),
-                                ended: false,
-                                at: env.now(),
-                            },
-                            WINDOW,
-                        ));
-                    }
-                    wire::Event::Data(bytes) => {
-                        let channel = self.channels.get_mut(id).unwrap();
-                        match Chunk::copy_of(env.budget(), &bytes) {
-                            Some(bytes) => channel.pending = Some(ExchangeEvent::Data(bytes)),
-                            None => channel.cancel(code::EXCESSIVE_LOAD),
-                        }
-                    }
-                    wire::Event::Trailers(head) => {
-                        let fields = Self::fields(env.budget(), head);
-                        let channel = self.channels.get_mut(id).unwrap();
-                        match fields {
-                            Some(fields) => channel.trailers = Some(RequestTrailers::new(fields)),
-                            None => channel.cancel(code::EXCESSIVE_LOAD),
-                        }
-                    }
-                    wire::Event::Unknown(_) => {}
-                    _ => self.fail(code::FRAME_UNEXPECTED),
                 }
             }
+        };
+        match event {
+            wire::Event::Headers(head) => {
+                if head
+                    .fields
+                    .iter()
+                    .filter(|f| !f.name.starts_with(b":"))
+                    .count()
+                    > self.limits.head.headers
+                {
+                    self.channels
+                        .get_mut(id)
+                        .unwrap()
+                        .cancel(code::EXCESSIVE_LOAD);
+                    return;
+                }
+                let Some(fields) = Self::fields(env.budget(), head) else {
+                    self.channels
+                        .get_mut(id)
+                        .unwrap()
+                        .cancel(code::EXCESSIVE_LOAD);
+                    return;
+                };
+                let length = fields
+                    .get(b"content-length")
+                    .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok());
+                let channel = self.channels.get_mut(id).unwrap();
+                if self.shutdown.is_some_and(|cutoff| channel.stream >= cutoff) {
+                    channel.cancel(code::REQUEST_REJECTED);
+                    return;
+                }
+                let Ok(child) = self.exchanges.insert(id) else {
+                    channel.cancel(code::REQUEST_REJECTED);
+                    return;
+                };
+                channel.exchange = Some(child.id());
+                channel.head_deadline = None;
+                channel.app_due = WINDOW;
+                self.next_request = self.next_request.max(channel.stream + 4);
+                self.up = Some(MuxEvent::Opened(
+                    child,
+                    Opening {
+                        head: RequestHead::http3(fields, length),
+                        ended: false,
+                        at: env.now(),
+                    },
+                    WINDOW,
+                ));
+            }
+            wire::Event::Data(bytes) => {
+                let channel = self.channels.get_mut(id).unwrap();
+                match Chunk::copy_of(env.budget(), &bytes) {
+                    Some(bytes) => channel.pending = Some(ExchangeEvent::Data(bytes)),
+                    None => channel.cancel(code::EXCESSIVE_LOAD),
+                }
+            }
+            wire::Event::Trailers(head) => {
+                let fields = Self::fields(env.budget(), head);
+                let channel = self.channels.get_mut(id).unwrap();
+                match fields {
+                    Some(fields) => channel.trailers = Some(RequestTrailers::new(fields)),
+                    None => channel.cancel(code::EXCESSIVE_LOAD),
+                }
+            }
+            wire::Event::Unknown(_) => {}
+            _ => self.fail(code::FRAME_UNEXPECTED),
         }
     }
 
@@ -484,6 +587,7 @@ impl Http3 {
             || channel.input_done
             || channel.pending.is_some()
             || channel.reset.is_some()
+            || self.decoder_output.is_some() && (channel.request.is_some() || channel.peer_encoder)
         {
             return false;
         }
@@ -494,6 +598,19 @@ impl Http3 {
             }
             return true;
         };
+        if let Some((section, _)) = &channel.blocked {
+            if section.required_insert_count() > self.decoder.insert_count() {
+                return false;
+            }
+            let (section, _charge) = channel.blocked.take().unwrap();
+            let result = channel
+                .request
+                .as_mut()
+                .unwrap()
+                .resume(channel.stream, section.retry(&self.decoder));
+            self.request_result(env, id, result);
+            return true;
+        }
         let before = channel.input.offset();
         let item = channel.input.next();
         let consumed = channel.input.offset() - before;
@@ -586,6 +703,27 @@ impl Http3 {
         }
         if fields.iter().map(qpack::Field::size).sum::<u64>() > self.peer_fields {
             return None;
+        }
+        if self.encoder_output.is_none() && self.encoder.table().capacity() != 0 {
+            // An instruction is smaller than the RFC size of its field. Pay
+            // for the entire batch before changing the encoder's table.
+            let bound = fields.iter().map(qpack::Field::size).sum::<u64>() as usize;
+            if let Some(mut bytes) = ChargedBytes::with_capacity(env.budget(), bound) {
+                bytes
+                    .fill(|out| {
+                        for field in &fields {
+                            if let Some(instruction) = self.encoder.warm(field) {
+                                instruction.write(out)?;
+                            }
+                        }
+                        Ok::<(), qpack::Error>(())
+                    })
+                    .expect("QPACK insertions fit the fields' RFC sizes");
+                if !bytes.is_empty() {
+                    bytes.trim();
+                    self.encoder_output = Some(bytes.into_chunk());
+                }
+            }
         }
         let headers = wire::HeaderList { fields };
         let kind = if status.is_some() {
@@ -696,16 +834,27 @@ impl Layer for Http3 {
                 if let Some(id) = self.channel(lower) {
                     let channel = self.channels.get_mut(id).unwrap();
                     match event {
-                        StreamEvent::Data(bytes) => {
+                        StreamEvent::Data(mut bytes) => {
                             if channel.input_done || channel.reset.is_some() {
                                 return Ok(Admit::Taken);
                             }
-                            if channel.input.push(&bytes) != bytes.len() {
-                                if channel.critical {
-                                    self.fail(code::EXCESSIVE_LOAD);
-                                } else {
-                                    channel.cancel(code::EXCESSIVE_LOAD);
-                                }
+                            // A QUIC delivery can contain the stream type and
+                            // several instructions. Let the codec consume one
+                            // item and change its input limit before admitting
+                            // the charged remainder through the carrier again.
+                            let n = channel.input.push(&bytes);
+                            if n == 0 && !bytes.is_empty() {
+                                return Ok(Admit::Blocked(MuxEvent::Child(
+                                    lower,
+                                    StreamEvent::Data(bytes),
+                                )));
+                            }
+                            bytes.advance(n);
+                            if !bytes.is_empty() {
+                                return Ok(Admit::Partial(MuxEvent::Child(
+                                    lower,
+                                    StreamEvent::Data(bytes),
+                                )));
                             }
                         }
                         StreamEvent::Ended => channel.input.end(),
@@ -869,6 +1018,26 @@ impl Layer for Http3 {
         };
         self.cursor = Some(id);
         let channel = self.channels.get_mut(id).unwrap();
+        if !self.closing
+            && self.qpack.table_capacity() != 0
+            && channel.request.is_some()
+            && !channel.cancelled
+            && (channel.reset.is_some() || (channel.lost || channel.stop_sent) && !channel.input_done)
+        {
+            if self.decoder_output.is_some() {
+                self.scan = self.scan.saturating_sub(1);
+                return Ok(self.scan > 0);
+            }
+            channel.cancelled = true;
+            channel.blocked = None;
+            let stream = channel.stream;
+            self.feedback(
+                env.budget(),
+                qpack::DecoderInstruction::StreamCancel(stream),
+            );
+            self.scan = self.channels.len();
+            return Ok(true);
+        }
         let mut moved = false;
         if channel.lost || self.gone {
             if let Some(exchange) = channel.exchange.take() {
@@ -962,6 +1131,12 @@ impl Layer for Http3 {
             channel.receive_due > 0
                 || channel.reset.is_some() && !channel.retiring
                 || channel.local.is_some() && !channel.response_started
+                || channel.sending.is_none()
+                    && match channel.local {
+                        Some(1) => self.encoder_output.is_some(),
+                        Some(2) => self.decoder_output.is_some(),
+                        _ => false,
+                    }
                 || channel
                     .sending
                     .as_ref()
@@ -1011,13 +1186,22 @@ impl Layer for Http3 {
                 0 => {
                     use fictionet::stdlib::protocols::quic;
                     let limit = self.field_limit();
-                    let length = 1 + quic::varint_len(limit).unwrap() as u64;
+                    let settings = [
+                        wire::setting::MAX_FIELD_SECTION_SIZE,
+                        limit,
+                        wire::setting::QPACK_MAX_TABLE_CAPACITY,
+                        self.qpack.table_capacity(),
+                        wire::setting::QPACK_BLOCKED_STREAMS,
+                        self.qpack.blocked_streams() as u64,
+                    ];
+                    let length = settings
+                        .iter()
+                        .map(|v| quic::varint_len(*v).unwrap() as u64)
+                        .sum();
                     let mut bytes = ChargedBytes::with_capacity(env.budget(), 64)?;
                     bytes
                         .fill(|out| {
-                            for value in
-                                [0, 4, length, wire::setting::MAX_FIELD_SECTION_SIZE, limit]
-                            {
+                            for value in [0, 4, length].into_iter().chain(settings) {
                                 quic::VarInt(value).write(out)?;
                             }
                             Ok::<(), quic::Error>(())
@@ -1036,6 +1220,23 @@ impl Layer for Http3 {
                 flight: 0,
                 body: 0,
             });
+        }
+        let channel = self.channels.get_mut(id).unwrap();
+        if channel.sending.is_none() {
+            let bytes = match channel.local {
+                Some(1) => self.encoder_output.take(),
+                Some(2) => self.decoder_output.take(),
+                _ => None,
+            };
+            if let Some(bytes) = bytes {
+                channel.sending = Some(Sending {
+                    bytes,
+                    flight: 0,
+                    body: 0,
+                });
+                channel.write_deadline = Some(env.now() + self.limits.write_timeout);
+                self.scan = self.channels.len();
+            }
         }
         let channel = self.channels.get_mut(id).unwrap();
         if channel.local == Some(0)

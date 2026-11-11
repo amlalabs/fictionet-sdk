@@ -10,9 +10,12 @@ struct Test {
 
 impl Test {
     fn new() -> Self {
+        Self::with_qpack(qpack::Settings::default())
+    }
+    fn with_qpack(settings: qpack::Settings) -> Self {
         Self {
             driver: Driver::new(
-                Http3::new(Limits::default()),
+                Http3::new(Limits::default()).qpack(settings),
                 Arc::new(SeededEntropy::new(Seed::from_u64(8))),
                 Budget::new(32 << 20),
                 Instant::ZERO,
@@ -152,7 +155,7 @@ fn control_requires_settings_and_forbids_repetition() {
 
 #[test]
 fn zero_capacity_rejects_dynamic_qpack_and_push_streams() {
-    let mut t = Test::new();
+    let mut t = Test::with_qpack(qpack::Settings::STATIC);
     let lower = t.open(2);
     t.deliver(lower, &[2, 0x21], false);
     assert_eq!(t.closed(), Some(code::QPACK_ENCODER_STREAM_ERROR));
@@ -160,6 +163,69 @@ fn zero_capacity_rejects_dynamic_qpack_and_push_streams() {
     let lower = t.open(2);
     t.deliver(lower, &[1, 0], false);
     assert_eq!(t.closed(), Some(code::STREAM_CREATION_ERROR));
+}
+
+#[test]
+fn coalesced_critical_stream_items_keep_their_remainder() {
+    let mut t = Test::new();
+    let mut settings = vec![0];
+    wire::Frame::Settings(wire::Settings {
+        entries: vec![
+            wire::Setting {
+                id: wire::setting::MAX_FIELD_SECTION_SIZE,
+                value: crate::stdlib::protocols::quic::MAX_VARINT,
+            },
+            wire::Setting {
+                id: wire::setting::QPACK_MAX_TABLE_CAPACITY,
+                value: 4096,
+            },
+            wire::Setting {
+                id: wire::setting::QPACK_BLOCKED_STREAMS,
+                value: 16,
+            },
+        ],
+    })
+    .write(&mut settings)
+    .unwrap();
+    let mut decoder = vec![3];
+    let mut encoder = vec![2];
+    for stream in (0..80).step_by(4) {
+        qpack::DecoderInstruction::StreamCancel(stream)
+            .write(&mut decoder)
+            .unwrap();
+        qpack::EncoderInstruction::SetCapacity(4096)
+            .write(&mut encoder)
+            .unwrap();
+    }
+    for (stream, bytes) in [(2, settings), (6, decoder), (10, encoder)] {
+        let lower = t.open(stream);
+        let mut event = MuxEvent::Child(
+            lower,
+            StreamEvent::Data(Chunk::copy_of(t.driver.budget(), &bytes).unwrap()),
+        );
+        let mut delivered = false;
+        for _ in 0..bytes.len() + 1 {
+            match t.driver.deliver(event).unwrap() {
+                Admit::Taken => {
+                    delivered = true;
+                    break;
+                }
+                Admit::Partial(rest) | Admit::Blocked(rest) => event = rest,
+                Admit::Closed(_) => panic!("valid critical stream delivery was refused"),
+            }
+            t.driver.run().unwrap();
+        }
+        assert!(delivered, "all coalesced bytes must be admitted");
+        t.driver.run().unwrap();
+        assert_eq!(t.closed(), None);
+        let id = t.driver.layer().channel(lower).unwrap();
+        assert_eq!(
+            t.driver.layer().channels.get(id).unwrap().input.buffered(),
+            0
+        );
+    }
+    assert_eq!(t.driver.layer().decoder.capacity(), 4096);
+    assert_eq!(t.driver.layer().encoder.table().capacity(), 4096);
 }
 
 #[test]

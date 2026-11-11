@@ -512,6 +512,8 @@ fn entry_size(name: &[u8], value: &[u8]) -> u64 {
         .saturating_add(ENTRY_OVERHEAD)
 }
 
+type TableEntry = (Box<[u8]>, Box<[u8]>);
+
 /// The dynamic table: entries inserted in order, each with an absolute
 /// index counting from 0, the oldest evicted first when room is needed.
 /// Both sides of a connection keep one, and keep it the same.
@@ -528,7 +530,7 @@ fn entry_size(name: &[u8], value: &[u8]) -> u64 {
 /// Send acknowledgments in return order before taking an increment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
-    entries: VecDeque<(Box<[u8]>, Box<[u8]>)>,
+    entries: VecDeque<TableEntry>,
     size: u64,
     capacity: u64,
     max_capacity: u64,
@@ -573,7 +575,7 @@ impl Table {
 
     /// Retained heap, including spare slots after eviction or a capacity fall.
     pub fn held(&self) -> usize {
-        self.entries.capacity() * size_of::<(Box<[u8]>, Box<[u8]>)>()
+        self.entries.capacity() * size_of::<TableEntry>()
             + self
                 .entries
                 .iter()
@@ -589,7 +591,7 @@ impl Table {
             return 0;
         }
         self.max_capacity as usize
-            + 3 * entries.max(4).next_power_of_two() * size_of::<(Box<[u8]>, Box<[u8]>)>()
+            + 3 * entries.max(4).next_power_of_two() * size_of::<TableEntry>()
     }
 
     /// How many entries the table holds.
