@@ -154,7 +154,16 @@ socket's `send_to` start traffic through the same `internet` attachment used
 for incoming traffic and replies, and on the Ethernet link through the same
 gateway. SSH input never starts traffic, and the executable runs no program.
 
-## Evidence and metrics
+## Evidence
+
+The world emits typed records (`record::Record`): observations, Ethernet
+frames and the executable's lifecycle. It hands them, and each captured IP
+packet, to an `EventSink`, and never turns them into JSON itself. One writer
+thread serializes each record into a line of the log, writes packets and
+frames to pcapng, and then passes the line, as typed values, to each
+`RecordConsumer` the executable gives `Writer::open`. Live attribution and
+the dashboard are consumers. Every line reads back into the same types, so a
+stored log replays as the same records.
 
 Files are named by stream, run and rotation index. `events-*.jsonl` contains
 versioned JSON objects with sensor/run identity, monotonic event sequence,
@@ -169,19 +178,22 @@ file, section, interface and byte offset where a persisted record can be
 correlated. Missing references stay unavailable; derived fragment observations
 do not claim one original packet.
 
-Default SSH analytics retain methods, outcomes and byte lengths while removing
-passwords and exact decrypted command/input/output bytes. Packet capture still
+By default, SSH records keep methods, outcomes and byte lengths, without
+passwords and exact decrypted command/input/output bytes, and TCP segment
+records keep a payload's length (`payload_bytes`), not its bytes. The world
+makes the records that way, so consumers see the same. Packet capture still
 contains original traffic, including unencrypted protocol payloads.
-`--restricted-evidence` explicitly retains exact decrypted SSH records in the
-protected state directory. Keep retention and exported destinations appropriate
+`--restricted-evidence` explicitly retains exact decrypted SSH records and
+segment payloads in the protected state directory. Keep retention and exported destinations appropriate
 for that choice. SSH `wire_payload` is reconstructed protocol data, never the
 original encrypted network packet.
 
-Evidence admission is bounded by record count and bytes. A worker performs file
-writes and envelopes outside the world; admission does not wait for disk.
-Observation-to-JSON serialization still occurs in the world before admission.
-Overflow and storage failure increment separate event/capture loss and
-write-failure counters. A small independent queue reserves lifecycle capacity.
+Evidence admission is bounded by record count and by bytes. A record's bytes
+are estimated at admission from its string and byte lengths, without
+formatting it; the writer drops a line that is over `--max-record-bytes`
+once written. The worker performs serialization, file writes and envelopes
+outside the world; admission does not wait for disk. Overflow and storage
+failure increment separate event/capture loss and write-failure counters. A small independent queue reserves lifecycle capacity.
 Rotation defaults to 64 MiB or one hour, with 32 files retained **per stream**
 across runs. Change `--rotate-bytes`, `--retain-files`, `--queue-bytes` and
 `--max-record-bytes` to bound the intended budget. Retention runs at startup
@@ -195,14 +207,13 @@ leave incomplete final records; restart preserves those files and starts new
 ones instead of appending into damaged tails. No automatic repair of old files
 is attempted.
 
-`--metrics 127.0.0.1:9108` enables a management HTTP listener. Prometheus
-scrapes `/metrics`. Metrics have bounded labels and remain readable during
-writer failure. They include queue occupancy, capture/event loss, write and sync
-failures, last persistence, port-zero observations and SSH authentication
-completions, MPTCP signals, and backend readiness. These observation counters
-describe records processed by the writer, not lossless ingress totals. Written
-event totals include Ethernet sidecars generated after queue admission.
-Software queue loss never substitutes for unknown NIC loss.
+The writer keeps health counters that stay readable during writer failure:
+queue occupancy, capture/event loss, write and sync failures, last
+persistence, port-zero observations and SSH authentication completions, MPTCP
+signals, and backend readiness. It counts by record type. The observation
+counters describe records processed by the writer, not lossless ingress
+totals. The executable prints them to standard error when it stops. Software
+queue loss never substitutes for unknown NIC loss.
 
 Observer maps each have a hard limit of 4096 entries and emit capacity loss
 records. Established service connections share a 256-connection guard.
@@ -253,7 +264,10 @@ systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=8G -p Me
 
 | Test | What it checks |
 | --- | --- |
-| `tests/port_zero.rs` | Sixteen probes, eleven with a literal zero port: the resets, the source-zero handshake and close, UDP delivery with the source kept, port unreachable quoting the probe, and one `port_zero` observation per zero-port probe pointing at its captured packet |
+| `tests/port_zero.rs` | Sixteen probes, eleven with a literal zero port: the resets, the source-zero handshake and close, UDP delivery with the source kept, port unreachable quoting the probe, and one `port_zero` line per zero-port probe pointing at its packet in the IP capture |
 | `tests/initiated.rs` | TCP and UDP exchanges started through `Honeypot::program` between two honeypots, then inbound HTTP on the same attachment, and the capture of both directions |
-| `tests/ethernet.rs` | The same probes and exchanges through `start_raw`, over two in-memory raw attachments joined by a task that copies frames: ARP and gateway resolution, the frame log, and the queue counters |
-| `tests/traps.rs` | The MCP, A2A and fleet gates, and the 150-second retry hold |
+| `tests/ethernet.rs` | The same probes and exchanges through `start_raw`, over two in-memory raw attachments joined by a task that copies frames: ARP and gateway resolution, the Ethernet capture and its log lines, and the queue counters |
+| `tests/traps.rs` | The MCP, A2A and fleet gates, the 150-second retry hold, and the gate records read back from the log as typed values |
+
+Each test writes its evidence with the real writer into a temporary state
+directory and checks the files it leaves.

@@ -25,14 +25,17 @@
 //! include DNS questions, ClientHello bytes and both-direction TCP behavior
 //! ([`network_observe`]); inference reads the evidence offline ([`inference`]).
 //!
-//! Every packet that crosses any attachment, both ways, goes to a pcapng
-//! file, and a typed [`Observation`](observe::Observation) per SYN,
-//! payload, answer and burst goes to a JSON-lines log ([`observe`]). The
-//! observer sees each packet before the world's TCP does, once it is
-//! whole: the relay puts fragments together and the world gets the
-//! packet it made. Port-zero facts instead describe original ingress packets.
-//! The executable supplies bounded asynchronous evidence sinks; rejected
-//! records are counted without waiting for storage.
+//! Every packet that crosses any attachment, both ways, is captured, and
+//! a typed [`Observation`](observe::Observation) per SYN, payload, answer,
+//! burst, SSH fact and gate input is recorded ([`observe`]). The observer
+//! sees each packet before the world's TCP does, once it is whole: the
+//! relay puts fragments together and the world gets the packet it made.
+//! Port-zero facts instead describe original ingress packets. Both go, as
+//! typed [`Record`](record::Record)s and packets, to an
+//! [`EventSink`](evidence::EventSink): a bounded queue whose writer thread
+//! makes the JSON-lines log and the pcapng files, and hands each record to
+//! the executable's consumers ([`evidence`]). Refused records are counted
+//! without waiting for storage.
 //!
 //! Nothing here is a real kernel, and nothing runs what a client sends.
 //! The packets come from the internet, so the world treats every byte as
@@ -45,7 +48,9 @@
 //! | [`fictionet_extras::linux::mptcp`] | How the listener answers MP_CAPABLE and MP_JOIN |
 //! | [`services`] | HTTP once a connection is open |
 //! | [`ssh`] | SSH authentication, fake prompt and command hangup |
-//! | [`observe`] | The packet log and the observations |
+//! | [`observe`] | The packet capture and the observations |
+//! | [`record`] | The typed records the world emits |
+//! | [`evidence`] | The bounded queue, the files and the record consumers |
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -68,6 +73,7 @@ pub mod evidence;
 pub mod inference;
 pub mod network_observe;
 pub mod observe;
+pub mod record;
 pub mod services;
 pub mod ssh;
 pub mod traps;
@@ -76,8 +82,9 @@ pub mod raw;
 pub use raw::start_raw;
 
 pub use config::{Args, Config, HttpProfile, Port, Service};
+use evidence::EventSink;
 use fictionet_extras::linux::mptcp::{Listener, Tokens};
-use observe::{Direction, Observer, Sinks};
+use observe::{Direction, Observer};
 
 /// The wall clock: the time the run's clock reads zero, so that run times
 /// become Unix times.
@@ -347,18 +354,17 @@ impl Honeypot {
 }
 
 /// Starts the honeypot in `fcx`: the network, and a relay for every
-/// sandbox in `attachments` that writes what crosses it to `sinks`.
-/// Returns once the network is up, or fails if `config` cannot be served
-/// or the pcapng header cannot be written.
+/// sandbox in `attachments` that hands what crosses it to `events`.
+/// Returns once the network is up, or fails if `config` cannot be served.
 pub fn start(
     fcx: &Cx,
     config: &Config,
     clock: Clock,
-    sinks: Sinks,
+    events: EventSink,
     mut attachments: Attachments,
 ) -> fictionet::Result<Honeypot> {
     let tokens = Arc::new(Tokens::default());
-    let mut observer = Observer::new(sinks, clock, config.burst, tokens.clone())?;
+    let mut observer = Observer::new(events, clock, config.burst, tokens.clone());
     observer.restricted_evidence(config.restricted_evidence);
     let observer = Arc::new(Mutex::new(observer));
     let network = network(fcx, config, clock, &tokens, observer.clone());

@@ -11,7 +11,7 @@ mod capture;
 #[path = "common/port_zero.rs"]
 mod port_zero;
 
-use capture::{Capture, config, sinks};
+use capture::{Evidence, config};
 use port_zero::{CLIENT, PEER, Probe};
 
 #[test]
@@ -19,17 +19,17 @@ fn port_zero_probes_are_answered_and_observed() {
     world(Duration::from_secs(30), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let end = attacher.attach(INTERNET)?;
-        let (log, pcap) = (Capture::default(), Capture::default());
+        let evidence = Evidence::new();
         let server = start(
             &fcx,
             &config(PEER, CLIENT),
             Clock::starting_now(),
-            sinks(&log, &pcap),
+            evidence.sink(),
             attachments,
         )?;
         let mut probe = Probe::new(&server, end).await?;
         probe.run(&fcx).await?;
-        probe.check(&log, &pcap);
+        probe.check(&evidence.finish());
         Ok(())
     });
 }

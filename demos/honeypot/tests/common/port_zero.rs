@@ -13,7 +13,7 @@ use fictionet::stdlib::network::{ip, udp};
 use fictionet::{Cx, End, Interface, InterfaceExt, Packet};
 use honeypot_world::Honeypot;
 
-use super::capture::{Capture, endpoints};
+use super::capture::{Written, endpoints, packet_at, packets};
 
 /// The prober's address.
 pub const CLIENT: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 2);
@@ -194,12 +194,13 @@ impl Probe {
         Ok(())
     }
 
-    /// Checks that `pcap` holds every probe, byte for byte and in order,
-    /// and that `log` has one `port_zero` observation for each probe with a
-    /// literal zero port, pointing at that probe in the capture, and none
-    /// for the others.
-    pub fn check(&self, log: &Capture, pcap: &Capture) {
-        let packets = pcap.packets();
+    /// Checks that the IP capture holds every probe, byte for byte and in
+    /// order, and that the log has one `port_zero` observation for each
+    /// probe with a literal zero port, pointing at that probe in the
+    /// capture by ordinal and by file offset, and none for the others.
+    pub fn check(&self, written: &Written) {
+        let capture = written.ip();
+        let packets = packets(&capture);
         let ingress: Vec<_> = packets
             .iter()
             .filter(|packet| ip::source(packet) == Some(CLIENT.into()))
@@ -221,10 +222,10 @@ impl Probe {
                 ))
             })
             .collect();
-        let records = lines(log);
-        let facts: Vec<_> = records
+        let events = written.events();
+        let facts: Vec<_> = events
             .iter()
-            .filter(|record| record["event"] == "port_zero")
+            .filter(|event| event["event"] == "port_zero")
             .collect();
         assert_eq!(facts.len(), expected.len());
         let mut last_capture = 0;
@@ -236,19 +237,14 @@ impl Probe {
             assert_eq!(fact["checksum_valid"], true);
             assert_eq!(fact["fragmented"], false);
             assert_eq!(fact["capture_queued"], true);
-            let capture = fact["capture_packet"].as_u64().unwrap();
-            assert!(capture > last_capture, "capture references are in order");
-            assert_eq!(&packets[capture as usize - 1], packet);
-            last_capture = capture;
+            let ordinal = fact["capture_packet"].as_u64().unwrap();
+            assert!(ordinal > last_capture, "capture references are in order");
+            assert_eq!(&packets[ordinal as usize - 1], packet);
+            last_capture = ordinal;
+            assert_eq!(fact["capture"]["available"], true);
+            assert_eq!(fact["capture"]["direction"], "in");
+            let offset = fact["capture"]["offset"].as_u64().unwrap() as usize;
+            assert_eq!(&packet_at(&capture, offset), packet);
         }
     }
-}
-
-/// The JSON lines written to `capture`.
-pub fn lines(capture: &Capture) -> Vec<serde_json::Value> {
-    std::str::from_utf8(&capture.bytes())
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
 }

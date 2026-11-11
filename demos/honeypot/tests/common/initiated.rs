@@ -9,7 +9,7 @@ use fictionet::stdlib::network::{Connection, ConnectionExt, ip};
 use fictionet::stdlib::world::net::Endpoints;
 use honeypot_world::Honeypot;
 
-use super::capture::{Capture, endpoints};
+use super::capture::{Written, endpoints, packets};
 
 /// The server that starts the exchanges.
 pub const CLIENT: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
@@ -118,9 +118,9 @@ pub async fn exchanges(fcx: &Cx, client: &Honeypot, remote: &Honeypot) -> fictio
 /// Checks that the client's capture holds the SYN it sent, the SYN-ACK
 /// that came back, and the UDP datagrams both ways, all with valid
 /// transport checksums.
-pub fn check(pcap: &Capture) {
+pub fn check(written: &Written) {
     let mut seen = [false; 4];
-    for packet in pcap.packets() {
+    for packet in packets(&written.ip()) {
         let header = ip::Header::parse_whole(&packet).expect("captured IP packet");
         let outbound = header.src == CLIENT && header.dst == PEER;
         let inbound = header.src == PEER && header.dst == CLIENT;

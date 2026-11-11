@@ -3,13 +3,12 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use honeypot_world::Args;
 use honeypot_world::config::{Flag, SshAuth};
-use serde_json::{Value, json};
+use honeypot_world::record::{CompanyHost, Configuration, Listener, Reachability, SshAuthPolicy};
 
 pub const HELP: &str = "honeypot run [OPTIONS]\n\
   --state-dir PATH        Protected persistent identity, key, and run evidence\n\
@@ -18,7 +17,6 @@ pub const HELP: &str = "honeypot run [OPTIONS]\n\
   --ssh PORT [--http PORT] [--http-profile caddy|nginx]\n\
   --mcp PORT --a2a PORT --fleet PORT   Northbank simulated company services\n\
   --ssh-auth accept|reject|password:VALUE\n\
-  --metrics IP:PORT       Explicit management Prometheus listener\n\
   --queue-bytes N --max-record-bytes N --rotate-bytes N --retain-files N\n\
   --restricted-evidence  Retain exact decrypted SSH bytes in protected files\n\
   --version              Build version\n\
@@ -27,7 +25,6 @@ This build has no packet path: run checks its options, then refuses to start.\n"
 pub struct Options {
     pub args: Args,
     pub state_dir: PathBuf,
-    pub metrics: Option<SocketAddr>,
     pub restricted_evidence: bool,
     pub queue_bytes: usize,
     pub max_record_bytes: usize,
@@ -69,14 +66,6 @@ impl Options {
         let state_dir = take(&mut values, "state-dir")
             .unwrap_or_else(|| "honeypot-state".into())
             .into();
-        let metrics: Option<SocketAddr> = take(&mut values, "metrics")
-            .map(|v| v.parse())
-            .transpose()?;
-        if metrics.is_some_and(|address| address.port() == 0) {
-            return Err(fictionet::Error::msg(
-                "metrics requires an explicit nonzero port",
-            ));
-        }
         let restricted_evidence = boolean(&mut values, "restricted-evidence")?;
         let queue_bytes = number(&mut values, "queue-bytes", 8 * 1024 * 1024)?;
         let max_record_bytes = number(&mut values, "max-record-bytes", 1024 * 1024)?;
@@ -126,7 +115,6 @@ impl Options {
         Ok(Self {
             args,
             state_dir,
-            metrics,
             restricted_evidence,
             queue_bytes,
             max_record_bytes,
@@ -135,24 +123,69 @@ impl Options {
         })
     }
 
-    pub fn summary(&self) -> Value {
-        json!({
-            "event": "configuration", "build": env!("CARGO_PKG_VERSION"),
-            "address": self.args.config.address, "address_v6": self.args.config.address_v6,
-            "persona": "Ubuntu 24.04 / Linux 6.8", "http_profile": format!("{:?}", self.args.config.http_profile),
-            "listeners": self.args.config.ports.iter().map(|port| json!({"port": port.number, "service": format!("{:?}", port.service).to_lowercase()})).collect::<Vec<_>>(),
-            "company_hosts": self.args.config.ports.iter().filter_map(|p|honeypot_world::company_host(p.service)).map(|(name,address)|json!({"name":name,"address":address,"http":80,"https":443})).collect::<Vec<_>>(),
-            "ssh_auth": match self.args.config.ssh_auth { SshAuth::Reject => "reject", SshAuth::AnyCredentials => "accept", SshAuth::PasswordOrPublicKey(_) => "configured_password_or_signed_public_key" },
-            "internet_ipv4": self.args.config.internet.ipv4.to_string(), "internet_ipv6": self.args.config.internet.ipv6.to_string(),
-            "burst_window_ms": self.args.config.burst.window.as_millis(), "burst_syns": self.args.config.burst.syns,
-            "gateway": self.args.config.gateway, "gateway_v6": format!("{:?}", self.args.config.gateway_v6),
-            "observations": ["mptcp", "ipv4_options", "ssh", "port_zero", "trap", "tcp_wire", "dns_wire", "tls_client_hello"],
-            "state_dir": self.state_dir, "metrics": self.metrics, "restricted_evidence": self.restricted_evidence,
-            "queue_bytes": self.queue_bytes, "max_record_bytes": self.max_record_bytes,
-            "rotate_bytes": self.rotate_bytes, "retain_files_per_stream": self.retain_files, "observation_state_limit_per_map": honeypot_world::observe::STATE_LIMIT,
-            "connection_limit": honeypot_world::CONNECTION_LIMIT,
-            "public_reachability": "not_tested",
-        })
+    /// This run's configuration, as the log records it, without the SSH password.
+    pub fn configuration(&self) -> Configuration {
+        let config = &self.args.config;
+        Configuration {
+            build: env!("CARGO_PKG_VERSION").into(),
+            address: config.address,
+            address_v6: config.address_v6,
+            persona: "Ubuntu 24.04 / Linux 6.8".into(),
+            http_profile: config.http_profile,
+            listeners: config
+                .ports
+                .iter()
+                .map(|port| Listener {
+                    port: port.number,
+                    service: port.service,
+                })
+                .collect(),
+            company_hosts: config
+                .ports
+                .iter()
+                .filter_map(|port| honeypot_world::company_host(port.service))
+                .map(|(name, address)| CompanyHost {
+                    name: name.into(),
+                    address,
+                    http: 80,
+                    https: 443,
+                })
+                .collect(),
+            ssh_auth: match config.ssh_auth {
+                SshAuth::Reject => SshAuthPolicy::Reject,
+                SshAuth::AnyCredentials => SshAuthPolicy::Accept,
+                SshAuth::PasswordOrPublicKey(_) => {
+                    SshAuthPolicy::ConfiguredPasswordOrSignedPublicKey
+                }
+            },
+            internet_ipv4: config.internet.ipv4,
+            internet_ipv6: config.internet.ipv6,
+            burst_window_ms: config.burst.window.as_millis() as u64,
+            burst_syns: config.burst.syns,
+            gateway: config.gateway,
+            gateway_v6: config.gateway_v6.into(),
+            observations: [
+                "mptcp",
+                "ipv4_options",
+                "ssh",
+                "port_zero",
+                "trap",
+                "tcp_wire",
+                "dns_wire",
+                "tls_client_hello",
+            ]
+            .map(String::from)
+            .to_vec(),
+            state_dir: self.state_dir.clone(),
+            restricted_evidence: self.restricted_evidence,
+            queue_bytes: self.queue_bytes,
+            max_record_bytes: self.max_record_bytes,
+            rotate_bytes: self.rotate_bytes,
+            retain_files_per_stream: self.retain_files,
+            observation_state_limit_per_map: honeypot_world::observe::STATE_LIMIT,
+            connection_limit: honeypot_world::CONNECTION_LIMIT,
+            public_reachability: Reachability::NotTested,
+        }
     }
 }
 
@@ -280,7 +313,6 @@ mod tests {
             "--ssh 0",
             "--ssh 22 --http 22",
             "--queue-bytes 1",
-            "--metrics 127.0.0.1:0",
             "--state-dir a --state-dir b",
             "--ssh 53 --mcp 8081",
             "--address 10.44.0.11 --mcp 8081",
@@ -291,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_leaves_out_the_ssh_password_and_parsing_writes_nothing() {
+    fn configuration_leaves_out_the_ssh_password_and_parsing_writes_nothing() {
         let state = std::env::temp_dir().join(format!(
             "honeypot-options-{}-{}",
             std::process::id(),
@@ -308,7 +340,8 @@ mod tests {
             "password:private-value".into(),
         ])
         .unwrap();
-        assert!(!options.summary().to_string().contains("private-value"));
+        let configuration = serde_json::to_string(&options.configuration()).unwrap();
+        assert!(!configuration.contains("private-value"));
         assert!(!state.exists());
     }
 

@@ -12,7 +12,7 @@ mod capture;
 #[path = "common/initiated.rs"]
 mod initiated;
 
-use capture::{Capture, config, sinks};
+use capture::{Evidence, config};
 use initiated::{CLIENT, PEER, check, exchanges};
 
 #[test]
@@ -22,19 +22,19 @@ fn initiated_tcp_and_udp_share_the_attachment_with_inbound_http() {
         let (peer_attacher, peers) = fictionet::attachments();
         let mut client_end = client_attacher.attach(INTERNET)?;
         let mut peer_end = peer_attacher.attach(INTERNET)?;
-        let pcap = Capture::default();
+        let (client_evidence, remote_evidence) = (Evidence::new(), Evidence::new());
         let client = start(
             &fcx,
             &config(CLIENT, PEER),
             Clock::starting_now(),
-            sinks(&Capture::default(), &pcap),
+            client_evidence.sink(),
             clients,
         )?;
         let remote = start(
             &fcx,
             &config(PEER, CLIENT),
             Clock::starting_now(),
-            sinks(&Capture::default(), &Capture::default()),
+            remote_evidence.sink(),
             peers,
         )?;
         fcx.spawn(move |fcx| async move {
@@ -47,7 +47,8 @@ fn initiated_tcp_and_udp_share_the_attachment_with_inbound_http() {
             }
         });
         exchanges(&fcx, &client, &remote).await?;
-        check(&pcap);
+        check(&client_evidence.finish());
+        remote_evidence.finish();
         Ok(())
     });
 }
