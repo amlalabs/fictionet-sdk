@@ -49,6 +49,7 @@ pub struct Endpoint {
     local_cid_generator: Box<dyn ConnectionIdGenerator>,
     config: Arc<EndpointConfig>,
     server_config: Option<Arc<ServerConfig>>,
+    datagram_receive_budget: Option<fictionet_buf::Budget>,
     /// Whether the underlying UDP socket promises not to fragment packets
     allow_mtud: bool,
     /// Time at which a stateless reset was most recently sent
@@ -88,11 +89,19 @@ impl Endpoint {
             local_cid_generator,
             config,
             server_config,
+            datagram_receive_budget: None,
             allow_mtud,
             last_stateless_reset: None,
             incoming_buffers: Slab::new(),
             all_incoming_buffers_total_bytes: 0,
         }
+    }
+
+    /// Pay for application datagram receive arenas of future connections.
+    /// The budget is installed before any connection processes packets,
+    /// including early data. Other engine allocations are not charged here.
+    pub fn set_datagram_receive_budget(&mut self, budget: &fictionet_buf::Budget) {
+        self.datagram_receive_budget = Some(budget.clone());
     }
 
     /// Replace the server configuration, affecting new incoming connections only
@@ -847,6 +856,7 @@ impl Endpoint {
             self.allow_mtud,
             rng_seed,
             side_args,
+            self.datagram_receive_budget.as_ref(),
         );
 
         let mut cids_issued = 0;

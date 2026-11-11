@@ -263,6 +263,7 @@ impl Connection {
         allow_mtud: bool,
         rng_seed: [u8; 32],
         side_args: SideArgs,
+        datagram_receive_budget: Option<&fictionet_buf::Budget>,
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
@@ -357,7 +358,7 @@ impl Connection {
                 config.receive_window,
                 config.stream_receive_window,
             ),
-            datagrams: DatagramState::default(),
+            datagrams: DatagramState::new(datagram_receive_budget),
             config,
             rem_cids: CidQueue::new(rem_cid),
             rng,

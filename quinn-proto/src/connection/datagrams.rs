@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 
 use bytes::Bytes;
-use fictionet_buf::{Budget, Chunk};
+use fictionet_buf::{Budget, Charge, Chunk};
 use thiserror::Error;
-use tracing::{debug, trace};
+use tracing::trace;
 
 use super::{Connection, Event};
 use crate::{
@@ -98,14 +98,18 @@ impl Datagrams<'_> {
         self.conn.datagrams.chunk.0 = None;
     }
 
+    /// Charge receive storage to this budget, including any storage already held.
+    /// A refusal leaves the previous budget and queued messages unchanged.
+    /// Set this before processing application packets to pay before allocation.
+    pub fn receive_budget(&mut self, budget: &Budget) -> bool {
+        self.conn.datagrams.incoming.set_budget(budget)
+    }
+
     /// Copy the next received datagram to charged storage before removing it.
-    /// A budget refusal leaves the queue unchanged, just as an empty queue
-    /// returns `None`. Empty datagrams return `Some` of an empty chunk.
+    /// A budget refusal leaves the queue unchanged. Empty datagrams return
+    /// `Some` of an empty chunk. The receive arena remains reserved for reuse.
     pub fn recv_chunk(&mut self, budget: &Budget) -> Option<Chunk> {
-        let front = self.conn.datagrams.incoming.queue.front()?;
-        let chunk = Chunk::copy_of(budget, &front.data)?;
-        self.conn.datagrams.recv();
-        Some(chunk)
+        self.conn.datagrams.incoming.recv_chunk(budget)
     }
 
     /// Discard queued datagrams that no longer fit the active path, waking blocked senders.
@@ -171,7 +175,7 @@ impl Datagrams<'_> {
 
 #[derive(Default)]
 pub(super) struct DatagramState {
-    pub(super) incoming: DatagramBuffer,
+    incoming: ReceivedDatagrams,
     pub(super) outgoing: DatagramBuffer,
     pub(super) send_blocked: bool,
     chunk: DatagramSlot,
@@ -193,6 +197,16 @@ impl DatagramSlot {
 }
 
 impl DatagramState {
+    pub(super) fn new(budget: Option<&Budget>) -> Self {
+        Self {
+            incoming: ReceivedDatagrams {
+                charge: budget.map(Charge::nothing),
+                ..ReceivedDatagrams::default()
+            },
+            ..Self::default()
+        }
+    }
+
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
@@ -201,22 +215,7 @@ impl DatagramState {
     ) -> Result<bool, TransportError> {
         let window = receive_window(encoded_size, *window)?;
 
-        let size_with_overhead = datagram.data.len() + size_of::<Datagram>();
-
-        if size_with_overhead > window {
-            // A legal frame may not fit with its heap metadata. Resource
-            // pressure permits a local drop, not a connection error.
-            return Ok(false);
-        }
-
-        let was_empty = self.incoming.is_empty();
-        while self.incoming.memory_used() + size_with_overhead > window {
-            debug!("dropping stale datagram");
-            self.recv();
-        }
-
-        self.incoming.push_back(datagram);
-        Ok(was_empty)
+        Ok(self.incoming.push(&datagram.data, window))
     }
 
     fn make_space_for(&mut self, datagram_len: usize, send_buffer_size: usize) {
@@ -305,8 +304,7 @@ impl DatagramState {
     }
 
     pub(super) fn recv(&mut self) -> Option<Bytes> {
-        let x = self.incoming.pop_front()?.data;
-        Some(x)
+        self.incoming.recv()
     }
 
     pub(super) fn can_send_1rtt(&self, max_size: usize) -> bool {
@@ -338,6 +336,129 @@ fn receive_window(encoded_size: usize, window: Option<usize>) -> Result<usize, T
 #[cfg(kani)]
 #[path = "../../../verification/quic/kani/datagrams.rs"]
 mod proofs;
+
+/// A reusable byte ring owns the payloads instead of retaining arbitrarily
+/// large packet backings. Lengths live in the ring, so empty datagrams also
+/// consume bounded space and no descriptor queue grows on receipt.
+#[derive(Default)]
+struct ReceivedDatagrams {
+    bytes: VecDeque<u8>,
+    count: usize,
+    payload: usize,
+    charge: Option<Charge>,
+}
+
+impl ReceivedDatagrams {
+    fn set_budget(&mut self, budget: &Budget) -> bool {
+        if let Some(charge) = &mut self.charge {
+            return charge.transfer(budget);
+        }
+        let Some(charge) = budget.charge(self.bytes.capacity()) else {
+            return false;
+        };
+        self.charge = Some(charge);
+        true
+    }
+
+    fn reserve(&mut self, window: usize) -> bool {
+        if window > isize::MAX as usize {
+            return false;
+        }
+        let capacity = self.bytes.capacity();
+        if window <= capacity {
+            return true;
+        }
+        // Reallocation may hold both buffers at once. Keep their combined
+        // reservation until the old allocation is gone.
+        let Some(transient) = capacity.checked_add(window) else {
+            return false;
+        };
+        if let Some(charge) = &mut self.charge {
+            if !charge.grow_to(transient) {
+                return false;
+            }
+        }
+        self.bytes.reserve_exact(window - self.bytes.len());
+        if let Some(charge) = &mut self.charge {
+            charge.shrink_to(self.bytes.capacity());
+        }
+        true
+    }
+
+    fn push(&mut self, data: &[u8], window: usize) -> bool {
+        // Preserve the configured per-message allowance. The ring uses
+        // only a length word of it; the remaining room is conservative.
+        let Some(size) = data.len().checked_add(size_of::<Datagram>()) else {
+            return false;
+        };
+        if size > window || !self.reserve(window) {
+            return false;
+        }
+        let was_empty = self.is_empty();
+        while self.memory_used() > window - size {
+            self.discard();
+        }
+        self.bytes.extend(data.len().to_le_bytes());
+        self.bytes.extend(data.iter().copied());
+        self.count += 1;
+        self.payload += data.len();
+        was_empty
+    }
+
+    fn front_len(&self) -> Option<usize> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut length = [0; size_of::<usize>()];
+        for (out, byte) in length.iter_mut().zip(&self.bytes) {
+            *out = *byte;
+        }
+        Some(usize::from_le_bytes(length))
+    }
+
+    fn front(&self, length: usize) -> impl Iterator<Item = u8> + '_ {
+        self.bytes
+            .iter()
+            .skip(size_of::<usize>())
+            .take(length)
+            .copied()
+    }
+
+    fn discard(&mut self) {
+        let length = self.front_len().expect("a queued datagram");
+        self.bytes.drain(..size_of::<usize>() + length);
+        self.count -= 1;
+        self.payload -= length;
+    }
+
+    fn recv(&mut self) -> Option<Bytes> {
+        let length = self.front_len()?;
+        let data: Vec<u8> = self.front(length).collect();
+        self.discard();
+        Some(Bytes::from(data))
+    }
+
+    fn recv_chunk(&mut self, budget: &Budget) -> Option<Chunk> {
+        let length = self.front_len()?;
+        let mut chunk = Chunk::block(budget, 0, length)?;
+        chunk.fill(|out| {
+            for (out, byte) in out.iter_mut().zip(self.front(length)) {
+                *out = byte;
+            }
+            length
+        })?;
+        self.discard();
+        Some(chunk)
+    }
+
+    fn memory_used(&self) -> usize {
+        self.payload + self.count * size_of::<Datagram>()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
 
 #[derive(Default)]
 pub(super) struct DatagramBuffer {
@@ -379,6 +500,149 @@ impl DatagramBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receive_ring_reuses_paid_storage_through_wraparound_and_eviction() {
+        use crate::cost::{Charged, Costs, Linear};
+        let window = 2 * size_of::<Datagram>() + 8;
+        let budget = Budget::new(window);
+        let mut incoming = ReceivedDatagrams::default();
+        assert!(incoming.set_budget(&budget));
+        let mut costs = Costs::new("QUIC receive ring");
+        for turn in 0..100u8 {
+            let data = [turn; 4];
+            costs.step(
+                data.len(),
+                window,
+                Linear {
+                    num: 0,
+                    den: 1,
+                    fixed: if turn == 0 { window } else { 0 },
+                },
+                || {
+                    incoming.push(&data, window);
+                    Charged {
+                        value: (),
+                        charged: 0,
+                    }
+                },
+            );
+            assert_eq!(budget.used(), window);
+            assert!(incoming.bytes.len() <= window);
+            assert_eq!(incoming.count, usize::from(turn != 0) + 1);
+        }
+        assert_eq!(incoming.recv().unwrap(), &[98; 4][..]);
+        assert_eq!(incoming.recv().unwrap(), &[99; 4][..]);
+        for _ in 0..100 {
+            incoming.push(&[], window);
+            assert_eq!(incoming.recv().unwrap(), &[][..]);
+        }
+        assert!(incoming.is_empty());
+        assert_eq!(budget.used(), window);
+        drop(incoming);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn receive_ring_refuses_before_allocating_or_evicting() {
+        use crate::cost::{Charged, Costs, Linear};
+        let window = size_of::<Datagram>() + 4;
+        let budget = Budget::new(window);
+        let mut incoming = ReceivedDatagrams::default();
+        assert!(incoming.set_budget(&budget));
+        let held = budget.charge(window).unwrap();
+        let mut costs = Costs::new("QUIC receive refusal");
+        let zero = Linear {
+            num: 0,
+            den: 1,
+            fixed: 0,
+        };
+        assert!(!costs.step(4, 0, zero, || Charged {
+            value: incoming.push(b"kept", window),
+            charged: 0,
+        }));
+        assert!(incoming.is_empty());
+        assert_eq!(incoming.bytes.capacity(), 0);
+        drop(held);
+        assert!(incoming.push(b"kept", window));
+        let pointer = incoming.bytes.as_slices().0.as_ptr();
+        assert!(!incoming.push(b"next", window + 1));
+        assert_eq!(incoming.bytes.as_slices().0.as_ptr(), pointer);
+        assert!(!incoming.set_budget(&Budget::new(window - 1)));
+        assert!(incoming.recv_chunk(&Budget::new(0)).is_none());
+        assert_eq!(incoming.recv().unwrap(), &b"kept"[..]);
+        assert_eq!(budget.used(), window);
+    }
+
+    #[test]
+    fn receive_ring_pays_for_both_allocations_during_growth() {
+        use crate::cost::{Charged, Costs, Linear};
+        let first = size_of::<Datagram>() + 4;
+        let second = first * 2;
+        let budget = Budget::new(first + second);
+        let mut incoming = ReceivedDatagrams::default();
+        assert!(incoming.set_budget(&budget));
+        let mut costs = Costs::new("QUIC receive growth");
+        for window in [first, second] {
+            let before = budget.used();
+            costs.step(
+                4,
+                before + window,
+                Linear {
+                    num: 0,
+                    den: 1,
+                    fixed: window,
+                },
+                || {
+                    incoming.push(b"held", window);
+                    Charged {
+                        value: (),
+                        charged: 0,
+                    }
+                },
+            );
+            assert_eq!(budget.used(), window);
+        }
+        let to = Budget::new(second);
+        assert!(incoming.set_budget(&to));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(to.used(), second);
+        assert_eq!(incoming.recv().unwrap(), &b"held"[..]);
+        assert_eq!(incoming.recv().unwrap(), &b"held"[..]);
+    }
+
+    #[test]
+    fn receive_ring_rejects_unrepresentable_capacity_without_charging() {
+        let budget = Budget::new(usize::MAX);
+        let mut incoming = ReceivedDatagrams::default();
+        assert!(incoming.set_budget(&budget));
+        assert!(!incoming.push(b"data", usize::MAX));
+        assert_eq!(incoming.bytes.capacity(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn receive_does_not_retain_the_packet_backing() {
+        struct Packet(std::sync::Arc<std::sync::atomic::AtomicBool>, [u8; 4096]);
+        impl AsRef<[u8]> for Packet {
+            fn as_ref(&self) -> &[u8] {
+                &self.1
+            }
+        }
+        impl Drop for Packet {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let packet = Bytes::from_owner(Packet(freed.clone(), [42; 4096]));
+        let data = packet.slice(100..104);
+        drop(packet);
+        let mut state = DatagramState::default();
+        assert!(state.received(Datagram { data }, 6, &Some(64)).unwrap());
+        assert!(freed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(state.recv().unwrap(), &[42; 4][..]);
+    }
 
     #[test]
     fn charged_datagrams_hold_backings_until_encoded_or_dropped() {

@@ -291,6 +291,10 @@ impl TransportConfig {
     /// exceeds this value, old datagrams are dropped until it is no longer exceeded.
     ///
     /// The amount of payload data buffered may be smaller than `value` due to overhead.
+    /// The first retained datagram reserves an arena of this size, reused until the
+    /// connection is dropped. Set [`crate::Datagrams::receive_budget`] before receiving
+    /// application packets to charge this storage before allocation. Budget pressure
+    /// drops new datagrams locally without closing the connection.
     pub fn datagram_receive_buffer_size(&mut self, value: Option<usize>) -> &mut Self {
         self.datagram_receive_buffer_size = value;
         self

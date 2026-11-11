@@ -570,3 +570,78 @@ Rustdoc builds both libraries with the existing redundant-link warning in
 at 16 KiB and 64 KiB; it still measures the legacy codec, not throughput of
 the new datagram carrier. Clippy with warnings denied and the workspace
 formatting check pass.
+
+## Charged datagram receive storage
+
+Received application datagrams now occupy a reusable byte ring, including
+inline length words. They no longer retain slices of the decrypted packet
+backing or grow a descriptor queue. A regression retains four bytes from a
+four-kilobyte packet and checks that receipt releases the packet owner; it
+fails against the preceding implementation and passes with the ring.
+The configured receive window keeps its conservative per-message allowance,
+including for empty datagrams, so oldest-first eviction is unchanged.
+
+`Endpoint::set_datagram_receive_budget` installs a budget in each future
+connection before it processes any packets. The arena is reserved lazily,
+at the configured receive-window capacity, before the first retained
+message. A refusal drops the incoming message locally without changing the
+queue or closing the connection. Storage is reused until connection drop.
+The engine regressions cover refusal and recovery over protected packets,
+and resumed early datagrams with both an available and an empty budget.
+`Datagrams::receive_budget` also allows an existing connection to transfer
+its arena's charge, with no mutation on refusal. Engine callers that set
+neither budget keep the explicitly unbudgeted compatibility behavior.
+
+The counting-allocator replays check initial reservation, a hundred
+admissions through wraparound and eviction, allocation-free refusal,
+reservation transfer, and the overlap of old and new storage during growth.
+The initial and growth steps request at most the configured new capacity;
+subsequent admissions request zero bytes. The arena peak is at most its
+reservation, including both allocations during reallocation. An intentional
+extra byte in the allocation fails both the replay and the Kani allocation
+bound; the mutation was removed. Separate tests cover empty datagrams,
+receive-output refusal without consumption, unrepresentable capacities,
+and complete release on drop.
+
+Three Kani allocation proofs pass with the shared allocation stubs, without
+stubbing production functions:
+
+- `receive_ring_reservation_covers_its_allocation`: initial reservation and
+  a sixty-four-byte allocation.
+- `receive_ring_growth_pays_for_old_and_new_storage`: growth from thirty-two
+  to sixty-four bytes within the ninety-six-byte transient reservation.
+- `receive_ring_growth_refuses_without_allocating`: the same growth refused
+  by a sixty-four-byte budget, preserving the old allocation and charge.
+
+The shared `the_counter_sees_every_allocation` harness also passes. Run
+these using `cargo kani -p fictionet-quinn-proto --lib -Z stubbing
+-Z c-ffi -Z mem-predicates -Z restrict-vtable --harness receive_ring_`,
+under the required scope. These are bounded proofs of the allocation
+primitive, not of payload admission or delivery. The separate
+`received_datagrams_allocate_only_the_reserved_ring` harness includes
+arbitrary four-byte payload admission and reading. It reached propositional
+conversion but exhausted the fourteen-gigabyte cap without a verdict.
+Reducing CBMC object bits either exhausted that representation or still
+reached the memory cap. Its assertions remain intact and it is unfinished.
+
+`DatagramStorage.tla` uses the shared resource store to model reservation,
+allocation, reallocation overlap, release, reuse and oldest-first eviction.
+The base passes with 479 generated states, 242 distinct and depth twelve.
+Missing reservation, forgetting the old allocation during growth, and an
+extra payload copy each violate `PaidStorage`; the reachability control
+violates `NoDelivery`. Run its five configs with the resource library and
+the same scoped TLC command used above. The model does not replay
+production traces, prove ring indexing, or include copying to application
+output. The old uncharged `recv` output API and the transient decrypted
+input packet are also outside this resource claim.
+
+This closes the datagram receive arena's storage gap, not whole-engine
+budgeting. Stream reassembly, packet input, recovery records, endpoint
+routing, TLS, and other engine metadata still need admission and resource
+evidence. HTTP/3, listener routing, QUIC version two and broader protocol
+refinement remain outstanding, as do the previously unfinished allocation,
+BBR and full stream receive-path proofs.
+
+All 338 engine library tests and three doctests pass after this storage
+change. Rustdoc builds the engine and SDK, retaining the existing
+redundant-link warning in `network/packet.rs`.

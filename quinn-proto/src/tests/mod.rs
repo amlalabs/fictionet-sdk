@@ -2462,6 +2462,84 @@ fn datagram_storage_pressure_does_not_close_the_connection() {
 }
 
 #[test]
+fn early_datagrams_use_the_endpoint_receive_budget() {
+    for limit in [0, 64] {
+        let server = ServerConfig {
+            transport: Arc::new(TransportConfig {
+                datagram_receive_buffer_size: Some(64),
+                ..TransportConfig::default()
+            }),
+            ..server_config()
+        };
+        let mut pair = Pair::new(Default::default(), server);
+        let budget = fictionet_buf::Budget::new(limit);
+        pair.server.endpoint.set_datagram_receive_budget(&budget);
+        let config = client_config();
+        let first = pair.begin_connect(config.clone());
+        pair.drive();
+        pair.server.assert_accept();
+        let now = pair.time;
+        pair.client_conn_mut(first)
+            .close(now, VarInt(0), Bytes::new());
+        pair.drive();
+        pair.client.addr = SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            CLIENT_PORTS.lock().unwrap().next().unwrap(),
+        );
+        let client = pair.begin_connect(config);
+        assert!(pair.client_conn_mut(client).has_0rtt());
+        pair.client_datagrams(client)
+            .send(Bytes::from_static(b"early"), false)
+            .unwrap();
+        pair.drive();
+        let server = pair.server.assert_accept();
+        assert!(pair.client_conn_mut(client).accepted_0rtt());
+        assert!(!pair.server_conn_mut(server).is_closed());
+        let received = pair.server_datagrams(server).recv();
+        if limit == 0 {
+            assert!(received.is_none());
+        } else {
+            assert_eq!(received.unwrap(), &b"early"[..]);
+        }
+        assert_eq!(budget.used(), limit);
+        drop(pair);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[test]
+fn datagram_receive_budget_refusal_drops_locally_and_recovers() {
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            datagram_receive_buffer_size: Some(64),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let budget = fictionet_buf::Budget::new(64);
+    pair.server.endpoint.set_datagram_receive_budget(&budget);
+    let (client, server) = pair.connect();
+    let held = budget.charge(64).unwrap();
+    pair.client_datagrams(client)
+        .send(Bytes::from_static(b"drop"), false)
+        .unwrap();
+    pair.drive();
+    assert!(pair.server_datagrams(server).recv().is_none());
+    assert!(!pair.server_conn_mut(server).is_closed());
+    drop(held);
+    pair.client_datagrams(client)
+        .send(Bytes::from_static(b"keep"), false)
+        .unwrap();
+    pair.drive();
+    assert_eq!(budget.used(), 64);
+    assert_eq!(pair.server_datagrams(server).recv().unwrap(), &b"keep"[..]);
+    assert!(!pair.client_conn_mut(client).is_closed());
+    drop(pair);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn datagram_recv_buffer_overflow() {
     let _guard = subscribe();
     const PAYLOAD_WINDOW: usize = 100;

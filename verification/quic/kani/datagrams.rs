@@ -37,3 +37,84 @@ counted_proof! {
         std::mem::forget((slot, source, budget));
     }
 }
+
+counted_proof! {
+    #[kani::unwind(10)]
+    fn received_datagrams_allocate_only_the_reserved_ring() {
+        let payload: [u8; 4] = kani::any();
+        let budget = Budget::new(64);
+        let mut incoming = ReceivedDatagrams::default();
+        assert!(incoming.set_budget(&budget));
+        let ((), cost) = measure(|| {
+            assert!(incoming.push(&payload, 64));
+            assert_eq!(incoming.front_len(), Some(4));
+            for (actual, expected) in incoming.front(4).zip(payload) {
+                assert_eq!(actual, expected);
+            }
+        });
+        assert!(cost.peak <= budget.used());
+        // The arena is allocated once at its fixed configured window;
+        // payloads and their length words are copied into that storage.
+        assert!(cost.requested <= 64);
+        std::mem::forget((incoming, budget));
+    }
+}
+
+counted_proof! {
+    #[kani::unwind(2)]
+    fn receive_ring_reservation_covers_its_allocation() {
+        let budget = Budget::new(64);
+        let mut incoming = ReceivedDatagrams::default();
+        assert!(incoming.set_budget(&budget));
+        let (accepted, cost) = measure(|| incoming.reserve(64));
+        assert!(accepted);
+        assert!(cost.peak <= budget.used());
+        assert!(cost.requested <= 64);
+        assert!(incoming.bytes.capacity() <= budget.used());
+        std::mem::forget((incoming, budget));
+    }
+}
+
+counted_proof! {
+    #[kani::unwind(2)]
+    fn receive_ring_growth_pays_for_old_and_new_storage() {
+        let budget = Budget::new(96);
+        let mut incoming = ReceivedDatagrams::default();
+        assert!(incoming.set_budget(&budget));
+        let ((), cost) = measure(|| {
+            assert!(incoming.reserve(32));
+            let before = crate::counting::so_far();
+            assert!(incoming.reserve(64));
+            let after = crate::counting::so_far();
+            assert!(after.requested - before.requested <= 64);
+        });
+        // Growing from thirty-two to sixty-four reserves their sum until
+        // the old allocation has been freed, then releases the old charge.
+        assert!(cost.peak <= budget.limit());
+        assert!(cost.requested <= 96);
+        assert_eq!(budget.used(), 64);
+        assert!(incoming.bytes.capacity() <= budget.used());
+        std::mem::forget((incoming, budget));
+    }
+}
+
+counted_proof! {
+    #[kani::unwind(2)]
+    fn receive_ring_growth_refuses_without_allocating() {
+        let budget = Budget::new(64);
+        let mut incoming = ReceivedDatagrams::default();
+        assert!(incoming.set_budget(&budget));
+        let ((), cost) = measure(|| {
+            assert!(incoming.reserve(32));
+            let before = crate::counting::so_far();
+            assert!(!incoming.reserve(64));
+            let after = crate::counting::so_far();
+            assert!(after.requested - before.requested <= 0);
+        });
+        assert!(cost.peak <= budget.used());
+        assert!(cost.requested <= 32);
+        assert_eq!(budget.used(), 32);
+        assert_eq!(incoming.bytes.capacity(), 32);
+        std::mem::forget((incoming, budget));
+    }
+}
