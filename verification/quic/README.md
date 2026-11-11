@@ -1833,8 +1833,8 @@ would ignore every later one.
   failed their unwinding assertions. `VersionList::push` scans the eight
   known versions, which their bounds of 4 and 3 did not cover. Both
   bounds are now 10. The correctness harness beside them,
-  `version_information_validates_all_versions_and_the_peer_role`, has the
-  same bound of 4 and is left to the correctness proofs.
+  `version_information_validates_all_versions_and_the_peer_role`, had the
+  same bound of 4 and now has 10 as well.
 - A token whose issue time overflows `SystemTime` panicked in
   `Token::decode`. The masking stand-in key in Kani reached it. With the
   real key, only a token this server sealed gets that far. Decode now
@@ -1956,13 +1956,11 @@ Scratch controls for the replays and tests, each reverted:
   `Keys::initial` and `KeyBuilder`. The replay confirms it for ring.
 - The Kani harnesses use stand-in keys and a stand-in token AEAD. The
   real derivation is bounded only by the replay.
-- `cargo xtask quic-verify resources` runs the harnesses that passed
-  above and the ten configs. Its Kani step runs in a 16 GiB scope, as for
-  HPACK. The verdicts recorded here come from the same harnesses and
-  flags, run one at a time in a 10 GiB scope, and from TLC run by hand on
-  each config. The command itself has not been run end to end.
 - `version_information_checks_the_connection_without_allocating` has no
   verdict, and `quic-verify` leaves it out.
+
+`cargo xtask quic-verify resources` runs the fourteen harnesses that pass
+above, in a 10 GiB scope, and the ten configs.
 
 ## Standard interoperability over version two
 
@@ -2112,3 +2110,32 @@ replaces a connection that never answered with one for the next first
 Initial. A real server would keep both. HTTP/3 runs in one direction only.
 Resumption, 0-RTT, key update and connection migration over version 2 are
 not among these cases.
+
+## QUIC version two: all checks together
+
+The correctness proofs, the resource proofs and the interoperability runs
+were each made on their own branch. This section records them run again on
+the code they now share, where the server chooses its version in
+`Connection::switch_server_version` and charges it through
+`OtherInitial::derive`.
+
+- All 19 correctness harnesses pass: the seven packet type harnesses, the
+  three key and Retry harnesses, the eight negotiation harnesses, and
+  `version_information_validates_all_versions_and_the_peer_role` at bound
+  10.
+- `cargo xtask quic-verify resources` passes: its fourteen counted
+  harnesses in a 10 GiB scope, and the ten `VersionResources` configs, each
+  passing or violating as its first line says.
+- All ten `VersionNegotiation` configs pass or violate as their first lines
+  say. The base generates 109,230,241 states, 3,797,295 distinct.
+- Each scratch mutation in the correctness and resource control tables
+  above was applied again, one at a time, and its harness failed. So did
+  two more: a `client_offer` that allocates fails the first-flight replay,
+  and a `switch_server_version` that charges nothing fails
+  `a_server_without_room_for_the_retained_keys_keeps_the_clients_version`.
+- 400 engine library tests, the 31 SDK QUIC tests, the 13 ngtcp2 cases and
+  the 39 quiche tests pass. Clippy with warnings denied passes for the
+  engine, xtask and both interoperability crates.
+
+`version_information_checks_the_connection_without_allocating` still has
+no verdict within 10 GiB.
