@@ -420,7 +420,7 @@ mod tests {
         assert_eq!(&chunk[..], b"abcd");
         assert_eq!(budget.used(), 4);
         assert_eq!(full.used(), 0);
-        eprintln!("cost: QUIC send source: {}", costs.summary());
+        costs.print();
     }
 
     #[test]

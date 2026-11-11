@@ -134,8 +134,8 @@ layers:
    `Costs::amortized` holds the linear bound over a session's steps
    together, for a holder that copies each byte a bounded number of
    times but not in the step that brought it (a store joining blocks).
-   Each test prints a `cost:` line per kind, and the area's `diff`
-   command reports it.
+   Each test ends a session with `Costs::print`, which prints a
+   `CostLine` (`resources/line.rs`), and the area's command reports it.
 
 Bytes copied are measured as bytes asked of the allocator. Every copy
 into fresh storage is asked for first, so a step that copies all it holds
@@ -154,7 +154,9 @@ Wire the layers into the area's verify command with `xtask/src/resources.rs`.
 `resources::kani` runs the named harnesses with the counting stubs and
 `-Z restrict-vtable`, one at a time (`-j 1`). `resources::tlc` runs the
 named configs and checks each against its first line (`\* Must pass` or
-`\* Must violate <invariant>`). Each area's command runs all three
+`\* Must violate <invariant>`). `resources::replay` runs the named tests,
+which must pass and print at least one `CostLine`; a line that starts
+like one but does not read back fails. Each area's command runs all three
 layers, except where the table says a replay runs with the area's `diff`.
 
 | Area | Command | Bounds proved | What each layer caught | Open gaps |

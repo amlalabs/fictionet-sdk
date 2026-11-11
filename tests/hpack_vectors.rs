@@ -320,7 +320,7 @@ fn blocks() {
         }
         total.absorb(&costs);
     });
-    println!("blocks cost: {}", total.summary());
+    total.print();
 }
 
 #[test]
@@ -378,5 +378,5 @@ fn encoder() {
         total.absorb(&costs);
         total.absorb(&decoder_costs);
     });
-    println!("encoder cost: {}", total.summary());
+    total.print();
 }

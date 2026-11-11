@@ -145,7 +145,7 @@ fn many_tiny_packets_stay_within_most_held() {
         assert_eq!(push(&mut costs, &mut r, f, at(0)), "waiting");
     }
     expire_and_take(&mut costs, &mut r, at(31));
-    eprintln!("cost: tiny packets: {}", costs.summary());
+    costs.print();
 }
 
 /// Many pieces of eight bytes in each packet, with a gap after each so
@@ -176,7 +176,7 @@ fn many_small_pieces_in_any_order_stay_within_most_held() {
                 push(&mut costs, &mut r, f, at(0));
             }
         }
-        eprintln!("cost: pieces, {name}: {}", costs.summary());
+        costs.print();
     }
 }
 
@@ -203,7 +203,7 @@ fn first_fragments_kept_for_answers_stay_within_most_held() {
     }
     let taken = expire_and_take(&mut costs, &mut r, at(1000));
     assert!(taken > 0, "no first fragment was kept");
-    eprintln!("cost: expired first fragments: {}", costs.summary());
+    costs.print();
 }
 
 /// Packets of 8,000 bytes sent as a thousand pieces of eight, shuffled:
@@ -238,7 +238,7 @@ fn packets_completed_from_small_pieces_stay_within_most_held() {
         }
     }
     assert_eq!(whole, 20);
-    eprintln!("cost: completed from small pieces: {}", costs.summary());
+    costs.print();
 }
 
 /// UDP sockets under floods of datagrams, through the IP layer as a host
@@ -400,7 +400,7 @@ mod udp {
             }
             take(&mut costs, &mut h, 20_000);
         }
-        eprintln!("cost: udp floods: {}", costs.summary());
+        costs.print();
     }
 
     /// A budget smaller than a flood: datagrams are dropped once it is
@@ -414,7 +414,7 @@ mod udp {
             arrive(&mut costs, &mut h, peer, &vec![2; i % 300]);
         }
         assert!(h.budget.used() <= 256 << 10);
-        eprintln!("cost: udp budget: {}", costs.summary());
+        costs.print();
     }
 }
 
@@ -512,7 +512,7 @@ mod dns {
                 all.absorb(&costs);
             }
         }
-        eprintln!("cost: dns queries: {}", all.summary());
+        all.print();
     }
 }
 
@@ -593,7 +593,7 @@ mod cache {
                     Charged::new((), budget.used().saturating_sub(before))
                 });
             }
-            eprintln!("cost: cache, {per} a set: {}", costs.summary());
+            costs.print();
         }
     }
 }

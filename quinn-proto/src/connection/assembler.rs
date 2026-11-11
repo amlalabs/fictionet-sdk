@@ -987,7 +987,7 @@ mod test {
         }
         drop(assembler);
         assert_eq!(budget.used(), 0);
-        println!("cost: {}", costs.summary());
+        costs.print();
     }
 
     #[test]
@@ -1049,7 +1049,7 @@ mod test {
             assert_eq!(retained.as_ref(), &input[size / 2..]);
             drop(retained);
             assert_eq!(budget.used(), 0);
-            println!("cost: {}", costs.summary());
+            costs.print();
         }
     }
 

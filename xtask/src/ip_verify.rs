@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Result;
-use crate::lean_vectors::{self, scoped};
-use crate::resources;
+use crate::lean_vectors::Report;
+use crate::resources::{self, Replay, Target};
 
 /// The axioms a headline theorem may rest on: Lean's own, and no `sorryAx`.
 const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"];
@@ -66,15 +66,27 @@ const TLC_HOLDING: [&str; 5] = [
     "Holding_without_headers.cfg",
 ];
 
-/// The costed sessions: the package, the test target, and the filter.
-const SESSIONS: [(&str, &str, &str); 3] = [
-    ("fictionet", "--test=it", "net_resources"),
-    (
-        "fictionet",
-        "--lib",
-        "listen::tests::a_packet_longer_than_a_block_is_paid_from_the_sandboxs_budget",
-    ),
-    ("smoltcp", "--lib", "store_costs"),
+/// The costed sessions: the layer's reassembly, UDP and DNS, with the
+/// relay's long packet paid from the sandbox's budget, and smoltcp's TCP
+/// stores.
+const SESSIONS: [Replay; 2] = [
+    Replay {
+        name: "fictionet",
+        package: "fictionet",
+        features: &[],
+        targets: &[Target::Lib, Target::Test("it")],
+        filters: &[
+            "net_resources",
+            "listen::tests::a_packet_longer_than_a_block_is_paid_from_the_sandboxs_budget",
+        ],
+    },
+    Replay {
+        name: "smoltcp",
+        package: "smoltcp",
+        features: &[],
+        targets: &[Target::Lib],
+        filters: &["store_costs"],
+    },
 ];
 
 /// Runs `ip-verify` with the arguments after it.
@@ -85,7 +97,7 @@ pub fn run(args: &[String]) -> Result {
         ["lean"] => {
             let report = lean(&paths)?;
             report.print();
-            report.result()
+            report.result(COMMAND)
         }
         ["vectors", seed @ ..] if seed.len() <= 1 => {
             let mut report = Report::new("vectors");
@@ -93,12 +105,12 @@ pub fn run(args: &[String]) -> Result {
                 report.absorb(vectors(&paths, seed)?);
             }
             report.print();
-            report.result()
+            report.result(COMMAND)
         }
         ["diff", seed @ ..] if seed.len() <= 1 => {
             let report = diff(&paths, &seeds_of(seed)?)?;
             report.print();
-            report.result()
+            report.result(COMMAND)
         }
         ["all"] => all(&paths),
         ["resources"] => {
@@ -153,62 +165,6 @@ impl Paths {
             out: crate::verification_run(&target.join("ip-verify"))?,
             root,
         })
-    }
-}
-
-/// What one step found: a line per check, and whether every check passed.
-struct Report {
-    step: &'static str,
-    lines: Vec<String>,
-    failures: usize,
-}
-
-impl Report {
-    fn new(step: &'static str) -> Report {
-        Report {
-            step,
-            lines: Vec::new(),
-            failures: 0,
-        }
-    }
-
-    fn pass(&mut self, line: String) {
-        self.lines.push(line);
-    }
-
-    fn fail(&mut self, line: String) {
-        self.lines.push(format!("FAILED: {line}"));
-        self.failures += 1;
-    }
-
-    fn heading(&self) -> String {
-        if self.failures == 0 {
-            format!("{}: passed", self.step)
-        } else {
-            format!("{}: {} failed", self.step, self.failures)
-        }
-    }
-
-    fn print(&self) {
-        for line in &self.lines {
-            println!("{line}");
-        }
-        println!("{}", self.heading());
-    }
-
-    /// Takes in the lines and failures of `other`, another run of the
-    /// same step.
-    fn absorb(&mut self, other: Report) {
-        self.lines.extend(other.lines);
-        self.failures += other.failures;
-    }
-
-    fn result(&self) -> Result {
-        if self.failures == 0 {
-            Ok(())
-        } else {
-            Err(format!("ip-verify {}: {} failed", self.step, self.failures).into())
-        }
     }
 }
 
@@ -373,6 +329,9 @@ fn diff(paths: &Paths, seeds: &[u64]) -> Result<Report> {
                 report.pass(format!("seed {seed}: {line}"));
             }
         }
+        // Reassembly holds its steps to cost bounds (verification/
+        // resources/cost.rs) and prints a line for its sessions.
+        resources::costs(&mut report, &format!("seed {seed}"), &text);
         if !passed {
             report.fail(format!(
                 "seed {seed}: cargo test --test ip_vectors; see {log}"
@@ -433,8 +392,8 @@ fn all(paths: &Paths) -> Result {
 /// The resource properties of TCP and below (verification/packet-udp/README.md,
 /// "Resource properties"): the counted Kani harnesses, `Holding.tla`'s
 /// configs, and the costed sessions, each of which must pass.
-fn resources(paths: &Paths) -> Result<lean_vectors::Report> {
-    let mut report = lean_vectors::Report::new("resources");
+fn resources(paths: &Paths) -> Result<Report> {
+    let mut report = Report::new("resources");
     report.absorb(resources::kani(
         &paths.root,
         &paths.out.join("fictionet"),
@@ -456,30 +415,8 @@ fn resources(paths: &Paths) -> Result<lean_vectors::Report> {
         "Holding",
         &TLC_HOLDING,
     )?);
-    let mut sessions = lean_vectors::Report::new("sessions");
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    for (package, target, filter) in SESSIONS {
-        let log = paths
-            .out
-            .join(format!("{package}-{}.out", target.trim_start_matches("--")));
-        let (text, ran) = logged(
-            scoped(&cargo, "8G")
-                .args(["test", "-p", package, target, filter, "--", "--nocapture"])
-                .current_dir(&paths.root),
-            &log,
-        )?;
-        for line in text.lines().filter_map(|line| line.split_once("cost: ")) {
-            sessions.pass(line.1.to_string());
-        }
-        if ran {
-            sessions.pass(format!("{package} {target} {filter}: passed"));
-        } else {
-            sessions.fail(format!(
-                "{package} {target} {filter}: see {}",
-                log.display()
-            ));
-        }
+    for replay in &SESSIONS {
+        report.absorb(resources::replay(&paths.root, &paths.out, replay)?);
     }
-    report.absorb(sessions);
     Ok(report)
 }

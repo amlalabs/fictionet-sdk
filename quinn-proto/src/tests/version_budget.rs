@@ -191,5 +191,5 @@ fn a_server_retry_allocates_nothing_beyond_its_buffer() {
         });
         assert!(size > 0 && size <= buf.capacity());
     }
-    eprintln!("cost: QUIC Retry: {}", costs.summary());
+    costs.print();
 }

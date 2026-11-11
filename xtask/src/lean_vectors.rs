@@ -72,9 +72,9 @@ impl Project {
 
 /// What one step found: a line per check, and whether every check passed.
 pub struct Report {
-    step: &'static str,
-    lines: Vec<String>,
-    failures: usize,
+    pub(crate) step: &'static str,
+    pub(crate) lines: Vec<String>,
+    pub(crate) failures: usize,
 }
 
 impl Report {
@@ -101,15 +101,20 @@ impl Report {
         self.failures += other.failures;
     }
 
+    /// The step, and whether it passed.
+    pub(crate) fn heading(&self) -> String {
+        if self.failures == 0 {
+            format!("{}: passed", self.step)
+        } else {
+            format!("{}: {} failed", self.step, self.failures)
+        }
+    }
+
     pub fn print(&self) {
         for line in &self.lines {
             println!("{line}");
         }
-        if self.failures == 0 {
-            println!("{}: passed", self.step);
-        } else {
-            println!("{}: {} failed", self.step, self.failures);
-        }
+        println!("{}", self.heading());
     }
 
     pub fn result(&self, command: &str) -> Result {
@@ -305,11 +310,12 @@ pub fn diff(project: &Project, seeds: &[u64]) -> Result<Report> {
                 report.fail(format!("seed {seed}: {line}"));
             }
         }
-        // A test that holds its steps to cost bounds (verification/
-        // resources/cost.rs) prints a line for each kind it costed; a
+        // The test holds its steps to cost bounds (verification/
+        // resources/cost.rs) and prints a line for each kind it costed; a
         // bound broken fails the test, and its log names the step.
-        for line in text.lines().filter(|line| line.contains(" cost: ")) {
-            report.pass(format!("seed {seed}: {line}"));
+        let costed = crate::resources::costs(&mut report, &format!("seed {seed}"), &text);
+        if passed && costed == 0 {
+            report.fail(format!("seed {seed}: no session was costed; see {log}"));
         }
         if !passed {
             report.fail(format!(

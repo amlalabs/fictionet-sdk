@@ -457,5 +457,5 @@ fn transport_traces_replay_on_the_production_transport() {
         "the injected IGNORE ends it"
     );
     all.absorb(&costs);
-    println!("cost: {}", all.summary());
+    all.print();
 }

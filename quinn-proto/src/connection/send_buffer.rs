@@ -330,7 +330,7 @@ mod tests {
         buffer.discard();
         assert_eq!(budget.used(), 0);
         assert_eq!(buffer.offset(), 128);
-        println!("cost: {}", costs.summary());
+        costs.print();
     }
 
     #[test]

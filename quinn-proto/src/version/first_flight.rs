@@ -420,7 +420,7 @@ mod tests {
         }
         // The whole offer, the shuffled one and the one with a gap are read.
         assert!(offers >= 3);
-        eprintln!("cost: QUIC first flight: {}", costs.summary());
+        costs.print();
     }
 }
 

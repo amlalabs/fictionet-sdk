@@ -786,6 +786,6 @@ mod tests {
                 }
             }
         }
-        eprintln!("cost: QUIC Initial keys: {}", all.summary());
+        all.print();
     }
 }

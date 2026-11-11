@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::Result;
-use crate::lean_vectors::{Report, scoped};
-use crate::resources;
+use crate::lean_vectors::Report;
+use crate::resources::{self, Replay, Target};
 
 /// The counter's own check, then rustls's read buffer as a message is
 /// joined in it (`verification/tls/kani/deframer.rs`).
@@ -42,11 +42,22 @@ const TLC_RESOURCES: [&str; 5] = [
     "Join_without_parseroom.cfg",
 ];
 
-/// The costed replays: a package's tests, filtered, each of whose steps is
-/// held to its bounds (`verification/resources/cost.rs`).
-const REPLAYS: [(&str, &[&str], &str); 2] = [
-    ("fictionet-rustls", &["--lib"], "budget::costs"),
-    ("fictionet", &["--test", "it"], "tls::costs"),
+/// The costed replays: rustls's, and the layer's.
+const REPLAYS: [Replay; 2] = [
+    Replay {
+        name: "costs-fictionet-rustls",
+        package: "fictionet-rustls",
+        features: &[],
+        targets: &[Target::Lib],
+        filters: &["budget::costs"],
+    },
+    Replay {
+        name: "costs-fictionet",
+        package: "fictionet",
+        features: &[],
+        targets: &[Target::Test("it")],
+        filters: &["tls::costs"],
+    },
 ];
 
 /// Runs `tls-verify` with the arguments after it.
@@ -87,36 +98,8 @@ fn resources_report(paths: &Paths) -> Result<Report> {
         "Join",
         &TLC_RESOURCES,
     )?);
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    for (package, target, filter) in REPLAYS {
-        let log = paths.out.join(format!("costs-{package}.out"));
-        let (text, passed) = crate::lean_vectors::logged(
-            scoped(&cargo, "8G")
-                .args(["test", "-p", package])
-                .args(target)
-                .args(["--", "--nocapture", filter])
-                .env("CARGO_BUILD_JOBS", "8")
-                .current_dir(&paths.root),
-            &log,
-        )?;
-        let costs: Vec<&str> = text
-            .lines()
-            .filter(|line| line.contains("cost: "))
-            .collect();
-        for line in &costs {
-            report.pass(format!("{package}: {}", line.trim()));
-        }
-        if !passed {
-            report.fail(format!(
-                "{package} {filter}: a cost bound broke; see {}",
-                log.display()
-            ));
-        } else if costs.is_empty() {
-            report.fail(format!(
-                "{package} {filter}: no session was costed; see {}",
-                log.display()
-            ));
-        }
+    for replay in &REPLAYS {
+        report.absorb(resources::replay(&paths.root, &paths.out, replay)?);
     }
     Ok(report)
 }
