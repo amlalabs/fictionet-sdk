@@ -328,7 +328,7 @@ impl Drop for HandshakeIter<'_, '_> {
 }
 
 #[derive(Debug)]
-struct FragmentSpan {
+pub(crate) struct FragmentSpan {
     /// version taken from containing message.
     version: ProtocolVersion,
 

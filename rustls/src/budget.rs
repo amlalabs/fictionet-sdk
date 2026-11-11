@@ -311,6 +311,9 @@ pub(crate) mod tests;
 #[cfg(all(test, feature = "std"))]
 mod record_trace;
 
+#[cfg(all(test, feature = "std"))]
+mod costs;
+
 #[cfg(test)]
 pub(crate) mod testing {
     //! A budget for the crate's own tests.

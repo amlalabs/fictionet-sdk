@@ -297,7 +297,11 @@
 //!
 
 // Require docs for public APIs, deny unsafe code, etc.
-#![forbid(unsafe_code, unused_must_use)]
+#![forbid(unused_must_use)]
+// Unsafe code only in the allocators that count what the tests and the
+// Kani proofs allocate (verification/resources), each allowed by name.
+#![cfg_attr(not(any(test, kani)), forbid(unsafe_code))]
+#![cfg_attr(any(test, kani), deny(unsafe_code))]
 #![cfg_attr(not(any(read_buf, bench, coverage_nightly)), forbid(unstable_features))]
 #![warn(
     clippy::alloc_instead_of_core,

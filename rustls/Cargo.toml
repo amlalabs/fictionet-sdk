@@ -123,6 +123,7 @@ priority = 0
 check-cfg = [
     "cfg(bench)",
     "cfg(coverage_nightly)",
+    "cfg(kani)",
     "cfg(read_buf)",
     "cfg(rustls_docsrs)",
 ]

@@ -781,8 +781,10 @@ impl<Data> ConnectionCommon<Data> {
     /// You should call [`process_new_packets()`] each time a call to this function succeeds in order
     /// to empty the incoming TLS data buffer.
     ///
-    /// It reads no further than the end of the record arriving, into a buffer of exactly that
-    /// record's size, which is freed once the record is processed. With a budget, the first
+    /// It reads no further than the end of the record arriving, into a buffer that holds that
+    /// record and the parts of a handshake message joined before it, freed once processing
+    /// empties it. While a message is joined the buffer grows to at least twice its size, so
+    /// its bytes move a few times, not once a record. With a budget, the first
     /// read also pays for the room the connection keeps for its final alert, and fails with
     /// `ErrorKind::OutOfMemory`, reading nothing, while the budget has no room. Once a whole record is
     /// buffered it reads nothing more, failing with `ErrorKind::Other`, until
