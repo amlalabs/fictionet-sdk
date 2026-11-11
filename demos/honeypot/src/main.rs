@@ -6,15 +6,21 @@
 // This module owns the host syscall boundary.
 #[allow(unsafe_code)]
 mod deploy;
+mod systemd;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use deploy::{Options, State};
-use fictionet_host::raw::RawAttachment;
+use fictionet_host::raw::{RawAttachment, RawPump};
+use fictionet_host::xdp::{Attached, XdpSocket, XskStatistics};
 use honeypot_world::Clock;
 use honeypot_world::evidence::{EventSink, Writer, WriterConfig};
-use honeypot_world::record::{Lifecycle, Reachability, Stopped};
+use honeypot_world::record::{
+    AttachMode, Backend, BindMode, Lifecycle, Reachability, Stopped, XskCounters,
+};
 use serde_json::json;
+use systemd::{Notification, Notifier};
 
 fn main() -> fictionet::Result {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
@@ -27,22 +33,59 @@ fn main() -> fictionet::Result {
         return Ok(());
     }
     let options = Options::parse(arguments)?;
-    let raw = attach()?;
-    tokio::runtime::Builder::new_current_thread()
+    let notifier = Notifier::from_env()?.map(Arc::new);
+    // The startup checks run here, before the state directory is touched.
+    let socket = XdpSocket::open(&options.interface)?;
+    let attached = socket.attached().clone();
+    let (pump, raw) = RawPump::attach(socket)?;
+    let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(run(options, raw))
+        .block_on(run(options, raw, &attached, &pump, notifier.clone()));
+    if let Some(notifier) = &notifier {
+        let _ = notifier.notify(Notification::Stopping);
+    }
+    let stopped = pump.shutdown();
+    result?;
+    stopped
 }
 
-/// The network card the world's frames go through. This build has none,
-/// so the honeypot refuses to start before it touches its state.
-fn attach() -> fictionet::Result<RawAttachment> {
-    Err(fictionet::Error::msg(
-        "this build has no packet path; the honeypot cannot attach to a network",
-    ))
+/// The attached interface, as the log records it.
+fn backend(attached: &Attached) -> Backend {
+    Backend {
+        interface: attached.interface.as_str().into(),
+        ifindex: attached.ifindex,
+        mac: attached.mac.map(|byte| format!("{byte:02x}")).join(":"),
+        driver: attached.driver.name.clone(),
+        driver_version: attached.driver.version.clone(),
+        firmware_version: attached.driver.firmware.clone(),
+        bus: attached.driver.bus.clone(),
+        mtu: attached.mtu,
+        queue: attached.queue,
+        combined_channels: attached.channels.combined,
+        max_combined_channels: attached.channels.max_combined,
+        attach_mode: AttachMode::Native,
+        bind_mode: BindMode::Copy,
+    }
 }
 
-async fn run(mut options: Options, raw: RawAttachment) -> fictionet::Result {
+fn counters(stats: XskStatistics) -> XskCounters {
+    XskCounters {
+        rx_dropped: stats.rx_dropped,
+        rx_ring_full: stats.rx_ring_full,
+        rx_fill_ring_empty: stats.rx_fill_ring_empty,
+        rx_invalid: stats.rx_invalid,
+        tx_invalid: stats.tx_invalid,
+    }
+}
+
+async fn run(
+    mut options: Options,
+    raw: RawAttachment,
+    attached: &Attached,
+    pump: &RawPump,
+    notifier: Option<Arc<Notifier>>,
+) -> fictionet::Result {
     let state = State::open(&options.state_dir)?;
     options.args.config.ssh_host_key = Some(state.host_key);
     options.args.config.restricted_evidence = options.restricted_evidence;
@@ -65,7 +108,7 @@ async fn run(mut options: Options, raw: RawAttachment) -> fictionet::Result {
         Vec::new(),
     )?;
     writer.lifecycle(Lifecycle::Configuration(Box::new(options.configuration())))?;
-    let result = serve(&options, &mut writer, events, raw).await;
+    let result = serve(&options, &mut writer, events, raw, attached, notifier).await;
     writer.set_ready(false);
     let _ = writer.lifecycle(Lifecycle::Shutdown {
         status: if result.is_ok() {
@@ -74,6 +117,7 @@ async fn run(mut options: Options, raw: RawAttachment) -> fictionet::Result {
             Stopped::Failed
         },
         error: result.as_ref().err().map(ToString::to_string),
+        xsk_statistics: pump.statistics().map(counters),
     });
     let metrics = writer.metrics_handle();
     let drained = writer.shutdown(Duration::from_secs(5));
@@ -97,12 +141,15 @@ async fn serve(
     writer: &mut Writer,
     events: EventSink,
     raw: RawAttachment,
+    attached: &Attached,
+    notifier: Option<Arc<Notifier>>,
 ) -> fictionet::Result {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let config = options.args.config.clone();
     let clock = Clock::starting_now();
     writer.lifecycle(Lifecycle::BackendAttached {
+        backend: backend(attached),
         public_reachability: Reachability::NotTested,
     })?;
     fictionet::run(fictionet::Seed::random(), move |fcx| {
@@ -128,6 +175,20 @@ async fn serve(
             match line {
                 Ok(line) => println!("{line}"),
                 Err(error) => return std::future::ready(Err(error.into())),
+            }
+            if let Some(notifier) = notifier {
+                if let Err(error) = notifier.notify(Notification::Ready) {
+                    return std::future::ready(Err(error.into()));
+                }
+                if let Some(period) = notifier.watchdog_period() {
+                    // A world task, so a stalled world stops the pings.
+                    fcx.spawn(move |fcx| async move {
+                        loop {
+                            notifier.notify(Notification::Watchdog)?;
+                            fcx.sleep(period).await?;
+                        }
+                    });
+                }
             }
         }
         std::future::ready(started.map(drop))

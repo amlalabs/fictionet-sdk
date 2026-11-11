@@ -1531,6 +1531,7 @@ mod tests {
         Lifecycle::Shutdown {
             status: Stopped::Stopped,
             error: None,
+            xsk_statistics: None,
         }
     }
 
@@ -1836,7 +1837,8 @@ mod tests {
         fs::write(&prior, b"{\"unfinished\":").unwrap();
         let (writer, _) = Writer::open(dir.config(), Vec::new()).unwrap();
         writer
-            .lifecycle(Lifecycle::BackendAttached {
+            .lifecycle(Lifecycle::LocalReady {
+                run_id: "run".into(),
                 public_reachability: Reachability::NotTested,
             })
             .unwrap();

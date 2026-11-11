@@ -10,7 +10,7 @@ use fictionet::stdlib::network::ethernet::host::{self, Host, Ipv4Config, Ipv6Con
 use fictionet::sync::Mutex;
 use fictionet::time::Instant;
 use fictionet::{Cx, Interface, Packet};
-use fictionet_host::raw::{EthernetFrame, QueueStats, RawAttachment, RawSender};
+use fictionet_host::raw::{DeviceStats, EthernetFrame, QueueStats, RawAttachment, RawSender};
 
 use crate::evidence::EventSink;
 use crate::observe::Direction;
@@ -28,6 +28,8 @@ struct Capture {
     transmit_stats: QueueStats,
     reported_queue_dropped: u64,
     reported_tx_queue_dropped: u64,
+    device_stats: Option<DeviceStats>,
+    reported_nic_rx_dropped: u64,
 }
 
 impl Capture {
@@ -40,6 +42,7 @@ impl Capture {
     ) {
         let queue_dropped = self.receive_stats.queue_dropped();
         let tx_queue_dropped = self.transmit_stats.queue_dropped();
+        let nic_rx_dropped = self.device_stats.as_ref().map(DeviceStats::rx_dropped);
         let frame = Frame {
             at_us: self.clock.micros(fcx.now()),
             received_at_us: received_at
@@ -54,14 +57,16 @@ impl Capture {
             lost: self.lost,
             rx_queue_dropped: queue_dropped.saturating_sub(self.reported_queue_dropped),
             tx_queue_dropped: tx_queue_dropped.saturating_sub(self.reported_tx_queue_dropped),
-            nic_rx_dropped: None,
             length: bytes.len(),
             bytes,
+            nic_rx_dropped: nic_rx_dropped
+                .map(|dropped| dropped.saturating_sub(self.reported_nic_rx_dropped)),
         };
         if self.events.frame(frame) {
             self.lost = 0;
             self.reported_queue_dropped = queue_dropped;
             self.reported_tx_queue_dropped = tx_queue_dropped;
+            self.reported_nic_rx_dropped = nic_rx_dropped.unwrap_or(0);
         } else {
             self.lost = self.lost.saturating_add(1);
         }
@@ -140,8 +145,10 @@ fn host(config: &Config, mac: Mac, now: Instant) -> fictionet::Result<Host> {
 /// EtherTypes and Ethernet padding included. `lost` counts frames `events`
 /// refused, and `rx_queue_dropped` and `tx_queue_dropped` count frames the
 /// full host queues discarded, all since the last frame it took.
-/// `nic_rx_dropped` is `None` because device and backend losses are
-/// unavailable, not zero. `events` also receives the IP capture and the
+/// `nic_rx_dropped` counts, over the same span, received frames the
+/// driver's path lost before the receive queue (see [`Frame`]); it is
+/// `None` when the attachment has no device counters, as an in-memory one
+/// has none. `events` also receives the IP capture and the
 /// observations, as [`crate::start`] gives them. `received_at_us` preserves
 /// backend receipt time from the host system clock before queueing, when
 /// available; `at_us` is world processing time. Neither clock represents a
@@ -202,6 +209,7 @@ pub fn start_raw(
     }
     let receive_stats = raw.receive_stats();
     let transmit_stats = raw.transmit_stats();
+    let device_stats = raw.device_stats();
     let (sender, mut receiver) = raw.split();
     let (attacher, attachments) = fictionet::attachments();
     let end = Arc::new(Mutex::new(attacher.attach(INTERNET)?));
@@ -217,6 +225,8 @@ pub fn start_raw(
             transmit_stats,
             reported_queue_dropped: 0,
             reported_tx_queue_dropped: 0,
+            device_stats,
+            reported_nic_rx_dropped: 0,
         },
         sender,
         timer: None,
