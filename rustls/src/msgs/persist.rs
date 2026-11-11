@@ -12,6 +12,7 @@ use crate::msgs::codec::{Codec, Reader};
 #[cfg(feature = "tls12")]
 use crate::msgs::handshake::SessionId;
 use crate::msgs::handshake::{CertificateChain, ProtocolName};
+use crate::quic::Version as QuicVersion;
 use crate::sync::{Arc, Weak};
 #[cfg(feature = "tls12")]
 use crate::tls12::Tls12CipherSuite;
@@ -76,6 +77,7 @@ pub struct Tls13ClientSessionValue {
     max_early_data_size: u32,
     pub(crate) common: ClientSessionCommon,
     quic_params: PayloadU16,
+    quic_version: Option<QuicVersion>,
 }
 
 impl Tls13ClientSessionValue {
@@ -105,6 +107,7 @@ impl Tls13ClientSessionValue {
                 client_creds,
             ),
             quic_params: PayloadU16::new(Vec::new()),
+            quic_version: None,
         }
     }
 
@@ -135,6 +138,16 @@ impl Tls13ClientSessionValue {
     pub fn quic_params(&self) -> Vec<u8> {
         self.quic_params.0.clone()
     }
+
+    /// Bind the ticket to the QUIC version of the connection that received it
+    pub fn set_quic_version(&mut self, version: QuicVersion) {
+        self.quic_version = Some(version);
+    }
+
+    /// The QUIC version the ticket belongs to, if it came over QUIC
+    pub fn quic_version(&self) -> Option<QuicVersion> {
+        self.quic_version
+    }
 }
 
 impl core::ops::Deref for Tls13ClientSessionValue {
@@ -153,6 +166,7 @@ impl fmt::Debug for Tls13ClientSessionValue {
             max_early_data_size,
             common,
             quic_params,
+            quic_version,
         } = self;
 
         f.debug_struct("Tls13ClientSessionValue")
@@ -161,6 +175,7 @@ impl fmt::Debug for Tls13ClientSessionValue {
             .field("max_early_data_size", max_early_data_size)
             .field("common", common)
             .field("quic_params", quic_params)
+            .field("quic_version", quic_version)
             .finish()
     }
 }
@@ -349,6 +364,8 @@ pub struct ServerSessionValue {
     pub(crate) application_data: PayloadU16,
     pub creation_time_sec: u64,
     pub(crate) age_obfuscation_offset: u32,
+    /// The QUIC version of the connection that issued the ticket
+    pub(crate) quic_version: Option<QuicVersion>,
     freshness: Option<bool>,
 }
 
@@ -365,6 +382,7 @@ impl fmt::Debug for ServerSessionValue {
             application_data,
             creation_time_sec,
             age_obfuscation_offset,
+            quic_version,
             freshness,
         } = self;
         f.debug_struct("ServerSessionValue")
@@ -377,6 +395,7 @@ impl fmt::Debug for ServerSessionValue {
             .field("application_data", application_data)
             .field("creation_time_sec", creation_time_sec)
             .field("age_obfuscation_offset", age_obfuscation_offset)
+            .field("quic_version", quic_version)
             .field("freshness", freshness)
             .finish_non_exhaustive()
     }
@@ -410,6 +429,13 @@ impl Codec<'_> for ServerSessionValue {
         self.application_data.encode(bytes);
         self.creation_time_sec.encode(bytes);
         self.age_obfuscation_offset.encode(bytes);
+        let quic_version: u8 = match self.quic_version {
+            None => 0,
+            Some(QuicVersion::V1Draft) => 1,
+            Some(QuicVersion::V1) => 2,
+            Some(QuicVersion::V2) => 3,
+        };
+        quic_version.encode(bytes);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -445,6 +471,13 @@ impl Codec<'_> for ServerSessionValue {
         let application_data = PayloadU16::read(r)?;
         let creation_time_sec = u64::read(r)?;
         let age_obfuscation_offset = u32::read(r)?;
+        let quic_version = match u8::read(r)? {
+            0 => None,
+            1 => Some(QuicVersion::V1Draft),
+            2 => Some(QuicVersion::V1),
+            3 => Some(QuicVersion::V2),
+            _ => return Err(InvalidMessage::UnknownProtocolVersion),
+        };
 
         Ok(Self {
             sni,
@@ -457,6 +490,7 @@ impl Codec<'_> for ServerSessionValue {
             application_data,
             creation_time_sec,
             age_obfuscation_offset,
+            quic_version,
             freshness: None,
         })
     }
@@ -485,8 +519,14 @@ impl ServerSessionValue {
             application_data: PayloadU16::new(application_data),
             creation_time_sec: creation_time.as_secs(),
             age_obfuscation_offset,
+            quic_version: None,
             freshness: None,
         }
+    }
+
+    /// Bind the ticket to the QUIC version of the connection issuing it
+    pub(crate) fn set_quic_version(&mut self, version: QuicVersion) {
+        self.quic_version = Some(version);
     }
 
     #[cfg(feature = "tls12")]
@@ -543,7 +583,7 @@ mod tests {
     fn serversessionvalue_no_sni() {
         let bytes = [
             0x00, 0x03, 0x03, 0xc0, 0x23, 0x03, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0xfe, 0xed, 0xf0, 0x0d,
+            0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0xfe, 0xed, 0xf0, 0x0d, 0x00,
         ];
         let mut rd = Reader::init(&bytes);
         let ssv = ServerSessionValue::read(&mut rd).unwrap();
@@ -554,10 +594,41 @@ mod tests {
     fn serversessionvalue_with_cert() {
         let bytes = [
             0x00, 0x03, 0x03, 0xc0, 0x23, 0x03, 0x01, 0x02, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0xfe, 0xed, 0xf0, 0x0d,
+            0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0xfe, 0xed, 0xf0, 0x0d, 0x00,
         ];
         let mut rd = Reader::init(&bytes);
         let ssv = ServerSessionValue::read(&mut rd).unwrap();
         assert_eq!(ssv.get_encoding(), bytes);
+    }
+
+    #[cfg(feature = "std")] // for UnixTime::now
+    #[test]
+    fn serversessionvalue_keeps_its_quic_version() {
+        use std::vec;
+        let versions = [
+            None,
+            Some(QuicVersion::V1Draft),
+            Some(QuicVersion::V1),
+            Some(QuicVersion::V2),
+        ];
+        for version in versions {
+            let mut ssv = ServerSessionValue::new(
+                None,
+                ProtocolVersion::TLSv1_3,
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+                &[0xa5; 48],
+                None,
+                None,
+                vec![],
+                UnixTime::now(),
+                0,
+            );
+            if let Some(version) = version {
+                ssv.set_quic_version(version);
+            }
+            let encoding = ssv.get_encoding();
+            let read = ServerSessionValue::read(&mut Reader::init(&encoding)).unwrap();
+            assert_eq!(read.quic_version, version);
+        }
     }
 }

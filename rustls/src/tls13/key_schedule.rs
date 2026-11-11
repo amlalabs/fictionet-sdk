@@ -241,6 +241,7 @@ impl KeyScheduleHandshakeStart {
         );
 
         if common.is_quic() {
+            common.quic.handshake_secrets_derived = true;
             common.quic.hs_secrets = Some(quic::Secrets::new(
                 client_secret.clone(),
                 server_secret.clone(),

@@ -299,6 +299,8 @@ mod client_hello {
                         })
                         .filter(|resumedata| {
                             hs::can_resume(self.suite.into(), &cx.data.sni, false, resumedata)
+                                && resumedata.quic_version
+                                    == cx.common.is_quic().then_some(cx.common.quic.version)
                         });
 
                     let Some(resume) = maybe_resume_data else {
@@ -1251,7 +1253,7 @@ fn get_server_session_value(
 
     let secret = resumption.derive_ticket_psk(nonce);
 
-    persist::ServerSessionValue::new(
+    let mut value = persist::ServerSessionValue::new(
         cx.data.sni.as_ref(),
         version,
         suite.common.suite,
@@ -1261,7 +1263,11 @@ fn get_server_session_value(
         cx.data.resumption_data.clone(),
         time_now,
         age_obfuscation_offset,
-    )
+    );
+    if cx.common.is_quic() {
+        value.set_quic_version(cx.common.quic.version);
+    }
+    value
 }
 
 struct ExpectFinished {

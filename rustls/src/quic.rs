@@ -206,6 +206,7 @@ mod connection {
 
             let mut inner = ConnectionCore::for_client(config, name, exts, Protocol::Quic)?;
             inner.common_state.quic.version = quic_version;
+            inner.common_state.quic.early_version = quic_version;
             Ok(Self {
                 inner: inner.into(),
             })
@@ -295,6 +296,7 @@ mod connection {
             let mut core = ConnectionCore::for_server(config, exts)?;
             core.common_state.protocol = Protocol::Quic;
             core.common_state.quic.version = quic_version;
+            core.common_state.quic.early_version = quic_version;
             Ok(Self { inner: core.into() })
         }
 
@@ -388,8 +390,33 @@ mod connection {
                 suite,
                 suite.quic?,
                 self.core.common_state.quic.early_secret.as_ref()?,
-                self.core.common_state.quic.version,
+                self.core.common_state.quic.early_version,
             ))
+        }
+
+        /// Switch to a compatible QUIC version (RFC 9368 section 2.3).
+        ///
+        /// Handshake and 1-RTT keys, key updates and session tickets then use
+        /// `version`. 0-RTT keys keep the version the connection was made
+        /// with, since 0-RTT packets are only sent in the original version
+        /// (RFC 9369 section 4.1). A server switches before reading the
+        /// client's first flight; a client switches before reading the
+        /// server's first CRYPTO data in the new version. Once handshake
+        /// secrets exist the version is fixed and this returns an error.
+        pub fn set_negotiated_version(&mut self, version: Version) -> Result<(), Error> {
+            let quic = &mut self.core.common_state.quic;
+            if quic.handshake_secrets_derived {
+                return Err(Error::General(
+                    "the QUIC version is fixed once handshake secrets exist".into(),
+                ));
+            }
+            quic.version = version;
+            Ok(())
+        }
+
+        /// The QUIC version of handshake and 1-RTT keys
+        pub fn negotiated_version(&self) -> Version {
+            self.core.common_state.quic.version
         }
 
         /// Consume unencrypted TLS handshake data.
@@ -476,7 +503,12 @@ pub(crate) struct Quic {
     /// Whether keys derived from traffic_secrets have been passed to the QUIC implementation
     #[cfg(feature = "std")]
     pub(crate) returned_traffic_keys: bool,
+    /// The version of handshake and 1-RTT keys, which may be negotiated
     pub(crate) version: Version,
+    /// The version the connection was made with, which 0-RTT keys use
+    pub(crate) early_version: Version,
+    /// Whether handshake secrets were derived, fixing `version`
+    pub(crate) handshake_secrets_derived: bool,
 }
 
 #[cfg(feature = "std")]
@@ -968,7 +1000,7 @@ pub enum KeyChange {
 ///
 /// Governs version-specific behavior in the TLS layer
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Version {
     /// Draft versions 29, 30, 31 and 32
     V1Draft,
