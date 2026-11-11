@@ -166,8 +166,8 @@ fn representation(out: &mut Vec<u8>, kind: u8, n: u64) -> Representation<'static
         2 => {
             out.extend([0x40, 0, 0]);
             Representation::Literal {
-                name: Name::Literal(Text::Raw(&[])),
-                value: Text::Raw(&[]),
+                name: Name::Literal(Text::Raw(Span::from(&[][..]))),
+                value: Text::Raw(Span::from(&[][..])),
                 indexing: Indexing::Incremental,
             }
         }
@@ -182,7 +182,7 @@ fn representation(out: &mut Vec<u8>, kind: u8, n: u64) -> Representation<'static
             out.push(0);
             Representation::Literal {
                 name: Name::Index(n),
-                value: Text::Raw(&[]),
+                value: Text::Raw(Span::from(&[][..])),
                 indexing,
             }
         }
