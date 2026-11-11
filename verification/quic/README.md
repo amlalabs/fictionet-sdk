@@ -11,8 +11,10 @@ the SDK's existing web handlers, with independent quiche interoperability.
 The shared listener also serves these handlers through a world host UDP
 socket, tested with several independent quiche connections at once. See
 [Shared datagram listener](#shared-datagram-listener) for the latest boundaries.
-Earlier sections record the state at each step. Remaining priorities are
-whole-engine budgeting, the remaining version-two work and unresolved proofs.
+Wire input now retains reservations through packet and frame ownership;
+see [Reserved wire backings](#reserved-wire-backings) for the latest resource
+evidence. Earlier sections record the state at each step. Remaining priorities
+are whole-engine budgeting, the remaining version-two work and unresolved proofs.
 
 The intended boundary is a layer over the world's datagram carrier, with
 typed multiplexed streams and application datagrams above it. The engine
@@ -1120,8 +1122,9 @@ Cargo doc succeeds with the existing redundant-link warning in
 throughput measurement. All Cargo, Kani and TLC commands ran in the required
 memory-limited scope with artifacts in the separate target directory.
 
-For the next budgeting step, both datagram adapters still copy incoming
-payloads into `BytesMut` before `Endpoint::handle`. Those backings can be
+At the end of the listener step, both datagram adapters still copied incoming
+payloads into `BytesMut` before `Endpoint::handle`. The reserved wire-backing
+step below replaces those copies. Those backings can be
 split and retained through packet and frame processing, so a temporary
 reservation around the call alone would not cover their lifetime. Endpoint
 routing and incoming queues, stream receive state, packet recovery and TLS
@@ -1189,7 +1192,10 @@ These bounds cover wire storage, including retained views, not all receive
 storage. Reassembly compaction can still copy into uncharged storage, and
 its heap nodes, interval sets and stream records remain outside this claim.
 TLS queues, recovery metadata and endpoint routing also remain unbudgeted.
-Whole-engine budgeting is still the next build-out priority, before the
+There is no dedicated reserve for receiving ACK/control packets when retained
+application data exhausts the shared budget; dropping input is safe for
+acknowledgment correctness, but progress under sustained budget exhaustion
+is not established. Whole-engine budgeting is still the next build-out priority, before the
 remaining version-two work and unresolved older proofs. No rustls files
 changed.
 
@@ -1199,3 +1205,27 @@ engine on all targets. Cargo doc succeeds with the existing redundant-link
 warning in `network/packet.rs`. The `quic_wire_admission` benchmark measures
 charged input copying at 1,200 and 65,527 bytes with ten samples; it is not
 a transport throughput measurement.
+
+A scratch commit moved the input copy before reservation. The unchanged
+refusal replay failed with 64 live bytes against zero charged; Kani failed
+the zero-peak-allocation assertion. The scratch commit is not on this branch.
+Restoring the reservation order passes the unchanged checks again.
+
+Both `QuicLayer` and `Listener` now use `PacketBuffer::copy_from` and
+`Endpoint::handle_buffer`. Refusal of input storage drops the unreliable
+wire datagram before endpoint processing, leaving it unacknowledged. It
+does not block the shared carrier behind an unread connection. Existing
+initialization and output-queue backpressure keep their prior contracts.
+The initial blocking implementation failed the existing application-datagram
+memory-pressure regression; changing the code to drop unpaid wire input
+restored that test without changing its assertions. A listener regression
+also exhausts its budget after initialization, checks that an Initial
+creates no connection, releases the memory and successfully retransmits it.
+
+The independent QUIC/HTTP/3 suite passes all 31 tests with the charged input
+path, including sustained loss/reordering, both quiche roles, concurrent
+HTTP/3 connections, streamed responses/trailers and the world UDP host.
+All 4,373 pre-existing SDK library tests, the new listener regression,
+1,413 integration tests and 303 SDK doctests pass. Rustfmt and clippy with
+warnings denied pass. All Cargo, Kani and TLC invocations use the required
+memory-limited scope and the separate target directory.

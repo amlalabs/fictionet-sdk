@@ -5,7 +5,6 @@ use std::time::Instant as EngineInstant;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use web_time::Instant as EngineInstant;
 
-use bytes::BytesMut;
 use quinn_proto::{Connection, ConnectionHandle, Dir, Endpoint, StreamId, VarInt};
 
 use crate::stdlib::layer::{
@@ -599,17 +598,23 @@ impl Layer for QuicLayer {
                 let Some(mut response) = self.wire(env.budget()) else {
                     return Ok(Admit::Blocked(DatagramEvent::Datagram(datagram)));
                 };
+                let Some(input) =
+                    quinn_proto::PacketBuffer::copy_from(env.budget(), datagram.payload())
+                else {
+                    self.wire = Some(response);
+                    // Unreliable input can be dropped before packet processing. Do not
+                    // block the shared carrier on storage held by unread streams.
+                    return Ok(Admit::Taken);
+                };
                 let now = self.now(env)?;
                 let event = response
                     .fill(|buf| {
-                        Ok::<_, ()>(self.endpoint.as_mut().expect("standalone endpoint").handle(
-                            now,
-                            *datagram.meta(),
-                            None,
-                            None,
-                            BytesMut::from(datagram.payload()),
-                            buf,
-                        ))
+                        Ok::<_, ()>(
+                            self.endpoint
+                                .as_mut()
+                                .expect("standalone endpoint")
+                                .handle_buffer(now, *datagram.meta(), None, None, input, buf),
+                        )
                     })
                     .expect("endpoint response fits a UDP payload");
                 let transmit = match event {

@@ -342,3 +342,55 @@ fn closing_the_socket_cancels_pending_application_datagram_completions() {
     assert!(matches!(lab.listener.take_event(), Some(MuxEvent::Closed(closed)) if closed == id));
     assert!(lab.listener.is_terminal());
 }
+
+#[test]
+fn unpaid_wire_input_is_dropped_before_listener_routing() {
+    let mut lab = Lab::new(1);
+    let mut observe = Observations::new(0);
+    let mut env = Env::new(
+        Instant::ZERO,
+        lab.entropy.as_ref(),
+        &lab.budget,
+        &mut observe,
+    );
+    let remote = "127.0.0.1:4444".parse().unwrap();
+    assert!(matches!(
+        lab.listener
+            .on_event(
+                &mut env,
+                DatagramEvent::Datagram(Datagram::new(Chunk::default(), remote))
+            )
+            .unwrap(),
+        Admit::Taken
+    ));
+    let Some(DatagramCommand::Send(initial)) = lab.client.take_command(&mut env) else {
+        panic!("client Initial");
+    };
+    let (payload, _) = initial.into_parts();
+    let held = lab
+        .budget
+        .charge(lab.budget.limit() - lab.budget.used())
+        .unwrap();
+    assert!(matches!(
+        lab.listener
+            .on_event(
+                &mut env,
+                DatagramEvent::Datagram(Datagram::new(payload.clone(), remote))
+            )
+            .unwrap(),
+        Admit::Taken
+    ));
+    assert_eq!(lab.listener.sessions.len(), 0);
+    assert_eq!(lab.budget.used(), lab.budget.limit());
+    drop(held);
+    assert!(matches!(
+        lab.listener
+            .on_event(
+                &mut env,
+                DatagramEvent::Datagram(Datagram::new(payload, remote))
+            )
+            .unwrap(),
+        Admit::Taken
+    ));
+    assert_eq!(lab.listener.sessions.len(), 1);
+}

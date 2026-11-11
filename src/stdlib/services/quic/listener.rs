@@ -230,15 +230,23 @@ impl Layer for Listener {
                     return Ok(Admit::Blocked(DatagramEvent::Datagram(datagram)));
                 };
                 response.clear();
+                let Some(input) =
+                    quinn_proto::PacketBuffer::copy_from(env.budget(), datagram.payload())
+                else {
+                    self.wire = Some(response);
+                    // Unreliable input can be dropped before packet processing. Do not
+                    // block the shared carrier on storage held by unread streams.
+                    return Ok(Admit::Taken);
+                };
                 let now = self.now(env)?;
                 let event = response
                     .fill(|buf| {
-                        Ok::<_, ()>(self.endpoint.as_mut().unwrap().handle(
+                        Ok::<_, ()>(self.endpoint.as_mut().unwrap().handle_buffer(
                             now,
                             *datagram.meta(),
                             None,
                             None,
-                            BytesMut::from(datagram.payload()),
+                            input,
                             buf,
                         ))
                     })
