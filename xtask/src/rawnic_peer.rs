@@ -481,7 +481,7 @@ fn segment6(port: u16, seq: u32, ack: u32, flags: u8, options: &[u8]) -> Vec<u8>
     let checksum = ip::transport_checksum(CLIENT6.into(), ADDRESS6.into(), 6, &segment);
     segment[16..18].copy_from_slice(&checksum.to_be_bytes());
     let packet = ip::packet(CLIENT6.into(), ADDRESS6.into(), 6, &segment);
-    frame::frame(HONEYPOT_MAC, GATEWAY_MAC, frame::IPV6, &packet.0)
+    frame::frame(HONEYPOT_MAC, GATEWAY_MAC, frame::IPV6, &packet)
 }
 
 /// The TCP segment in `bytes`, checked to come from the honeypot's IPv6

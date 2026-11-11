@@ -119,7 +119,7 @@ async fn relay_packets(
             ready = socket.writable(), if pending.is_some() => {
                 let mut guard = ready?;
                 let packet = pending.as_ref().expect("pending packet enables this branch");
-                if let Ok(result) = guard.try_io(|fd| unix::send_parts(fd.get_ref().as_raw_fd(), &[&[relay::PACKET], &packet.0], true)) {
+                if let Ok(result) = guard.try_io(|fd| unix::send_parts(fd.get_ref().as_raw_fd(), &[&[relay::PACKET], &packet[..]], true)) {
                     result?;
                     pending = None;
                 }
@@ -129,7 +129,7 @@ async fn relay_packets(
                 let Message::Packet(packet) = relay::decode(&bytes[..len])? else {
                     return Err(fictionet::Error::msg("unexpected world relay message"));
                 };
-                end.send(fictionet::Packet(packet.to_vec()));
+                end.send(fictionet::Packet::new(packet.to_vec()));
             }
         }
     }
@@ -181,13 +181,13 @@ async fn read_dhcp(
 ) -> fictionet::Result<dhcp::Message> {
     loop {
         let packet = end.recv(fcx).await?;
-        let Some(header) = ip::Header::parse_whole(&packet.0) else {
+        let Some(header) = ip::Header::parse_whole(&packet) else {
             continue;
         };
         if header.protocol != ip::protocol::UDP {
             continue;
         }
-        let Some(datagram) = udp::Datagram::parse(header.payload(&packet.0)) else {
+        let Some(datagram) = udp::Datagram::parse(header.payload(&packet)) else {
             continue;
         };
         if datagram.source_port() != dhcp::SERVER_PORT

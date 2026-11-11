@@ -179,7 +179,7 @@ fn mapped_http(peer: &mut Peer) -> Result {
             HONEYPOT_MAC,
             CLIENT_MAC,
             frame::IPV4,
-            &packet.0,
+            &packet,
         ))
     };
     send(peer, 5000, 0, 2, capable(Keys::Absent), 0, &[])?;
@@ -345,16 +345,16 @@ fn oversized_ping(peer: &mut Peer) -> Result {
     let checksum = ip::checksum(&echo);
     echo[2..4].copy_from_slice(&checksum.to_be_bytes());
     for (index, chunk) in echo.chunks(1024).enumerate() {
-        let mut packet = ip::packet("192.0.2.1".parse()?, "192.0.2.2".parse()?, 1, chunk);
-        packet.0[4..6].copy_from_slice(&0x4321u16.to_be_bytes());
+        let mut packet = ip::packet("192.0.2.1".parse()?, "192.0.2.2".parse()?, 1, chunk).into_vec();
+        packet[4..6].copy_from_slice(&0x4321u16.to_be_bytes());
         let fragment = (index as u16 * 128) | if index < 3 { 0x2000 } else { 0 };
-        packet.0[6..8].copy_from_slice(&fragment.to_be_bytes());
-        ip::set_header_checksum(&mut packet.0[..20]);
+        packet[6..8].copy_from_slice(&fragment.to_be_bytes());
+        ip::set_header_checksum(&mut packet[..20]);
         peer.send(&frame::frame(
             HONEYPOT_MAC,
             CLIENT_MAC,
             frame::IPV4,
-            &packet.0,
+            &packet,
         ))?;
     }
     Ok(())
