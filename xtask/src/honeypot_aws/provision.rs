@@ -52,6 +52,15 @@ impl FirstBoot {
                 mode: 0o644,
                 content: "net.ipv4.ip_forward = 0\n".into(),
             },
+            // The management SSH port is open to every address, so the
+            // launch's key is the only way in. Sorts before Amazon Linux's
+            // own drop-ins, and sshd keeps the first value it reads.
+            File {
+                path: "/etc/ssh/sshd_config.d/10-honeypot-keys-only.conf",
+                mode: 0o600,
+                content: "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n"
+                    .into(),
+            },
         ]
     }
 
@@ -72,6 +81,7 @@ impl FirstBoot {
             command(&["sysctl", "--system"]),
             command(&["udevadm", "control", "--reload"]),
             command(&["networkctl", "reload"]),
+            command(&["systemctl", "reload", "sshd"]),
         ]
     }
 
