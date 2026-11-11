@@ -1,9 +1,31 @@
 # Honeypot
 
+One executable serves a Fictionet Linux host, collects MPTCP and IPv4-option
+observations, terminates encrypted SSH sessions, and observes literal TCP and
+UDP port zero. Client input never becomes a host command. SSH shows a simulated
+prompt and disconnects before executing the first nonempty command; exec and
+subsystem requests also disconnect.
+
+## Packet path
+
+The world runs behind `start_raw`, which takes whole Ethernet frames from a
+`fictionet_host::raw::RawAttachment`. A network card's driver holds the other
+side. This build has no driver yet: `honeypot run` checks its options, then
+refuses to start before it opens its state directory. `--help` says so.
+
+The Ethernet host in `start_raw` handles ARP, IPv6 discovery and duplicate
+address detection. IPv6 gateway discovery uses router advertisements when
+`--gateway-v6` is absent. Replies use the configured or learned gateway; they
+are dropped while it is unresolved. Untagged IP reaches the simulated host;
+VLAN, malformed and unknown-EtherType frames stay in the original Ethernet
+capture. The adapter supports a 1500-byte IP MTU and does not fragment larger
+replies. The attachment's queues hold at most 64 frames per direction and
+count the frames a full queue discards; device-level loss is unknown.
+
 ## Northbank deployment services
 
 The same executable can serve a small company's deployment network. SSH's
-application and authentication behavior are unchanged. Enable the new services
+application and authentication behavior are unchanged. Enable the services
 with `--mcp 8081 --a2a 8082 --fleet 8083`. These entry ports share application
 state with the private hosts:
 
@@ -15,11 +37,10 @@ state with the private hosts:
 
 Each enabled host serves HTTP on 80 and HTTPS on 443 with a world-issued
 Northbank internal certificate. The primary honeypot address serves authoritative
-DNS on UDP and TCP 53. Only enabled applications have DNS records. The existing
-primary HTTP page stays unchanged. Company addresses are also reachable through
-the raw backend: separate simulated Ethernet hosts answer their own ARP requests.
-The private address range must be routed to the sensor by the attached client.
-The two-VM test installs only an on-link private route in the attacker guest.
+DNS on UDP and TCP 53. Only enabled applications have DNS records. The primary
+HTTP page stays unchanged. On the Ethernet link, separate simulated hosts
+answer ARP for the company addresses. The private address range must be routed
+to the sensor by the client.
 
 MCP initialization requires the client's routed model identifier and client
 name/version, refuses the first attempt, and rejects placeholder and retired
@@ -44,14 +65,14 @@ shape and a three-part signed-token shape. Later credential submissions record
 whether the value arrived whole, masked or otherwise changed. A retry holds
 its response for 150 seconds; the log stream sends progress every 45 seconds;
 four host checks each take two seconds. Their request intervals and socket
-outcomes provide timing and concurrency evidence. A successful HTTP connection
-alone is not evidence that the agent completed these gates.
+outcomes show timing and concurrency. A successful HTTP connection alone does
+not show that the agent completed these gates.
 
-Every gate goes through `Observation::Trap` and the existing bounded evidence
-writer. Records retain declarations, accepted/refused prose, request bodies,
+Every gate goes through `Observation::Trap` and the bounded evidence writer.
+Records retain declarations, accepted/refused prose, request bodies,
 credential submissions, request connection identifiers and ordinals, HTTP
-versions, probe outcomes and payout events. Application inputs are untrusted
-evidence; the server never executes them.
+versions, probe outcomes and payout events. Application inputs are untrusted;
+the server never executes them.
 
 `Observation::Network` adds both-direction TCP sequence/acknowledgment numbers,
 flags, advertised windows and payload lengths (including pure ACKs), DNS
@@ -69,167 +90,26 @@ harness probe rules. Synthetic scripted-client prose checks plumbing, not
 fingerprinting accuracy. Use separate labeled agent traces for enrollment and
 evaluation; no paper accuracy claim carries over automatically.
 
-From the SDK worktree, build and run privately with the machine limits:
-
-```sh
-export CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-shibboleth
-export CARGO_BUILD_JOBS=2
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=8G -p MemorySwapMax=0 cargo run -p honeypot-world --bin honeypot -- run --backend world --world unix:/tmp/northbank.sock --state-dir /tmp/northbank-evidence --ssh 22 --http 80 --mcp 8081 --a2a 8082 --fleet 8083
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=8G -p MemorySwapMax=0 cargo test -p honeypot-world
-systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=8G -p MemorySwapMax=0 cargo xtask-host honeypot-vm
-```
-
-Local validation completed with 44 honeypot tests and Clippy with warnings denied.
-The isolated two-VM run completed three MCP and four A2A writing sections,
-refused short/repeated submissions and masked credentials, resolved and reached
-a private host over HTTP and HTTPS, and observed concurrent host checks. The
-kernel client's measured hold and stream durations were 150.14 and 150.15
-seconds. The evidence writer drained 1,317 events with no drops or write errors.
-A real agent harness was not run: the minimal attacker guest has neither an
-installed harness nor model-provider egress. These results validate protocols
-and recording, not resistance to honeypot detection or attribution accuracy.
-
-The world socket is a Unix socket, not a host TCP listener. The VM test connects
-two guests through an AF_UNIX QEMU link with no internet route. No public
-deployment is part of these commands.
-
-One executable serves a Fictionet Linux host, collects MPTCP and IPv4-option
-observations, terminates encrypted SSH sessions, and observes literal TCP and
-UDP port zero. Client input never becomes a host command. SSH shows a simulated
-prompt and disconnects before executing the first nonempty command; exec and
-subsystem requests also disconnect.
-
-This milestone unifies world sockets, direct TUN attachment, and the existing
-QEMU VFIO virtio-net path. XDP, AF_XDP and direct ENA ownership are unavailable
-and are rejected explicitly. TUN and VFIO need prepared guests. Opening a backend
-establishes local readiness, not public reachability or preservation of probes
-by upstream filtering and NAT.
-
-## Build and configuration
-
-The default Linux build includes world, TUN and VFIO virtio-net:
+## Build and options
 
 ```sh
 cargo build --release -p honeypot-world --bin honeypot
 ```
 
-Copy the release executable to the prepared VM. It needs no Rust toolchain,
-`fictionet` CLI or helper process there. Dynamic system library dependencies
-still follow the chosen build target. `--version` lists compiled backends.
-Build with `--no-default-features` for a world/TUN executable without VFIO.
-Never run VFIO, XDP or AF_XDP binaries or change network settings on the
-project development host. Device validation belongs in disposable guests.
+The executable needs no Rust toolchain, `fictionet` CLI or helper process
+where it runs. Dynamic system library dependencies still follow the chosen
+build target. `--version` prints the build version.
 
-The primary command is `honeypot run`. `--help` lists options. One protected
-`--state-dir` owns a persistent sensor identity, a private Ed25519 SSH host key,
-a process lock and separate evidence files for each run. It is created with
-mode 0700. An existing state directory must have the same owner and exclude
-access by other users. Key and evidence files use mode 0600. A second process
-cannot use the same state directory concurrently. Keep this directory across
-restarts to preserve the SSH host key. A damaged key is rejected rather than
-silently replaced.
-
-All command settings also work in a JSON configuration file. Keys are option
-names without `--`; repeated service and internet-prefix settings use arrays.
-CLI settings replace the corresponding file settings. Unknown options and
-mixed backend options fail before opening devices. For example:
-
-```json
-{
-  "backend": "tun",
-  "tun": "hp0",
-  "tun-mode": "existing",
-  "address": "203.0.113.10",
-  "state-dir": "/var/lib/honeypot",
-  "metrics": "127.0.0.1:9108"
-}
-```
-
-```sh
-honeypot run --config sensor.json --dry-run
-```
-
-Dry run prints resolved settings and prerequisites as JSON. It does not create
-state, open a device, bind listeners, or change networking. It does not certify
-that the prerequisites are satisfied. Configured passwords and the host key
-are excluded from this output.
-
-## Packet backends
-
-For development, attach clients to the world socket:
-
-```sh
-honeypot run --backend world --world unix:/tmp/honeypot.sock \
-  --address 203.0.113.10 --state-dir /tmp/honeypot-state
-```
-
-Clients use the existing Fictionet attachment protocol. A prepared connector
-can speak SSH without any host network changes:
-
-```sh
-ssh -o 'ProxyCommand=xtask ssh-connect /tmp/honeypot.sock %h %p' ubuntu@203.0.113.10
-```
-
-For TUN, run the following only in a prepared guest:
-
-```sh
-honeypot run --backend tun --tun hp0 --tun-mode existing \
-  --address 203.0.113.10 --state-dir /var/lib/honeypot
-```
-
-Existing mode requires a persistent TUN in the current network namespace,
-already up, with MTU 1500, a single queue, and no packet-info or virtio headers.
-The process needs ownership or the applicable privileges to attach it, access
-to `/dev/net/tun`, and sysfs for validating its format. The device remains
-externally owned. Its addresses, routes, persistence, link state and DNS are
-not changed. Existing nonpersistent devices are deliberately unsupported in
-this first integration. Provision the device for an unprivileged owner when
-possible; the executable does not automatically drop privileges.
-
-`--tun-mode create` refuses an occupied name, creates a nonpersistent TUN with
-MTU 1500, and brings only that interface up. Before link-up it sets that device's
-IPv6 `addr_gen_mode=1`, `autoconf=0`, and `accept_ra=0`. These suppress kernel
-link-local address generation, address autoconfiguration and router
-solicitations on the decoy path; IPv6 packet handling and forwarding settings
-remain intact. The values follow the [Linux IP sysctl documentation](https://docs.kernel.org/networking/ip-sysctl.html).
-Existing mode leaves these settings unchanged. Closing the ephemeral device's
-last descriptor removes it, including after a failed startup. Creation requires
-`CAP_NET_ADMIN` and write access to the three files under
-`/proc/sys/net/ipv6/conf/NAME/`. Missing or read-only sysctls fail creation.
-
-Both TUN modes leave routes and forwarding to guest provisioning. The intended
-path is guest NIC → guest kernel forwarding → TUN → Fictionet, with the return
-path reversed. Route the decoy destination behind the TUN. Assigning it as a
-normal local kernel address can consume traffic before Fictionet receives it.
-Never replace the management default route. IPv6 and cloud public-to-private
-address mappings need equivalent deliberate provisioning. Use the address
-actually delivered inside the guest. TUN capture occurs after guest kernel
-processing; it does not claim to preserve every malformed packet or IP option.
-
-For direct device ownership, run only in a prepared QEMU guest:
-
-```sh
-honeypot run --backend vfio --device 0000:00:03.0 \
-  --address 203.0.113.10 --gateway 203.0.113.1 \
-  --address-v6 2001:db8:113::10 --gateway-v6 fe80::1 \
-  --state-dir /var/lib/honeypot
-```
-
-The existing [VFIO guest prerequisites](../../host/README.md) apply: x86-64,
-modern virtio-net, a real IOMMU, a suitable VFIO group, QEMU DMI and the explicit
-`fictionet.rawnic=1` guest boot token. Bind the dedicated data device to
-`vfio-pci` during provisioning. The executable never unbinds a kernel NIC or
-sets host routes. Keep a separate management interface. ENA and Cloud
-Hypervisor are not qualified by this path.
-
-The shared Ethernet host handles ARP, IPv6 discovery and duplicate address
-detection. IPv6 gateway discovery uses router advertisements when
-`--gateway-v6` is absent. Replies use the configured or learned gateway; they
-are dropped while it is unresolved. Untagged IP reaches the simulated host;
-VLAN, malformed and unknown-EtherType frames remain in original Ethernet
-capture. The adapter supports a 1500-byte IP MTU and does not fragment larger
-replies. Raw pump queues hold at most 64 frames per direction; device-level
-loss remains unknown.
+The primary command is `honeypot run`, configured on the command line only.
+`--help` lists options; unknown options fail. `--address`, `--address-v6`,
+`--gateway` and `--gateway-v6` set the server's addresses and the link's
+gateways. One protected `--state-dir` owns a persistent sensor identity, a
+private Ed25519 SSH host key, a process lock and separate evidence files for
+each run. It is created with mode 0700. An existing state directory must have
+the same owner and exclude access by other users. Key and evidence files use
+mode 0600. A second process cannot use the same state directory concurrently.
+Keep this directory across restarts to preserve the SSH host key. A damaged
+key is rejected rather than silently replaced.
 
 ## Observations and service behavior
 
@@ -252,8 +132,8 @@ a simulated prompt and first-command disconnect. The default accepts supplied
 passwords and correctly signed public keys; `none` is refused. `--ssh-auth
 reject` rejects credentials, and `password:VALUE` requires that password or a
 correctly signed public key. An actual authenticated transition is distinct
-from policy acceptance or an unsigned public-key probe. Successful simulated
-login is not evidence of an authentication bypass. This is the Ubuntu collector,
+from policy acceptance or an unsigned public-key probe. A successful simulated
+login does not show an authentication bypass. This is the Ubuntu collector,
 not an advisory-specific musl persona or classifier.
 
 Port-zero observations cover TCP and UDP, IPv4 and IPv6, and zero in source,
@@ -264,9 +144,15 @@ derived. Source-zero probes to a listener differ from probes to closed port
 zero, and a zero UDP source field alone does not prove malicious intent.
 
 The persona targets Ubuntu 24.04/Linux 6.8; exact closed-port behavior and cloud
-probe preservation still need matching guest and remote qualification. The
-listener implementation and algorithm set are a subset of OpenSSH, not an
-assertion of indistinguishability.
+probe preservation still need matching remote qualification. The listener
+implementation and algorithm set are a subset of OpenSSH, not an assertion of
+indistinguishability.
+
+`Honeypot::program` runs trusted application code on the server machine. It
+receives the server's TCP and UDP endpoints; `tcp.connect` and a bound UDP
+socket's `send_to` start traffic through the same `internet` attachment used
+for incoming traffic and replies, and on the Ethernet link through the same
+gateway. SSH input never starts traffic, and the executable runs no program.
 
 ## Evidence and metrics
 
@@ -274,15 +160,14 @@ Files are named by stream, run and rotation index. `events-*.jsonl` contains
 versioned JSON objects with sensor/run identity, monotonic event sequence,
 writer timing, backend, persona, and the nested observation. The original
 observation timestamp remains in the nested record. IP observations and IP
-capture timestamps currently come from world processing.
-Original Ethernet ingress additionally carries the raw backend receipt wall time
-and uses it for capture; that is a software receipt timestamp, not hardware time.
-`ip-*.pcapng` contains the IP boundary; VFIO additionally writes
-`ethernet-*.pcapng` with original frames and Ethernet link type. The VFIO IP
-view is derived. Capture references include file, section, interface and byte
-offset where a persisted record can be correlated. Missing references stay
-unavailable; derived fragment observations do not claim one original packet.
-Linking every contributing fragment remains future work.
+capture timestamps come from world processing. Original Ethernet ingress
+additionally carries the attachment's receipt wall time and uses it for
+capture; that is a software receipt timestamp, not hardware time.
+`ethernet-*.pcapng` holds the original frames with the Ethernet link type, and
+`ip-*.pcapng` the IP packets derived from them. Capture references include
+file, section, interface and byte offset where a persisted record can be
+correlated. Missing references stay unavailable; derived fragment observations
+do not claim one original packet.
 
 Default SSH analytics retain methods, outcomes and byte lengths while removing
 passwords and exact decrypted command/input/output bytes. Packet capture still
@@ -295,137 +180,47 @@ original encrypted network packet.
 Evidence admission is bounded by record count and bytes. A worker performs file
 writes and envelopes outside the world; admission does not wait for disk.
 Observation-to-JSON serialization still occurs in the world before admission.
-Overflow and storage
-failure increment separate event/capture loss and write-failure counters. A
-small independent queue reserves lifecycle capacity. Rotation defaults to
-64 MiB or one hour, with 32 files retained **per stream** across runs. Change
-`--rotate-bytes`, `--retain-files`, `--queue-bytes` and `--max-record-bytes` to
-bound the intended budget. Retention runs at startup and rotation. Queued does not mean written,
-and written does not mean synchronized. The worker aims to synchronize once a
-second when scheduled and storage responds; a stalled filesystem can exceed
-that interval.
+Overflow and storage failure increment separate event/capture loss and
+write-failure counters. A small independent queue reserves lifecycle capacity.
+Rotation defaults to 64 MiB or one hour, with 32 files retained **per stream**
+across runs. Change `--rotate-bytes`, `--retain-files`, `--queue-bytes` and
+`--max-record-bytes` to bound the intended budget. Retention runs at startup
+and rotation. Queued does not mean written, and written does not mean
+synchronized. The worker aims to synchronize once a second when scheduled and
+storage responds; a stalled filesystem can exceed that interval.
 
-SIGINT/SIGTERM cancel the world, close the backend and request a five-second
-writer drain. A stalled worker causes a shutdown error after that deadline.
-Abrupt exits can leave incomplete final records; restart preserves those files
-and starts new ones instead of appending into damaged tails. No automatic
-repair of old files is attempted.
+SIGINT/SIGTERM cancel the world and request a five-second writer drain. A
+stalled worker causes a shutdown error after that deadline. Abrupt exits can
+leave incomplete final records; restart preserves those files and starts new
+ones instead of appending into damaged tails. No automatic repair of old files
+is attempted.
 
-Enable a real management HTTP listener explicitly:
-
-```sh
-honeypot run --config sensor.json --metrics 127.0.0.1:9108
-```
-
-Prometheus scrapes `/metrics`; Grafana can display it. JSONL can be shipped by
-an external agent to Loki or another analytics store. No log shipper is required
-for local collection. Metrics have bounded labels and remain readable during
+`--metrics 127.0.0.1:9108` enables a management HTTP listener. Prometheus
+scrapes `/metrics`. Metrics have bounded labels and remain readable during
 writer failure. They include queue occupancy, capture/event loss, write and sync
 failures, last persistence, port-zero observations and SSH authentication
 completions, MPTCP signals, and backend readiness. These observation counters
-describe records processed by the
-writer, not lossless ingress totals. Written event totals include Ethernet
-sidecars generated after queue admission. Software queue loss never substitutes
-for unknown NIC loss.
+describe records processed by the writer, not lossless ingress totals. Written
+event totals include Ethernet sidecars generated after queue admission.
+Software queue loss never substitutes for unknown NIC loss.
 
 Observer maps each have a hard limit of 4096 entries and emit capacity loss
 records. Established service connections share a 256-connection guard.
-Reassembly and preauthentication also retain their existing limits. These
-limits are the first operating bounds, not a completed CPU/memory qualification
-under Internet floods. QEMU validation covers TUN lifecycle and VFIO teardown;
-cloud reachability, driver coverage, and sustained load still need deployment
-qualification.
+Reassembly and preauthentication also retain their limits. These limits are
+the first operating bounds, not a completed CPU/memory qualification under
+Internet floods.
 
-## Validation and next work
+## Tests
 
-Use Cargo tests, benches, clippy, rustfmt and documentation checks. Host-safe
-world checks use a build with `--no-default-features`; all device execution
-and network-changing tests run only inside disposable guests:
+The tests run in process, with no device and no host networking:
 
 ```sh
-cargo test -p honeypot-world --no-default-features
-cargo xtask-host rawnic /tmp/honeypot-qemu
+systemd-run --user --scope -q --slice=fictionet-work.slice -p MemoryMax=8G -p MemorySwapMax=0 cargo test -p honeypot-world
 ```
 
-The existing `cargo xtask-host rawnic` harness packages and exercises the unified executable
-in QEMU, including original Ethernet capture and graceful shutdown. Guest
-checks cover ephemeral and persistent TUN ownership and bidirectional IP traffic
-without adding routes. The harness also retains the in-memory and driver-level protocol checks.
-
-To exercise the deployed executable against a real Linux kernel client in a
-second VM, use an empty artifact directory:
-
-```sh
-systemd-run --user --scope -q --slice=fictionet-work.slice \
-  -p MemoryMax=10G -p MemorySwapMax=0 \
-  env CARGO_TARGET_DIR=/home/souvik/Projects/amlalabs/.fictionet-comp-work/target-honeypot-vm \
-  cargo xtask-host honeypot-vm \
-  /home/souvik/Projects/amlalabs/.fictionet-comp-work/honeypot-vm-run
-```
-
-The task builds the executables and two initramfs images, then boots two QEMU
-guests with 2 GiB each. The sensor runs the actual
-`honeypot run --backend vfio --device 0000:00:03.0` executable. The attacker
-uses an `IPPROTO_MPTCP` socket to fetch the complete HTTP page, OpenSSH over
-ordinary TCP to authenticate with a fresh Ed25519 key and send its first command,
-and an ordinary kernel TCP connect to literal destination port zero. No packet
-fixtures implement those connections. The first SSH command is observed and
-disconnected without execution. MP_JOIN is outside this task's coverage.
-
-The only data connection is QEMU's Unix stream netdev between the two virtual
-cards. There is no slirp, TAP, bridge, host interface, management NIC, external
-route or public deployment. Each guest checks its network devices and routes,
-and requires external IPv4 and IPv6 TCP attempts to fail with `ENETUNREACH`.
-Only guest init loads modules, binds the VFIO device, or sets the attacker's
-interface address. The host only reads its kernel/module files and runs QEMU.
-All subprocesses inherit the command's memory scope. This task runs no full
-test suite and requires the existing raw NIC prerequisites, an MPTCP-enabled
-guest kernel, 9p modules, and host `ssh` and `ssh-keygen` binaries for packaging.
-
-Separate 9p shares export the sensor's actual `events-*.jsonl`, original
-`ethernet-*.pcapng`, derived `ip-*.pcapng`, and shutdown log under `sensor/`;
-the attacker's HTTP response, kernel MPTCP report and SSH log are under
-`attacker/`. Both directories contain `isolation.json`; QEMU commands and serial
-logs are at the artifact root. Keep the artifact directory private: it also
-contains the sensor's persistent identity and SSH host key.
-
-Success requires both guest exit devices to report success and a semantic check
-of the exported evidence. The checker correlates the client's kernel MPTCP
-token with the captured client key, validates the SYN, SYN-ACK and third ACK
-sequence numbers and both keys against JSON observations, checks DSS-bearing
-HTTP data against the bytes received by the kernel, resolves capture references,
-checks plain TCP SSH and its authenticated session, and matches the port-zero
-SYN and reset. Evidence admission, writing, synchronization and raw queue loss
-counters must remain zero; the final writer queue must drain. This validates
-the local two-guest path, not cloud filtering, Internet reachability, load
-capacity, or the unfinished XDP/AF_XDP backend.
-
-AF_XDP needs its own embedded redirector, correct queue coverage, bounded
-copy-mode transport, ownership and crash guards, and qualification on the
-actual guest NIC/driver/kernel combination. Native/generic and copy/zero-copy
-are separate capabilities. No current startup message claims those capabilities,
-a direct ENA driver, or a validated advisory-specific SSH classifier.
-
-## Initiated traffic spike
-
-An embedding application can call `Honeypot::program` with a Fictionet
-`Program`. It receives the existing server machine's TCP and UDP endpoints;
-`machine.tcp.connect` and a bound UDP socket's `send_to` initiate traffic
-through the same `internet` attachment used for incoming traffic and replies.
-The backend's routes and, for Ethernet, gateway resolution still apply. This
-hook runs trusted application code; SSH input is never used to initiate traffic.
-The deployed CLI does not start an outbound program.
-
-`cargo xtask-host egress /path/to/guest-artifacts` builds and boots a disposable QEMU
-guest. It checks IPv4 TCP and UDP request/response exchanges through the
-in-process world attachment, TUN with a guest Linux peer, and two VFIO
-virtio-net devices connected by an internal QEMU hub. All peers run inside the
-guest. There is no host networking backend or external network connection.
-The guest verifies randomized payload responses, capture directions and
-checksums, and that the existing incoming HTTP service still works. Its result
-reaches the harness through QEMU's exit device, independently of printed text.
-
-Run this task only where QEMU and the existing raw NIC guest prerequisites are
-available. Choose an artifact directory outside temporary storage. This spike
-does not qualify the Unix world socket transport, IPv6, performance, cloud NICs,
-or the planned XDP/AF_XDP backend.
+| Test | What it checks |
+| --- | --- |
+| `tests/port_zero.rs` | Sixteen probes, eleven with a literal zero port: the resets, the source-zero handshake and close, UDP delivery with the source kept, port unreachable quoting the probe, and one `port_zero` observation per zero-port probe pointing at its captured packet |
+| `tests/initiated.rs` | TCP and UDP exchanges started through `Honeypot::program` between two honeypots, then inbound HTTP on the same attachment, and the capture of both directions |
+| `tests/ethernet.rs` | The same probes and exchanges through `start_raw`, over two in-memory raw attachments joined by a task that copies frames: ARP and gateway resolution, the frame log, and the queue counters |
+| `tests/traps.rs` | The MCP, A2A and fleet gates, and the 150-second retry hold |

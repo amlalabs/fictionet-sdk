@@ -620,9 +620,8 @@ fn http_door_connects_and_forwards() {
     );
 }
 
-/// A service at TCP port 0 is reachable from a TUN sandbox and through
-/// `ssh-connect`; a sandbox behind the HTTP door must reach it too, by
-/// CONNECT and by absolute URI.
+/// A service at TCP port 0 is reachable from a TUN sandbox; a sandbox
+/// behind the HTTP door must reach it too, by CONNECT and by absolute URI.
 #[test]
 fn port_zero_through_the_http_door() {
     let world = World::start();
