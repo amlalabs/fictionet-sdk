@@ -1098,6 +1098,14 @@ impl ClientSessionValue {
             .and_then(|resuming| {
                 resuming.compatible_config(&config.verifier, &config.client_auth_cert_resolver)
             })
+            // A QUIC ticket only resumes a connection of its own version.
+            .filter(|resuming| match resuming {
+                Self::Tls13(ticket) => {
+                    ticket.quic_version() == cx.common.is_quic().then_some(cx.common.quic.version)
+                }
+                #[cfg(feature = "tls12")]
+                Self::Tls12(_) => true,
+            })
             .and_then(|resuming| {
                 let now = config
                     .current_time()

@@ -440,12 +440,14 @@ fn resources(paths: &Paths) -> Result<lean_vectors::Report> {
         &paths.out.join("fictionet"),
         "fictionet",
         &KANI_FICTIONET,
+        "14G",
     )?);
     report.absorb(resources::kani(
         &paths.root,
         &paths.out.join("smoltcp"),
         "smoltcp",
         &KANI_SMOLTCP,
+        "14G",
     )?);
     report.absorb(resources::tlc(
         &paths.root,

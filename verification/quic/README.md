@@ -14,11 +14,13 @@ socket, tested with several independent quiche connections at once. See
 Wire input now retains reservations through packet and frame ownership;
 see [Reserved reassembly storage](#reserved-reassembly-storage) for the latest
 resource evidence and the acknowledgment admission fix. Application send
-descriptors now also reserve storage before consuming writes. The latest
+descriptors now also reserve storage before consuming writes. Later
 sections cover that reservation, corrected BBR sampling and startup growth,
-and independent HTTP/3 transfers over a lossy world network. Earlier sections
-record the state at each step. Whole-engine budgeting, version two, the
-complete standard test matrix and unresolved proofs remain incomplete.
+and independent HTTP/3 transfers over a lossy world network. QUIC version
+two and version negotiation are implemented; see
+[QUIC version two](#quic-version-two). Earlier sections record the state at
+each step. Remaining priorities are whole-engine budgeting, proofs of the
+version-two code, the complete standard test matrix and unresolved proofs.
 
 The intended boundary is a layer over the world's datagram carrier, with
 typed multiplexed streams and application datagrams above it. The engine
@@ -1525,3 +1527,788 @@ changes. This is why the quiche suite has its own crate. The full receive
 compiler failure and solver timeouts above remain open despite these test
 results. No rustls source changed, and all Cargo, Kani and TLC commands used
 the required memory-limited scope and external target directory.
+
+## QUIC version two
+
+The engine now runs [RFC 9369](https://www.rfc-editor.org/rfc/rfc9369.html)
+and the compatible and incompatible negotiation of
+[RFC 9368](https://www.rfc-editor.org/rfc/rfc9368.html). This section
+describes the implementation and its tests. The sections after it give its
+correctness proofs, its resource proofs and its interoperability runs
+against ngtcp2.
+
+`quinn-proto/src/version.rs` names versions 1 (`0x00000001`) and 2
+(`0x6b3343cf`), the drafts the engine already ran, and which versions are
+compatible: 1 and 2 in both directions, every version with itself. Lists of
+versions are `VersionList`, an inline set of known versions, so a peer's
+list is reduced to the versions the engine knows without allocating.
+
+Long header type bits follow the packet's version: `LongHeaderType::from_byte`
+and `to_byte` in `packet.rs` map version 2's Initial 1, 0-RTT 2, Handshake
+3 and Retry 0. The rustls adapter maps `0x6b3343cf` to the fork's version 2
+key schedule, whose Initial salt and `quicv2` labels were already present.
+Retry tags use the version 2 key and nonce in `retry_integrity`, and Retry
+validation takes the Retry packet's own version.
+
+Every connection sends Version Information, which `TransportParameters`
+now keeps as a `VersionInformation`: the Chosen Version, the known
+Available Versions in order, and whether others were listed. The decoder's
+existing checks are unchanged. A server compares the client's Chosen
+Version with the version of the client's first flight; a client compares
+the server's with the negotiated version.
+
+A client's `ClientConfig::version` is its Original Version and
+`preferred_versions` its preference, versions 2 then 1 by default. Its
+first flight offers the preferred versions that the first flight converts
+to and its endpoint accepts. Endpoints accept versions 1 and 2 by default,
+in that order of preference.
+
+A server chooses before its TLS session reads the ClientHello, since its
+own Version Information names the chosen version. It starts in the
+client's version and holds the client's Initial crypto stream back from
+TLS until the offer has arrived, across however many packets carry it.
+`version::first_flight::client_offer` reads the ClientHello, the transport
+parameter extension and Version Information from that stream in place,
+without copying. `select_compatible` takes the first version of the
+server's preference that the first flight converts to and the client
+offered. When the ClientHello arrives without a valid offer, or anything
+is unexpected, the server keeps the client's version, as RFC 9368 allows.
+[The server's choice across packets](#the-servers-choice-across-packets)
+gives the details.
+
+`Connection::switch_server_version` then charges a second key set to the
+connection's budget, derives the negotiated version's Initial keys, and
+starts a TLS session with `set_negotiated_version`. The server keeps the
+original Initial receive keys, paid for by that charge, until a Handshake
+packet in the negotiated version is processed, then drops them and their
+charge. If the budget refuses, the server keeps the original version.
+
+The client accepts Initial packets in the versions it offered until its
+version is settled. `connection/negotiation.rs` decides each long header:
+`Negotiation::admit` returns the current keys, the other version's keys, a
+trial of an offered version, or a drop. A trial charges the offered
+version's Initial keys before deriving them. The client adopts the version
+only after a packet authenticates under those keys, and before its CRYPTO
+data reaches TLS, in `Connection::adopt_tried_version`. CRYPTO data in the
+original version settles the original version. Handshake packets must use
+the negotiated version, 0-RTT stays in the original version, and a client
+follows a Retry only in its original version before settling.
+
+After a Version Negotiation packet, `Negotiation::react` ignores it when it
+lists the Original Version or when the client already reacted once.
+Otherwise the client starts again in its most preferred listed version that
+its endpoint accepts, through `Connection::restart_in_version`. That
+replaces the TLS session and Initial keys and abandons any 0-RTT.
+`Negotiation::check_server` then requires the server's Version Information
+and applies RFC 9368 section 4's downgrade check,
+`version::negotiation_was_genuine`. Servers ignore Version Negotiation.
+
+The rustls fork changed in two separate commits. A QUIC connection can
+switch to a negotiated version until its handshake secrets exist; 0-RTT
+keys keep the original version. Session tickets record the QUIC version of
+the connection that issued or received them. A server resumes only a
+ticket of its connection's version, and a client offers only one of its
+first flight's version. The client constructor now sets the version before
+the ClientHello chooses a ticket, which the first commit missed. Address
+tokens were already bound to versions.
+
+`QuicLayer::version` reports the settled version, and
+`with_address_validation(AddressValidation::Retry)` makes a server layer
+answer unvalidated clients with a Retry. HTTP/3 above the layer needs no
+change; callers offer and accept version 2 through the configurations
+they already pass.
+
+### Tests
+
+The RFC 9369 Appendix A client Initial, server Initial and Retry run
+through the engine's encoder, protection and decoder as known answers in
+`packet/rfc9369_vectors.rs`; changing the version 2 type bits fails all
+four tests. The fork adds the Appendix A.5 key update vector beside its
+existing version 2 key vectors, and a ticket encoding round trip.
+
+Unit tests cover version lists, compatibility, server selection, the
+downgrade check, the first-flight reader on shuffled pieces of the crypto
+stream and the RFC's sample ClientHello, and each negotiation decision. Two engines in
+`tests/version.rs` complete version 2 handshakes, an upgrade from version
+1, a version 2 Retry, a Retry before an upgrade, Version Negotiation into
+version 2, and a refusal without a common version. They check the version
+of every long header on the wire and a stream exchange. A forged Version
+Negotiation packet ends in `VERSION_NEGOTIATION_ERROR`, and one listing the
+Original Version is ignored. A version 1 ticket is not offered to a version
+2 connection, a version 2 ticket gives 0-RTT, and a server refuses a version
+1 ticket presented as version 2.
+
+The `versions` module of `services/quic/tests.rs`, which the
+interoperability crate also includes, runs two `QuicLayer`s on the simulated
+datagram carrier: a version 2 handshake, an upgrade, a client offering only
+version 1, a version 2 Retry, a Retry before an upgrade and Version
+Negotiation into version 2. Each checks the versions on the carrier and a
+stream exchange.
+
+Scratch mutations, all reverted: removing the server's ticket check fails
+the relabelled-ticket test; offering tickets of any version fails the
+ticket offer check; skipping the downgrade check fails the forged Version
+Negotiation test and its unit test; never upgrading fails both upgrade
+layer tests.
+
+All 386 engine library tests, 287 fork library tests, 31 SDK QUIC tests and
+37 tests of the quiche interoperability crate passed at this step. Clippy
+with warnings denied passed for the engine, the fork and the SDK library
+and tests. quiche 0.30 speaks only version 1; independent version 2
+interoperability runs against ngtcp2, in
+[Standard interoperability over version two](#standard-interoperability-over-version-two).
+
+What version two holds and copies, and what each path is charged, is in
+[QUIC version two: resource proofs](#quic-version-two-resource-proofs).
+Tickets taken from the client store in the wrong version are dropped, not
+returned.
+
+### Limits
+
+A server reading the client's offer looks at each buffered piece of the
+crypto stream for every byte, so past 64 pieces (`MAX_OFFER_PIECES`) it
+keeps the client's version. A ticket from an upgraded connection
+belongs to the negotiated version, so a client starting in version 1 does
+not resume it; a client resumes by starting in that version. With the
+default preference for version 1, endpoints that both prefer version 2 must
+say so. The server's Available Versions are its known accepted versions.
+
+### Proof targets
+
+Version rules: `version::compatible`, `select_compatible`,
+`negotiation_was_genuine`, `VersionList::{new, known, push,
+compatible_with, first_offered}` and `TypeBits::of`.
+
+Packet types: `LongHeaderType::from_byte` and `to_byte` in `packet.rs`, a
+bijection per version, and `ProtectedHeader::decode` and `Header::encode`.
+
+First-flight reading: `version/first_flight.rs`, `client_offer` over the
+`Received` crypto stream and the `Cursor` reads. Bounds, no allocation,
+and agreement with the transport parameter decoder on the offer.
+
+Negotiation decisions in `connection/negotiation.rs`:
+`Negotiation::{client, server, decodable, admit, react, check_server}`,
+for example that Handshake packets are only admitted in the current
+version, 0-RTT only in the original, that a client reacts at most once and
+never to a list with its Original Version, and that `check_server` rejects
+every forged downgrade.
+
+Connection integration in `connection/mod.rs`: `handle_decode`,
+`choose_version`, `switch_server_version`, `prepare_other_initial`,
+`adopt_tried_version`, `restart_in_version`, the
+Retry and Version Negotiation arms of `process_decrypted_packet`, the
+Handshake arm that drops the server's other keys, `read_crypto` settling a
+client, and the 0-RTT header version in `packet_builder.rs`.
+`packet_crypto::{unprotect_header, decrypt_packet_body}` with other keys.
+
+Endpoint: `Endpoint::accept` and `connect`.
+
+Transport parameters: `read_version_information` and the
+`VersionInformation` arm of `TransportParameters::write` and `read_inner`;
+the existing Kani harnesses in `kani/version_information.rs` were adjusted
+to the returned structure only.
+
+Retry integrity: `crypto/rustls.rs` `retry_integrity`, `retry_tag`,
+`is_valid_retry` and `interpret_version`.
+
+Resources: the charge-before-derivation in `prepare_other_initial` and
+`switch_server_version`, the charge against measured allocation, and the
+release of the other keys.
+
+rustls fork: `ConnectionCommon::set_negotiated_version` and the
+`handshake_secrets_derived` flag set in `tls13/key_schedule.rs`,
+`zero_rtt_keys` using `early_version`, ticket binding in
+`server/tls13.rs` (`get_server_session_value` and the resumption filter),
+`client/hs.rs` (`ClientSessionValue::retrieve`), `client/tls13.rs` and
+the `ServerSessionValue` codec in `msgs/persist.rs`, and
+`ConnectionCore::for_client` setting the version before the ClientHello.
+
+Layer: `QuicLayer::version`, `with_address_validation` and the Retry
+branch of the layer's datagram handling.
+
+## QUIC version two: correctness proofs
+
+These proofs cover the version two code of [QUIC version two](#quic-version-two):
+packet types and protection keys per version, the negotiation decisions,
+and the negotiation as a whole against an attacker on the path. Resource
+bounds are in
+[QUIC version two: resource proofs](#quic-version-two-resource-proofs).
+
+### What the proofs found
+
+The downgrade check judged the wrong version. RFC 9368 section 4 asks
+whether the client would have attempted the same version had the Version
+Negotiation packet listed the server's Available Versions plus the
+Negotiated Version. `negotiation_was_genuine` compared that choice with the
+final negotiated version. When a server upgrades the attempt, as in RFC
+9368's Figure 1, the two differ, and a negotiation with no attacker failed
+with `VERSION_NEGOTIATION_ERROR`. One case: a client starting in a draft
+the server does not run, preferring version 2, restarted in 2 from the
+server's list of 1 and 2. A server preferring 1 then upgraded it to 1.
+The model's `NoFalseRefusal` and the Kani lemma both state the property
+this broke. c589fee32 compares with the attempted version. Its two-engine
+test, `version_negotiation_followed_by_a_compatible_upgrade_completes`,
+failed before the fix and passes after it.
+
+### Kani
+
+The harnesses are compiled into the production modules under `cfg(kani)`
+and call the production functions. Run each with `cargo kani -p
+fictionet-quinn-proto --lib -Z restrict-vtable --harness <name>` under
+the required memory scope.
+
+`kani/version_packets.rs`, in `packet.rs`, has no stubs. The expected type
+bits are the tables of RFC 9000 section 17.2 and RFC 9369 section 3.2.
+
+- `long_header_types_are_each_versions_rfc_bijection`: for every 32-bit
+  version and type, `to_byte` writes the RFC's bits with the form and fixed
+  bits set. `from_byte` reads them back whatever the other bits are, and
+  is one-to-one on the two type bits.
+- `version_one_and_two_never_share_a_type_byte`: no type's byte in one
+  version reads as that type in the other.
+- `decoding_types_a_long_header_by_its_own_version`: for any first byte
+  and version, `ProtectedHeader::decode` types the header by the table of
+  its own version. Version zero is Version Negotiation, and other versions
+  are refused with the version named.
+- `encoded_{initial,zero_rtt,handshake,retry}_headers_decode_in_their_version`:
+  `Header::encode` of each type in version 1 or 2 decodes as that type and
+  version. One symbolic type in a single harness ran past an hour in the
+  solver, so there is one harness per type.
+
+`kani/version_keys.rs`, in `crypto/rustls.rs`, runs the fork's real
+`Suite::keys`, `Keys::initial`, `KeyBuilder` and HKDF-Expand-Label. Only
+the hash and the ciphers are replaced, by a symbolic suite: an extraction
+records its salt and whether its input was the connection ID, and each
+expansion adds its label. Each key so names its own derivation, and the
+harness reads it back through the engine's `PacketKey` and `HeaderKey`.
+The expected salts, labels, keys and nonces are copied from RFC 9001
+sections 5.2 and 5.8 and RFC 9369 section 3.3.
+
+- `initial_keys_use_the_salt_and_labels_of_their_version`: for every
+  32-bit version and both sides, the engine derives Initial keys exactly
+  for the versions it knows. Each packet key, IV and header key comes from
+  that version's salt and the client's Destination Connection ID, through
+  the sending side's `client in` or `server in` secret. It then uses
+  `quicv2 key`, `quicv2 iv` and `quicv2 hp` for version 2 and the
+  `quic` labels otherwise.
+- `retry_integrity_and_type_bits_follow_the_version`: Retry tags use RFC
+  9369's key and nonce exactly for version 2, RFC 9001's for version 1 and
+  drafts 33 and 34, other keys for drafts 29 to 32, and none for unknown
+  versions. The adapter runs version 2's key schedule exactly when the
+  type bits are version 2's.
+- `a_retry_in_an_unknown_version_is_never_valid`: such a Retry is never
+  valid and gets no tag.
+
+`kani/version_negotiation.rs`, in `connection/negotiation.rs`, has no
+stubs. Lists are the known versions of three arbitrary 32-bit values.
+
+- `the_server_chooses_only_from_the_clients_offer`: `select_compatible`
+  answers in a version it supports, that the client listed and the first
+  flight converts to. It takes its own most preferred such version, and
+  otherwise keeps the original.
+- `a_client_reacts_once_never_to_its_own_version_and_by_preference`:
+  `react` ignores a list naming the Original Version, and any list after
+  it reacted once. Otherwise it restarts in its most preferred listed
+  version that it supports, or fails when there is none.
+- `the_downgrade_check_is_sound_and_complete`: suppose an honest server
+  accepted the attempt and negotiated the attempt or a compatible version
+  both offered. Then `negotiation_was_genuine` passes exactly when no
+  version the server reports comes before the attempt in the client's
+  preferences. That includes the case where the server upgraded the
+  attempt. With the `react` harness, a forged Version Negotiation packet
+  can only end an attempt, never move it. This harness runs over two-entry
+  lists of each kind of version: 1, 2, two drafts and an unknown version.
+  Three entries, or composing `Negotiation::client`, `select_compatible`
+  and `check_server` in one harness, ran CBMC past 10 GiB during symbolic
+  execution.
+- `a_client_accepts_only_a_chosen_version_it_offered`: `check_server`
+  accepts an honest compatible choice, and any Chosen Version exactly when
+  it was offered. A client's offer holds its Original Version and only
+  preferred versions its first flight converts to.
+- `{initial,zero_rtt,handshake,retry}_packets_are_admitted_only_in_their_version`:
+  in every state, `admit` takes Handshake packets only in the current
+  version, and 0-RTT only on a server and in the Original Version. It
+  takes an Initial in another version only with that version's retained
+  keys on a server, or as a client's trial of an offered compatible
+  version before it settles. It takes a Retry only in the Original Version
+  before the client settles. Every admitted version is one the header
+  decoder accepts. One harness per kind: a symbolic kind ran past eighteen
+  minutes, and dropping the boxed test keys ran CBMC out of memory.
+
+The Chosen Version comparison itself is the decoder's, proved by the
+existing `version_information_body_checks_the_connection_without_allocating`.
+
+### TLA+
+
+`tla/VersionNegotiation.tla` follows one client and one server through
+compatible and incompatible negotiation over versions 1, 2 and a draft
+compatible with neither. Its header names the code of each action. The
+attacker can deliver, at any moment, a Version Negotiation packet listing
+any versions and a server Initial in any version, since Initial keys come
+from the connection ID. It can also send the server a client Initial with
+any offer. It cannot make Handshake packets, and TLS authenticates the
+client's offer. Honest messages stay in the network, so they can be
+delayed, reordered, replayed or dropped. Every client and server
+preference list over the three versions is checked, with every Original
+Version the client prefers.
+
+The base config checks these invariants:
+
+- `Agreement`: a client that completes runs the server's version.
+- `NoDowngrade`: the final version is one an honest network gives. That
+  is the server's choice for the Original Version, or for the client's
+  most preferred version the server lists. RFC 9368 allows the second even
+  when the server accepts the Original Version.
+- `NoFalseRefusal`: with no attacker, the client fails only when it shares
+  no version with the server.
+- `ServerChoosesOffered`: the server runs a supported version the client
+  offered, compatible with the first flight.
+- `ClientRunsOffered`: the client runs only a version it offered.
+- `ClientSingleVersion`: once settled, the client holds and accepts only
+  its version's Initial keys and packets, and Handshake keys of that
+  version alone.
+- `ServerSingleVersion`: the server drops the original Initial keys on a
+  Handshake in the negotiated version and never reads an original Initial
+  after it.
+
+Run each config with the scoped TLC command above. The base passes:
+109,230,241 states generated, 3,797,295 distinct, depth 11.
+
+| Config | Change | Result |
+| --- | --- | --- |
+| `_without_genuine` | no downgrade check | violates `NoDowngrade` |
+| `_without_transcript` | the client's offer unauthenticated | violates `NoDowngrade` |
+| `_without_server_offer` | the server ignores the client's list | violates `ServerChoosesOffered` |
+| `_without_try_offered` | the client adopts any Initial's version | violates `ClientRunsOffered` |
+| `_without_drop_other` | the server keeps original keys | violates `ServerSingleVersion` |
+| `_with_negotiated_judged` | the check before c589fee32 | violates `NoFalseRefusal` |
+| `_reaches_completion` | | violates `NoCompletion` |
+| `_reaches_upgrade` | | violates `NoUpgrade` |
+| `_reaches_restart_upgrade` | | violates `NoRestartUpgrade` |
+
+The `_with_negotiated_judged` trace has no attacker. A client prefers 1,
+2, then a draft and starts in the draft. The server lists 2 and 1 and
+prefers 2. The client restarts in 1, is upgraded to 2, and is refused.
+That is the bug above.
+
+The model has no control for ignoring a list that names the Original
+Version. With the downgrade check in place, reacting to such a list still
+ends in a version `NoDowngrade` allows, because the check pins the attempt
+to the client's top choice among the server's versions. The Kani `react`
+harness proves the code ignores such lists. The model leaves out
+cryptography, Retry, 0-RTT, session tickets, a ClientHello split across
+packets, and fleets whose Available Versions differ from the accepted
+ones.
+
+### Negative controls in the code
+
+Each scratch mutation was applied to the production code, its harness was
+run, and the code was restored.
+
+| Mutation | Harness that failed |
+| --- | --- |
+| `negotiation_was_genuine` compares with the negotiated version (the old bug) | `the_downgrade_check_is_sound_and_complete` |
+| `react` answers a list naming the Original Version | `a_client_reacts_once_never_to_its_own_version_and_by_preference` |
+| `select_compatible` ignores the client's list | `the_server_chooses_only_from_the_clients_offer` |
+| `admit` takes Handshake packets in any version | `handshake_packets_are_admitted_only_in_their_version` |
+| `admit` tries Initials of versions not offered | `initial_packets_are_admitted_only_in_their_version` |
+| `check_server` skips the offered check | `a_client_accepts_only_a_chosen_version_it_offered` |
+| `from_byte` reads version 2's Initial bits as 0 | `long_header_types_are_each_versions_rfc_bijection`, `decoding_types_a_long_header_by_its_own_version` |
+| `interpret_version` maps version 2 to version 1 | `retry_integrity_and_type_bits_follow_the_version`, `initial_keys_use_the_salt_and_labels_of_their_version` |
+| the fork's version 2 salt starts with version 1's bytes | `initial_keys_use_the_salt_and_labels_of_their_version` |
+| the fork's version 2 IV label is `quic iv` | `initial_keys_use_the_salt_and_labels_of_their_version` |
+| version 2's Retry nonce is version 1's | `retry_integrity_and_type_bits_follow_the_version` |
+
+All 387 engine library tests pass after the fix. Clippy with warnings
+denied and the formatting check pass on the engine.
+
+## QUIC version two: resource proofs
+
+This section covers what version two and version negotiation hold and
+copy, using the method in
+[`verification/README.md`](../README.md#resource-properties). Every key
+derivation they add is charged to the connection's reassembly budget
+before it starts. A charge is given back only after the storage it paid
+for is freed. A server's Retry and Version Negotiation packets are
+written into its send buffer. Version Information and the version rules
+allocate nothing. When a budget refuses a charge, only the packet that
+needed it is lost, and the attempt goes on.
+
+### What is charged
+
+| Path | Storage | Charge |
+| --- | --- | --- |
+| Client tries an offered version (`prepare_other_initial`) | that version's Initial keys | `initial_keys_charge`, held while the keys are kept |
+| Server switches version (`Connection::switch_server_version`) | the new version's Initial keys, derived beside the original ones, which are then kept until a Handshake packet in the new version | `initial_keys_charge`, taken before the derivation and held while the original keys are kept |
+| Client restarts after Version Negotiation (`restart_in_version`) | the new version's Initial keys, beside the old ones | `initial_keys_charge`, until the old keys are freed |
+| Client follows a Retry | the copy the tag is checked over (`packet/retry.rs` `PseudoPacket`), then the new Initial keys | the copy's length, then `initial_keys_charge` |
+| Server sends a Retry (`Endpoint::retry`) | the token and the Retry Pseudo-Packet | none: both are built in the send buffer |
+| Server sends Version Negotiation (`write_version_negotiation`) | the packet | none: it is written in the send buffer |
+| Version Information, first-flight reading, version choice | none | none |
+
+`crypto::Session::initial_keys_charge` and the same method of
+`crypto::ServerConfig` give the most heap a derivation of Initial keys
+holds at once. For rustls this is the four keys and two HKDF expanders:
+rustls' `Keys::initial` holds the expander of the Initial secret while
+each direction's `KeyBuilder` holds one more. `InitialSuite` measures
+both sizes once, when a configuration is made.
+
+`OtherInitial::derive` charges first and derives only after the charge
+is granted. `OtherInitial::install` puts tried keys in place of the
+current ones. It frees the old keys first, then releases the charge.
+The fields of `OtherInitial` drop in order, so its keys are always freed
+before its charge is released.
+
+A refused charge loses only the packet that needed it. A client that
+cannot try an offered version drops that server Initial. The server sends
+it again, and the client tries again once the budget has room. A server
+that cannot pay for the original keys keeps the client's version, as RFC
+9368 allows. When a Version Negotiation packet or a Retry cannot be
+processed for lack of budget, it is treated as lost:
+`Connection::unprocess_packet` takes it out of the count of processed
+packets. Otherwise, under RFC 9000 sections 6.2 and 17.2.5.2, the client
+would ignore every later one.
+
+### Found and fixed
+
+- The charge for another version's keys was `Keys::heap_size`, the size
+  of the keys alone: 1728 bytes with ring. A derivation holds 2032 bytes
+  at its peak, because HKDF expanders are live beside the keys while
+  they are built. The client's tried keys and the server's retained keys
+  were allocated past their charge. The charge is now
+  `initial_keys_charge`: the keys and two expanders, 2096 bytes with ring.
+  The replay below fails with the old charge.
+- `adopt_tried_version` dropped the tried keys' charge before it replaced
+  the original keys. For a moment both sets were held while only one was
+  charged. It now calls `OtherInitial::install`.
+- A restart after Version Negotiation and a followed Retry derived new
+  Initial keys while the old ones were still held, with nothing charged.
+  Both now take a `KeyCharge` first and give it back once the old keys
+  are freed. A refusal ignores the packet.
+- A client checking a Retry copied the whole packet into an uncharged
+  `Vec` (`is_valid_retry`). The copy is now a `PseudoPacket` that is
+  charged before it is allocated. `crypto::Session::is_valid_retry` now
+  takes the Pseudo-Packet.
+- A server Retry allocated its token, the token's boxed AEAD key and a
+  copy of the packet for the tag. Each grew with the input, and none was
+  charged. `Token::encode_into` now seals the token in place in the send
+  buffer. `HandshakeTokenKey::{seal, open}` replace the boxed
+  `AeadKey`, and the token key lives on the stack. `retry::tag_in_place`
+  rotates the Original Destination Connection ID in front of the packet
+  inside the buffer to compute the tag, then rotates it back.
+  `crypto::ServerConfig::retry_tag` takes the Pseudo-Packet. A returned
+  token is opened in a stack buffer of `Token::MAX_ENCODED` bytes. A
+  longer token cannot be one this server sealed, so it is refused before
+  any copy.
+- The counted Kani harnesses for Version Information parsing,
+  `version_information_body_checks_the_connection_without_allocating`
+  and `version_information_checks_the_connection_without_allocating`,
+  failed their unwinding assertions. `VersionList::push` scans the eight
+  known versions, which their bounds of 4 and 3 did not cover. Both
+  bounds are now 10. The correctness harness beside them,
+  `version_information_validates_all_versions_and_the_peer_role`, had the
+  same bound of 4 and now has 10 as well.
+- A token whose issue time overflows `SystemTime` panicked in
+  `Token::decode`. The masking stand-in key in Kani reached it. With the
+  real key, only a token this server sealed gets that far. Decode now
+  refuses such a token, and `a_token_issued_past_the_end_of_time_is_refused`
+  seals one under the real key.
+
+### Kani (`kani/negotiation_storage.rs`, `retry_storage.rs`, `version_negotiation_storage.rs`, `token_storage.rs`, `first_flight_storage.rs`, `version_storage.rs`)
+
+These are counted harnesses (`counted_proof!`), run with `-Z stubbing -Z
+c-ffi -Z mem-predicates -Z restrict-vtable`. Kani cannot run ring, so the
+keys in `negotiation_storage.rs` are fixed 32-byte stand-ins. Each one
+asserts, when it is freed, that its charge is still held. The token key
+in `token_storage.rs` is a masking stand-in for the AEAD that checks its
+tag. The real derivation's peak is bounded by the replay below.
+
+| Harness | States | Verdict | Control (scratch edit), result |
+| --- | --- | --- | --- |
+| `other_initial_keys_are_charged_before_they_are_derived` | with a budget one byte short, nothing is derived or allocated; with room, peak and bytes asked ≤ the charge, and every key is freed while its charge is held | passes | derive before charging: fails ("a key outlived its charge"); `OtherInitial`'s charge field before its keys: fails, same check |
+| `installed_keys_free_the_old_ones_before_the_charge_goes` | `install` frees the replaced keys while the charge is held; peak ≤ two key sets | passes | release the charge first: fails, same check |
+| `a_key_charge_is_all_or_nothing` | a `KeyCharge` holds all of its bytes or none, and returns them | passes | ignore a refusal: fails |
+| `negotiation_decisions_allocate_nothing` | reading a Version Negotiation list, `react`, `admit` and `decodable` ask for 0 bytes | passes | `react` copies the supported list: fails |
+| `a_server_tags_a_retry_in_its_send_buffer` | 0 bytes asked; the tag covers the Pseudo-Packet; the packet is left unchanged, then the tag | passes | copy the packet for the tag: fails |
+| `a_client_copies_a_retry_only_within_its_charge` | a refusal asks for 0 bytes; otherwise peak ≤ the charge and bytes ≤ 1 × Retry + 21 | passes | allocate before charging: fails |
+| `version_negotiation_is_written_in_the_send_buffer` | 0 bytes asked; IDs swapped, a greasing version, then the supported ones | passes | copy the version list: fails |
+| `a_retry_token_is_sealed_in_place` | 0 bytes asked, at most `MAX_ENCODED` bytes of the buffer used, and the token opens again | passes | copy the nonce to the heap: fails |
+| `a_returned_token_never_allocates` | any returned token of up to `MAX_ENCODED + 1` bytes asks for 0 bytes; a longer one is refused | passes | open it in heap storage: fails |
+| `the_transport_parameter_offer_is_read_in_place` | the offer is read with 0 bytes asked and found exactly when valid | passes | the reader allocates: fails |
+| `version_choices_allocate_nothing` | `VersionList::known`, `compatible_with`, `select_compatible` and `negotiation_was_genuine` ask for 0 bytes | passes | `select_compatible` copies its preference: fails |
+| `version_information_is_encoded_in_place` | `TransportParameters::write` with Version Information asks for 0 bytes | passes | copy the available list: fails |
+| `version_information_body_checks_the_connection_without_allocating` (existing, bound raised) | `read_version_information` asks for 0 bytes | passes | allocate in the decoder: fails |
+| `version_information_checks_the_connection_without_allocating` (existing, bound raised) | the same, through `TransportParameters::read_for_version` | no verdict: CBMC ran out of 10 GiB at bound 10 | none |
+| `the_counter_sees_every_allocation` | the counter's own check | passes | none |
+
+Two earlier forms of these harnesses also ran out of 10 GiB, and the
+harnesses above replace them. One was a token round trip with every field
+symbolic. The other was the whole first-flight reader, then over symbolic
+CRYPTO frames, on a 69-byte ClientHello and on 8 to 24 arbitrary bytes.
+The replay `version::first_flight::tests::the_reader_allocates_nothing_on_any_first_flight`
+costs the whole reader instead, `client_offer` over pieces of the crypto
+stream. It covers 163 streams: a whole offer, shuffled pieces, pieces with
+a gap before the offer, every truncation and every flipped byte. Each asks
+for 0 bytes.
+
+### TLA+ (`tla/VersionResources.tla`)
+
+The model has one client connection and one server connection. Each
+threads a store through `Resources.tla`, in the code's order. The steps
+are: trying an offered version, adopting it, dropping tried keys,
+settling, restarting after Version Negotiation, copying and checking a
+Retry and deriving its keys, a server accepting with or without
+retaining keys, and dropping them. The rest of each connection takes and
+frees budget between steps, so any charge can be refused. `Resources.tla`
+compares a step's peak with what is reserved at the step's end. A charge
+given back after the storage it paid for is freed therefore starts a step
+of its own (`ClientRelease`, `ServerRelease`). A release inside a step
+would hide the storage it paid for. Units are K = 2 (a key set), T = 1
+(the expanders), P = 1 (a Retry copy), with a limit of 5.
+
+| Config | Must | Result |
+| --- | --- | --- |
+| `VersionResources_base` | pass `ClientPaid`, `ServerPaid`, `ClientWithinLimit`, `ServerWithinLimit`, `ClientTracks`, `ServerTracks` | passes, 7,584 distinct states |
+| `_without_chargefirst` | violate `ClientPaid`: keys derived, then the budget refuses | violated by `ClientTry` |
+| `_without_coverderivation` | violate `ClientPaid`: the charge is the keys' size alone (the bug fixed above) | violated by `ClientTry` |
+| `_without_freefirst` | violate `ServerPaid`: the charge is released before the keys are freed | violated by `ServerDrop` |
+| `_without_chargerederive` | violate `ClientPaid`: a restart derives beside the old keys uncharged | violated by `ClientRestart` |
+| `_without_chargeretrycopy` | violate `ClientPaid`: the Retry copy is uncharged | violated by `ClientRetryCopy` |
+| `_without_honorrefusal` | violate `ClientWithinLimit`: a charge goes on past a refusal | violated by `ClientTry` |
+| `_reaches_refusal` | violate `NeverRefused` | violated |
+| `_reaches_upgrade` | violate `NeverUpgradedWithRetry`: a client follows a Retry and adopts version 2 while a server retains keys | violated |
+| `_reaches_restart` | violate `NeverRestartedAfterRefusal` | violated |
+
+### Replays and tests
+
+- `crypto::rustls::tests::initial_key_derivations_stay_within_their_charge`
+  covers 18 real derivations through the counting allocator: drafts,
+  version 1 and version 2, both sides, and connection IDs of 0, 8 and 20
+  bytes. Each holds at most its charge. Each asks for at most the charge
+  plus one expander, since three expanders are made but only two live at
+  once. Closest: 2032 of 2096 bytes held, 2280 of 2280 bytes asked for.
+- `tests::version_budget::a_server_retry_allocates_nothing_beyond_its_buffer`
+  costs `Endpoint::retry` for versions 1 and 2 with nothing allowed. It
+  passes: 0 bytes asked for.
+- `tests::version_budget` also runs two engines with a budget that has
+  room for everything but one charge: one byte short of
+  `initial_keys_charge`, or no room at all for the Retry copy. A server
+  that cannot pay for retained keys completes in version 1. A client that
+  cannot try version 2 holds nothing more and stays in version 1. Once
+  the budget frees, the server's next Initial completes the handshake in
+  version 2. A client that cannot restart ignores Version Negotiation,
+  then restarts on the next one. A client that cannot check or follow a
+  Retry discards it, then follows the next one. All five pass.
+- `packet::retry::tests` checks the Pseudo-Packet layout and its charge.
+  The RFC 9369 Appendix A.4 Retry vector now runs through
+  `tag_in_place` and `PseudoPacket`.
+
+Scratch controls for the replays and tests, each reverted:
+
+- Charging the keys' size alone (`initial_keys_charge` without the
+  expanders) fails `initial_key_derivations_stay_within_their_charge`:
+  2032 bytes held against a charge of 1728.
+- Making `unprocess_packet` do nothing fails the Version Negotiation and
+  Retry budget tests. The client ignores every later packet.
+- Copying the packet for the server's tag fails
+  `a_server_retry_allocates_nothing_beyond_its_buffer`.
+- Ignoring a refused `KeyCharge` fails the four budget tests that need a
+  refusal.
+- The old decode of a token's time fails
+  `a_token_issued_past_the_end_of_time_is_refused`: it panics.
+- In `VersionResources.tla`, each `_without_` config above is a control,
+  and each violates the invariant it names.
+
+### Not covered
+
+- A restart after Version Negotiation starts a new TLS session. The TLS
+  session is outside the budget on every path, version 1 included.
+  `initial_keys_charge` covers only the Initial keys.
+- `initial_keys_charge` is measured from the rustls provider's types.
+  That two expanders at most are live comes from reading rustls'
+  `Keys::initial` and `KeyBuilder`. The replay confirms it for ring.
+- The Kani harnesses use stand-in keys and a stand-in token AEAD. The
+  real derivation is bounded only by the replay.
+- `version_information_checks_the_connection_without_allocating` has no
+  verdict, and `quic-verify` leaves it out.
+
+`cargo xtask quic-verify resources` runs the fourteen harnesses that pass
+above, in a 10 GiB scope, and the ten configs.
+
+## Standard interoperability over version two
+
+`tests/quic-ngtcp2` runs the
+[QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)'s
+test cases over version 2. The SDK's `QuicLayer` runs against ngtcp2
+1.25.0, with nghttp3 1.18.0 and the system OpenSSL 3.6, in both roles.
+ngtcp2 implements RFC 9369 and RFC 9368 independently of the vendored
+engine. `peer.c` wraps it with no sockets and no clock: the test hands it
+every datagram and timestamp, so both endpoints share one virtual clock
+on one simulated link. The crate has its own test binary, because quiche's
+BoringSSL defines the same symbols as OpenSSL.
+
+The link follows the runner's network simulator. It has a 15 ms one-way
+delay and a 10 Mbps bottleneck with a queue of 25 packets. `drop-rate`
+and `corrupt-rate` decide each packet as the simulator's
+`drop-rate-error-model.cc` and `corrupt-rate-error-model.cc` do. Each
+packet is impaired with the given probability, but never more than three
+in a row. Corruption replaces one of the first 51 bytes of the datagram,
+so it often hits the QUIC header. Version Negotiation packets are not
+corrupted. Every random choice comes from the case's seed, so a failure
+repeats exactly. The test reads the long header type of every datagram
+from its version's type bits, as the runner's packet traces do.
+
+Each case uses the runner's files and checks from `testcases_quic.py`.
+Where the runner requires version 1, these cases require version 2 on
+both sides. Unless a case says otherwise, the client's first flight is
+in version 1 and offers 2 then 1, and the server prefers 2. So every
+connection reaches version 2 by compatible negotiation, as the runner's
+`v2` case sets it up. Every case also requires every Handshake packet in
+both directions to be in version 2. The file bytes must match exactly.
+The `v2`, `handshake` and `transfer` cases also require the server to
+receive the client's close with error code 0.
+
+| Case | Files | SDK client, ngtcp2 server | ngtcp2 client, SDK server |
+| --- | --- | --- | --- |
+| `v2`: the runner's version checks | 1 KB | passed | passed |
+| `handshake`, no Retry | 1 KB | passed | passed |
+| `handshake` with a version 2 first flight | 1 KB | passed | passed |
+| `transfer` | 2, 3 and 5 MB | passed | passed |
+| `retry`, Retry in version 1, then upgrade | 10 KB | passed | passed |
+| `retry` with a version 2 first flight | 10 KB | passed | passed |
+| `http3` | 5 KB, 10 KB and 500 KB | no SDK HTTP/3 client | passed |
+| `handshakeloss`, 30% | 50 connections of 1 KB | passed | passed |
+| `transferloss`, 2% | 2 MB | passed | passed |
+| `handshakecorruption`, 30% | 50 connections of 1 KB | passed | passed |
+| `transfercorruption`, 2% | 2 MB | passed | passed |
+| `versionnegotiation` into version 2 | 1 KB | passed | not run |
+
+The `v2` case applies the runner's checks: a client Initial in version 1,
+a server Initial in version 2, and only version 2 in both directions'
+Handshake packets. The retry cases require a Retry carrying a token in
+the client's first version (RFC 9369 section 4.1), and a later client
+Initial carrying that token. A server may answer each datagram of a
+two-datagram first flight with a Retry; the client follows only the
+first. The
+`http3` case fetches through the SDK's HTTP/3 server and requires status
+200. In `versionnegotiation`, the ngtcp2 server accepts only version 2, so
+the SDK client's version 1 Initial draws a Version Negotiation packet. The
+client then starts again in version 2, and the server's Version
+Information passes its downgrade check. The reverse direction needs an
+ngtcp2 client that restarts after Version Negotiation, which `peer.c` does
+not do. The loss and corruption cases also require that the link dropped,
+or corrupted, at least one packet.
+
+All thirteen tests pass. Run `cargo test --locked -p fictionet-quic-ngtcp2`
+under the scope above. It needs `libngtcp2`, `libngtcp2_crypto_ossl`,
+`libnghttp3` and OpenSSL 3.5 or later, found through `pkg-config`.
+
+quiche 0.30.1 accepts only version 1: its `version_is_supported` matches
+only `0x00000001`, and it sends no Version Information. It cannot run
+any version 2 case. Two tests in `tests/quic-interop` instead check that
+version 2 capable endpoints still work with it. An SDK client that offers
+versions 2 and 1, and an SDK server that prefers version 2, each complete
+the exchange with quiche in version 1. All 39 tests in that crate pass.
+No other independent implementation runs here without Docker. Upstream
+quinn shares the vendored engine's code, and curl's HTTP/3 uses the same
+ngtcp2. aioquic, msquic, lsquic and picoquic are not installed.
+
+### The server's choice across packets
+
+The first run of the `v2` case failed with the SDK as server: the
+connection stayed in version 1. ngtcp2 puts eleven CRYPTO frames in its
+first Initial packet and leaves bytes 134 to 140 of the ClientHello for
+its second, on purpose. The server read the client's offer only from its
+first packet, in at most eight CRYPTO frames, so it never upgraded an
+ngtcp2 client. It also missed any offer that fell in a later packet.
+
+The server now starts every connection in the client's version and
+chooses in `Connection::choose_version`. The choice is made on each
+Initial CRYPTO frame, before the TLS session reads anything. The client's
+Initial crypto stream stays in its assembler, where it is already bounded
+by `crypto_buffer_size`, 16 KiB by default, and charged to the reassembly
+budget. The `version::first_flight` reader now reads that stream in place, through the
+`Received` trait, which the assembler implements. It returns one of three
+outcomes. `Found` is the offer, read from bytes that have arrived even
+where other parts of the ClientHello have not. `Arriving` means more is
+needed. `Absent` means the stream does not start with a ClientHello, or
+the whole ClientHello arrived without a valid offer. The server waits on
+`Arriving` and keeps the client's version on `Absent`. Reading a byte looks
+at every buffered piece, so past 64 pieces (`MAX_OFFER_PIECES`) the server
+keeps the client's version.
+
+When the server moves to another version, `switch_server_version` takes
+`initial_keys_charge` through `OtherInitial::derive` before deriving the
+new keys; the charge then pays for the original keys it keeps. It then
+starts a TLS session whose Version Information names the new version.
+Without budget it stays in the client's version. The server may already
+have sent an acknowledgment in the original version; the runner's `v2`
+check allows that. `Negotiation::server` holds the server's transport
+parameters until `chose` releases them.
+
+The new two-engine test
+`a_server_reads_an_offer_spread_over_reordered_initial_packets` delivers
+a two-datagram ClientHello with the second datagram first. The server's
+first packet then holds no start of the ClientHello. It passes, and it
+fails on the previous engine. The `v2` case also fails on the previous
+engine and passes with the change. The first-flight unit tests cover an
+offer read across a gap, an offer still arriving, and whole ClientHellos
+without a valid offer. All 389 engine library tests, the 31 SDK QUIC
+tests, and the 39 tests of `tests/quic-interop` pass. Clippy with
+warnings denied passes for the engine and both interoperability crates.
+
+### Controls
+
+Each control below was a temporary change, reverted afterwards.
+
+- `the_version_2_checks_reject_a_connection_that_stays_in_version_1` runs
+  both roles with a server that prefers version 1. Both sides end in
+  version 1, and the `v2` and per-case checks reject the run.
+- Encoding version 2 with version 1's long header type bits
+  (`TypeBits::of`) fails the `v2` and version 2 first flight cases against
+  ngtcp2. Five of the six SDK-to-SDK `versions` layer tests still pass
+  with the same bug, since the engine agrees with itself.
+- Giving version 2 Retry packets version 1's integrity key and nonce fails
+  the version 2 `retry` case. The `retry` case, whose Retry is in
+  version 1, still passes.
+- Restoring the old engine fails the `v2` case and the reordered-packet
+  test.
+
+### Limits
+
+These runs share virtual time, so they say nothing about real-time
+behavior. The ngtcp2 server in `peer.c` holds one connection. When
+corruption damages the Destination Connection ID of a first Initial, it
+replaces a connection that never answered with one for the next first
+Initial. A real server would keep both. HTTP/3 runs in one direction only.
+Resumption, 0-RTT, key update and connection migration over version 2 are
+not among these cases.
+
+## QUIC version two: all checks together
+
+The correctness proofs, the resource proofs and the interoperability runs
+were each made on their own branch. This section records them run again on
+the code they now share, where the server chooses its version in
+`Connection::switch_server_version` and charges it through
+`OtherInitial::derive`.
+
+- All 19 correctness harnesses pass: the seven packet type harnesses, the
+  three key and Retry harnesses, the eight negotiation harnesses, and
+  `version_information_validates_all_versions_and_the_peer_role` at bound
+  10.
+- `cargo xtask quic-verify resources` passes: its fourteen counted
+  harnesses in a 10 GiB scope, and the ten `VersionResources` configs, each
+  passing or violating as its first line says.
+- All ten `VersionNegotiation` configs pass or violate as their first lines
+  say. The base generates 109,230,241 states, 3,797,295 distinct.
+- Each scratch mutation in the correctness and resource control tables
+  above was applied again, one at a time, and its harness failed. So did
+  two more: a `client_offer` that allocates fails the first-flight replay,
+  and a `switch_server_version` that charges nothing fails
+  `a_server_without_room_for_the_retained_keys_keeps_the_clients_version`.
+- 400 engine library tests, the 31 SDK QUIC tests, the 13 ngtcp2 cases and
+  the 39 quiche tests pass. Clippy with warnings denied passes for the
+  engine, xtask and both interoperability crates.
+
+`version_information_checks_the_connection_without_allocating` still has
+no verdict within 10 GiB.

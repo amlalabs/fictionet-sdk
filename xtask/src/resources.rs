@@ -21,11 +21,18 @@ use crate::lean_vectors::{Report, logged, scoped};
 /// (`-Z restrict-vtable`), which proves no less: without it, a harness
 /// that charges a `Budget` runs CBMC out of 14 GiB on the wake path of
 /// its release. Each harness must report `VERIFICATION:- SUCCESSFUL`.
-/// What Kani prints goes to `kani-<package>.out`.
-pub fn kani(root: &Path, out: &Path, package: &str, harnesses: &[&str]) -> Result<Report> {
+/// Kani runs in a scope of `memory` (a systemd `MemoryMax`, such as
+/// `10G`). What Kani prints goes to `kani-<package>.out`.
+pub fn kani(
+    root: &Path,
+    out: &Path,
+    package: &str,
+    harnesses: &[&str],
+    memory: &str,
+) -> Result<Report> {
     let mut report = Report::new("kani");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = scoped(cargo, "14G");
+    let mut command = scoped(cargo, memory);
     command.args([
         "kani",
         "-p",

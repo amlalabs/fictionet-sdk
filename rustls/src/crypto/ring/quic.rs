@@ -365,6 +365,34 @@ mod tests {
     }
 
     #[test]
+    fn key_update_test_vector_v2() {
+        // RFC 9369 Appendix A.5: ku = HKDF-Expand-Label(secret, "quicv2 ku", "", 32)
+        let secret = OkmBlock::new(&[
+            0x9a, 0xc3, 0x12, 0xa7, 0xf8, 0x77, 0x46, 0x8e, 0xbe, 0x69, 0x42, 0x27, 0x48, 0xad,
+            0x00, 0xa1, 0x54, 0x43, 0xf1, 0x82, 0x03, 0xa0, 0x7d, 0x60, 0x60, 0xf6, 0x88, 0xf3,
+            0x0f, 0x21, 0x63, 0x2b,
+        ]);
+        let ku = [
+            0xc6, 0x93, 0x74, 0xc4, 0x9e, 0x3d, 0x2a, 0x94, 0x66, 0xfa, 0x68, 0x9e, 0x49, 0xd4,
+            0x76, 0xdb, 0x5d, 0x0d, 0xfb, 0xc8, 0x7d, 0x32, 0xce, 0xea, 0xa6, 0x34, 0x3f, 0xd0,
+            0xae, 0x4c, 0x7d, 0x88,
+        ];
+        for (version, matches) in [(Version::V2, true), (Version::V1, false)] {
+            let mut secrets = Secrets::new(
+                secret.clone(),
+                secret.clone(),
+                TLS13_CHACHA20_POLY1305_SHA256_INTERNAL,
+                TLS13_CHACHA20_POLY1305_SHA256_INTERNAL.quic.unwrap(),
+                Side::Server,
+                version,
+            );
+            secrets.update();
+            assert_eq!(secrets.server.as_ref() == ku, matches);
+            assert_eq!(secrets.client.as_ref() == ku, matches);
+        }
+    }
+
+    #[test]
     fn short_packet_header_protection_v2() {
         // https://www.ietf.org/archive/id/draft-ietf-quic-v2-10.html#name-chacha20-poly1305-short-head
         test_short_packet(

@@ -6,6 +6,7 @@ use bytes::BytesMut;
 
 use super::*;
 use crate::packet::{FixedLengthConnectionIdParser, Header, ProtectedHeader};
+use crate::version::{VersionList, QUIC_V1, QUIC_V2};
 
 #[test]
 fn mismatched_token_versions_leave_the_address_unvalidated() {
@@ -163,10 +164,10 @@ fn oversized_retry_token() {
         let mut retry = Vec::new();
         header.encode(&mut retry);
         retry.resize(retry.len() + token_len, 0);
-        let tag = server_config()
-            .crypto
-            .retry_tag(initial.version, &initial.dst_cid, &retry);
-        retry.extend_from_slice(&tag);
+        let crypto = server_config().crypto;
+        crate::packet::retry::tag_in_place(&mut retry, 0, &initial.dst_cid, |pseudo| {
+            crypto.retry_tag(initial.version, pseudo)
+        });
         let Some(DatagramEvent::ConnectionEvent(_, event)) = endpoint.handle(
             now,
             address,
@@ -263,12 +264,15 @@ fn cached_tokens_stay_with_their_connection_version() {
     // Keep both versions' tokens while each completed connection issues two more.
     config.token_store(Arc::new(TokenMemoryCache::new(1, 8)));
     for (version, validated) in [
-        (1, false),
-        (0xff00_0021, false),
-        (1, true),
-        (0xff00_0021, true),
+        (QUIC_V1, false),
+        (QUIC_V2, false),
+        (QUIC_V1, true),
+        (QUIC_V2, true),
     ] {
-        config.version(version);
+        // Offer only the chosen version, so the server cannot switch it.
+        config
+            .version(version)
+            .preferred_versions(VersionList::new(&[version]).unwrap());
         pair.server.handle_incoming = Box::new(move |incoming| {
             assert_eq!(incoming.remote_address_validated(), validated);
             IncomingConnectionBehavior::Accept

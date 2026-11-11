@@ -174,6 +174,20 @@ pub struct QuicLayer {
     datagram_limit: Option<Option<usize>>,
     datagram_turn: bool,
     datagrams_ended: bool,
+    address_validation: AddressValidation,
+}
+
+/// How a server treats a client whose address it has not validated
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressValidation {
+    /// Accept the connection; RFC 9000 section 8.1 limits what the server
+    /// sends until the address is validated
+    #[default]
+    Accept,
+    /// Answer the first Initial with a Retry and accept only an Initial
+    /// carrying its token (RFC 9000 section 8.1.2). The Retry uses the
+    /// client's version, as RFC 9369 section 4.1 requires.
+    Retry,
 }
 
 /// One application send, followed through packet construction and the
@@ -298,7 +312,22 @@ impl QuicLayer {
             datagram_limit: None,
             datagram_turn: true,
             datagrams_ended: false,
+            address_validation: AddressValidation::Accept,
         }
+    }
+
+    /// Choose how this server treats clients with unvalidated addresses
+    pub fn with_address_validation(mut self, validation: AddressValidation) -> Self {
+        self.address_validation = validation;
+        self
+    }
+
+    /// The connection's QUIC version: the negotiated one once the handshake
+    /// has settled it (RFC 9368). `None` before a connection exists.
+    pub fn version(&self) -> Option<u32> {
+        self.connection
+            .as_ref()
+            .map(|(_, connection)| connection.version())
     }
 
     /// Start this layer's client connection. Configuration must disable
@@ -635,6 +664,15 @@ impl Layer for QuicLayer {
                                 .expect("standalone endpoint")
                                 .ignore(incoming);
                             None
+                        } else if self.address_validation == AddressValidation::Retry
+                            && !incoming.remote_address_validated()
+                            && incoming.may_retry()
+                        {
+                            let endpoint = self.endpoint.as_mut().expect("standalone endpoint");
+                            response
+                                .fill(|buf| Ok::<_, ()>(endpoint.retry(incoming, buf)))
+                                .expect("a Retry fits a UDP payload")
+                                .ok()
                         } else {
                             match response
                                 .fill(|buf| {

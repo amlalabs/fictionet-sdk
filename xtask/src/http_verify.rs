@@ -395,6 +395,7 @@ fn resource_properties(paths: &Paths) -> Result {
         &paths.out,
         "fictionet",
         &KANI_RESOURCES,
+        "14G",
     )?);
     let tla = paths.root.join("verification").join("http").join("tla");
     for (module, configs) in TLC_RESOURCES {

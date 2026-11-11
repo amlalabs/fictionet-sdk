@@ -1491,6 +1491,7 @@ impl ExpectTraffic {
             if let Some(quic_params) = &cx.quic.params {
                 value.set_quic_params(quic_params);
             }
+            value.set_quic_version(cx.quic.version);
         }
 
         self.session_storage

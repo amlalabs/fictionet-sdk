@@ -78,6 +78,7 @@ fn resources_report(paths: &Paths) -> Result<Report> {
         &paths.out,
         "fictionet-rustls",
         &KANI_RUSTLS,
+        "14G",
     )?);
     report.absorb(resources::tlc(
         &paths.root,

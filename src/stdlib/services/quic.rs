@@ -17,9 +17,10 @@
 mod layer;
 
 pub use layer::{
-    Connections, Control, ControlCommand, ControlEvent, Error, Listener, ListenerConfig, Quic,
-    QuicLayer, Stream,
+    AddressValidation, Connections, Control, ControlCommand, ControlEvent, Error, Listener,
+    ListenerConfig, Quic, QuicLayer, Stream,
 };
+pub use quinn_proto::version::{QUIC_V1, QUIC_V2, VersionList};
 pub use quinn_proto::{ClientConfig, Dir, EndpointConfig, ServerConfig, StreamId, VarInt};
 
 #[cfg(test)]

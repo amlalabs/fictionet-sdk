@@ -272,6 +272,36 @@ impl Assembler {
         self.buffered = 0;
         self.allocated = 0;
     }
+
+    /// How many separately received pieces are buffered
+    pub(super) fn pieces(&self) -> usize {
+        self.data.len()
+    }
+}
+
+/// The buffered, unread part of the stream. Reading each byte looks at
+/// every piece, so callers bound `pieces`.
+impl crate::version::Received for Assembler {
+    fn byte(&self, position: u64) -> Option<u8> {
+        self.data.iter().find_map(|buffer| {
+            let index = usize::try_from(position.checked_sub(buffer.offset)?).ok()?;
+            buffer.bytes.get(index).copied()
+        })
+    }
+
+    fn prefix(&self) -> u64 {
+        let mut end = self.bytes_read;
+        while let Some(next) = self
+            .data
+            .iter()
+            .filter(|buffer| buffer.offset <= end)
+            .map(|buffer| buffer.offset + buffer.bytes.len() as u64)
+            .find(|&next| next > end)
+        {
+            end = next;
+        }
+        end
+    }
 }
 
 /// Grow the heap only after reserving both old and new descriptor allocations.

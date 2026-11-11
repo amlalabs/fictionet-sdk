@@ -116,6 +116,7 @@ fn resources() -> Result {
             &paths.out.join("kani").join(name),
             "fictionet",
             &[harness],
+            "14G",
         )?);
     }
     for (dir, module, configs) in TLC_RESOURCES {

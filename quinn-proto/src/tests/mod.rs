@@ -32,6 +32,8 @@ mod util;
 use util::*;
 
 mod token;
+mod version;
+mod version_budget;
 
 #[test]
 fn tls_checks_authenticated_version_information_in_both_roles() {
@@ -502,7 +504,9 @@ fn draft_version_compat() {
     let _guard = subscribe();
 
     let mut client_config = client_config();
-    client_config.version(0xff00_0020);
+    client_config
+        .version(0xff00_0020)
+        .preferred_versions(crate::version::VersionList::new(&[0xff00_0020]).unwrap());
 
     let mut pair = Pair::default();
     let (client_ch, server_ch) = pair.connect_with(client_config);

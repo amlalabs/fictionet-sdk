@@ -26,8 +26,26 @@ pub mod rustls;
 
 /// A cryptographic session (commonly TLS)
 pub trait Session: Send + Sync + 'static {
-    /// Create the initial set of keys given the client's initial destination ConnectionId
-    fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys;
+    /// Create the Initial keys of `version` given the client's initial destination ConnectionId
+    fn initial_keys(
+        &self,
+        version: u32,
+        dst_cid: &ConnectionId,
+        side: Side,
+    ) -> Result<Keys, UnsupportedVersion>;
+
+    /// The most heap bytes live at once while [`initial_keys`](Self::initial_keys)
+    /// derives a set, the keys it returns included: what a budget is charged
+    /// before a derivation
+    fn initial_keys_charge(&self) -> usize;
+
+    /// Switch to a compatible version (RFC 9368 section 2.3) before handshake keys exist
+    ///
+    /// Handshake and 1-RTT keys then use `version`, and so does the check of
+    /// a server's Chosen Version. A server still expects the client's Chosen
+    /// Version to be the version the session started with. 0-RTT keys keep
+    /// that version too.
+    fn set_negotiated_version(&mut self, version: u32) -> Result<(), UnsupportedVersion>;
 
     /// Get data negotiated during the handshake, if available
     ///
@@ -76,8 +94,10 @@ pub trait Session: Send + Sync + 'static {
     /// Compute keys for the next key update
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>>;
 
-    /// Verify the integrity of a retry packet
-    fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool;
+    /// Whether `pseudo_packet`, the Retry Pseudo-Packet of a Retry of wire
+    /// `version` followed by the Retry's integrity tag (RFC 9001 section
+    /// 5.8), carries a valid tag
+    fn is_valid_retry(&self, version: u32, pseudo_packet: &mut [u8]) -> bool;
 
     /// Fill `output` with `output.len()` bytes of keying material derived
     /// from the [Session]'s secrets, using `label` and `context` for domain
@@ -109,6 +129,20 @@ pub struct Keys {
     pub packet: KeyPair<Box<dyn PacketKey>>,
 }
 
+impl Keys {
+    /// Heap bytes of the four keys, including their boxes
+    pub fn heap_size(&self) -> usize {
+        size_of_val(&*self.header.local)
+            + self.header.local.heap_size()
+            + size_of_val(&*self.header.remote)
+            + self.header.remote.heap_size()
+            + size_of_val(&*self.packet.local)
+            + self.packet.local.heap_size()
+            + size_of_val(&*self.packet.remote)
+            + self.packet.remote.heap_size()
+    }
+}
+
 /// Client-side configuration for the crypto protocol
 pub trait ClientConfig: Send + Sync {
     /// Start a client session with this configuration
@@ -129,10 +163,15 @@ pub trait ServerConfig: Send + Sync {
         dst_cid: &ConnectionId,
     ) -> Result<Keys, UnsupportedVersion>;
 
-    /// Generate the integrity tag for a retry packet
+    /// The most heap bytes live at once while [`initial_keys`](Self::initial_keys)
+    /// derives a set, the keys it returns included
+    fn initial_keys_charge(&self) -> usize;
+
+    /// The integrity tag of a Retry whose Retry Pseudo-Packet (RFC 9001
+    /// section 5.8) is `pseudo_packet`
     ///
     /// Never called if `initial_keys` rejected `version`.
-    fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16];
+    fn retry_tag(&self, version: u32, pseudo_packet: &[u8]) -> [u8; 16];
 
     /// Start a server session with this configuration
     ///
@@ -162,6 +201,8 @@ pub trait PacketKey: Send + Sync {
     /// Maximum number of incoming packets that may fail decryption before the connection must be
     /// abandoned
     fn integrity_limit(&self) -> u64;
+    /// Heap bytes this key occupies, so storage for another key can be charged first
+    fn heap_size(&self) -> usize;
 }
 
 /// Keys used to protect packet headers
@@ -172,6 +213,8 @@ pub trait HeaderKey: Send + Sync {
     fn encrypt(&self, pn_offset: usize, packet: &mut [u8]);
     /// The sample size used for this key's algorithm
     fn sample_size(&self) -> usize;
+    /// Heap bytes this key occupies, so storage for another key can be charged first
+    fn heap_size(&self) -> usize;
 }
 
 /// A key for signing with HMAC-based algorithms
@@ -190,19 +233,27 @@ pub trait HmacKey: Send + Sync {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExportKeyingMaterialError;
 
-/// A pseudo random key for HKDF
-pub trait HandshakeTokenKey: Send + Sync {
-    /// Derive AEAD using hkdf
-    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn AeadKey>;
-}
+/// The length of a token's AEAD tag
+pub const TOKEN_TAG_LEN: usize = 16;
 
-/// A key for sealing data with AEAD-based algorithms
-pub trait AeadKey {
-    /// Method for sealing message `data`
-    fn seal(&self, data: &mut Vec<u8>, additional_data: &[u8]) -> Result<(), CryptoError>;
-    /// Method for opening a sealed message `data`
+/// A pseudo random key for HKDF, from which each token's AEAD key is derived
+///
+/// Both operations work in place, so a token is sealed in the buffer it is
+/// sent from and opened in the caller's storage.
+pub trait HandshakeTokenKey: Send + Sync {
+    /// Seal `data` in place under the key derived from `random_bytes`,
+    /// returning the tag
+    fn seal(
+        &self,
+        random_bytes: &[u8],
+        data: &mut [u8],
+        additional_data: &[u8],
+    ) -> Result<[u8; TOKEN_TAG_LEN], CryptoError>;
+    /// Open `data`, a sealed message followed by its tag, in place under
+    /// the key derived from `random_bytes`, returning the message
     fn open<'a>(
         &self,
+        random_bytes: &[u8],
         data: &'a mut [u8],
         additional_data: &[u8],
     ) -> Result<&'a mut [u8], CryptoError>;
