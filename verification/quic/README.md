@@ -1293,7 +1293,9 @@ cargo kani -p fictionet-quinn-proto --lib -Z stubbing -Z c-ffi \
 The broader `reassembly_descriptor_growth_fits_its_reservation` harness
 inserts five descriptors with an arbitrary offset and checks their contents
 as well as both allocation bounds. Its first run exhausted the fourteen
-GiB scope during propositional conversion. The focused empty-capacity proof
+GiB scope during propositional conversion. A repeat with twelve object bits
+also exhausted the scope; ten object bits failed on the tool's addressed-object
+limit before a solver verdict. The focused empty-capacity proof
 does not prove heap ordering, payload preservation or the full insertion
 path. The existing five-insertion assertions remain in the broader harness.
 
@@ -1323,3 +1325,30 @@ these bounds. A dedicated control-input reserve and progress under sustained
 budget pressure also remain unresolved. No rustls files changed. The next
 priority remains those engine allocations, followed by version two and the
 older unresolved proofs.
+
+
+Two scratch allocation mutations were tested and removed. Omitting heap
+admission makes the refusal replay observe 224 live bytes against zero
+reserved; its Kani refusal assertion fails too. Allocating the compaction
+vector before reserving makes the copy-refusal replay observe five live
+bytes against zero; Kani fails the zero-peak-allocation bound. The restored
+production code passes the unchanged replays and focused proofs. The
+scratch commits are not on this branch. The acknowledgment regression
+also failed before moving admission, as described above.
+
+Both datagram adapters now install the reassembly budget before creating
+any connections. The same world/socket budget therefore covers the layer's
+storage, wire owners, application datagram arena, and the newly reserved
+STREAM and CRYPTO storage. They still make no whole-engine memory claim.
+The independent suite passes all 31 tests, including HTTP/3 handler traffic
+through the shared world UDP listener, concurrent quiche clients, streamed
+responses and trailers, and sustained QUIC loss and reordering.
+
+Validation: all 357 engine library tests, 4,374 SDK library tests, 1,413
+integration tests, 303 SDK doctests and three engine doctests pass. Clippy
+with warnings denied and workspace formatting pass. Rustdoc succeeds with
+the existing redundant-link warning in `network/packet.rs`. The existing
+`quic_wire_admission` benchmark ran at 1,200 and 65,527 bytes with ten samples;
+it measures wire copying, not reassembly throughput. All Cargo, Kani and
+TLC commands ran under the required memory-limited scope with Cargo targets
+outside the worktree.

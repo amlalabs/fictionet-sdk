@@ -263,6 +263,7 @@ impl QuicLayer {
         env.entropy().fill_random(&mut seed);
         let mut endpoint = Endpoint::new(config, server, false, Some(seed));
         endpoint.set_datagram_receive_budget(env.budget());
+        endpoint.set_reassembly_budget(env.budget());
         Ok(Self::with_channels(Some(endpoint), epoch, channels, cancel))
     }
 
