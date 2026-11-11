@@ -97,6 +97,12 @@ fn exact(bytes: &[u8]) -> Vec<u8> {
 }
 
 impl Chunk {
+    /// The bytes every backing allocates besides the bytes it holds: its
+    /// shared header, two reference counts and what pays for the bytes.
+    /// No charge counts it, so a holder that keeps many small chunks counts
+    /// it with each one it keeps.
+    pub const HEADER: usize = 2 * size_of::<usize>() + size_of::<Backing>();
+
     /// Bytes nothing pays for yet: input from the wire, data from the
     /// world. Whoever takes them in pays at admission
     /// ([`repay`](Self::repay)).

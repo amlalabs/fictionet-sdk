@@ -74,6 +74,11 @@ pub struct Charged<T> {
     pub value: T,
     /// Bytes the step itself charged to a budget, such as a block it grew.
     pub charged: usize,
+    /// Bytes a reallocation moved into storage the step charged: growing
+    /// a container asks the allocator for its old contents again. Allowed
+    /// in the linear bound, not in the charge. A container that at least
+    /// doubles moves no more than it charged.
+    pub moved: usize,
 }
 
 impl Costs {
@@ -120,14 +125,18 @@ impl Costs {
             self.session,
             done.charged,
         );
-        let bound = linear.at(input).saturating_add(done.charged);
+        let bound = linear
+            .at(input)
+            .saturating_add(done.charged)
+            .saturating_add(done.moved);
         assert!(
             stats.bytes_requested <= bound,
             "{} step {step}: {} bytes asked for on {input} bytes of input, past \
-             {linear:?} and {} the step charged",
+             {linear:?} and {} the step charged and {} it moved",
             self.session,
             stats.bytes_requested,
             done.charged,
+            done.moved,
         );
         self.live += left;
         if peak * self.closest_charge.1 > self.closest_charge.0 * allowed {
