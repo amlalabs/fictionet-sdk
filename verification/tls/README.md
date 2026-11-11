@@ -220,14 +220,17 @@ that take them, as the transport and the caller make them.
 `tests/it/tls_costs.rs` (`cargo test -p fictionet --test it tls::costs`),
 the layer with rustls under it. The charge is the room the budget had
 when the session started and `HEADERS`, what the budget does not count:
-at most five chunk backings of 128 bytes and four spans of 48:
+at most five chunk backings (`Chunk::HEADER`) and rustls's spans of the
+message it joins (`rustls::budget::JOINING_SPANS`). Every size comes
+from the code: a record is `TlsLayer::RECORD`, the most joined
+`TlsLayer::JOINED`, and the parse's fixed part `parse_room(0)`.
 
-| Session | Linear bound | Closest, November 10, 2026 |
+| Session | Linear bound | Closest, November 11, 2026 |
 | --- | --- | --- |
-| Application data of seeded sizes in chunks cut at seeded places, TLS 1.3 (638 steps) and TLS 1.2 (576), a step a chunk | 0 × input + a record (`HEADER` + `BODY`) + `HEADERS`: at most one record gathered a chunk | 16,502 and 16,509 of 262,749 bytes; 16,502 and 16,509 of 19,269 |
-| The security review's 60,000-byte message a byte a record, a step a record (10,921 steps) | 0 × input + twice `JOINED` + a record: a step may move what is held | 65,631 of 1,049,181; 65,631 of 150,339 |
-| The same, one step for all | 4 × input + 2 records + `HEADERS` | 165,331 of 299,810 bytes asked for |
-| A 60 KiB hello of one-byte protocol names on a 256 KiB budget, which waits, and on a 4 MiB one, which is taken | 66.5 × input (the read buffer 4, parsing 50, the `Hello`'s copies 12.5) + fixed | 66,391 of 262,976 and 1,567,756 of 4,195,136 live; 115,563 and 2,529,220 of 4,044,191 asked |
+| Application data of seeded sizes in chunks cut at seeded places, TLS 1.3 (638 steps) and TLS 1.2 (576), a step a chunk | 0 × input + a record (`TlsLayer::RECORD`) + `HEADERS`: at most one record gathered a chunk | 16,502 and 16,509 of 262,557 bytes; 16,502 and 16,509 of 19,077 |
+| The security review's 60,000-byte message a byte a record, a step a record (10,921 steps) | 0 × input + twice `TlsLayer::JOINED` + a record: a step may move what is held | 65,631 of 1,048,989; 65,631 of 150,147 |
+| The same, one step for all | 4 × input + 2 records + `HEADERS` | 165,331 of 299,618 bytes asked for |
+| A 60 KiB hello of one-byte protocol names on a 256 KiB budget, which waits, and on a 4 MiB one, which is taken | 66.5 × input (the read buffer 4, parsing 50, the `Hello`'s copies 12.5) + fixed | 66,391 of 262,784 and 1,567,756 of 4,194,944 live; 115,563 and 2,529,220 of 4,041,999 asked |
 
 A step frees the chunks it is handed, which were made before it, and that
 lowers the live bytes it is counted with. The joined message is therefore

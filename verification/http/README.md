@@ -911,7 +911,7 @@ block dropped gives its charge back through the budget's wakers.
 | Harness | Bound | Result, November 10, 2026 |
 | --- | --- | --- |
 | `a_collected_body_copies_linearly` | the joins ask for at most `JOIN_PER` (4) times the bytes taken, on a roomy budget | passes, 258.4 s (105.3 s with a choice of two budgets, before 84530d0d5) |
-| `a_backing_is_within_its_constant` | a one-byte chunk asks for at most its byte and `BACKING` (128) | passes, 0.1 s |
+| `a_backing_is_within_its_constant` | a one-byte chunk asks for at most its byte and `Chunk::HEADER` | passes, 0.3 s (November 11) |
 | `the_counter_sees_every_allocation` | the counter's own check | passes, 20.8 s |
 | `a_collected_body_stays_within_its_charge` | on a budget of `TIGHT` (3), the most live at once is at most what was live before and `TIGHT`, and the joins ask for at most `JOIN_PER` times the bytes taken | does not fit: out of 14 GiB in CBMC's propositional reduction, on a budget of 3 or 6; before 84530d0d5, with the bound against the charge at the end, it failed on `ChargedBytes` growth in 78.3 s |
 | `a_head_in_pieces_within_a_roomy_budget_copies_linearly` | the most live at once is at most what was live once the stream was made, the budget's limit, three backings and a piece; the pushes ask for at most `JOIN_PER` times the bytes taken, both slots and `HEAD_BLOCKS` (8) backings | not finished: still in CBMC's symbolic execution after an hour, at 9.7 GiB |
@@ -963,12 +963,14 @@ input. The bounds, with their constants in the test:
 limit, a byte a delivery, within a roomy budget and one that leaves it no
 room to double past 32 KiB.
 
-`cargo xtask http-verify diff` over seeds 1 to 8 on November 10, 2026:
+`cargo xtask http-verify diff` over seeds 1 to 8 on November 11, 2026:
 every seed passes, 6,066 request cases each, none disagreeing, every
 served case within its bounds. The closest a case came to its charge was
-12,296 of 25,362 bytes; to its linear bound, 12,818 to 25,360 bytes
-against 30,042 to 46,841. The heads came to 99,961 of 103,105 bytes
-charged (the tight budget) and 6,320,262 of 8,445,148 asked.
+12,296 of 24,978 bytes; to its linear bound, 12,818 to 25,360 bytes
+against 29,722 to 46,041. The heads came to 99,961 of 102,849 bytes
+charged (the tight budget) and 6,320,262 of 6,420,124 asked. The sizes
+in the bounds come from the code: a backing is `Chunk::HEADER`, the
+pools' slots `Http1::SMALL_SLOT` and `Http1::LARGE_SLOT`.
 
 | Mutation, in a scratch copy | Failed check |
 | --- | --- |
