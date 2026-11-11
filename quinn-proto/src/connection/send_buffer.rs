@@ -316,6 +316,7 @@ mod tests {
                     Charged {
                         value: (),
                         charged: budget.used() - before,
+                        moved: 0,
                     }
                 },
             );
@@ -354,6 +355,7 @@ mod tests {
             || Charged {
                 value: buffer.prepare_write(),
                 charged: budget.used(),
+                moved: 0,
             },
         );
         assert!(!admitted);

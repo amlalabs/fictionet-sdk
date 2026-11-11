@@ -899,6 +899,7 @@ mod test {
             || Charged {
                 value: assembler.insert(0, Bytes::from_static(b"data"), 4),
                 charged: budget.used(),
+                moved: 0,
             },
         );
         assert!(result.is_err());
@@ -932,6 +933,7 @@ mod test {
                         Charged {
                             value: (),
                             charged: budget.used() - before,
+                            moved: 0,
                         }
                     },
                 );
@@ -950,6 +952,7 @@ mod test {
                     Charged {
                         value: (),
                         charged: 0,
+                        moved: 0,
                     }
                 },
             );
@@ -995,6 +998,7 @@ mod test {
                         Charged {
                             value: (),
                             charged: budget.used() - before,
+                            moved: 0,
                         }
                     },
                 );
@@ -1015,6 +1019,7 @@ mod test {
                     Charged {
                         value: (),
                         charged: 2 * size + Compacted::OVERHEAD,
+                        moved: 0,
                     }
                 },
             );
@@ -1057,6 +1062,7 @@ mod test {
                 Charged {
                     value: (),
                     charged: 0,
+                    moved: 0,
                 }
             },
         );
