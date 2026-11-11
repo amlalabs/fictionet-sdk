@@ -7,6 +7,8 @@
 mod capture;
 mod dns_verify;
 mod gate;
+#[cfg(feature = "host-tools")]
+mod honeypot_aws;
 mod hpack_verify;
 mod http_verify;
 #[cfg(feature = "host-tools")]
@@ -35,6 +37,10 @@ use std::path::PathBuf;
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn main() -> Result {
+    #[cfg(feature = "host-tools")]
+    if std::env::var_os(honeypot_aws::MUSL_CC).is_some() {
+        return honeypot_aws::musl_cc();
+    }
     let mut args = std::env::args().skip(1);
     let task = args.next().ok_or(
         "expected gate, dns-verify, http-verify, mptcp-verify, hpack-verify, quic-verify, layer-verify or a host command",
@@ -78,9 +84,13 @@ fn main() -> Result {
     }
     if !matches!(
         task.as_str(),
-        "search-web" | "search-requisites" | "search-capture" | "search-image"
+        "search-web" | "search-requisites" | "search-capture" | "search-image" | "honeypot-aws"
     ) {
         return Err(format!("unknown task: {task}").into());
+    }
+    #[cfg(feature = "host-tools")]
+    if task == "honeypot-aws" {
+        return honeypot_aws::run(&args.collect::<Vec<_>>());
     }
     #[cfg(feature = "host-tools")]
     {

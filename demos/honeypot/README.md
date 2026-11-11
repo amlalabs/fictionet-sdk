@@ -210,6 +210,39 @@ Reassembly and preauthentication also retain their limits. These limits are
 the first operating bounds, not a completed CPU/memory qualification under
 Internet floods.
 
+## Running on EC2
+
+`cargo xtask-host honeypot-aws` runs one honeypot instance in eu-west-2 with
+the AWS CLI. Every command first checks the AWS session; when it has expired,
+it stops and says to run `aws login`.
+
+| Command | What it does |
+| --- | --- |
+| `launch` | Creates an m8i.large on Amazon Linux 2023 with two network interfaces. The management interface gets its own Elastic IP and a security group that admits SSH only from the address this workstation has when it launches. The data interface gets no public address and a security group with no rules. The SSH key pair is made here, kept under `~/.ssh`, and its public half imported. |
+| `deploy` | Builds `honeypot` as a static `x86_64-unknown-linux-musl` executable, copies it over SSH, writes its systemd unit and restarts the service. The unit restarts the honeypot whenever it exits and limits its memory to 4 GiB. The commit it was built from is kept on the instance. |
+| `status` | The instance's state and addresses, the data interface as Linux sees it, the service state, the deployed commit and the service's last log lines. |
+| `dashboard` | Forwards `127.0.0.1:8700` here to the same port on the instance over SSH, until Ctrl-C. |
+| `stop`, `start` | Stops or starts the instance. Both addresses stay. |
+| `terminate` | Terminates the instance and deletes the data interface, both security groups, the key pair (in AWS and here) and the Elastic IP. |
+
+`launch` records the ID of each resource it creates in
+`~/.local/state/fictionet/honeypot-aws/state.json` (or under
+`$XDG_STATE_HOME`), and tags each one `fictionet-honeypot=<launch ID>`. The
+other commands act only on the resources in that file, and only after AWS
+reports the same tag on them. A `launch` that stops partway can be cleaned up
+with `terminate`. `launch` refuses to run while a launch is recorded.
+
+The first boot leaves the data interface to the honeypot. A systemd-networkd
+file marks it unmanaged, matched by its MAC address, and a udev rule turns off
+IPv6 router advertisements, link-local addresses and IPv6 itself when it
+appears. `launch` attaches the data interface only after the first boot has
+finished, then reports its addresses, which should be none.
+
+The musl build compiles the crates with C in them (aws-lc, ring, OpenSSL, xz
+and zstd) with `zig cc`, which carries musl's headers and C library. The xtask
+executable stands in for the C compiler and passes each call to `zig cc` with
+zig's name for the target. OpenSSL is built from source for musl builds.
+
 ## Tests
 
 The tests run in process, with no device and no host networking:
