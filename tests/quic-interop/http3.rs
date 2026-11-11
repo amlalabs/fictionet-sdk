@@ -291,3 +291,269 @@ fn http3_connection_storage_is_reserved_before_growth() {
 mod listener {
     include!("listener.rs");
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DynamicRequest {
+    Release,
+    Cancel,
+    CapacityError,
+    BlockedLimit,
+    DecoderError,
+}
+
+#[test]
+fn quiche_transport_unblocks_a_dynamic_request_after_the_insert() {
+    dynamic_request(DynamicRequest::Release);
+}
+
+#[test]
+fn quiche_transport_cancels_a_blocked_dynamic_request() {
+    dynamic_request(DynamicRequest::Cancel);
+}
+
+#[test]
+fn quiche_transport_rejects_capacity_above_the_advertised_limit() {
+    dynamic_request(DynamicRequest::CapacityError);
+}
+
+#[test]
+fn quiche_transport_rejects_too_many_blocked_streams() {
+    dynamic_request(DynamicRequest::BlockedLimit);
+}
+
+#[test]
+fn quiche_transport_rejects_an_invalid_decoder_instruction() {
+    dynamic_request(DynamicRequest::DecoderError);
+}
+
+fn dynamic_request(case: DynamicRequest) {
+    use fictionet::stdlib::codec::{Decode, Frames, Step, Wire};
+    use fictionet::stdlib::protocols::{http3 as wire, qpack};
+
+    struct Seen(Arc<std::sync::Mutex<Vec<String>>>);
+    impl httpd::Handler for Seen {
+        fn call(&self, request: web::Request, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+            assert_eq!(request.head.host(), Some(b"localhost".as_slice()));
+            self.0.lock().unwrap().push(request.head.path().to_owned());
+            httpd::Reply::Now(web::Response::new(httpd::Body::empty()))
+        }
+    }
+    let entropy: Arc<dyn Entropy> = Arc::new(SeededEntropy::new(Seed::from_u64(812)));
+    let (_, mut server, endpoint) = configs_with_protocol(entropy.clone(), false, b"h3");
+    if case == DynamicRequest::BlockedLimit {
+        let mut transport = quinn_proto::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(32u32.into());
+        server.transport_config(Arc::new(transport));
+    }
+    let budget = Budget::new(32 << 20);
+    let mut observations = Observations::new(0);
+    let mut env = Env::new(Instant::ZERO, entropy.as_ref(), &budget, &mut observations);
+    let transport = QuicLayer::new(
+        &mut env,
+        endpoint,
+        Some(Arc::new(server)),
+        std::time::Instant::now(),
+        32,
+        |_| 0x10cu32.into(),
+    )
+    .unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let responder = httpd::Responder::new(Seen(seen.clone()));
+    let mut sdk = Driver::new(
+        Chain::new(transport, responder.http3()),
+        entropy,
+        budget,
+        Instant::ZERO,
+    );
+    let mut worker = stdlib::services::stack::Polling::new();
+    let local = "127.0.0.1:4433".parse().unwrap();
+    let remote = "127.0.0.1:4444".parse().unwrap();
+    let mut config = super::interop::configuration();
+    config.set_application_protos(&[b"h3"]).unwrap();
+    let cid = quiche::ConnectionId::from_ref(&[38; 16]);
+    let mut peer = quiche::connect(Some("localhost"), &cid, remote, local, &mut config).unwrap();
+    let mut started = false;
+    let mut acted = false;
+    let mut received = std::collections::BTreeMap::<u64, Vec<u8>>::new();
+    let mut finished = std::collections::BTreeSet::new();
+    let mut buffer = [0; 65535];
+    for _ in 0..20000 {
+        sdk.run().unwrap();
+        worker.work(&mut sdk).unwrap();
+        sdk.run().unwrap();
+        while let Some(command) = sdk.take_command() {
+            let DatagramCommand::Send(datagram) = command else {
+                panic!("early closure")
+            };
+            let mut bytes = datagram.into_parts().0.into_vec();
+            peer.recv(
+                &mut bytes,
+                quiche::RecvInfo {
+                    from: local,
+                    to: remote,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                sdk.deliver(DatagramEvent::Sent(1)).unwrap(),
+                Admit::Taken
+            ));
+        }
+        if let Some(error) = peer.peer_error() {
+            assert!(error.is_app);
+            let expected = match case {
+                DynamicRequest::CapacityError => wire::error_code::QPACK_ENCODER_STREAM_ERROR,
+                DynamicRequest::BlockedLimit => wire::error_code::QPACK_DECOMPRESSION_FAILED,
+                DynamicRequest::DecoderError => wire::error_code::QPACK_DECODER_STREAM_ERROR,
+                _ => panic!("unexpected close for {case:?}: {error:?}"),
+            };
+            assert_eq!(error.error_code, expected);
+            return;
+        }
+        if peer.is_established() && !started {
+            // quiche 0.30's HTTP/3 encoder is static-only. These RFC 9204
+            // field sections deliberately use raw quiche QUIC streams so
+            // the test exercises transport ordering and the SDK decoder.
+            assert_eq!(peer.stream_send(2, &[0, 4, 0], false).unwrap(), 3);
+            assert_eq!(peer.stream_send(6, &[2], false).unwrap(), 1);
+            assert_eq!(peer.stream_send(10, &[3], false).unwrap(), 1);
+            if case == DynamicRequest::CapacityError {
+                // Set Dynamic Table Capacity: 4097, above the server's 4096.
+                assert_eq!(peer.stream_send(6, &[0x3f, 0xe2, 0x1f], false).unwrap(), 3);
+            } else if case == DynamicRequest::DecoderError {
+                // Insert Count Increment must be nonzero.
+                assert_eq!(peer.stream_send(10, &[0], false).unwrap(), 1);
+            } else {
+                // Required Insert Count 1, Base 1, static GET and https,
+                // dynamic relative entry 0 (:authority), literal :path.
+                let mut request = vec![1, 15, 2, 0, 0xd1, 0xd7, 0x80, 0x51, 8];
+                request.extend_from_slice(b"/blocked");
+                let streams = if case == DynamicRequest::BlockedLimit {
+                    17
+                } else {
+                    1
+                };
+                for index in 0..streams {
+                    assert_eq!(
+                        peer.stream_send(4 * index, &request, false).unwrap(),
+                        request.len()
+                    );
+                }
+                // A static request can finish while stream zero is blocked.
+                let mut barrier = vec![1, 25, 0, 0, 0xd1, 0xd7, 0x50, 9];
+                barrier.extend_from_slice(b"localhost");
+                barrier.extend_from_slice(&[0x51, 8]);
+                barrier.extend_from_slice(b"/barrier");
+                if case != DynamicRequest::BlockedLimit {
+                    assert_eq!(peer.stream_send(4, &barrier, true).unwrap(), barrier.len());
+                }
+            }
+            started = true;
+        }
+        let readable: Vec<_> = peer.readable().collect();
+        for id in readable {
+            loop {
+                match peer.stream_recv(id, &mut buffer) {
+                    Ok((n, fin)) => {
+                        received
+                            .entry(id)
+                            .or_default()
+                            .extend_from_slice(&buffer[..n]);
+                        if fin {
+                            finished.insert(id);
+                            break;
+                        }
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(quiche::Error::StreamReset(_))
+                        if case == DynamicRequest::Cancel && id == 0 =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("raw response on {id}: {error:?}"),
+                }
+            }
+        }
+        if finished.contains(&4) && !acted {
+            assert_eq!(*seen.lock().unwrap(), ["/barrier"]);
+            let control = received.get(&3).expect("server control stream");
+            let wire::Frame::Settings(settings) = wire::Frame::parse(&control[1..]).unwrap() else {
+                panic!("server SETTINGS")
+            };
+            assert_eq!(
+                settings.get(wire::setting::QPACK_MAX_TABLE_CAPACITY),
+                Some(4096)
+            );
+            assert_eq!(settings.get(wire::setting::QPACK_BLOCKED_STREAMS), Some(16));
+            if case == DynamicRequest::Release {
+                // Set capacity to 4096; Insert With Name Reference to static
+                // :authority (entry 0), value "localhost".
+                let mut instruction = vec![0x3f, 0xe1, 0x1f, 0xc0, 9];
+                instruction.extend_from_slice(b"localhost");
+                assert_eq!(
+                    peer.stream_send(6, &instruction, false).unwrap(),
+                    instruction.len()
+                );
+                peer.stream_send(0, &[], true).unwrap();
+            } else {
+                peer.stream_shutdown(
+                    0,
+                    quiche::Shutdown::Write,
+                    wire::error_code::REQUEST_CANCELLED,
+                )
+                .unwrap();
+            }
+            acted = true;
+        }
+        if acted {
+            let feedback = received.values().find(|bytes| bytes.first() == Some(&3));
+            if let Some(feedback) = feedback {
+                let mut bytes = &feedback[1..];
+                while let Ok(Step::Item(instruction, used)) =
+                    Frames::<qpack::DecoderInstruction>::new().decode(bytes, false)
+                {
+                    let instruction = instruction.unwrap();
+                    let complete = match case {
+                        DynamicRequest::Release => {
+                            instruction == qpack::DecoderInstruction::SectionAck(0)
+                                && finished.contains(&0)
+                        }
+                        DynamicRequest::Cancel => {
+                            instruction == qpack::DecoderInstruction::StreamCancel(0)
+                        }
+                        DynamicRequest::CapacityError
+                        | DynamicRequest::BlockedLimit
+                        | DynamicRequest::DecoderError => false,
+                    };
+                    if complete {
+                        let seen = seen.lock().unwrap();
+                        assert_eq!(
+                            seen.iter().any(|path| path == "/blocked"),
+                            case == DynamicRequest::Release
+                        );
+                        return;
+                    }
+                    bytes = &bytes[used..];
+                }
+            }
+        }
+        loop {
+            match peer.send(&mut buffer) {
+                Ok((n, _)) => {
+                    let payload = Chunk::copy_of(sdk.budget(), &buffer[..n]).unwrap();
+                    assert!(matches!(
+                        sdk.deliver(DatagramEvent::Datagram(Datagram::new(payload, remote)))
+                            .unwrap(),
+                        Admit::Taken
+                    ));
+                }
+                Err(quiche::Error::Done) => break,
+                Err(error) => panic!("client send: {error:?}"),
+            }
+        }
+    }
+    panic!(
+        "dynamic request {case:?} stalled: finished {finished:?}, seen {:?}, received {received:?}",
+        seen.lock().unwrap()
+    );
+}
